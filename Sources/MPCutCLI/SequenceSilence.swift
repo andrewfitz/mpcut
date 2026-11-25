@@ -22,6 +22,7 @@ struct SequenceSilenceResult: Encodable {
     let duration: RationalTime
     let removedDuration: RationalTime
     let retainedDuration: RationalTime
+    let pauseReviewNeedsAttention: Bool
     var outProject: String?
 }
 
@@ -38,6 +39,10 @@ func sequenceSilence(project: CutProject, location: URL, path: String, options: 
     var boundaries: [URL: (ends: [RationalTime], starts: [RationalTime])] = [:]
     var containers: [URL: String] = [:]
     var protectionCache = TranscriptPauseProtectionCache()
+    let annotations = project.analysisAnnotations.mappingPaths { CutProject.mediaURL($0, relativeTo: location).path }
+    let reviews = Dictionary(grouping: annotations.pauseReviews, by: \.occurrenceID)
+    var manualPoints = Set<RationalTime>()
+    var needsAttention = false
     let authored = protectionCache.resolve(project.transcripts, relativeTo: location)
     var cursor = RationalTime.zero, removed = RationalTime.zero
     var rows: [SequencePauseRow] = []
@@ -47,7 +52,13 @@ func sequenceSilence(project: CutProject, location: URL, path: String, options: 
     var sourceRemovals: [String: [AudioSpan]] = [:]
     for item in project.sequenceItems ?? [] {
         try interruption.check()
-        if let card = item.still { cursor = try cursor.adding(card.duration); continue }
+        if let card = item.still {
+            for row in reviews[card.id] ?? [] where row.kind == .marker && row.sources.isEmpty && row.from >= .zero && row.from < card.duration {
+                manualPoints.insert(try cursor.adding(row.from))
+            }
+            cursor = try cursor.adding(card.duration)
+            continue
+        }
         guard let clip = item.source else { continue }
         let bounds = AudioSpan(from: clip.from, to: clip.to)
         let start = cursor
@@ -55,6 +66,13 @@ func sequenceSilence(project: CutProject, location: URL, path: String, options: 
         let file = try CutProject.checkedMediaURL(clip.file, relativeTo: location)
         let media = try indexed[file] ?? engine.inspect(file, keyframes: true)
         indexed[file] = media
+        var verified: [ProjectPauseReview] = []
+        for row in reviews[clip.id] ?? [] {
+            guard row.sources.count == 1, row.sources[0].matches(media) else { needsAttention = true; continue }
+            if row.kind == .marker {
+                if row.from >= clip.from, row.from < clip.to { manualPoints.insert(try start.adding(row.from.subtracting(clip.from))) }
+            } else { verified.append(row) }
+        }
         guard !media.audio.isEmpty else { continue }
         let ordinal = clip.audioTrack ?? 0
         guard media.audio.indices.contains(ordinal) else { throw CutError(code: "no_audio", message: "Unavailable analysis track on " + clip.id) }
@@ -62,7 +80,7 @@ func sequenceSilence(project: CutProject, location: URL, path: String, options: 
         let scan: Scan
         if let saved = scans[file]?[stream] { scan = saved }
         else {
-            let detection = try AudioAnalysis.silence(media, stream: stream, thresholdDB: options.thresholdDB, minimum: options.minimum,
+            let detection = try AudioAnalysis.silence(media, stream: stream, thresholdDB: options.thresholdDB ?? annotations.threshold(for: media, stream: stream), minimum: options.minimum,
                                                       cancelled: { !interruption.isActive })
             let protections = authored.sequence(file: file.path, origin: media.multicamSourceOffset, stream: stream,
                                                sourceFingerprint: media.identity.transcriptFingerprint)
@@ -71,14 +89,20 @@ func sequenceSilence(project: CutProject, location: URL, path: String, options: 
             scans[file, default: [:]][stream] = scan
         }
         var cuts: [AudioSpan] = []
-        let first = scan.pauses.lowerBound { $0.to > clip.from }
-        for pause in scan.pauses[first...].prefix(while: { $0.from < clip.to }) {
+        let scopedReviews = verified.filter { $0.sources[0].stream == stream }
+        let fixed = Set(scopedReviews.compactMap(\.span))
+        if !fixed.isEmpty, !fixed.isSubset(of: Set(scan.pauses)) { needsAttention = true }
+        let pauses = ProjectPauseReview.preserving(fixed, in: scan.pauses)
+        let saved = Dictionary(grouping: scopedReviews, by: \.span)
+        let first = pauses.lowerBound { $0.to > clip.from }
+        for pause in pauses[first...].prefix(while: { $0.from < clip.to }) {
             try interruption.check()
             let span = AudioSpan(from: max(clip.from, pause.from), to: min(clip.to, pause.to))
             guard try span.to.subtracting(span.from).seconds >= options.minimum else { continue }
             let id = "\(clip.id):\(stream):\(span.from):\(span.to)"
-            let keep = options.protectedPauses.contains(id) || scan.protections.contains { $0.from < span.to && $0.to > span.from }
-            let requested = options.retainedPauseSeconds[id]
+            let choices = saved[pause] ?? []
+            let keep = options.protectedPauses.contains(id) || choices.contains { $0.kind == .protect } || scan.protections.contains { $0.from < span.to && $0.to > span.from }
+            let requested = options.retainedPauseSeconds[id] ?? choices.first { $0.kind == .retain }?.retainedSeconds
             var cut: AudioSpan?
             if !keep {
                 let padding = requested.map { $0 / 2 } ?? options.padding ?? 0.2
@@ -117,12 +141,12 @@ func sequenceSilence(project: CutProject, location: URL, path: String, options: 
         throw CLIError("invalid_arguments", "A pause ID is absent from this scan. Scan again with the same settings.")
     }
     let retained = AudioAnalysis.retained(in: AudioSpan(from: .zero, to: cursor), removing: outputRemovals)
-    let candidates = try options.splitTakeCandidates(retained)
+    let candidates = try options.splitTakeCandidates(retained, saved: manualPoints)
     let candidate = try project.removingSequencePauses(sourceRemovals, checkCancellation: interruption.check)
     try interruption.check()
     for (file, media) in indexed where !media.identity.isCurrentSnapshot(at: file) {
         throw CutError(code: "source_changed", message: file.lastPathComponent + " changed during silence analysis.")
     }
     return try (candidate, .init(projectPath: path, pauses: rows, takeCandidates: candidates, duration: cursor, removedDuration: removed,
-                                 retainedDuration: cursor.subtracting(removed)))
+                                 retainedDuration: cursor.subtracting(removed), pauseReviewNeedsAttention: needsAttention))
 }

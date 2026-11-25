@@ -1,25 +1,25 @@
 import Compression
 import Foundation
 
-/// The form a project keeps an attached transcript in. Nobody reads these files, and a long
-/// interview holds tens of thousands of words, so the form spends as little as it can on each:
-///
-/// - A time is the text `n` or `n/d` in place of an object naming both parts. A word's projection
-///   and the provenance are rare and keep their exported shape.
-/// - A word and an observation use one-letter field names and leave out a field at its usual
-///   value: `word` precision, `recognized` evidence, no observations.
-/// - An observation names its track by position in `tracks`. It leaves out the bounds, text
-///   and speaker it shares with the track's own word of that ID or, where the track keeps no
-///   such word, with the word it belongs to. A written `null` means the field is absent.
-/// - A track carries no activity. Audio levels belong to the recording's analysis sidecar.
-/// - The JSON is LZFSE-compressed behind a short header.
-///
-/// The exported JSON is the schema version 2 document. This form converts to and from it
-/// exactly, apart from the activity it leaves behind.
+/// Compact JSON for an immutable transcript asset. Sorted keys and unescaped
+/// slashes make these bytes the input to the asset's content digest.
+/// Word observations share track positions, text and exact times with their
+/// source words. Activity supplied by an importer uses the track's source clock.
 enum TranscriptStoredForm {
-    static let schemaVersion = 3
+    static let schemaVersion = 4
 
-    // MARK: Container
+    static func allowsFraction(at keys: ArraySlice<String>) -> Bool {
+        if keys.starts(with: ["provenance", "metadata"]) || keys.starts(with: ["tracks", "stream_evidence"]) {
+            return true
+        }
+        switch Array(keys) {
+        case ["words", "c"], ["words", "o", "c"], ["tracks", "words", "c"],
+             ["tracks", "words", "o", "c"], ["tracks", "provider_activity", "level"]:
+            return true
+        default:
+            return false
+        }
+    }
 
     /// A NUL first byte cannot begin JSON or a subtitle file.
     private static let magic: [UInt8] = [0x00, 0x4D, 0x50, 0x43, 0x54, 0x5A, 0x31, 0x0A]
@@ -29,29 +29,10 @@ enum TranscriptStoredForm {
     static func encode(_ document: TranscriptDocument) throws -> Data {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        let json = try encoder.encode(Document(document))
-        return compressed(json) ?? json
+        return try encoder.encode(Document(document))
     }
 
-    private static func compressed(_ json: Data) -> Data? {
-        guard !json.isEmpty, json.count <= maximumSize else { return nil }
-        // A stream that cannot shrink its input grows it a little.
-        let capacity = json.count + json.count / 64 + 1024
-        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: capacity)
-        defer { buffer.deallocate() }
-        let written = json.withUnsafeBytes { source -> Int in
-            guard let base = source.bindMemory(to: UInt8.self).baseAddress else { return 0 }
-            return compression_encode_buffer(buffer, capacity, base, source.count, nil, COMPRESSION_LZFSE)
-        }
-        guard written > 0 else { return nil }
-        var result = Data(capacity: headerSize + written)
-        result.append(contentsOf: magic)
-        withUnsafeBytes(of: UInt64(json.count).littleEndian) { result.append(contentsOf: $0) }
-        result.append(buffer, count: written)
-        return result
-    }
-
-    /// The JSON inside a compressed transcript, or nil for bytes that are not one.
+    /// Accept compressed v3 inputs when importing a standalone transcript.
     static func expanded(_ data: Data) throws -> Data? {
         guard data.starts(with: magic) else { return nil }
         let damaged = TranscriptDocument.invalid("The compressed transcript is damaged.")
@@ -360,6 +341,31 @@ enum TranscriptStoredForm {
         }
     }
 
+    struct Activity: Codable {
+        private enum CodingKeys: String, CodingKey { case start, end, level }
+        let start: Time
+        let end: Time
+        let level: Double
+
+        init(_ frame: TranscriptActivityFrame) {
+            start = Time(frame.start)
+            end = Time(frame.end)
+            level = frame.level
+        }
+
+        init(from decoder: Decoder) throws {
+            try ProjectField.rejectUnknown(CodingKeys.self, in: decoder, code: "invalid_transcript")
+            let fields = try decoder.container(keyedBy: CodingKeys.self)
+            start = try fields.decode(Time.self, forKey: .start)
+            end = try fields.decode(Time.self, forKey: .end)
+            level = try fields.decode(Double.self, forKey: .level)
+        }
+
+        var frame: TranscriptActivityFrame {
+            TranscriptActivityFrame(start: start.value, end: end.value, level: level)
+        }
+    }
+
     struct Track: Codable {
         private enum CodingKeys: String, CodingKey {
             case id
@@ -371,6 +377,7 @@ enum TranscriptStoredForm {
             case sessionStart = "session_start"
             case coverage
             case role
+            case providerActivity = "provider_activity"
             case words
             case speakers
             case streamEvidence = "stream_evidence"
@@ -386,6 +393,7 @@ enum TranscriptStoredForm {
         var channel: Int?
         var origin: Time
         var sessionStart: Time
+        var providerActivity: [Activity]?
         var coverage: TranscriptCoverage
         var role: TranscriptRole
         var words: [Word]?
@@ -406,6 +414,7 @@ enum TranscriptStoredForm {
             sessionStart = Time(track.sessionStart)
             coverage = track.coverage
             role = track.role
+            providerActivity = track.activity.isEmpty ? nil : track.activity.map(Activity.init)
             words = try track.words?.map { try Word($0, tables: tables) }
             speakers = track.speakers
             streamEvidence = track.streamEvidence
@@ -417,8 +426,8 @@ enum TranscriptStoredForm {
         func track(tables: Tables) throws -> TranscriptTrack {
             TranscriptTrack(id: id, name: name, sourceID: sourceID, streamIndex: streamIndex, channel: channel,
                             origin: origin.value, sessionStart: sessionStart.value, coverage: coverage, role: role,
-                            words: try words?.map { try $0.word(tables: tables) }, speakers: speakers,
-                            streamEvidence: streamEvidence, error: error, warning: warning,
+                            activity: providerActivity?.map(\.frame) ?? [], words: try words?.map { try $0.word(tables: tables) },
+                            speakers: speakers, streamEvidence: streamEvidence, error: error, warning: warning,
                             approximateClock: approximateClock)
         }
 
@@ -434,6 +443,7 @@ enum TranscriptStoredForm {
             sessionStart = try fields.decode(Time.self, forKey: .sessionStart)
             coverage = try fields.decode(TranscriptCoverage.self, forKey: .coverage)
             role = try fields.decode(TranscriptRole.self, forKey: .role)
+            providerActivity = try fields.decodeIfPresent([Activity].self, forKey: .providerActivity)
             words = try fields.decodeIfPresent([Word].self, forKey: .words)
             speakers = try fields.decodeIfPresent([TranscriptSpeaker].self, forKey: .speakers)
             streamEvidence = try fields.decodeIfPresent(TranscriptJSONValue.self, forKey: .streamEvidence)
@@ -483,10 +493,13 @@ enum TranscriptStoredForm {
             provenance = document.provenance
         }
 
-        func document() throws -> TranscriptDocument {
-            guard schemaVersion == TranscriptStoredForm.schemaVersion else {
+        func document(storedVersion: Int = TranscriptStoredForm.schemaVersion) throws -> TranscriptDocument {
+            guard schemaVersion == storedVersion else {
                 throw CutError(code: "unsupported_transcript_version",
                                message: "Unsupported transcript schema version \(schemaVersion)")
+            }
+            if schemaVersion == 3, tracks.contains(where: { $0.providerActivity != nil }) {
+                throw TranscriptDocument.invalid("Provider activity requires transcript schema version 4")
             }
             let ids = tracks.map(\.id)
             guard Set(ids).count == ids.count else { throw TranscriptDocument.invalid("Duplicate or empty track ID") }

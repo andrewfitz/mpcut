@@ -205,6 +205,7 @@ enum ListFile {
             let end: Scalar
             let view: Decimal
             let number: Decimal?
+            let viewLabel: String?
 
             init(from decoder: Decoder) throws {
                 let fields = try decoder.requestFields(SceneExportInput.Scene.CodingKeys.self, in: "Scene")
@@ -212,6 +213,7 @@ enum ListFile {
                 end = try fields.decode(Scalar.self, forKey: .end)
                 view = try fields.decode(Decimal.self, forKey: .view)
                 number = try fields.decodeIfPresent(Decimal.self, forKey: .number)
+                viewLabel = try fields.decodeIfPresent(String.self, forKey: .viewLabel)
             }
         }
         return try values(path, csv: { records in
@@ -237,7 +239,7 @@ enum ListFile {
                     throw invalid("Scene view and number must be integers.")
                 }
                 return try SceneExportInput.Scene(number: number, view: view, start: RationalTime(parsing: $0.start.value),
-                                                  end: RationalTime(parsing: $0.end.value))
+                                                  end: RationalTime(parsing: $0.end.value), viewLabel: $0.viewLabel)
             }
         })
     }

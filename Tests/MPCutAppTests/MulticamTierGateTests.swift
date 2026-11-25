@@ -233,6 +233,9 @@ final class MulticamTierGateTests: XCTestCase {
         try await settle(model)
         XCTAssertEqual(asked.prompts.count, 1)
         XCTAssertFalse(model.preferences.warnBeforeLoweringExportTier)
+        // Recorded as the alert's suppression, so Reset All Warnings turns the question on again.
+        XCTAssertTrue(model.preferences.suppressedWarnings.contains(.exportTierDowngrade))
+        XCTAssertFalse(model.preferences.asks(.exportTierDowngrade))
         XCTAssertEqual(model.settledTier, .lossless)
         model.undo()
         try await settle(model)

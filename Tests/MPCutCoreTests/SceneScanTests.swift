@@ -56,16 +56,17 @@ final class SceneScanTests: XCTestCase {
         let firstPolicy = SceneScanPolicy.restart(operationID: "initial")
         let first = try XCTUnwrap(SceneAnalysis.run(source, policy: firstPolicy, session: SceneScanSession()).report)
         let sidecar = try AnalysisSidecar(source: source)
-        try sidecar.save(AnalysisSidecar.viewNameSections([1: "Wide"], for: first))
-
+        let original = try XCTUnwrap(sidecar.persistedSceneAttempts().first?.id)
         let replacement = try SceneAnalysis.run(source, policy: .restart(operationID: "replacement"),
                                                 session: SceneScanSession())
-        XCTAssertEqual(replacement.report?.views.first?.name, "Wide")
+        XCTAssertEqual(replacement.state, .completed)
+        let latest = try XCTUnwrap(sidecar.persistedSceneAttempts().first { $0.current }?.id)
+        XCTAssertNotEqual(latest, original)
 
         let replay = try SceneAnalysis.run(source, policy: firstPolicy, session: SceneScanSession())
         XCTAssertEqual(replay.state, .upToDate)
-        XCTAssertEqual(replay.report?.views.first?.name, first.views.first?.name)
-        XCTAssertEqual(sidecar.sceneReport()?.views.first?.name, "Wide")
+        XCTAssertEqual(replay.report?.scenes.map(\.start), first.scenes.map(\.start))
+        XCTAssertEqual(sidecar.persistedSceneAttempts().first { $0.current }?.id, latest)
     }
 
     func testWholeSidecarClearInvalidatesCompletedSceneInOpenSession() throws {
@@ -79,25 +80,20 @@ final class SceneScanTests: XCTestCase {
             XCTAssertNotNil(SceneAnalysis.lookup(media, session: session)?.report)
             let entries = SidecarCacheCleaner.preview(sources: [source])
             XCTAssertEqual(entries.count, 1)
-            let clear = SidecarCacheCleaner.clear(entries, wholeSidecars: true)
+            let clear = SidecarCacheCleaner.clear(entries)
             XCTAssertEqual(clear.cleared.count, 1, "\(clear.skipped)")
             XCTAssertNil(SceneAnalysis.lookup(media, session: session)?.report)
         }
     }
 
-    func testRecoveringSceneCheckpointHonorsClearedViewNames() throws {
+    func testRecoveringSceneCheckpointRestoresOriginalMarkers() throws {
         let source = try copyFixture()
         let first = try XCTUnwrap(SceneAnalysis.run(source, session: SceneScanSession()).report)
         let sidecar = try AnalysisSidecar(source: source)
-        try sidecar.save(AnalysisSidecar.viewNameSections([1: "Wide"], for: first))
-        let named = try XCTUnwrap(SceneAnalysis.run(source, policy: .restart(operationID: "named"),
-                                                    session: SceneScanSession()).report)
-        XCTAssertEqual(named.views.first?.name, "Wide")
-        var sections = try AnalysisSidecar.viewNameSections([:], for: named)
-        sections[AnalysisSidecar.sceneSectionKey] = Data("{}".utf8)
-        try sidecar.save(sections)
+        try sidecar.save([AnalysisSidecar.sceneSectionKey: Data("{}".utf8)])
         let recovered = try XCTUnwrap(SceneAnalysis.run(source, session: SceneScanSession()).report)
-        XCTAssertNil(try XCTUnwrap(recovered.views.first).name)
+        XCTAssertEqual(recovered.scenes.map(\.start), first.scenes.map(\.start))
+        XCTAssertEqual(recovered.scenes.map(\.end), first.scenes.map(\.end))
     }
 
     func testOneSubscriberCanCancelWhileCompatibleWorkContinues() throws {
@@ -144,21 +140,55 @@ final class SceneScanTests: XCTestCase {
         wait(for: [second], timeout: 5)
     }
 
-    func testSessionOnlyViewNameTransfersToVerifiedReplacement() throws {
+    func testEditingOneReportKeepsReusedAndRecomputedDetectionsIndependent() throws {
         let source = try copyFixture()
         let media = try CutEngine(useSidecar: false).inspect(source, keyframes: false)
         let session = SceneScanSession()
-        _ = try SceneAnalysis.run(media, useSidecar: false, session: session)
-        session.setViewName("Wide", view: 1, for: media)
-        let named = try SceneAnalysis.run(media, policy: .restart(operationID: "named"), useSidecar: false,
-                                          session: session)
-        XCTAssertEqual(named.report?.views.first?.name, "Wide")
-
-        session.setViewName(nil, view: 1, for: media)
-        let cleared = try SceneAnalysis.run(media, policy: .restart(operationID: "cleared"), useSidecar: false,
-                                             session: session)
-        XCTAssertNil(cleared.report?.views.first?.name)
+        var edited = try XCTUnwrap(SceneAnalysis.run(media, useSidecar: false, session: session).report)
+        edited.setViewName("Wide", for: 1)
+        let reused = try SceneAnalysis.run(media, useSidecar: false, session: session)
+        let restarted = try SceneAnalysis.run(media, policy: .restart(operationID: "restart"),
+                                              useSidecar: false, session: session)
+        XCTAssertEqual(edited.views.first?.name, "Wide")
+        XCTAssertNil(reused.report?.views.first?.name)
+        XCTAssertNil(restarted.report?.views.first?.name)
         XCTAssertFalse(FileManager.default.fileExists(atPath: AnalysisSidecar.url(for: source).path))
+    }
+
+    func testNamedViewsAreSavedAsFullSourceChoicesAndRetainTheirEvidence() throws {
+        let source = try copyFixture()
+        let engine = CutEngine(useSidecar: false)
+        let media = try engine.inspect(source, keyframes: true)
+        let session = SceneScanSession()
+        var report = try XCTUnwrap(SceneAnalysis.run(media, useSidecar: false, session: session).report)
+        let view = try XCTUnwrap(report.views.first?.view)
+        report.setViewName("Wide", for: view)
+        var annotations = ProjectAnalysisAnnotations()
+        XCTAssertTrue(annotations.setScene(report, for: media))
+        let named = try XCTUnwrap(annotations.scene(for: media))
+        let evidence = try XCTUnwrap(named.sourceEvidence)
+
+        let otherLocation = source.deletingLastPathComponent().appendingPathComponent("moved.mov")
+        try FileManager.default.copyItem(at: source, to: otherLocation)
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_600_000_000)],
+                                              ofItemAtPath: otherLocation.path)
+        let moved = try engine.inspect(otherLocation, keyframes: true)
+        XCTAssertNotEqual(named.sourceStamp, SceneSourceStamp(media: moved))
+        XCTAssertEqual(named.forSource(otherLocation).sourceEvidence, evidence)
+        var relinked = annotations.mappingPaths { _ in otherLocation.path }
+        var restored = try XCTUnwrap(relinked.scene(for: moved))
+        XCTAssertEqual(restored.views.first?.name, "Wide")
+        XCTAssertEqual(restored.sourceStamp, SceneSourceStamp(media: moved))
+        restored.setViewName("Establishing", for: view)
+        XCTAssertTrue(relinked.setScene(restored, for: moved))
+        XCTAssertEqual(relinked.scene(for: moved)?.sourceEvidence, evidence)
+
+        let first = try XCTUnwrap(report.scenes.first)
+        let inside = try first.end.multiplied(by: .init(numerator: 1, denominator: 2))
+        let slice = try XCTUnwrap(SceneAnalysis.run(media, scope: .range(start: .zero, end: inside),
+                                                          useSidecar: false, session: session).report)
+        XCTAssertFalse(annotations.setScene(slice, for: media))
+        XCTAssertEqual(annotations.scene(for: media), named)
     }
 
     func testCompletedRangeReplacementWinsOverDerivedFullSlice() throws {

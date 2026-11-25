@@ -14,7 +14,10 @@ extension TilesCLI.Operation {
         case .scan: return "MEDIA [--output SCAN.json] \(scanOptions) \(counts) [--include-scenes] [--no-sidecar] [--resume-file SCAN.json] \(progress)"
         case .inspect: return "\(input) [--clock source] [--at TIME | --issues | --layout-changes] \(range) [--rule JSON]"
         case .preview: return "\(input) [--clock source] (--at TIME | --issue-id ID) --output PNG"
-        case .accept: return "\(project) (--scan SCAN.json \(counts) | --expected-feeds COUNT [--max-visible-tiles COUNT] | --max-visible-tiles COUNT | --clear-count-hints [--scan SCAN.json]) \(edit)"
+        case .accept: return "\(project) [--review-token TOKEN | --scan SCAN.json \(counts) | --expected-feeds COUNT [--max-visible-tiles COUNT] | --max-visible-tiles COUNT | --clear-count-hints [--scan SCAN.json]] \(edit)"
+        case .readPending: return project
+        case .stagePending: return "\(project) --review-token TOKEN --choices JSON \(edit)"
+        case .discardPending: return "\(project) --review-token TOKEN \(edit)"
         case .link: return "\(project) --tile-id ID (--feed-id ID | --clear) \(range) \(edit)"
         case .listFeeds: return input
         case .inspectFeed: return "\(input) --feed-id ID"
@@ -33,7 +36,7 @@ extension TilesCLI.Operation {
         case .exportISOs: return "(MEDIA | PROJECT.cut) --output DIRECTORY [--dry-run] [--resume] \(counts) \(scanOptions) \(planOptions) \(progress)"
         case .useAngles: return "\(project) \(picks) [--clip-id ID] \(edit)"
         case .proposeSwitches: return "--project PROJECT.cut [--attachment-id ID] [--minimum-hold TIME] [--voice-angle SPEAKER_ID=ANGLE_ID ...]"
-        case .reconcile: return "\(project) --scan SCAN.json [--apply --review TOKEN \(edit)]"
+        case .reconcile: return "\(project) [--scan SCAN.json] [--apply --review TOKEN \(edit)]"
         case .correctGrid: return "\(project) --from TIME --to TIME --grid COLSxROWS \(edit)"
         case .setLayout: return "\(project) (--clip-id ID | --occurrence-id ID | --group) --layout LAYOUT [--feed-id ID ...] [--slot JSON ...] [--compact] \(range) \(edit)"
         case .listLayouts: return "\(project) [--clip-id ID]"
@@ -49,6 +52,9 @@ extension TilesCLI.Operation {
         case .inspect: return "reviewed.cut --issues"
         case .preview: return "meeting.json --at 00:32:10 --output gallery.png"
         case .accept: return "--project edit.cut --source-id meeting.mov --scan meeting.json --out-project reviewed.cut"
+        case .readPending: return "meeting.cut"
+        case .stagePending: return #"meeting.cut --review-token TOKEN --choices '{"names":{"feed-1":"Alice"}}' --in-place"#
+        case .discardPending: return "meeting.cut --review-token TOKEN --in-place"
         case .link: return "reviewed.cut --tile-id tile-1 --feed-id alice --in-place"
         case .listFeeds: return "reviewed.cut"
         case .inspectFeed: return "reviewed.cut --feed-id alice"

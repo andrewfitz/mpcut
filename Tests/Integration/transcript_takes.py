@@ -77,7 +77,7 @@ def exercise(cli, directory):
     left_transcript = make_take(left, 70, 440, [complete, unqualified])
     right_transcript = make_take(right, 180, 880, [complete])
     project = directory / "takes.cut"
-    project.write_text(json.dumps({"format": "mpcut", "schema_version": 3, "kind": "sequence",
+    project.write_text(json.dumps({"format": "mpcut", "schema_version": 9, "kind": "sequence",
                                    "clips": [{"id": path.stem, "file": path.name, "from": "0", "to": "4"}
                                              for path in (left, right)]}))
     for video, transcript in ((left, left_transcript), (right, right_transcript)):

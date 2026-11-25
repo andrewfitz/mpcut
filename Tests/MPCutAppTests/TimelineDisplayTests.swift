@@ -115,12 +115,14 @@ final class TimelineDisplayTests: XCTestCase {
 
     private struct MulticamTimelineFixture: View {
         @ObservedObject var state: MulticamTimelineState
+        var preferences = EditorPreferences()
 
         var body: some View {
             MulticamTimeline(project: MulticamTimelineState.project, media: [:], playhead: state.playhead,
                              clock: state.clock, seek: { _ in }, take: { _ in }, moveSwitch: { _, _ in },
                              deleteSwitch: { _ in }, selectSwitch: { _ in },
-                             thumbnailService: state.thumbnails, selectedSwitch: state.selectedSwitch, zoom: $state.zoom)
+                             thumbnailService: state.thumbnails, selectedSwitch: state.selectedSwitch, zoom: $state.zoom,
+                             trackLabelWidth: Binding(get: { preferences.trackLabelWidth }, set: { preferences.trackLabelWidth = $0 }))
         }
     }
 
@@ -171,7 +173,9 @@ final class TimelineDisplayTests: XCTestCase {
         defaults.set(230.0, forKey: "multicam_track_label_width_points")
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 650, height: 240),
                               styleMask: .titled, backing: .buffered, defer: false)
-        let hosting = NSHostingView(rootView: MulticamTimelineFixture(state: state).defaultAppStorage(defaults))
+        let preferences = EditorPreferences(defaults: defaults)
+        XCTAssertEqual(preferences.trackLabelWidth, 230)
+        let hosting = NSHostingView(rootView: MulticamTimelineFixture(state: state, preferences: preferences))
         window.contentView = hosting
         hosting.layoutSubtreeIfNeeded()
 
@@ -353,7 +357,8 @@ final class TimelineDisplayTests: XCTestCase {
                                         selectSwitch: { _ in }, thumbnailService: model.filmstrip,
                                         assembly: MulticamAssemblyTimeline(model: model, preview: preview))
                 .frame(minHeight: 150, idealHeight: 240, maxHeight: .infinity),
-            status: Color.gray.frame(height: 32), showsTimeline: true, showsStatus: true, allowsTimelineResize: true)
+            status: Color.gray.frame(height: 32), preferences: EditorPreferences(), showsTimeline: true, showsStatus: true,
+            allowsTimelineResize: true)
         let hosting = NSHostingView(rootView: root)
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1060, height: 730),
                               styleMask: .titled, backing: .buffered, defer: false)

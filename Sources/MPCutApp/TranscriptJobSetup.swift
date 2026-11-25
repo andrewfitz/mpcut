@@ -1,44 +1,7 @@
 import SwiftUI
 import MPCutCore
 
-private struct TranscriptEngines: Decodable {
-    struct Engine: Decodable, Identifiable {
-        let name: String
-        let included: Bool
-        let helper_present: Bool?
-        let default_model: String
-        let minimum_macos: String
-        let diarization: Bool
-        let diarization_speaker_limit: Int?
-        let estimated_realtime_factor: Double?
-        var id: String { name }
-
-        var title: String {
-            switch name {
-            case "qwen3": "Qwen3"
-            case "parakeet-v3": "Parakeet v3"
-            case "apple-native": "Apple Speech"
-            default: name
-            }
-        }
-
-        var available: Bool {
-            let version = minimum_macos.split(separator: ".").compactMap { Int($0) }
-            guard let major = version.first, included, helper_present != false else { return false }
-            return ProcessInfo.processInfo.isOperatingSystemAtLeast(.init(
-                majorVersion: major, minorVersion: version.dropFirst().first ?? 0,
-                patchVersion: version.dropFirst(2).first ?? 0
-            ))
-        }
-    }
-
-    struct Automation: Decodable {
-        let plan: String?
-        let zoom_iso_inventory: [String]?
-    }
-    let automation: Automation?
-    let engines: [Engine]
-}
+private typealias TranscriptEngines = TranscriptEngineCatalog
 
 struct TranscriptSetupTarget: Hashable {
     let file: URL
@@ -61,6 +24,8 @@ struct TranscriptJobSetup: View {
     let controller: LiveTranscriptController
     var targets: Set<TranscriptSetupTarget> = []
     let start: (TranscriptJobOptions, Bool) throws -> Void
+    /// Read from Settings once, when the sheet is made.
+    @State private var defaults: TranscriptSheetDefaults
     @Environment(\.dismiss) private var dismiss
     @State private var showsOptions = false
     @State private var contentHeight: CGFloat = 160
@@ -78,11 +43,12 @@ struct TranscriptJobSetup: View {
     @State private var discoveryFailures: [String] = []
     @State private var speakerEdits: [String: [String: String]] = [:]
     @State private var selectedEngine = ""
-    @State private var language = ""
+    @State private var engineIssue: String?
+    @State private var language: String?
     @State private var model = ""
     @State private var speakerCount = ""
     @State private var diarization = false
-    @State private var download = false
+    @State private var download: Bool
     @State private var providerStatus: String? = "Checking Transcriberrr…"
     @State private var readingTracks = true
     @State private var loadAttempt = 0
@@ -101,6 +67,15 @@ struct TranscriptJobSetup: View {
         }
     }
     @State private var error: String?
+
+    init(controller: LiveTranscriptController, targets: Set<TranscriptSetupTarget> = [], defaults: TranscriptSheetDefaults,
+         start: @escaping (TranscriptJobOptions, Bool) throws -> Void) {
+        self.controller = controller
+        self.targets = targets
+        self.start = start
+        _defaults = State(initialValue: defaults)
+        _download = State(initialValue: defaults.downloadsModels)
+    }
 
     private var engine: TranscriptEngines.Engine? { engines.first { $0.name == selectedEngine } }
     private var duration: Double {
@@ -190,7 +165,7 @@ struct TranscriptJobSetup: View {
         defer { providerStatus = nil }
         do {
             let data = try await controller.capabilities { providerStatus = $0 }
-            let capabilities = try JSONDecoder().decode(TranscriptEngines.self, from: data)
+            let capabilities = try TranscriptEngines.read(data)
             engines = capabilities.engines
             if let inventory = capabilities.automation?.zoom_iso_inventory {
                 supportsPlan = inventory == ["--plan", "--inventory-only", "--offline"]
@@ -198,8 +173,11 @@ struct TranscriptJobSetup: View {
                 supportsPlan = capabilities.automation?.plan == "--plan"
             }
             if engines.contains(where: { $0.available && $0.name == selectedEngine }) { return }
-            selectedEngine = engines.first(where: { $0.available && $0.name == "qwen3" })?.name
-                ?? engines.first(where: \.available)?.name ?? ""
+            // Settings names the engine. One that cannot run here says why and keeps the preference.
+            let choice = capabilities.resolve(preferred: defaults.engine)
+            engineIssue = choice.issue
+            selectedEngine = choice.engine ?? ""
+            seedSpeakers()
         } catch {
             if !Task.isCancelled { providerError = error.localizedDescription }
         }
@@ -233,7 +211,7 @@ struct TranscriptJobSetup: View {
     }
 
     @MainActor private func discoverZoom() async {
-        guard let helper = try? TranscriptJobStore.helperURL() else { return }
+        guard let helper = try? controller.helperURL() else { return }
         let placements = Dictionary(grouping: tracks.filter { $0.streamIndex != nil }, by: \.file)
             .filter { Set($0.value.compactMap(\.streamIndex)).count == 1 }
         let folders = Dictionary(grouping: placements.keys, by: { $0.deletingLastPathComponent() })
@@ -346,11 +324,16 @@ struct TranscriptJobSetup: View {
                 }
                 .accessibilityIdentifier("transcript.setup.engine")
                 .onChange(of: selectedEngine) { _, _ in
-                    diarization = false
+                    seedSpeakers()
                     speakerCount = ""
                     model = ""
                 }
                 .help("Transcription engine supplied by Transcriberrr")
+            }
+            if let engineIssue, let engine {
+                Text("\(engineIssue) This job uses \(engine.title).")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("transcript.setup.engine.issue")
             }
             DisclosureGroup("Recognition options", isExpanded: $showsOptions) {
                 VStack(alignment: .leading, spacing: 8) {
@@ -359,8 +342,14 @@ struct TranscriptJobSetup: View {
                             .accessibilityLabel("Model")
                     }
                     InspectorRow("Language") {
-                        TextField("Language", text: $language, prompt: Text("Automatic"))
-                            .accessibilityLabel("Language")
+                        // Transcriberrr sessions recognize English only, so the choice is limited to it.
+                        Picker("Language", selection: $language) {
+                            Text("Automatic").tag(nil as String?)
+                            Text("English").tag("en" as String?)
+                        }
+                        .accessibilityLabel("Language")
+                        .accessibilityIdentifier("transcript.setup.language")
+                        .help("Transcriberrr sessions transcribe English. Automatic uses English.")
                     }
                     if engine?.diarization == true && hasMixedAudio {
                         Toggle("Identify speakers in mixed audio", isOn: $diarization)
@@ -430,6 +419,15 @@ struct TranscriptJobSetup: View {
         .padding(.top, 4)
     }
 
+    /// Identify speakers starts from Settings wherever the chosen engine supports it, and again on each engine change.
+    private func seedSpeakers() {
+        diarization = Self.seededSpeakers(defaults, engine: engine)
+    }
+
+    static func seededSpeakers(_ defaults: TranscriptSheetDefaults, engine: TranscriptEngineCatalog.Engine?) -> Bool {
+        defaults.identifiesSpeakers && engine?.diarization == true
+    }
+
     private func submit() {
         do {
             let countText = speakerCount.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -472,7 +470,7 @@ struct TranscriptJobSetup: View {
                     return edited
                 }
             }
-            var options = TranscriptJobOptions(engine: selectedEngine, model: value(model), language: value(language),
+            var options = TranscriptJobOptions(engine: selectedEngine, model: value(model), language: language,
                             expectedSpeakers: identifySpeakers ? count : nil, diarization: identifySpeakers,
                             selectedTracks: excluded.isEmpty ? nil : selected.map(\.id), trackOptions: settings.filter { zoom[$0.key] == nil })
             options.zoomParticipants = zoom.isEmpty ? nil : zoom
@@ -487,8 +485,16 @@ struct TranscriptRetryForm: View {
     @Environment(\.dismiss) private var dismiss
     let message: String?
     let retry: (Bool) throws -> Void
-    @State private var download = false
+    /// Starts from Settings. The retry otherwise uses the options its job captured.
+    @State private var download: Bool
     @State private var error: String?
+
+    init(message: String?, downloadsModels: Bool = TranscriptSheetDefaults.factory.downloadsModels,
+         retry: @escaping (Bool) throws -> Void) {
+        self.message = message
+        self.retry = retry
+        _download = State(initialValue: downloadsModels)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {

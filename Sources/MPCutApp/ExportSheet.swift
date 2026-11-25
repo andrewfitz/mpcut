@@ -117,6 +117,49 @@ struct ExportSheetOptions: Sendable, Equatable {
     }
 }
 
+/// The re-encode fields Settings → Export seeds. A field the editor changes in a sheet stays for that window's session.
+struct ExportEncodingFields: OptionSet, Sendable {
+    let rawValue: Int
+    static let codec = ExportEncodingFields(rawValue: 1 << 0)
+    static let standardQuality = ExportEncodingFields(rawValue: 1 << 1)
+    static let proResQuality = ExportEncodingFields(rawValue: 1 << 2)
+    static let encodeContainer = ExportEncodingFields(rawValue: 1 << 3)
+}
+
+extension ExportSheetOptions {
+    /// Takes the codec, the two qualities and the H.264 and HEVC container from Settings, except the fields in `kept`.
+    /// Automatic uses `automaticContainer`, this entry point's own container. ProRes keeps its MOV container.
+    @MainActor
+    mutating func seedEncoding(from preferences: EditorPreferences, keeping kept: ExportEncodingFields = [],
+                               automaticContainer: String = "mp4") {
+        // A starting value from Settings is not a quality chosen in this sheet.
+        let chosen = qualityChosen
+        defer { qualityChosen = chosen }
+        if !kept.contains(.codec), EditorPreferences.reencodeCodecs.contains(preferences.reencodeCodec) {
+            codec = preferences.reencodeCodec
+        }
+        if !kept.contains(.standardQuality), ExportRules.qualities(.h264).contains(preferences.reencodeQuality) {
+            standardQuality = preferences.reencodeQuality
+        }
+        if !kept.contains(.proResQuality), ExportRules.qualities(.prores).contains(preferences.proresQuality) {
+            proResQuality = preferences.proresQuality
+        }
+        if !kept.contains(.encodeContainer) {
+            encodeContainer = preferences.reencodeContainer == .automatic ? automaticContainer : preferences.reencodeContainer.rawValue
+        }
+    }
+
+    /// The re-encode fields that differ from `previous`.
+    func encodingFields(changedFrom previous: ExportSheetOptions) -> ExportEncodingFields {
+        var fields: ExportEncodingFields = []
+        if codec != previous.codec { fields.insert(.codec) }
+        if standardQuality != previous.standardQuality { fields.insert(.standardQuality) }
+        if proResQuality != previous.proResQuality { fields.insert(.proResQuality) }
+        if encodeContainer != previous.encodeContainer { fields.insert(.encodeContainer) }
+        return fields
+    }
+}
+
 extension ExportAlternative {
     var requestedStillAudio: ReencodeAudio? {
         guard id.hasPrefix("still-") else { return nil }
@@ -509,8 +552,10 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
          allowsApplyingReviewToTimeline: Bool = true, stillProject: CutProject? = nil,
          expectedSoundtrackIdentity: SourceIdentity? = nil,
          stillAudioIssue: @escaping (ExportTracks, ReencodeAudio) -> CutError? = { _, _ in nil },
+         savesExportResult: Bool = false,
          changed: @escaping (ExportSheetOptions, Bool) -> Void,
          directoryChanged: @escaping (URL) -> Void) {
+        saveExportResult.state = savesExportResult ? .on : .off
         self.allowsApplyingReviewToTimeline = allowsApplyingReviewToTimeline
         self.stillProject = stillProject
         self.expectedSoundtrackIdentity = expectedSoundtrackIdentity

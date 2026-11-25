@@ -229,6 +229,9 @@ extension MulticamEditorModel {
         guard let index = queuedRanges.firstIndex(where: { $0.id == id }) else { throw QueueEdit.invalidTarget }
         let original = queuedRanges[index]
         var entry = try captureMarkedQueueRange()
+        if let issue = entry.recordingDependencies.lazy.compactMap({ self.sourceIssues[$0.id] }).first {
+            throw CutError(code: "source_needs_review", message: issue)
+        }
         try checkQueueDependencies(entry.mediaDependencies, status: mediaStatus)
         if extending {
             guard original.usesAssembly == entry.usesAssembly else { throw QueueEdit.incompatibleCoordinateSpace }
@@ -237,9 +240,16 @@ extension MulticamEditorModel {
         }
         entry.id = original.id
         entry.name = original.name
+        if let excerpt = original.excerpt {
+            let snapshot = try entry.usesAssembly ? entry.snapshot : entry.project.pictureExportSnapshot(ranges: [entry.range])
+            entry.excerpt = try TranscriptQueueExcerpt(name: excerpt.name, project: .multicam(snapshot),
+                                                       location: transcriptAssetContext(),
+                                                       mediaSnapshot: projectMediaSnapshotForWriting)
+        }
         queuedRanges[index] = entry
         clearQueueInvalidation(id)
         clearQueueMarks()
+        reconcileSourceLoads()
         status = "Updated the queued range."
     }
 
@@ -336,6 +346,8 @@ extension MulticamEditorModel {
         isBulkQueuePresented = false
         isReplacementAudioPresented = false
         bulkExportDirectory = nil
+        exportSessionFolder = nil
+        lastExportedURL = nil
     }
 
     /// Plans every queued range with these settings, without writing: nil, or the failure with the alternatives
@@ -368,12 +380,14 @@ extension MulticamEditorModel {
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.canCreateDirectories = true
-        panel.directoryURL = bulkExportDirectory
+        // Automatic keeps the queue's rule: the folder of its last export.
+        panel.directoryURL = exportStartFolder(automatic: nil, remembered: bulkExportDirectory)
         panel.accessoryView = multicamDeliveryAccessory(summary)
         panel.isAccessoryViewDisclosed = true
         ProjectPanels.present(panel, in: window, fromSheet: true) { [weak self] accepted in
             guard let self, self.isBulkQueuePresented, accepted, let directory = panel.url,
                   self.readyQueuedRanges.map(\.contentID) == contentIDs else { return }
+            self.noteExportFolder(directory)
             self.exportQueuedRanges(to: directory, container: choices.container, mode: choices.effectiveMode,
                                     tracks: choices.tracks, settings: choices.settings, organization: organization,
                                     requireCameraCopy: choices.requireCameraCopy, audioOutput: choices.audioOutput,
@@ -434,6 +448,8 @@ extension MulticamEditorModel {
             let (count, written) = result
             let folder = organization.subfolder.isEmpty ? directory.lastPathComponent : organization.subfolder
             self.status = (["Exported \(count) \(count == 1 ? "file" : "files") to \(folder)."] + written).joined(separator: " ")
+            let destination = organization.subfolder.isEmpty ? directory : directory.appendingPathComponent(organization.subfolder, isDirectory: true)
+            self.exportFinished(destination, title: "Queue export finished")
         }
     }
 }
@@ -451,6 +467,7 @@ struct MulticamBulkQueueView: View {
     init(model: MulticamEditorModel) {
         self.model = model
         var options = MulticamExportChoices(entry: .multicamQueue, preferred: model.preferences.defaultExportMode)
+        options.seed(from: model.preferences)
         let placements = model.readyQueuedRanges.map(\.placements)
         options.placements = placements.contains(.insertion) ? .insertion : placements.contains(.replacement) ? .replacement : .none
         options.usePictureProject(model.readyQueuedRanges.map { CutProject.multicam($0.project) }.first(where: \.requiresPictureProcessing))
@@ -500,7 +517,7 @@ struct MulticamBulkQueueView: View {
                                                                      revise: { try model.reviseQueuedRange(entry.id, extending: $0) })
                                             },
                                             saveExcerpt: entry.excerpt.map { excerpt in
-                                                { excerpt.presentSave(in: model.window, canSave: model.canSaveProjectTo) }
+                                                { excerpt.presentSave(in: model.window, canSave: model.canSaveProjectTo, preferences: model.preferences) }
                                             },
                                             replan: model.invalidatedQueueIDs.contains(entry.id)
                                                 ? { try model.replanQueuedRange(entry.id) } : nil) {

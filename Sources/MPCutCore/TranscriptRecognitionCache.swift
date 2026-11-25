@@ -3,15 +3,19 @@ import Darwin
 import Foundation
 
 struct TranscriptRecognitionCache {
-    private static let legacyPrefix = "transcript_recognition.v1."
-    private static let prefix = "transcript_recognition.v2."
-
     struct Artifacts: Codable {
         let result: Data
         let activity: Data?
 
         var recognitionKey: String? {
             Self.checkedRecognition(result)?.key
+        }
+
+        /// Partial jobs can leave a valid track result before session assembly finishes.
+        func belongs(to track: TranscriptJobTrack) -> Bool {
+            guard let checked = Self.checkedRecognition(result), checked.evidence == track.evidence,
+                  let duration = try? track.duration.roundedToSamples(16_000), duration == checked.duration else { return false }
+            return true
         }
 
         func matches(key: String, evidence: String?, needsActivity: Bool = false) -> Bool {
@@ -109,7 +113,7 @@ struct TranscriptRecognitionCache {
             return checked.evidence == evidence && (duration == nil || checked.duration == duration)
         }
 
-        private static func valid(_ levels: [TranscriptNativeSession.Activity], duration: Int64) -> Bool {
+        fileprivate static func valid(_ levels: [TranscriptNativeSession.Activity], duration: Int64) -> Bool {
             var end: Int64 = 0
             for frame in levels {
                 guard frame.start_sample == end, end < duration,
@@ -186,240 +190,131 @@ struct TranscriptRecognitionCache {
         let activity: [TranscriptNativeSession.Activity]
     }
 
-    let sidecar: AnalysisSidecar
+    static func providerActivity(for track: TranscriptJobTrack) throws -> [TranscriptActivityFrame] {
+        let duration = try track.duration.roundedToSamples(16_000)
+        var frames: [TranscriptNativeSession.Activity] = []
+        if let data = track.activity.flatMap(TranscriptJobArtifact.read),
+           track.measuredActivitySHA256 != TranscriptStore.digest(data),
+           Artifacts.matchesActivity(data, evidence: track.evidence, duration: duration) {
+            frames = try JSONDecoder().decode(Levels.self, from: data).activity
+        } else if let data = track.result.flatMap(TranscriptJobArtifact.read),
+                  let result = try? JSONDecoder().decode(Recognition.self, from: data),
+                  result.version == 1, result.stream_evidence == track.evidence, result.sample_rate == 16_000,
+                  result.duration_samples == duration, Artifacts.valid(result.activity, duration: duration) {
+            frames = result.activity
+        }
+        return try frames.map { frame in
+            let bounds = try TranscriptNativeSession.Bounds(start: frame.start_sample, end: frame.end_sample,
+                                                           rate: 16_000, origin: track.origin)
+            return .init(start: bounds.start, end: bounds.end, level: frame.level)
+        }
+    }
+
     let key: String
     let evidence: String
-    let stream: Int
-    var channel: Int? = nil
     /// The highest exchange version the provider's capabilities say it reads. A provider
     /// that says nothing reads version 1, and is written that.
     var providerExchangeVersion = 1
 
-    var section: String { "\(Self.prefix)\(stream).\(key)" }
     var claimID: String {
-        TranscriptExternalCacheDescriptor.claimID(
-            scope: TranscriptExternalCacheDescriptor.scope(for: sidecar.source, stream: stream), key: key)
-    }
-
-    static func stream(forKey key: String) -> Int? {
-        guard let prefix = [prefix, legacyPrefix].first(where: { key.hasPrefix($0) }) else { return nil }
-        let components = key.dropFirst(prefix.count).split(separator: ".", omittingEmptySubsequences: false)
-        guard components.count == 2, let stream = Int(components[0]), stream >= 0,
-              TranscriptStore.validDigest(String(components[1])) else { return nil }
-        return stream
+        TranscriptExternalCacheDescriptor.claimID(scope: evidence, key: key)
     }
 
     func read(cancelled: () -> Bool) -> Artifacts? {
-        guard AnalysisSidecar.readsEnabled, !sidecar.isExcluded else { return nil }
-        if let hit = readSidecar(cancelled: cancelled) { return hit }
-        return readExchange(cancelled: cancelled)
-    }
-
-    private var legacySection: String { "\(Self.legacyPrefix)\(stream).\(key)" }
-
-    // An empty first line means the result contains its levels. Otherwise the first
-    // line identifies an immutable activity section shared by recognition settings.
-    // The rest is the exact original result, including its provider-specific fields.
-    private func artifacts(from record: Data, read: (String) -> Data?,
-                           alternateLevels: (String) -> Data? = { _ in nil }) -> Artifacts? {
-        guard let split = record.prefix(65).firstIndex(of: 10) else { return nil }
-        let result = Data(record.suffix(from: split + 1))
-        if split == record.startIndex { return Artifacts(result: result, activity: nil) }
-        let digest = String(decoding: record[..<split], as: UTF8.self)
-        guard TranscriptStore.validDigest(digest) else { return nil }
-        if let levels = read(activitySection(digest)), TranscriptStore.digest(levels) == digest {
-            return Artifacts(result: result, activity: levels)
-        }
-        let key = TranscriptActivityKey(stream: stream, channel: channel)
-        if let name = try? AnalysisSidecar.transcriptActivitySection(key),
-           let alternate = read(name), TranscriptStore.digest(alternate) == digest {
-            return Artifacts(result: result, activity: alternate)
-        }
-        return alternateLevels(digest).map { Artifacts(result: result, activity: $0) }
-    }
-
-    /// Copy the paid result and its exact levels as one immutable group.
-    /// An extraction alias may be the last surviving copy of a referenced digest.
-    static func merge(from peer: AnalysisSidecar.CopySnapshot, into target: AnalysisSidecar.CopySnapshot,
-                      peerKeys: [String], cancelled: () -> Bool) throws {
-        let targetKeys = try AnalysisSidecar.sectionNames(in: target.db)
-        let names = Set(targetKeys + peerKeys).filter { stream(forKey: $0) != nil }
-        guard !names.isEmpty else { return }
-        func read(_ name: String, _ snapshot: AnalysisSidecar.CopySnapshot) -> Data? {
-            try? snapshot.store.verifiedSection(name, in: snapshot.db, stamp: snapshot.stamp, maxBytes: nil, cancelled: cancelled)
-        }
-        func proof(_ snapshot: AnalysisSidecar.CopySnapshot) -> MediaRefreshEvidence? {
-            MediaRefreshEvidence.decode(try? snapshot.store.verifiedSection(AnalysisSidecar.evidenceKey, in: snapshot.db,
-                stamp: snapshot.stamp, maxBytes: 16 * 1024 * 1024, cancelled: cancelled))
-        }
-        let media = [target.store.sourceEvidence, proof(target), proof(peer)].compactMap { $0 }
-        var streamProofs: [Int: String] = [:]
-        for name in names {
-            try checkSidecarCancellation(cancelled)
-            guard let stream = stream(forKey: name), let suffix = name.split(separator: ".").last else { continue }
-            let key = String(suffix)
-            if let index = media.first, !index.streams.indices.contains(stream) || index.streams[stream].kind != "audio" {
-                continue
-            }
-            if streamProofs[stream] == nil {
-                for index in media {
-                    if let proof = try TranscriptJobPlan.streamEvidence(index, streamIndex: stream) {
-                        streamProofs[stream] = proof
-                        break
-                    }
-                }
-            }
-            let evidence = streamProofs[stream]
-            let cache = Self(sidecar: target.store, key: key, evidence: evidence ?? "", stream: stream)
-            let local = read(name, target)
-            func validated(_ bytes: Data?, in snapshot: AnalysisSidecar.CopySnapshot) -> Artifacts? {
-                guard let bytes else { return nil }
-                let artifact: Artifacts?
-                if name.hasPrefix(legacyPrefix) {
-                    artifact = try? JSONDecoder().decode(Artifacts.self, from: bytes)
-                } else {
-                    artifact = cache.artifacts(from: bytes, read: { read($0, snapshot) }) { digest in
-                        // A digest-verified dependency can also be recovered from another copy.
-                        let alternate = snapshot.db === target.db ? peer : target
-                        if let levels = read(cache.activitySection(digest), alternate), TranscriptStore.digest(levels) == digest {
-                            return levels
-                        }
-                        let prefix = "transcript_activity.v1.\(stream)."
-                        for (copy, keys) in [(target, targetKeys), (peer, peerKeys)] {
-                            for candidate in keys where candidate.hasPrefix(prefix) {
-                                if cancelled() { return nil }
-                                if let levels = read(candidate, copy), TranscriptStore.digest(levels) == digest { return levels }
-                            }
-                        }
-                        return nil
-                    }
-                }
-                guard let artifact, artifact.matches(key: key, evidence: evidence) else { return nil }
-                return artifact
-            }
-            let chosen: Artifacts
-            if let existing = validated(local, in: target) {
-                chosen = existing
-            } else {
-                guard let incoming = read(name, peer), let valid = validated(incoming, in: peer) else { continue }
-                chosen = valid
-                if local != incoming {
-                    try target.store.writeSection(name, value: incoming, db: target.db, stamp: target.stamp, cancelled: cancelled)
-                    let change = try peer.store.changeTime(name, in: peer.db, at: peer.store.url)
-                    try target.store.setChangeTime(change, key: name, in: target.db)
-                }
-            }
-            if name.hasPrefix(prefix), let levels = chosen.activity {
-                let dependency = cache.activitySection(TranscriptStore.digest(levels))
-                if read(dependency, target) != levels {
-                    try target.store.writeSection(dependency, value: levels, db: target.db, stamp: target.stamp, cancelled: cancelled)
-                }
-            }
+        guard !cancelled() else { return nil }
+        if let shared = readExchange(cancelled: cancelled) { return shared }
+        guard let folder = try? archiveDirectory() else { return nil }
+        return Self.readArchive(in: folder, cancelled: cancelled) {
+            $0.matches(key: key, evidence: evidence)
         }
     }
 
-    func readSidecar(cancelled: () -> Bool) -> Artifacts? {
-        guard AnalysisSidecar.readsEnabled, !cancelled() else { return nil }
-        // Read a result and its levels together, then release SQLite before parsing
-        // provider output. A valid checksum alone cannot identify the right stream.
-        for store in sidecar.readCandidates(orderedBy: section) {
-            guard !cancelled() else { return nil }
-            let candidate: Artifacts? = try? store.withReadSnapshot(cancelled: cancelled) { read in
-                guard let record = read(section) else { return nil }
-                return artifacts(from: record, read: read)
-            }
-            if let candidate, candidate.matches(key: key, evidence: evidence), !cancelled(),
-               sidecar.identity.isCurrentSnapshot(at: sidecar.source) { return candidate }
+    static func readPreserved(track: TranscriptJobTrack, key: String, in jobResults: URL,
+                              cancelled: () -> Bool) -> Artifacts? {
+        readArchive(in: trackArchive(track, in: jobResults), cancelled: cancelled) {
+            $0.belongs(to: track) && $0.matches(key: key, evidence: track.evidence, needsActivity: track.activity != nil)
         }
-        for store in sidecar.readCandidates(orderedBy: legacySection) {
-            guard !cancelled() else { return nil }
-            if let bytes = store.read(legacySection, cancelled: cancelled),
-               let candidate = try? JSONDecoder().decode(Artifacts.self, from: bytes),
-               candidate.matches(key: key, evidence: evidence), !cancelled(),
-               sidecar.identity.isCurrentSnapshot(at: sidecar.source) { return candidate }
+    }
+
+    private static func readArchive(in folder: URL, cancelled: () -> Bool,
+                                    matching: (Artifacts) -> Bool) -> Artifacts? {
+        guard !cancelled(),
+              let files = try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)
+        else { return nil }
+        for file in files.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+            if cancelled() { return nil }
+            guard let candidate = Self.decodeFile(file, cancelled: cancelled),
+                  matching(candidate), digest(candidate) == file.lastPathComponent else { continue }
+            return candidate
         }
         return nil
     }
 
-    private func activitySection(_ digest: String) -> String {
-        "transcript_activity.v1.\(stream).\(digest)"
+    private func archiveDirectory() throws -> URL {
+        guard TranscriptStore.validDigest(key) else { throw transcriptError("Invalid recognition key.") }
+        return try TranscriptRecognitionClaims.directory().appendingPathComponent("Results", isDirectory: true)
+            .appendingPathComponent(key, isDirectory: true)
     }
 
-    private func validatedEvidence(for artifacts: Artifacts, media: MediaInfo) throws -> MediaRefreshEvidence {
-        guard media.identity.matchesSnapshot(sidecar.identity), let evidence = media.refreshEvidence else {
-            throw transcriptError("Fully indexed stream evidence is required to cache transcript results.",
-                                  code: "missing_stream_evidence")
+    private static func digest(_ value: Artifacts) -> String {
+        Exchange.digest(result: value.result, activity: value.activity)
+    }
+
+    private static func decodeFile(_ file: URL, cancelled: () -> Bool) -> Artifacts? {
+        guard !cancelled(), let bytes = try? Data(contentsOf: file, options: .mappedIfSafe) else { return nil }
+        if let pair = try? TranscriptRecognitionExchange.decode(bytes, cancelled: cancelled) {
+            return .init(result: pair.result, activity: pair.activity)
         }
-        guard try TranscriptJobPlan.streamEvidence(evidence, streamIndex: stream) == self.evidence,
-              artifacts.matches(key: key, evidence: self.evidence) else {
+        return (try? JSONDecoder().decode(Exchange.self, from: bytes))?.artifacts
+    }
+
+    /// The lookup key describes a track and the recognition settings. Each result under it
+    /// is immutable, including earlier results when a provider repeats a run.
+    private func archive(_ value: Artifacts, cancelled: () -> Bool) throws {
+        guard value.matches(key: key, evidence: evidence) else {
             throw transcriptError("The recognition result does not match its stream evidence or settings.")
         }
-        return evidence
+        try Self.archive(value, in: archiveDirectory(), cancelled: cancelled)
     }
 
-    func saveSidecar(_ artifacts: Artifacts, media: MediaInfo, cancelled: () -> Bool) throws {
+    private static func archive(_ value: Artifacts, in directory: URL, cancelled: () -> Bool) throws {
+        let files = FileManager.default
+        try files.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let digest = Self.digest(value)
+        let file = directory.appendingPathComponent(digest)
+        func verified() -> Bool {
+            guard let copy = Self.decodeFile(file, cancelled: cancelled) else { return false }
+            return copy.result == value.result && copy.activity == value.activity
+        }
+        if verified() { return }
+        let data = try TranscriptRecognitionExchange.encode(result: value.result, activity: value.activity,
+                                                             cancelled: cancelled) ?? JSONEncoder().encode(Exchange(value))
+        try data.write(to: file, options: .atomic)
         try checkSidecarCancellation(cancelled)
-        let evidence = try validatedEvidence(for: artifacts, media: media)
-        try saveSidecar(artifacts, evidence: evidence, cancelled: cancelled)
+        guard verified() else { throw transcriptError("The saved recognition result could not be verified.") }
     }
 
-    private func saveSidecar(_ artifacts: Artifacts, evidence: MediaRefreshEvidence, cancelled: () -> Bool) throws {
-        let digest = artifacts.activity.map(TranscriptStore.digest) ?? ""
-        var record = Data(digest.utf8)
-        record.append(10)
-        record.append(artifacts.result)
-        try sidecar.transact([AnalysisSidecar.evidenceKey: evidence.encoded()], cancelled: cancelled) { db, stamp in
-            let prior = try sidecar.verifiedSection(section, in: db, stamp: stamp, maxBytes: nil, cancelled: cancelled)
-            if prior != record {
-                if let prior, let existing = self.artifacts(from: prior, read: { name in
-                    try? sidecar.verifiedSection(name, in: db, stamp: stamp, maxBytes: nil, cancelled: cancelled)
-                }, alternateLevels: { requested in requested == digest ? artifacts.activity : nil }),
-                   existing.matches(key: key, evidence: self.evidence) {
-                    // An arriving retry can restore a surviving result's missing levels.
-                    guard let levels = existing.activity, levels == artifacts.activity else { return }
-                } else {
-                    try sidecar.writeSection(section, value: record, db: db, stamp: stamp, cancelled: cancelled)
-                }
-            }
-            if let levels = artifacts.activity,
-               try !extractionSectionHolds(levels, in: db, stamp: stamp, cancelled: cancelled) {
-                // Equal bytes already under the content name leave that row as it is.
-                try sidecar.writeSection(activitySection(digest), value: levels, db: db, stamp: stamp, cancelled: cancelled)
+    /// Before changing a preparation, retain completed tracks even when the session
+    /// stopped before it produced a transcript. Incomplete stream proof scopes them to this job.
+    static func preserve(track: TranscriptJobTrack, in jobResults: URL, cancelled: () -> Bool) throws {
+        guard let result = track.result, let value = Artifacts(job: result, activity: track.activity),
+              value.belongs(to: track) else { return }
+        if track.hasReusableEvidence, let key = value.recognitionKey, TranscriptStore.validDigest(key),
+           value.matches(key: key, evidence: track.evidence) {
+            do {
+                try Self(key: key, evidence: track.evidence).archive(value, cancelled: cancelled)
+                return
+            } catch {
+                try checkSidecarCancellation(cancelled)
+                // Keep the job's result locally when the shared store is unavailable.
             }
         }
+        try archive(value, in: trackArchive(track, in: jobResults), cancelled: cancelled)
     }
 
-    /// Staging saves a track's levels under its extraction key before the track is recognized,
-    /// and a record reads its levels under either name. A section's checksum covers its name
-    /// and bytes, so different levels are told apart without reading them. Equal ones are
-    /// read once, because a damaged copy cannot stand in for the record's levels.
-    private func extractionSectionHolds(_ levels: Data, in db: SidecarDatabase, stamp: String,
-                                        cancelled: () -> Bool) throws -> Bool {
-        let key = TranscriptActivityKey(stream: stream, channel: channel)
-        guard let name = try? AnalysisSidecar.transcriptActivitySection(key) else { return false }
-        let checksum = try levels.withUnsafeBytes { try sidecar.checksum(name, stamp: stamp, $0, cancelled: cancelled) }
-        return try sidecar.verifiedSection(name, in: db, stamp: stamp, maxBytes: levels.count, cancelled: cancelled,
-                                           matchingDigest: checksum) != nil
-    }
-
-    /// A record saved while the extraction section held its levels has no other copy of them.
-    /// Before different levels replace that section, keep the outgoing bytes under their
-    /// content name if a record for the stream still names them.
-    static func retainReferencedLevels(at name: String, stream: Int, replacement: Data, in sidecar: AnalysisSidecar,
-                                       db: SidecarDatabase, stamp: String, cancelled: () -> Bool) throws {
-        guard let outgoing = try sidecar.verifiedSection(name, in: db, stamp: stamp, maxBytes: nil, cancelled: cancelled),
-              outgoing != replacement else { return }
-        let digest = TranscriptStore.digest(outgoing)
-        let reference = Data((digest + "\n").utf8)
-        let records = "\(prefix)\(stream)."
-        for record in try AnalysisSidecar.sectionNames(in: db) where record.hasPrefix(records) {
-            try checkSidecarCancellation(cancelled)
-            guard let bytes = try sidecar.verifiedSection(record, in: db, stamp: stamp, maxBytes: nil, cancelled: cancelled),
-                  bytes.starts(with: reference) else { continue }
-            try sidecar.writeSection("transcript_activity.v1.\(stream).\(digest)", value: outgoing, db: db, stamp: stamp,
-                                     cancelled: cancelled)
-            return
-        }
+    private static func trackArchive(_ track: TranscriptJobTrack, in jobResults: URL) -> URL {
+        let name = TranscriptStore.digest(Data(track.id.utf8))
+        return jobResults.appendingPathComponent("Tracks").appendingPathComponent(name)
     }
 
     /// Either program may have written either version. A current file that is damaged or
@@ -461,43 +356,24 @@ struct TranscriptRecognitionCache {
         try? FileManager.default.removeItem(at: other)
     }
 
-    /// The standalone helper writes only the exchange. Import mirrors a
-    /// matching helper artifact into the normal analysis sidecar.
+    /// A standalone provider can publish only the track files and a session result.
     static func promoteExternal(in record: TranscriptJobRecord, stamps: [String: SourceIdentity],
-                                recognizedIDs: Set<String>) {
-        guard AnalysisSidecar.readsEnabled, AnalysisSidecar.automaticWritesEnabled else { return }
+                                recognizedIDs: Set<String>, jobResults: URL) throws {
         for track in record.sessions.flatMap(\.tracks) {
-            guard recognizedIDs.contains(track.id), track.hasReusableEvidence, track.sourceIsCurrent,
-                  !AnalysisSidecar.isExcluded(track.file, in: AnalysisSidecar.excludedSources), let stream = track.streamIndex,
-                  let stamp = stamps[track.id], let result = track.result,
-                  // A finished job keeps a track's files packed, and is verified again.
-                  let local = Artifacts(job: result, activity: track.activity),
-                  let key = local.recognitionKey, TranscriptStore.validDigest(key) else { continue }
-            let sidecar = AnalysisSidecar(source: track.file, identity: stamp)
-            let cache = Self(sidecar: sidecar, key: key, evidence: track.evidence, stream: stream, channel: track.stagedChannel)
-            guard cache.readSidecar(cancelled: { false }) == nil,
-                  let shared = cache.readExchange(), shared.result == local.result,
-                  shared.activity == local.activity else { continue }
-            do {
-                let media = try CutEngine().inspectMulticamSource(track.file)
-                guard track.sourceIsCurrent else { continue }
-                try cache.saveSidecar(shared, media: media, cancelled: { false })
-            } catch {
-                // The independent result remains importable if its source folder is read-only.
-            }
+            guard recognizedIDs.contains(track.id),
+                  let stamp = stamps[track.id], stamp.isCurrentSnapshot(at: track.file) else { continue }
+            try preserve(track: track, in: jobResults, cancelled: { false })
         }
     }
 
-    func save(_ artifacts: Artifacts, media: MediaInfo, cancelled: () -> Bool) throws {
+    func save(_ artifacts: Artifacts, cancelled: () -> Bool) throws {
         try checkSidecarCancellation(cancelled)
-        let evidence = try validatedEvidence(for: artifacts, media: media)
-        guard sidecar.identity.isCurrentSnapshot(at: sidecar.source) else {
-            throw transcriptError("The recording changed before its transcript result could be cached.",
-                                  code: "missing_stream_evidence")
+        try archive(artifacts, cancelled: cancelled)
+        // A standalone reader can have published a different result for these settings.
+        // Its exchange stays current while this generation is retained by digest.
+        if readExchange(cancelled: cancelled) == nil {
+            try writeExchange(artifacts, cancelled: cancelled)
         }
-        try checkSidecarCancellation(cancelled)
-        try writeExchange(artifacts, cancelled: cancelled)
-        try saveSidecar(artifacts, evidence: evidence, cancelled: cancelled)
     }
 }
 
@@ -585,45 +461,25 @@ final class TranscriptRecognitionClaims {
             && held.st_ino == named.st_ino && held.st_dev == named.st_dev
     }
 
-    /// Removes each shared result, with its claim file, that was last written before the
-    /// cutoff and that no process has claimed. Nothing else removes them: every recognized
-    /// stream and settings combination leaves a result here for a standalone provider to reuse.
-    /// A claim file that a failed or cancelled run left without a result goes the same way.
+    /// Providers read the published exchange directly. Keep it reachable even when the
+    /// project moved or another job attached the same track. Reclaim abandoned lock files.
     static func prune(in directory: URL, olderThan age: TimeInterval, now: Date) -> Int {
         let manager = FileManager.default
         guard age > 0, let entries = try? manager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else {
             return 0
         }
         let cutoff = now.addingTimeInterval(-age)
-        func isIdle(_ url: URL) -> Bool {
-            guard let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
-            else { return true }
-            return date < cutoff
-        }
-        // A result is in either exchange version, or in both after a change of provider.
         let versions = [TranscriptRecognitionExchange.legacyExtension, TranscriptRecognitionExchange.fileExtension]
-        let claims = Set(entries.compactMap { entry -> String? in
-            guard entry.pathExtension.isEmpty || versions.contains(entry.pathExtension) else { return nil }
-            let name = entry.deletingPathExtension().lastPathComponent
-            return TranscriptStore.validDigest(name) ? name : nil
-        })
-        var removed = 0
-        for claim in claims.sorted() {
-            let lock = directory.appendingPathComponent(claim)
-            let exchanges = versions.map { lock.appendingPathExtension($0) }
-            guard isIdle(lock), exchanges.allSatisfy(isIdle) else { continue }
-            let descriptor = open(lock.path, O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_RDWR, 0o600)
+        for lock in entries where TranscriptStore.validDigest(lock.lastPathComponent) {
+            guard let date = (try? lock.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
+                  date < cutoff else { continue }
+            let descriptor = open(lock.path, O_NOFOLLOW | O_CLOEXEC | O_RDWR)
             guard descriptor >= 0 else { continue }
             defer { close(descriptor) }
-            // A session holds its claims from lookup to publication.
             guard flock(descriptor, LOCK_EX | LOCK_NB) == 0, names(lock.path, descriptor),
-                  exchanges.allSatisfy(isIdle) else { continue }
-            let results = exchanges.filter {
-                manager.fileExists(atPath: $0.path) && (try? manager.removeItem(at: $0)) != nil
-            }
-            if !results.isEmpty { removed += 1 }
+                  versions.allSatisfy({ !manager.fileExists(atPath: lock.appendingPathExtension($0).path) }) else { continue }
             try? manager.removeItem(at: lock)
         }
-        return removed
+        return 0
     }
 }

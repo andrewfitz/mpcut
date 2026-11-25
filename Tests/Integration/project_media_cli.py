@@ -17,9 +17,11 @@ def exercise(cli, folder):
             input=json.dumps(request) if request is not None else None,
             capture_output=True, text=True, timeout=60,
         )
+        assert result.stdout, (arguments, result.returncode, result.stderr)
         payload = json.loads(result.stdout)
         assert (result.returncode == 0) == succeeds, (arguments, payload, result.stderr)
-        assert payload["ok"] == succeeds, payload
+        if arguments[:2] != ("history", "compare") and arguments[:3] != ("project", "document", "print"):
+            assert payload["ok"] == succeeds, payload
         return payload
 
     def write_wave(path, frames):
@@ -58,6 +60,36 @@ def exercise(cli, folder):
     assert set(by_name) == {"take.wav", "unused.wav"}, initial
     assert {row["status"] for row in by_name.values()} == {"offline"}, initial
 
+    compared = run("history", "compare", "--project", "edit.cut", "--history-index", "0")
+    assert [(change["kind"], change["before"]["id"]) for change in compared["changes"]] == [
+        ("removed", "unused"),
+    ], compared
+    out_of_range = run("history", "restore-copy", "--project", "edit.cut", "--history-index", "2",
+                       "--out-project", "invalid.cut", succeeds=False)
+    assert out_of_range["error"]["code"] == "revision_unavailable" and not (folder / "invalid.cut").exists()
+    run("history", "restore-copy", "--project", "edit.cut", "--history-index", "0", "--out-project", "old.cut")
+    restored = run("project", "document", "print", "old.cut")
+    assert [clip["id"] for clip in restored["clips"]] == ["take", "unused"], restored
+    assert not restored["history"].get("undo") and len(restored["history"]["redo"]) == 1, restored
+    compared_redo = run("history", "compare", "--project", "old.cut", "--history-index", "1")
+    assert [(change["kind"], change["after"]["id"]) for change in compared_redo["changes"]] == [
+        ("added", "unused"),
+    ], compared_redo
+    already_exists = run("history", "restore-copy", "--project", "edit.cut", "--history-index", "0",
+                         "--out-project", "original.cut", succeeds=False)
+    assert already_exists["error"]["code"] == "destination_exists", already_exists
+    run("history", "restore-copy", "--project", "old.cut", "--history-index", "1", "--out-project", "new.cut")
+    current = read_project(folder / "new.cut")
+    assert [clip["id"] for clip in current["clips"]] == ["take"] and len(current["history"]["undo"]) == 1, current
+    assert edit.read_bytes() == original_bytes
+
+    run("project", "media", "leave-offline", "edit.cut", "--source", by_name["take.wav"]["path"],
+        "--out-project", "ignored.cut")
+    ignored = run("project", "media", "list", "ignored.cut")["sources"]
+    assert [row["status"] for row in ignored] == ["ignored"], ignored
+    ignored_locate = run("project", "media", "locate", "ignored.cut", "--folder", "archive")["sources"]
+    assert not ignored_locate, ignored_locate
+
     refresh = run("project", "media", "refresh", "--project", "edit.cut", "--no-sidecar")
     assert {Path(row["path"]).name: row["status"] for row in refresh["media"]} == {
         "take.wav": "offline",
@@ -68,13 +100,16 @@ def exercise(cli, folder):
     write_wave(folder / "traversal.wav", 8000)
     traversal = folder / "traversal.cut"
     traversal.write_text(json.dumps({
-        "format": "mpcut", "schema_version": 4, "kind": "sequence",
+        "format": "mpcut", "schema_version": 9, "kind": "sequence",
         "clips": [{"id": "unresolved", "file": "absent/../traversal.wav", "from": "0", "to": "1"}],
     }))
     inspected = run("project", "inspect", "--project", traversal, "--no-sidecar")
     assert inspected["duration"] == {"numerator": 1, "denominator": 1}, inspected
     assert inspected["sources"]["unresolved"].endswith("/absent/../traversal.wav"), inspected
     assert inspected["tier"]["id"] == "unavailable", inspected
+    run("project", "media", "leave-offline", "traversal.cut", "--source", "absent/../traversal.wav", "--in-place")
+    traversal_rows = run("project", "media", "list", "traversal.cut")["sources"]
+    assert [row["status"] for row in traversal_rows] == ["ignored"], traversal_rows
 
     locate = run("project", "media", "locate", "edit.cut", "--folder", "archive", "--include-history")
     assert {Path(row["path"]).name for row in locate["sources"]} == {"take.wav", "unused.wav"}, locate
@@ -84,6 +119,11 @@ def exercise(cli, folder):
     located = run("project", "media", "locate", "edit.cut", "--folder", "archive",
                   "--include-history", "--apply-matches", "--out-project", "located.cut")
     assert located["applied_count"] == 2 and Path(located["out_project"]).resolve() == folder / "located.cut", located
+    run("project", "media", "revert", "located.cut", "--source", moved_root / "take.wav", "--out-project", "reverted.cut")
+    reverted = run("project", "media", "list", "reverted.cut", "--include-history")["sources"]
+    assert {Path(row["path"]).name: row["status"] for row in reverted} == {"take.wav": "offline", "unused.wav": "online"}, reverted
+    undone = run("history", "compare", "--project", "reverted.cut", "--history-index", "0")
+    assert [change["kind"] for change in undone["changes"]] == ["removed"], undone
 
     subdirectory = folder / "project copies"
     subdirectory.mkdir()

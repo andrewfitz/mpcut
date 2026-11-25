@@ -30,11 +30,15 @@ final class MulticamPreviewTests: XCTestCase {
         let camera = try indexed("Shuttle-Chirp", "mov")
         let alternate = try indexed("Multicam-Delayed-AAC", "mov")
         let media = ["camera": camera, "alternate": alternate]
+        // Both audio tracks cover this excerpt. Repeat it so a delayed callback still
+        // switches a live track, even after the first occurrence has finished.
+        let excerpt = MulticamRange(from: .zero, to: .init(numerator: 1, denominator: 5))
         var project = MulticamProject(referenceAngle: "camera",
-                                      range: .init(from: .zero, to: .init(numerator: 1)),
+                                      range: excerpt,
                                       angles: [.init(id: "camera", file: camera.url.path, audioStream: 1)],
                                       audioSources: [.init(id: "alternate", file: alternate.url.path)],
-                                      audio: .follow, switches: [.init(at: .zero, angle: "camera")])
+                                      audio: .follow, switches: [.init(at: .zero, angle: "camera")],
+                                      assembly: Array(repeating: excerpt, count: 64))
         let preview = MulticamPreview()
         preview.configure(plan: try project.plan(), media: media)
         preview.togglePlayback()
@@ -45,7 +49,7 @@ final class MulticamPreviewTests: XCTestCase {
         }
         let instant = preview.currentTime()
         XCTAssertGreaterThanOrEqual(instant.seconds, 0.05)
-        project.switches.append(.init(at: instant, angle: "camera", audio: .init(source: "alternate", stream: 1)))
+        project.switches[0].audio = .init(source: "alternate", stream: 1)
         preview.configure(plan: try project.plan(), media: media)
         let immediatelyAfterSwitch = preview.currentTime()
         // Keep the main actor occupied so the new audio can't finish preroll.

@@ -153,36 +153,25 @@ final class MulticamAudioLaneTests: XCTestCase {
         XCTAssertNoThrow(try project.validate())
     }
 
-    func testV3PreservesFixedOverridesAndHistoryUntilExplicitV4Save() throws {
+    func testFixedOverridesAndMixHistorySurviveReopen() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let url = directory.appendingPathComponent("edit.cut")
         let original = multicam
-        var old = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(original)) as? [String: Any])
-        old["schema_version"] = 3
-        old.removeValue(forKey: "fixed_audio")
-        old["history"] = ["undo": [["action": "Fixed audio", "audio": ["mode": "follow"]]]]
-        let v3 = try JSONSerialization.data(withJSONObject: old)
-        try v3.write(to: url)
-        let opened = try CutProject.loadDocument(from: url, limit: 10)
-        XCTAssertEqual(opened.project, .multicam(original))
-        XCTAssertEqual(try Data(contentsOf: url), v3)
-        guard case .multicam(let follow) = opened.undo.first?.project else { return XCTFail("Expected Follow history state") }
-        XCTAssertEqual(follow.audio, .follow)
-        XCTAssertNil(follow.fixedAudio)
-
+        var follow = original
+        follow.audio = .follow
+        follow.fixedAudio = nil
         var mix = original
         mix.mixLanes = original.defaultMixLanes
         mix.audio = .mix
-        let undo = opened.undo + [CutHistoryState(action: "Mix", project: opened.project)]
+        let undo = [CutHistoryState(action: "Fixed audio", project: .multicam(follow)),
+                    CutHistoryState(action: "Mix", project: .multicam(original))]
         try CutProject.multicam(mix).save(to: url, undo: undo, redo: [])
         let reopened = try CutProject.loadDocument(from: url, limit: 10)
         XCTAssertEqual(reopened.project, .multicam(mix))
         XCTAssertEqual(reopened.undo, undo)
-        var v4 = try XCTUnwrap(JSONSerialization.jsonObject(with: CutProject.documentJSON(at: url)) as? [String: Any])
-        XCTAssertEqual(v4["schema_version"] as? Int, 4)
-        v4["schema_version"] = 3
-        XCTAssertThrowsError(try CutProject.decode(JSONSerialization.data(withJSONObject: v4)))
+        let saved = try XCTUnwrap(JSONSerialization.jsonObject(with: CutProject.documentJSON(at: url)) as? [String: Any])
+        XCTAssertEqual(saved["schema_version"] as? Int, 9)
     }
 }

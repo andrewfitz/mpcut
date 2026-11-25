@@ -12,7 +12,16 @@ final class ProjectSession: ObservableObject {
     let id: UUID
     let editor: EditorModel
     let multicam: MulticamEditorModel
-    let presentation = EditorPresentation()
+    let presentation: EditorPresentation
+    // Protecting a listed pause saves an undo step, but its scan ID remains
+    // usable for a subsequent review action. Any intervening edit expires it.
+    var mcpPauseReviewRevision: (handle: String, project: Int, listing: Int)?
+    var mcpPauseListingRevision: Int {
+        guard let anchor = mcpPauseReviewRevision, anchor.handle == mcpHandle,
+              anchor.project == mcpRevision else { return mcpRevision }
+        return anchor.listing
+    }
+
     let transcriptBasket = TranscriptPaneBasket()
     let transcriptPaneMemory = TranscriptPaneMemory()
     private var participantGeometryRevision: ParticipantSpeakerIndexKey?
@@ -283,6 +292,7 @@ final class ProjectSession: ObservableObject {
         }
     }
     @Published var isHistoryPresented = false
+    weak var historyDismissingSheet: NSWindow?
     @Published var isTimelineMapPresented = false
     @Published var isOutputSettingsPresented = false
     @Published var isISOVerificationPresented = false
@@ -304,6 +314,7 @@ final class ProjectSession: ObservableObject {
 
     init(id: UUID, preferences: EditorPreferences) {
         self.id = id
+        presentation = EditorPresentation(startingFrom: preferences)
         editor = EditorModel(preferences: preferences)
         multicam = MulticamEditorModel(preferences: preferences)
         editor.conversionRedoArchive = { [weak self] in self?.feedAngleRedoArchive ?? [] }
@@ -408,8 +419,12 @@ final class ProjectSession: ObservableObject {
             monitor.orderFront(nil)
             return
         }
+        let preferences = editor.preferences
         let editorScreen = window?.screen ?? NSScreen.main
-        let screen = NSScreen.screens.first { $0 != editorScreen } ?? editorScreen
+        let lastFrame = Self.lastMonitorFrame(preferences.monitorLastFrame, placement: preferences.monitorPlacement,
+                                              screens: NSScreen.screens.map(\.frame))
+        let screen = lastFrame.flatMap { frame in NSScreen.screens.first { $0.frame.intersects(frame) } }
+            ?? NSScreen.screens.first { $0 != editorScreen } ?? editorScreen
         let monitor = VideoMonitorPanel(contentRect: NSRect(x: 0, y: 0, width: 800, height: 450),
                               styleMask: [.titled, .closable, .resizable, .miniaturizable, .nonactivatingPanel],
                               backing: .buffered, defer: false, screen: screen)
@@ -421,19 +436,30 @@ final class ProjectSession: ObservableObject {
         monitor.isExcludedFromWindowsMenu = true
         monitor.collectionBehavior.insert(.fullScreenPrimary)
         monitor.contentView = NSHostingView(rootView: ProjectMonitor(
-            ordinary: editor.preview, multicam: multicam.preview,
+            ordinary: editor.preview, multicam: multicam.preview, preferences: editor.preferences,
             mode: $isMulticam, isMulticam: isMulticam
         ))
-        if let screen {
+        if let lastFrame {
+            monitor.setFrame(lastFrame, display: false)
+        } else if let screen {
             let available = screen.visibleFrame
             let scale = min(1, available.width / monitor.frame.width, available.height / monitor.frame.height)
             let size = NSSize(width: monitor.frame.width * scale, height: monitor.frame.height * scale)
             monitor.setFrame(NSRect(x: available.midX - size.width / 2, y: available.midY - size.height / 2,
                                     width: size.width, height: size.height), display: false)
         } else { monitor.center() }
+        // Remembered for the Last position placement whichever placement is chosen now.
+        monitor.observeFrame { [weak preferences] frame in preferences?.monitorLastFrame = frame }
         monitor.onClose = { [weak self] in self?.monitor = nil }
         self.monitor = monitor
         monitor.orderFront(nil)
+    }
+
+    /// The saved Video Monitor frame for the Last position placement, or nil to use the other-display rule:
+    /// Other display is chosen, nothing is saved, or the saved frame is on no attached screen.
+    nonisolated static func lastMonitorFrame(_ saved: CGRect?, placement: VideoMonitorPlacement, screens: [CGRect]) -> CGRect? {
+        guard placement == .lastPosition, let saved, saved.width >= 1, saved.height >= 1 else { return nil }
+        return screens.contains { !$0.intersection(saved).isNull && !$0.intersection(saved).isEmpty } ? saved : nil
     }
 
     func pausePreview() {
@@ -455,7 +481,30 @@ final class ProjectSession: ObservableObject {
 private final class VideoMonitorPanel: NSPanel {
     override var canBecomeMain: Bool { false }
     var onClose: (() -> Void)?
+    private var frameChanged: ((NSRect) -> Void)?
+    private var frameObservers: [NSObjectProtocol] = []
+
+    /// Reports the frame when the monitor moves, finishes a resize or closes. A full-screen frame is not reported.
+    func observeFrame(_ report: @escaping (NSRect) -> Void) {
+        frameChanged = report
+        let center = NotificationCenter.default
+        for name in [NSWindow.didMoveNotification, NSWindow.didEndLiveResizeNotification] {
+            frameObservers.append(center.addObserver(forName: name, object: self, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.reportFrame() }
+            })
+        }
+    }
+
+    private func reportFrame() {
+        guard !styleMask.contains(.fullScreen) else { return }
+        frameChanged?(frame)
+    }
+
     override func close() {
+        reportFrame()
+        frameObservers.forEach(NotificationCenter.default.removeObserver)
+        frameObservers = []
+        frameChanged = nil
         super.close()
         contentView = nil
         onClose?()
@@ -466,13 +515,14 @@ private final class VideoMonitorPanel: NSPanel {
 private struct ProjectMonitor: View {
     let ordinary: SequencePreview
     let multicam: MulticamPreview
+    let preferences: EditorPreferences
     let mode: Published<Bool>.Publisher
     @State var isMulticam: Bool
 
     var body: some View {
         Group {
-            if isMulticam { MulticamPreviewView(preview: multicam, isVideoMonitor: true) }
-            else { PreviewView(preview: ordinary, isVideoMonitor: true) }
+            if isMulticam { MulticamPreviewView(preview: multicam, preferences: preferences, isVideoMonitor: true) }
+            else { PreviewView(preview: ordinary, preferences: preferences, isVideoMonitor: true) }
         }
         .onReceive(mode) { isMulticam = $0 }
     }
@@ -531,11 +581,19 @@ final class ProjectSessions: ObservableObject {
     }
     private var pendingFiles: [OpenRequest] = []
     private var isPresentingFinderChoice = false
+    /// The Finder alert while it is showing, so tests can answer its “Don't ask again” box.
+    private(set) var finderChoiceAlert: NSAlert?
     private var addClipsOnOpen: Set<UUID> = []
     private weak var reopeningSession: ProjectSession?
     private var approvedQuitStates: [UUID: ProjectSession.DocumentState] = [:]
     private enum LaunchState { case launching, awaitingWindow, ready }
     private var launchState: LaunchState
+    /// Settings → General → Offer to recover untitled projects at launch, waiting for the launch window.
+    private var launchDraftOffer: [URL]?
+    /// Shows the launch recovery offer. Tests replace it; the app uses File → Recover Untitled Project…'s alert.
+    var presentLaunchDraftRecovery: (([URL], ProjectSession) -> Void)?
+    /// Enforces Settings → Storage → Limit the shared cache folder in the running app only.
+    var sharedCacheLimit: SharedCacheLimitEnforcer?
 
     init(preferences: EditorPreferences, launching: Bool = false, openWindow: ((UUID) -> Void)? = nil) {
         self.preferences = preferences
@@ -648,6 +706,58 @@ final class ProjectSessions: ObservableObject {
         if launchState == .awaitingWindow { launchState = .ready }
         let shouldChooseClips = addClipsOnOpen.remove(session.id) != nil
         schedulePendingFiles(in: session, chooseClips: shouldChooseClips)
+        if launchDraftOffer != nil { scheduleLaunchDraftOffer() }
+    }
+
+    // MARK: Launch
+
+    /// Draft retention, then the recovery offer, then the shared cache limit. Called once by the app delegate
+    /// after launch; every routine does nothing at its factory value.
+    func runLaunchMaintenance(drafts directory: URL = ProjectDraft.autosaveDirectory,
+                              trash: @escaping @Sendable (URL) throws -> Void = {
+                                  try FileManager.default.trashItem(at: $0, resultingItemURL: nil)
+                              }) async {
+        let days = preferences.draftRetentionDays
+        if days > 0 {
+            let open = openDraftURLs
+            // Retention and recovery lock the same draft folders, so the offer waits for retention.
+            _ = await Task.detached(priority: .utility) {
+                DraftRetention.run(days: days, open: open, directory: directory, trash: trash)
+            }.value
+        }
+        offerDraftRecoveryAtLaunch(drafts: directory)
+    }
+
+    /// Files are still waiting to open: launch has not finished, a Finder open is queued or its choice is showing.
+    var hasPendingOpens: Bool { launchState != .ready || !pendingFiles.isEmpty || isPresentingFinderChoice }
+
+    /// Every open window's untitled draft, sequence and multicam.
+    var openDraftURLs: Set<URL> {
+        Set(sessions.values.flatMap { [$0.editor.draft.url, $0.multicam.draft.url].compactMap { $0 } })
+    }
+
+    /// Offers the recoverable drafts once the launch window is ready, only when Settings asks for it and drafts exist.
+    func offerDraftRecoveryAtLaunch(drafts directory: URL = ProjectDraft.autosaveDirectory) {
+        guard preferences.offersDraftRecovery,
+              let files = try? ProjectDraft.recoverable(in: directory), !files.isEmpty else { return }
+        launchDraftOffer = files
+        scheduleLaunchDraftOffer()
+    }
+
+    private func scheduleLaunchDraftOffer() {
+        guard launchState == .ready, sessions.values.contains(where: { $0.window != nil }) else { return }
+        Task { [weak self] in self?.presentLaunchDraftOffer() }
+    }
+
+    private func presentLaunchDraftOffer() {
+        guard let files = launchDraftOffer else { return }
+        launchDraftOffer = nil
+        // A Finder open at launch takes the window; File → Recover Untitled Project… still lists the drafts.
+        guard pendingFiles.isEmpty, !isPresentingFinderChoice, let target = frontSession ?? sessions.values.first(where: { $0.window != nil }),
+              target.window?.attachedSheet == nil, target.isMulticam ? !target.multicam.hasSession : target.editor.canOpenProject,
+              target.isMulticam || target.editor.isEmpty else { return }
+        if let present = presentLaunchDraftRecovery { present(files, target) }
+        else { presentDraftRecovery(files, in: target, atLaunch: true) }
     }
 
     func finishLaunching() {
@@ -895,7 +1005,18 @@ final class ProjectSessions: ObservableObject {
         }
     }
 
+    /// Several recordings from Finder follow Settings → General: ask, join them or open them as multicam.
     private func chooseFinderImport(_ media: [URL], in source: ProjectSession?) {
+        switch preferences.multipleRecordingsAction {
+        case .join:
+            if let openWindow { openMedia(media, in: source, using: openWindow) }
+            return
+        case .multicam:
+            openFinderMulticam(media, in: source)
+            return
+        case .ask:
+            break
+        }
         isPresentingFinderChoice = true
         let alert = NSAlert()
         alert.messageText = "Open \(media.count) files in MPCut"
@@ -903,16 +1024,23 @@ final class ProjectSessions: ObservableObject {
         alert.addButton(withTitle: "Join Clips")
         alert.addButton(withTitle: "Open as Multicam")
         alert.addButton(withTitle: "Cancel")
-        let finish: (NSApplication.ModalResponse) -> Void = { [weak self, weak source] response in
+        alert.showsSuppressionButton = true
+        alert.suppressionButton?.title = "Don’t ask again"
+        alert.suppressionButton?.toolTip = "Use this choice from now on. Reset All Warnings in Settings → General asks again."
+        finderChoiceAlert = alert
+        let finish: (NSApplication.ModalResponse) -> Void = { [weak self, weak source, weak alert] response in
+            let remember = alert?.suppressionButton?.state == .on
             Task { @MainActor in
-                guard let self, let openWindow = self.openWindow else { return }
+                guard let self else { return }
+                self.finderChoiceAlert = nil
+                guard let openWindow = self.openWindow else { return }
                 let source = source.flatMap { self.sessions[$0.id] === $0 ? $0 : nil }
                 if response == .alertFirstButtonReturn {
+                    if remember { self.preferences.suppress(.openMultipleRecordings, choosing: .join) }
                     self.openMedia(media, in: source, using: openWindow)
-                } else if response == .alertSecondButtonReturn,
-                          let target = self.multicamTarget(in: source, accepting: nil) {
-                    target.multicam.importSources(media, startAutomatically: true)
-                    target.window?.makeKeyAndOrderFront(nil)
+                } else if response == .alertSecondButtonReturn {
+                    if remember { self.preferences.suppress(.openMultipleRecordings, choosing: .multicam) }
+                    self.openFinderMulticam(media, in: source)
                 }
                 self.isPresentingFinderChoice = false
                 self.openPendingFiles(in: source)
@@ -924,6 +1052,12 @@ final class ProjectSessions: ObservableObject {
         } else {
             finish(alert.runModal())
         }
+    }
+
+    private func openFinderMulticam(_ media: [URL], in source: ProjectSession?) {
+        guard let target = multicamTarget(in: source, accepting: nil) else { return }
+        target.multicam.importSources(media, startAutomatically: true)
+        target.window?.makeKeyAndOrderFront(nil)
     }
 
     func project(at url: URL, excluding excluded: ProjectSession? = nil) -> ProjectSession? {
@@ -1074,6 +1208,7 @@ private struct ProjectWorkspace: View {
         }
         .onAppear {
             session.presentation.showAbout = { [openWindow] in openWindow(id: "about") }
+            SettingsWindow.register(openSettings)
             session.presentation.showSettings = { [openSettings] in openSettings() }
         }
         .sheet(isPresented: $session.isHistoryPresented) {
@@ -1237,6 +1372,13 @@ final class EditorApplication: NSObject, NSApplicationDelegate {
         sessions.finishLaunching()
         sessions.mcpBridge.observeSetting()
         LiveTranscriptController.pruneAbandonedWork()
+        // Settings → Storage. Both do nothing at their factory values.
+        let cacheLimit = SharedCacheLimitEnforcer(preferences: sessions.preferences) { [weak sessions] in
+            sessions.map { SidecarClearContext(sessions: $0) } ?? SidecarClearContext()
+        }
+        sessions.sharedCacheLimit = cacheLimit
+        cacheLimit.start()
+        Task { [sessions] in await sessions.runLaunchMaintenance() }
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
@@ -1256,7 +1398,7 @@ final class EditorApplication: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !isQuitting else { return .terminateLater }
-        EditorSettings.commitPendingEdits()
+        SettingsWindow.commitPendingEdits()
         let decision = sessions.prepareToQuit(stopExports: {
             let alert = NSAlert()
             alert.messageText = "Stop ongoing work and quit?"

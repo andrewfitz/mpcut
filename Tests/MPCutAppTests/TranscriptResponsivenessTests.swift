@@ -202,7 +202,6 @@ final class TranscriptResponsivenessTests: XCTestCase {
             let data = try TranscriptCodec.encode(document, format: .json)
             let asset = try TranscriptStore.put(data, relativeTo: context, draft: false)
             encode.append(ContinuousClock.now - started)
-            TranscriptStore.releaseDecoded(relativeTo: context)
             started = ContinuousClock.now
             _ = try TranscriptStore.decoded(asset, relativeTo: context)
             decode.append(ContinuousClock.now - started)
@@ -210,7 +209,7 @@ final class TranscriptResponsivenessTests: XCTestCase {
             _ = try TranscriptStore.decoded(asset, relativeTo: context)
             again.append(ContinuousClock.now - started)
         }
-        report("encode, hash and write a 28,800-word result", median(encode))
+        report("encode and hash a 28,800-word result", median(encode))
         report("verify and decode a stored 28,800-word result", median(decode))
         report("read the same result again, as Rebind and Reconcile do once the reader has opened it", median(again))
     }
@@ -344,8 +343,7 @@ extension TranscriptResponsivenessTests {
         multicam.project.assembly = [.init(from: .init(numerator: 30), to: .init(numerator: 90)),
                                      .init(from: .init(numerator: 30), to: .init(numerator: 45)),
                                      .init(from: .init(numerator: 200), to: end)]
-        let attached = TranscriptAttachment(id: "dialogue", asset: .init(file: "Interview.transcripts/" + String(repeating: "a", count: 64) + ".json",
-                                                                       sha256: String(repeating: "a", count: 64)),
+        let attached = TranscriptAttachment(id: "dialogue", asset: .init(sha256: String(repeating: "a", count: 64)),
                                             bindings: multicam.document.tracks.map {
                                                 TranscriptBinding(trackID: $0.id, sourceID: $0.id, streamIndex: 0)
                                             })
@@ -420,7 +418,7 @@ extension TranscriptResponsivenessTests {
                    match: (Int, TranscriptOccurrence)? = nil) -> TranscriptReaderPlace {
             TranscriptReaderPlace(owner: fixture.session.mcpHandle, attachmentID: attachment.id, resultID: attachment.resultID,
                                   selectedAttachmentID: nil, scope: scope, searchText: query, query: query,
-                                  followPlayback: true, anchor: anchor, anchorIndex: anchorIndex,
+                                  anchor: anchor, anchorIndex: anchorIndex,
                                   selectionStart: selection?.0, selectionEnd: selection?.1,
                                   matchNumber: match?.0, matchWord: match?.1)
         }
@@ -487,8 +485,7 @@ extension TranscriptResponsivenessTests {
             return .init(id: "w\(second)", text: "word\(second)", start: start, end: end,
                          observations: [.init(trackID: track.id, start: start, end: end, evidence: .recognized)])
         })
-        let attachment = TranscriptAttachment(id: "dialogue", asset: .init(file: "Interview.transcripts/" + String(repeating: "b", count: 64) + ".json",
-                                                                         sha256: String(repeating: "b", count: 64)),
+        let attachment = TranscriptAttachment(id: "dialogue", asset: .init(sha256: String(repeating: "b", count: 64)),
                                               bindings: [.init(trackID: track.id, file: file, streamIndex: 0)])
         func clip(_ id: String, _ from: Int64, _ to: Int64) -> CutSequenceClip {
             .init(id: id, file: file, from: .init(numerator: from), to: .init(numerator: to))

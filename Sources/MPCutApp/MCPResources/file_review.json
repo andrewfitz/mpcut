@@ -6,7 +6,7 @@
     "inputSchema": {
       "type": "object",
       "properties": {
-        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."},
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."},
         "project_path": {"type": "string", "description": "Absolute path to the saved .cut project."},
         "space": {"type": "string", "enum": ["source", "sequence", "group", "assembly"]},
         "from": {"type": "string", "description": "Inclusive rational time in the selected clock."},
@@ -20,16 +20,48 @@
   },
   {
     "name": "history_file_compare",
-    "description": "Compare two saved .cut projects and report project fields and occurrence ranges that changed.",
+    "description": "Compare a saved .cut with another file or with one of its retained undo or redo states.",
     "annotations": {"readOnlyHint": true, "openWorldHint": false},
     "inputSchema": {
       "type": "object",
       "properties": {
-        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."},
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."},
         "before_project_path": {"type": "string", "description": "Absolute path to the earlier saved .cut."},
-        "project_path": {"type": "string", "description": "Absolute path to the later saved .cut."}
+        "project_path": {"type": "string", "description": "Absolute path to the later saved .cut."},
+        "history_index": {"type": "integer", "minimum": 0, "description": "Zero-based index from oldest retained state through newest. The number of undo steps is the current cursor."}
       },
-      "required": ["operation_id", "before_project_path", "project_path"],
+      "required": ["operation_id", "project_path"],
+      "oneOf": [{"required": ["before_project_path"]}, {"required": ["history_index"]}],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "history_file_restore_copy",
+    "description": "Write a new .cut copy with its cursor at the selected retained state, carrying over its undo and redo history. Poll file_job_status_read with the returned job_id.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it to retry an identical request."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "Absolute path to the saved .cut project."},
+        "history_index": {"type": "integer", "minimum": 0, "description": "Zero-based index from oldest retained state through newest. The number of undo steps is the current cursor."},
+        "out_project": {"type": "string", "pattern": "^/", "description": "Absolute path for the new .cut copy."}
+      },
+      "required": ["operation_id", "project_path", "history_index", "out_project"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "project_file_document_print",
+    "description": "Read the expanded JSON of a saved .cut without opening it, including retained history. Poll file_job_status_read and use file_job_result_read for larger documents.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it to retry an identical request."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "Absolute path to the saved .cut project."}
+      },
+      "required": ["operation_id", "project_path"],
       "additionalProperties": false
     }
   },
@@ -40,7 +72,7 @@
     "inputSchema": {
       "type": "object",
       "properties": {
-        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."},
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."},
         "project_path": {"type": "string", "description": "Absolute path to the saved multicam .cut."},
         "source_id": {"type": "string", "minLength": 1, "description": "Analyze one recording other than the reference. Defaults to all other recordings."},
         "reference_source_id": {"type": "string", "minLength": 1, "description": "Choose a recording on the reference camera for group sync, or any camera recording for replacement sync."},
@@ -68,7 +100,7 @@
     "inputSchema": {
       "type": "object",
       "properties": {
-        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."},
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."},
         "project_path": {"type": "string", "description": "Absolute path to the saved multicam .cut."},
         "angle_id": {"type": "string", "minLength": 1, "description": "Camera angle ID for the proposed switch."},
         "group_time": {"type": "string", "description": "Exact proposed group time in rational seconds."}

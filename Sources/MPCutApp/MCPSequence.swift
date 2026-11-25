@@ -167,6 +167,8 @@ extension EditorModel {
         case "clear_marks": clearMarks()
         case "range_tool": rangeTool = try input.bool("enabled")
         case "snap":
+            // Snap to is a shared setting, so an agent changes it only while Settings allows agents to change settings.
+            try preferences.checkAgentWrite()
             guard let target = TimelineSnapTarget(rawValue: try input.string("value")),
                   !isAudioOnly || target == .off || target == .silence else { throw input.invalid("Unsupported snap target.") }
             chooseSnapTarget(target)

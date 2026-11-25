@@ -137,7 +137,7 @@ func checkStillAuthoring(t *testing.T, toolCaller func(*testing.T) func(string, 
 		t.Run(fixture.name, func(t *testing.T) {
 			call := toolCaller(t)
 			path := filepath.Join(dir, "still-"+fixture.name+".cut")
-			doc := `{"format":"mpcut","schema_version":3,"kind":"` + fixture.name + `",` + fixture.contents + `}`
+			doc := `{"format":"mpcut","schema_version":9,"kind":"` + fixture.name + `",` + fixture.contents + `}`
 			if err := os.WriteFile(path, []byte(doc), 0600); err != nil {
 				t.Fatal(err)
 			}
@@ -451,7 +451,7 @@ func checkClipSpacing(t *testing.T, call func(string, object, string) object, di
 	first := object{"id": "first", "file": filepath.Base(source), "from": "0", "to": "1001/7500"}
 	second := object{"id": "second", "file": source, "from": "1001/5000", "to": "1001/2500"}
 	clips := []object{first, second}
-	document := object{"format": "mpcut", "schema_version": 3, "kind": "sequence", "clips": clips}
+	document := object{"format": "mpcut", "schema_version": 9, "kind": "sequence", "clips": clips}
 	saved, err := json.Marshal(document)
 	if err != nil {
 		t.Fatal(err)
@@ -561,7 +561,7 @@ func checkClearVariableRateSpacing(t *testing.T, call func(string, object, strin
 	_, testFile, _, _ := runtime.Caller(0)
 	source := filepath.Join(filepath.Dir(testFile), "../../Tests/MPCutAppTests/Fixtures/VFR-PTS.mp4")
 	path := filepath.Join(t.TempDir(), "Variable rate spacing.cut")
-	document := object{"format": "mpcut", "schema_version": 3, "kind": "sequence", "clips": []object{
+	document := object{"format": "mpcut", "schema_version": 9, "kind": "sequence", "clips": []object{
 		{"id": "first", "file": source, "from": "0", "to": "1/5"},
 		{"id": "second", "file": source, "from": "2/5", "to": "3/5"},
 	}}

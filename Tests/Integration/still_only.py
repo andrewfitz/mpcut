@@ -204,7 +204,7 @@ class StillOnlyTests(unittest.TestCase):
                         "--codec", codec, "--container", extension, "--color", program_color, "--frames", "5",
                     ])
                     project = read_project(cut)
-                    self.assertIn(project["schema_version"], (4, 5))
+                    self.assertEqual(project["schema_version"], 9)
                     self.assertEqual(project["clips"][0]["kind"], "still")
                     self.assertEqual(project["still_assets"][0]["file"], image.name)
                     self.assertEqual(project["program_color_policy"]["transfer"], transfer)

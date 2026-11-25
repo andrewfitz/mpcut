@@ -75,10 +75,9 @@ final class ProjectMediaReplaceTests: XCTestCase {
             try wave(candidate, seconds: 4)
             let bindings = [TranscriptBinding(trackID: "track", file: "old.wav", streamIndex: 0,
                                                sourceFingerprint: String(repeating: "a", count: 64), sourceConfirmed: true)]
-            let digest = String(repeating: "b", count: 64)
+            let asset = try TranscriptStore.put(TranscriptDocument(clock: .presentation))
             let attachment = TranscriptAttachment(id: "old",
-                asset: .init(file: "edit.transcripts/\(digest).json", sha256: digest, unavailable: .missing),
-                bindings: bindings)
+                asset: asset, bindings: bindings)
             var project = CutProject.sequence([clip("first", "old.wav", 0, 2), clip("other", "old.wav", 2, 4)])
             project.transcripts = .init(attachments: [attachment])
             let one = try ProjectMediaReplace.preview(project, relativeTo: projectURL, source: "old.wav",

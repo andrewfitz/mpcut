@@ -17,16 +17,21 @@ extension MulticamEditorModel {
         do {
             if let still = try stillFrameAtPlayhead() {
                 let options = StillFrameSaveOptions()
-                let panel = options.panel(source: still.url, directory: projectURL?.deletingLastPathComponent())
+                let panel = options.panel(source: still.url, directory: exportStartFolder(
+                    automatic: projectURL?.deletingLastPathComponent(), sourceRecording: still.url))
                 ProjectPanels.present(panel, in: window) { [weak self, options] accepted in
                     guard let self, accepted, let output = panel.url, self.mcpGeneration == generation,
                           self.project == project else { return }
                     do { try self.validateHistoryDestination(output) }
                     catch { self.fail(error.localizedDescription); return }
+                    self.noteExportFolder(output.deletingLastPathComponent())
                     let confirmed = options.confirmedDestination(at: output)
                     self.run("Exporting current frame…", exporting: true) { token, _ in
                         try still.write(to: output, replacing: confirmed, cancelled: { token.isCancelled })
-                    } onSuccess: { self.status = "Exported " + output.lastPathComponent }
+                    } onSuccess: {
+                        self.status = "Exported " + output.lastPathComponent
+                        self.exportFinished(output, title: "Frame exported")
+                    }
                 }
                 return
             }
@@ -45,12 +50,14 @@ extension MulticamEditorModel {
             let url = indexed?.url ?? projectURL.map { project.sourceURL(for: angle, relativeTo: $0) }
                 ?? URL(fileURLWithPath: angle.file)
             let options = StillFrameSaveOptions()
-            let panel = options.panel(source: url, directory: projectURL?.deletingLastPathComponent())
+            let panel = options.panel(source: url, directory: exportStartFolder(
+                automatic: projectURL?.deletingLastPathComponent(), sourceRecording: url))
             ProjectPanels.present(panel, in: window) { [weak self, options] accepted in
                 guard let self, accepted, let output = panel.url, self.mcpGeneration == generation,
                       self.project == project, self.mapping == mapping else { return }
                 do { try self.validateHistoryDestination(output) }
                 catch { self.fail(error.localizedDescription); return }
+                self.noteExportFolder(output.deletingLastPathComponent())
                 let confirmed = options.confirmedDestination(at: output)
                 self.run("Exporting current frame…", exporting: true) { token, sidecar in
                     let engine = CutEngine(cancelled: { token.isCancelled }, useSidecar: sidecar)
@@ -60,7 +67,10 @@ extension MulticamEditorModel {
                     }
                     try JPEGExport.writeStill(source, at: position.sourceTime, to: output, replacing: confirmed,
                                               exclusiveEnd: position.exclusiveEnd, cancelled: { token.isCancelled })
-                } onSuccess: { self.status = "Exported " + output.lastPathComponent }
+                } onSuccess: {
+                    self.status = "Exported " + output.lastPathComponent
+                    self.exportFinished(output, title: "Frame exported")
+                }
             }
         } catch { notice = Notice(title: "Export Current Frame", message: error.localizedDescription) }
     }
@@ -108,7 +118,8 @@ extension MulticamEditorModel {
         let options = JPEGExportOptions(preset: preferences.jpegPreset)
         let source = angle.flatMap { ordinaryAnalysisMedia($0.id) }
         let stream = angle.flatMap { $0.audioStream ?? media[$0.id]?.streams.first(where: { $0.kind == "audio" })?.index }
-        let panel = options.panel(source: panelSource, directory: projectURL?.deletingLastPathComponent(),
+        let panel = options.panel(source: panelSource, directory: exportStartFolder(
+                                      automatic: projectURL?.deletingLastPathComponent(), sourceRecording: panelSource),
                                   hasAudio: stream != nil, multicam: true, hasAnalysisSource: angle != nil,
                                   hasProgramStill: still != nil)
         ProjectPanels.present(panel, in: window) { [weak self] accepted in
@@ -116,6 +127,7 @@ extension MulticamEditorModel {
                   self.project == project else { return }
             do {
                 try self.validateHistoryDestination(directory, includesContents: true)
+                self.noteExportFolder(directory.deletingLastPathComponent())
                 let limit = try options.frameLimit()
                 let preset = options.preset, sample = options.sample, mode = options.mode
                 let programPicture = options.programPicture
@@ -173,6 +185,7 @@ extension MulticamEditorModel {
                     let missing = failed == 0 ? "" : failed == 1 ? " 1 camera frame was not written because its recording is missing or unreadable."
                         : " \(failed) camera frames were not written because their recordings are missing or unreadable."
                     self.status = "Exported \(count) JPEG frames to \(directory.lastPathComponent)." + missing
+                    self.exportFinished(directory, title: "JPEG frames exported")
                 }
             } catch { self.notice = Notice(title: "Export JPEG Frames", message: error.localizedDescription) }
         }
@@ -187,15 +200,17 @@ extension MulticamEditorModel {
             let source = document ?? URL(fileURLWithPath: "Output")
             let stillOptions = StillFrameSaveOptions()
             let jpegOptions = JPEGExportOptions(preset: preferences.jpegPreset)
+            let start = exportStartFolder(automatic: document?.deletingLastPathComponent())
             let panel = directory
-                ? jpegOptions.panel(source: source, directory: document?.deletingLastPathComponent(),
+                ? jpegOptions.panel(source: source, directory: start,
                                     hasAudio: false, multicam: true, hasAnalysisSource: false, programOnly: true)
-                : stillOptions.panel(source: source, directory: document?.deletingLastPathComponent())
+                : stillOptions.panel(source: source, directory: start)
             ProjectPanels.present(panel, in: window) { [weak self] accepted in
                 guard let self, accepted, let output = panel.url, self.mcpGeneration == generation,
                       self.mcpRevision == revision else { return }
                 do {
                     try self.validateHistoryDestination(output, includesContents: directory)
+                    self.noteExportFolder(output.deletingLastPathComponent())
                     let replacing = directory ? nil : stillOptions.confirmedDestination(at: output)
                     let preset = directory ? jpegOptions.preset : .full
                     let outputProject: MulticamProject
@@ -219,6 +234,7 @@ extension MulticamEditorModel {
                         self.status = directory
                             ? "Exported \(times.count) JPEG frames to \(output.lastPathComponent)." + summary
                             : "Exported \(output.lastPathComponent)." + summary
+                        self.exportFinished(output, title: directory ? "JPEG frames exported" : "Frame exported")
                     }
                 } catch { self.fail(error.localizedDescription) }
             }

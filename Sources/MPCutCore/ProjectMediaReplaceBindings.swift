@@ -1,9 +1,73 @@
 import Foundation
 
 extension ReplaceEdit {
+    /// Keep the original evidence when changing the path. A different recording
+    /// leaves the decision available for review, while an identical copy verifies.
+    func rebindAnalysis(in revised: inout CutProject) throws {
+        var annotations = revised.analysisAnnotations
+        guard !annotations.isEmpty else { return }
+        func files(_ state: CutProject) -> [String: String] {
+            if case .multicam(let group) = state {
+                return Dictionary(uniqueKeysWithValues: group.sources.map { ($0.id, $0.file) })
+            }
+            var result = Dictionary((state.sequenceClips ?? []).map { ($0.id, $0.file) }, uniquingKeysWith: { first, _ in first })
+            if let track = state.stillSoundtrack { result[track.id] = track.file }
+            if case .stillSequence(let sequence) = state {
+                if let reference = sequence.stillAudioReference { result[reference.id] = reference.file }
+                for select in sequence.sourceSelects { result[select.id] = select.range.file }
+            }
+            return result
+        }
+        let original = files(project), current = files(revised)
+        let changed = Set(original.keys.filter { id in
+            original[id].map(sameSource) == true && original[id] != destination && current[id] == destination
+        })
+        guard !changed.isEmpty else { return }
+        let keepsOriginal = current.values.contains { $0 != destination && sameSource($0) }
+        let conflict = CutError(code: "conflicting_analysis_annotations",
+                                message: "Both recordings have different saved analysis decisions for the same stream. Resolve the conflicting decision before replacing the recording.")
+        let scenes = annotations.scenes.filter { $0.file != destination && sameSource($0.file) }
+        let levels = annotations.silence.filter { $0.file != destination && sameSource($0.file) }
+        if !keepsOriginal {
+            annotations.scenes.removeAll { $0.file != destination && sameSource($0.file) }
+            annotations.silence.removeAll { $0.file != destination && sameSource($0.file) }
+        }
+        for var scene in scenes {
+            scene.file = destination
+            if let other = annotations.scenes.first(where: { $0.file == destination && $0.sourceEvidence == scene.sourceEvidence }) {
+                guard other.views == scene.views && other.scenes == scene.scenes else { throw conflict }
+            } else { annotations.scenes.append(scene) }
+        }
+        for var level in levels {
+            level.file = destination
+            if let other = annotations.silence.first(where: { $0.file == destination && $0.sourceEvidence == level.sourceEvidence }) {
+                guard other.thresholdDB == level.thresholdDB else { throw conflict }
+            } else { annotations.silence.append(level) }
+        }
+        annotations.pauseReviews = annotations.pauseReviews.map { row in
+            var moved = row
+            for index in row.sources.indices {
+                let input = row.sources[index]
+                if sameSource(input.file) && (!keepsOriginal || (input.sourceID ?? row.occurrenceID).map(changed.contains) == true) {
+                    moved.sources[index].file = destination
+                }
+            }
+            return moved
+        }
+        revised.analysisAnnotations = annotations
+    }
+
     func reviseParticipants(_ participants: inout ParticipantProject, id: String, newID: String,
                             preserveOriginal: Bool) throws {
         guard let media else { return }
+        if !preserveOriginal, let index = participants.pendingReviews.firstIndex(where: { $0.sourceID == id }) {
+            // A replacement can make evidence stale, but the original review remains recoverable.
+            if id != newID, participants.pendingReviews.contains(where: { $0.sourceID == newID }) {
+                throw invalidParticipantProject("Both recordings have pending tile reviews. Resolve a review before replacing the recording.")
+            }
+            participants.pendingReviews[index].sourceID = newID
+            participants.pendingReviews[index].file = destination
+        }
         let existing = participants.sources.first { $0.sourceID == id }
         let existingDestination = id != newID ? participants.sources.first { $0.sourceID == newID } : nil
         let redactions = participants.effectiveRedactions

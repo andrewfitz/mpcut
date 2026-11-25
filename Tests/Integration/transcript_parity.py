@@ -40,7 +40,7 @@ def run_suite(cli, directory):
 
     def project(name, ranges=((0, 8),)):
         return store(name + ".cut", {
-            "format": "mpcut", "schema_version": 3, "kind": "sequence",
+            "format": "mpcut", "schema_version": 9, "kind": "sequence",
             "clips": [
                 {"id": f"clip-{index}", "file": "source.wav", "from": str(start), "to": str(end)}
                 for index, (start, end) in enumerate(ranges)

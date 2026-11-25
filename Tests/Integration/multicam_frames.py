@@ -35,7 +35,7 @@ class MulticamFrames(unittest.TestCase):
         (cls.media / "bad.mov").write_bytes(b"Not a recording")
         cls.project = cls.root / "interview.cut"
         cls.project.write_text(json.dumps({
-            "format": "mpcut", "schema_version": 3, "kind": "multicam", "reference_angle_id": "wide",
+            "format": "mpcut", "schema_version": 9, "kind": "multicam", "reference_angle_id": "wide",
             "group_range": {"from": "0", "to": "3"},
             "angles": [
                 {"id": "wide", "file": "media/wide.mkv", "offset": "0"},

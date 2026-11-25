@@ -109,9 +109,13 @@ async function poll() {
             let result;
             try { result = await convert(JSON.parse(payload)); }
             catch (error) { result = { error: String(error) }; }
-            const response = await directory.createFile(responseName);
-            await response.write(JSON.stringify(result));
-            document.getElementById("status").textContent = result.error || "Conversion completed. Ready for MPCut.";
+            try {
+                const response = await directory.createFile(responseName);
+                await response.write(JSON.stringify(result));
+                document.getElementById("status").textContent = result.error || "Conversion completed. Ready for MPCut.";
+            } catch (error) {
+                document.getElementById("status").textContent = String(error);
+            }
         }
     } catch (error) { document.getElementById("status").textContent = String(error); }
     finally { busy = false; }

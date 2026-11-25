@@ -357,7 +357,8 @@ final class EditorModelTests: XCTestCase {
         let settingsDeadline = ContinuousClock.now + .seconds(5)
         while !model.pauseAnalysisReady, ContinuousClock.now < settingsDeadline { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertTrue(model.pauseAnalysisReady, "Pause detection did not finish within 5 s of changing the threshold")
-        XCTAssertNotEqual(model.pausePlan.last?.sequence.from, oldStart)
+        XCTAssertEqual(model.pausePlan.last?.sequence.from, oldStart)
+        XCTAssertTrue(model.pauseReviewMismatch)
         XCTAssertEqual(model.pausePlan.map(\.isProtected), [false, true])
         model.endSession()
         XCTAssertTrue(model.audioStore.waves.isEmpty)

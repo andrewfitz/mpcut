@@ -835,8 +835,53 @@
     }
   },
   {
+    "name": "multicam_voice_angle_edit",
+    "description": "Set a persistent link from a transcript attachment and speaker to a camera angle. Clear it to resume automatic matching. Read explicit links in multicam_state_read with section voice_angles.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string"
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operation_id": {
+          "type": "string",
+          "description": "Unique operation ID for this edit. Retry the same request with the same ID."
+        },
+        "action": {
+          "type": "string",
+          "enum": ["set", "clear"]
+        },
+        "attachment_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "speaker_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "angle_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Required for set."
+        }
+      },
+      "required": [
+        "project_handle",
+        "expected_revision",
+        "action",
+        "attachment_id",
+        "speaker_id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
     "name": "multicam_state_read",
-    "description": "Inspect the live group, program audio and reference camera. Page sources with offsets, index issues and stream IDs, switches with overrides, suggested switch boundaries and range edges, assembly occurrences, or still placements. For switch_coverage, supply group_time and angle_id to check the proposed snapped interval before committing a take. The audio section gives the saved Mix lanes and bindings and the resolved program spans and gaps.",
+    "description": "Inspect the live group, program audio and reference camera. Page sources with offsets, index issues and stream IDs, switches with overrides, persistent transcript voice links, suggested switch boundaries and range edges, assembly occurrences, or still placements. For switch_coverage, supply group_time and angle_id to check the proposed snapped interval before committing a take. The audio section gives the saved Mix lanes and bindings and the resolved program spans and gaps.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -852,7 +897,8 @@
             "assembly",
             "stills",
             "switch_coverage",
-            "audio"
+            "audio",
+            "voice_angles"
           ]
         },
         "offset": {

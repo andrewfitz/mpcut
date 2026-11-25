@@ -140,7 +140,7 @@ def write_manifest(root, audio):
 def write_parity_fixture(root):
     rate = 48000
     write_wav(root / "parity.wav", [4000] * rate + [-4000] * rate + [8000] * (2 * rate), rate)
-    save_json(root / "parity.cut", {"format": "mpcut", "schema_version": 3, "kind": "sequence",
+    save_json(root / "parity.cut", {"format": "mpcut", "schema_version": 9, "kind": "sequence",
                                    "clips": [{"id": "clip", "file": "parity.wav", "from": "0", "to": "4"}]})
     save_json(root / "parity-words.json", {
         "source": "parity.wav", "duration_seconds": 4,
@@ -152,7 +152,7 @@ def write_parity_fixture(root):
         ]}],
     })
     save_json(root / "queue.cut", {
-        "format": "mpcut", "schema_version": 3, "kind": "multicam", "reference_angle_id": "wide",
+        "format": "mpcut", "schema_version": 9, "kind": "multicam", "reference_angle_id": "wide",
         "group_range": {"from": "0", "to": "4"},
         "angles": [{"id": "wide", "file": "wide.mov"}, {"id": "close", "file": "close.mov"}],
         "audio_sources": [{"id": "lav", "file": "lav.wav"}],
@@ -212,7 +212,7 @@ def create(root, flite="flite"):
         write_wav(tmp / "click.wav", click)
         camera(root / "priming-click.mov", tmp / "click.wav", seconds=4, color="white", codec="aac")
         camera(root / "delayed-click.mov", tmp / "click.wav", seconds=4, color="white", delay="0.5")
-    project = {"format": "mpcut", "schema_version": 3, "kind": "multicam", "reference_angle_id": "wide",
+    project = {"format": "mpcut", "schema_version": 9, "kind": "multicam", "reference_angle_id": "wide",
                "group_range": {"from": "0", "to": "18"},
                "angles": [{"id": key, "file": TRACKS[key]["file"], "offset": TRACKS[key]["offset"],
                            "audio_stream_index": TRACKS[key]["stream"]} for key in ("wide", "close")],
@@ -221,7 +221,7 @@ def create(root, flite="flite"):
                "switches": [{"group_time": "0", "angle_id": "wide"}, {"group_time": "2", "angle_id": "close"},
                             {"group_time": "12", "angle_id": "wide"}]}
     save_json(root / "interview.cut", project)
-    save_json(root / "sequence.cut", {"format": "mpcut", "schema_version": 3, "kind": "sequence",
+    save_json(root / "sequence.cut", {"format": "mpcut", "schema_version": 9, "kind": "sequence",
                                      "clips": [{"id": "lav", "file": "lav.wav", "from": "0", "to": "18"}]})
     save_json(root / "truth.json", {"sampleRate": RATE, "duration": samples(DURATION), "tracks": TRACKS,
                                    "wordBounds": "Flite phoneme boundaries, reported to 1 ms",

@@ -34,7 +34,7 @@ func writeProgramFrames(_ project: CutProject, media: CutProjectMedia, projectPa
                         at times: [RationalTime], clock: StillOptions.Clock?, to output: URL, preset: JPEGPreset,
                         format: FrameImageFormat = .jpeg,
                         documentIdentity: SourceIdentity?,
-                        useSidecar: Bool, cancelled: @escaping @Sendable () -> Bool) throws -> ProgramFrameManifest {
+                        useSidecar: Bool, writeManifest: Bool = true, cancelled: @escaping @Sendable () -> Bool) throws -> ProgramFrameManifest {
     let sequence = project.sequenceClips
     let requiredClock: StillOptions.Clock = sequence == nil ? .assembly : .sequence
     let groupClock = clock == .group && sequence == nil && project.requiresPictureProcessing
@@ -57,7 +57,7 @@ func writeProgramFrames(_ project: CutProject, media: CutProjectMedia, projectPa
             origin = .zero
         }
         let renderer = try ProjectOutputJPEG(snapshot, document: location, cancelled: cancelled)
-        return try JPEGExport.writeProgramFrameDirectory(to: output, cancelled: cancelled, validate: {
+        return try JPEGExport.writeProgramFrameDirectory(to: output, cancelled: cancelled, writeManifest: writeManifest, validate: {
             if let documentIdentity, !documentIdentity.isCurrentSnapshot(at: location) {
                 throw CutError(code: "source_changed", message: "The project changed during frame export.")
             }
@@ -126,7 +126,7 @@ func writeProgramFrames(_ project: CutProject, media: CutProjectMedia, projectPa
         return nil
     }
 
-    return try JPEGExport.writeProgramFrameDirectory(to: output, cancelled: cancelled, validate: {
+    return try JPEGExport.writeProgramFrameDirectory(to: output, cancelled: cancelled, writeManifest: writeManifest, validate: {
         for (url, identity) in identities {
             guard identity.isCurrentSnapshot(at: url) else {
                 throw CutError(code: "source_changed", message: "‘\(url.path)’ changed while exporting review frames.")

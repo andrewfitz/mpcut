@@ -70,25 +70,25 @@ final class SidecarRepairTests: XCTestCase {
         rows("UPDATE source SET stamp = CAST(? AS TEXT)", [Data(stamp.utf8)])
     }
 
-    func testRemountedVolumeKeepsUserSections() throws {
+    func testRemountedVolumeKeepsComputedSections() throws {
         let sidecar = try makeSidecar()
-        let names = Data(#"{"1":"Wide"}"#.utf8)
-        try sidecar.save([AnalysisSidecar.viewNameSectionKey: names, "silence_threshold_overrides_db.v1": Data([4])])
+        let peaks = Data([1, 2])
+        try sidecar.save(["peaks": peaks, "silence": Data([4])])
         try changeStoredDevice(sidecar)
         XCTAssertEqual(sidecar.status(), "current")
-        XCTAssertEqual(sidecar.keys(), [AnalysisSidecar.viewNameSectionKey, "silence_threshold_overrides_db.v1"])
-        XCTAssertEqual(sidecar.read(AnalysisSidecar.viewNameSectionKey), names)
+        XCTAssertEqual(sidecar.keys(), ["peaks", "silence"])
+        XCTAssertEqual(sidecar.read("peaks"), peaks)
         var seen: Data?
-        try sidecar.save(["wave": Data([9])], updating: ["silence_threshold_overrides_db.v1": { seen = $0; return Data([5]) }])
+        try sidecar.save(["wave": Data([9])], updating: ["silence": { seen = $0; return Data([5]) }])
         XCTAssertEqual(seen, Data([4]))
-        XCTAssertEqual(sidecar.read(AnalysisSidecar.viewNameSectionKey), names)
+        XCTAssertEqual(sidecar.read("peaks"), peaks)
         XCTAssertEqual(sidecar.read("wave"), Data([9]))
-        XCTAssertEqual(sidecar.read("silence_threshold_overrides_db.v1"), Data([5]))
+        XCTAssertEqual(sidecar.read("silence"), Data([5]))
         // A changed file is still stale.
         try Data([7, 8, 9, 10]).write(to: sidecar.source)
         let changed = try AnalysisSidecar(source: sidecar.source)
         XCTAssertEqual(changed.status(), "stale")
-        XCTAssertNil(changed.read(AnalysisSidecar.viewNameSectionKey))
+        XCTAssertNil(changed.read("peaks"))
     }
 
     func testRemountedVolumeKeepsTheEditIndex() throws {
@@ -120,7 +120,22 @@ final class SidecarRepairTests: XCTestCase {
         XCTAssertEqual(sidecar.status(), "current")
         XCTAssertEqual(sidecar.read("a"), Data([1]))
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: sidecar.source.deletingLastPathComponent().path).sorted(),
-                       ["shot.mov", "shot.mov.cutdb"])
+                       ["shot.mov", "shot.mov.cutcache"])
+    }
+
+    func testSaveRollsBackWhenTheOpenCacheFileIsMoved() throws {
+        let store = try makeSidecar()
+        try store.save(["key": Data([1])])
+        let moved = store.url.deletingLastPathComponent().appendingPathComponent("moved.cutcache")
+        XCTAssertThrowsError(try store.transact(cancelled: { false }) { db, stamp in
+            try store.writeSection("key", value: Data([2]), db: db, stamp: stamp, cancelled: { false })
+            try FileManager.default.moveItem(at: store.url, to: moved)
+        }) {
+            XCTAssertEqual(($0 as? CutError)?.code, "sidecar_error")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.url.path))
+        try FileManager.default.moveItem(at: moved, to: store.url)
+        XCTAssertEqual(store.read("key"), Data([1]))
     }
 
     func testForeignJournalSurvivesFirstSaveRepairAndUpdates() throws {

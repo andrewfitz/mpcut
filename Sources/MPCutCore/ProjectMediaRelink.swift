@@ -60,6 +60,13 @@ public struct ProjectMediaSearchRow: Encodable, Sendable {
         self.outcome = outcome
         self.candidates = candidates
     }
+
+    package var eligibleMapping: ProjectMediaMapping? {
+        guard outcome.canRelink, let candidate = candidates.first(where: { $0.outcome == outcome }) else {
+            return nil
+        }
+        return .init(from: path, candidate: candidate)
+    }
 }
 
 public struct ProjectMediaMapping: Sendable {

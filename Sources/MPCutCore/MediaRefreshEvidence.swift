@@ -223,14 +223,11 @@ struct MediaRefreshEvidence: Codable, Sendable {
         var audio = Set<Int>()
         var review = Set<Int>()
         var displayChanged = true
-        var audioRoutes = Set<Int>()
         var pictureNeedsReview = false
-
-        var verifiedThresholdStreams: Set<Int> { audioRoutes.subtracting(review) }
 
         func preservedSectionKeys(_ keys: Set<String>) -> Set<String> {
             Set(keys.filter { key in
-                if key == AnalysisSidecar.sceneSectionKey || key == AnalysisSidecar.viewNameSectionKey {
+                if key == AnalysisSidecar.sceneSectionKey {
                     return scenes
                 }
                 if key.hasPrefix("timeline_filmstrip.v1.") { return !displayChanged }
@@ -310,7 +307,6 @@ struct MediaRefreshEvidence: Codable, Sendable {
                 continue
             }
             if previous.kind == "audio" {
-                result.audioRoutes.insert(index)
                 if clockMatches, current.hasSameAudioInput(as: previous) { result.audio.insert(index) }
             } else {
                 let colorMatches = current.color == previous.color

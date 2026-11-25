@@ -87,7 +87,7 @@ class MulticamTests(unittest.TestCase):
     def project(self, *, close=None, wide=None, lav=None, end="4", offset="0", switches=None, **changes):
         payload = {
             "format": "mpcut",
-            "schema_version": 3,
+            "schema_version": 9,
             "kind": "multicam",
             "reference_angle_id": "wide",
             "group_range": {"from": "0", "to": end},
@@ -312,8 +312,8 @@ class MulticamTests(unittest.TestCase):
                  "--clip", wide, "--output", ordinary)
         self.assertEqual(chapters(single), chapters(ordinary))
 
-    def test_mix_v4_format_round_trips_order_relative_offset_and_history(self):
-        fixture = Path(__file__).parent / "fixtures" / "multicam" / "mix-v4.cut"
+    def test_mix_format_round_trips_order_relative_offset_and_history(self):
+        fixture = Path(__file__).parent / "fixtures" / "multicam" / "mix-v9.cut"
         original = fixture.read_bytes()
         self.project_path.write_bytes(original)
         copy = self.project_dir / "copy.cut"
@@ -323,7 +323,7 @@ class MulticamTests(unittest.TestCase):
         self.assertEqual(self.project_path.read_bytes(), original)
         expected = json.loads(original)
         saved = read_project(copy)
-        self.assertIn(saved["schema_version"], (4, 5))
+        self.assertEqual(saved["schema_version"], 9)
         for step in expected["history"]["undo"]:
             step.setdefault("origin", "unknown")
         for field in ("audio", "mix_lanes", "fixed_audio", "audio_replacements", "switches", "assembly", "history"):
@@ -333,7 +333,7 @@ class MulticamTests(unittest.TestCase):
         help_json = subprocess.run([CLI, "help", "multicam", "--json"], check=True,
                                    capture_output=True, text=True, timeout=90)
         template = json.loads(help_json.stdout)["project_template"]
-        self.assertEqual((template["format"], template["schema_version"], template["kind"]), ("mpcut", 4, "multicam"))
+        self.assertEqual((template["format"], template["schema_version"], template["kind"]), ("mpcut", 9, "multicam"))
         self.project()
         inspected = self.cli("project", "inspect", "--project", self.project_path, "--json")
         self.assertEqual(Path(inspected["project_path"]), self.project_path)

@@ -85,6 +85,11 @@ struct TranscriptEditTimeline {
         var sequenceItems: [StillSequenceItem] = []
         var assemblyItems: [StillAssemblyItem] = []
         var retainedFragments: [String: [(clipID: String, from: RationalTime?, to: RationalTime?)]] = [:]
+        let ownedReviews = Dictionary(grouping: project.analysisAnnotations.pauseReviews, by: \.occurrenceID)
+        var retainedReviews = ownedReviews[nil] ?? []
+        let implicitGroup: Bool
+        if case .multicam(let multicam) = project { implicitGroup = multicam.assemblyItems == nil }
+        else { implicitGroup = false }
         var nextID = 0
 
         func uniqueID(_ preferred: String) -> String {
@@ -129,7 +134,12 @@ struct TranscriptEditTimeline {
                     }
                     still.duration = length
                     _ = try still.frameCount()
+                    let original = still.id
                     still.id = uniqueID(still.id)
+                    let prefix = item.sequence == nil ? "still/" : ""
+                    retainedReviews += try (ownedReviews[prefix + original] ?? []).compactMap {
+                        try $0.retained(by: prefix + still.id, within: input, onCard: true)
+                    }
                     if item.sequence != nil { sequenceItems.append(.still(still)) }
                     else { assemblyItems.append(.still(still)) }
                 } else if var clip = item.sequence?.source {
@@ -143,10 +153,14 @@ struct TranscriptEditTimeline {
                     clip.tileLayouts = clip.tileLayouts.compactMap { $0.limited(from: lower, to: upper) }
                     clip.from = input.from
                     clip.to = input.to
+                    retainedReviews += try (ownedReviews[originalID] ?? []).compactMap { try $0.retained(by: clip.id, within: input) }
                     onRetainedClip(clip.id, originalID)
                     sequenceItems.append(.source(clip))
                 } else if let group = item.multicam, let original = group.group {
-                    let id = group.occurrenceID.map(uniqueID)
+                    let originalOwner = implicitGroup ? "whole-group" : ProjectPauseReview.occurrenceID(group)
+                    let owned = originalOwner.flatMap { ownedReviews[$0] } ?? []
+                    let id = group.occurrenceID.map(uniqueID) ?? (!owned.isEmpty ? uniqueID(ProjectIdentifier.make()) : nil)
+                    if let id { retainedReviews += try owned.compactMap { try $0.retained(by: "group/" + id, within: input) } }
                     let coverage = group.tileLayouts.compactMap { span in
                         span.limited(from: preservingHiddenStillHandles && input.from == original.from ? nil : input.from,
                                      to: preservingHiddenStillHandles && input.to == original.to ? nil : input.to)
@@ -182,6 +196,7 @@ struct TranscriptEditTimeline {
             multicam.assemblyItems = assemblyItems
         })
         updated.transcripts = project.transcripts
+        updated.analysisAnnotations.pauseReviews = retainedReviews
         return updated
     }
 

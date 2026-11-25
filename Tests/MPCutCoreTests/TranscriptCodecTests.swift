@@ -101,9 +101,8 @@ final class TranscriptCodecTests: XCTestCase {
         XCTAssertEqual(document.words[0].observations.first?.start, try origin.adding(RationalTime(numerator: 1, denominator: 16000)))
         XCTAssertEqual(document.tracks[0].words?.first?.speakerID, "local-0")
         XCTAssertEqual(document.tracks[1].coverage, .skipped)
-        // The provider's levels stay with the recording's analysis sidecar.
-        XCTAssertTrue(try Self.sampleSession().contains(#""activity""#))
-        XCTAssertTrue(document.tracks.allSatisfy(\.activity.isEmpty))
+        XCTAssertEqual(document.tracks[0].activity, [.init(start: origin,
+            end: try origin.adding(RationalTime(numerator: 320, denominator: 16_000)), level: 0.5)])
         XCTAssertEqual(document.words[0].observations.map(\.trackID), ["mic"])
         XCTAssertEqual(try TranscriptCodec.decode(TranscriptCodec.encode(document, format: .json), format: .json), document)
     }
@@ -261,7 +260,7 @@ final class TranscriptCodecTests: XCTestCase {
         let document = TranscriptDocument(clock: .presentation, tracks: [.init(id: "mic", name: "Mic")], words: [
             .init(id: "w", text: "Hello", start: .init(numerator: 12), end: .init(numerator: 13))
         ])
-        let attachment = TranscriptAttachment(id: "a", asset: .init(file: "t.json", sha256: String(repeating: "a", count: 64)),
+        let attachment = TranscriptAttachment(id: "a", asset: .init(sha256: String(repeating: "a", count: 64)),
                                               bindings: [.init(trackID: "mic", file: "recording.mov", streamIndex: 1,
                                                                sequenceClockOrigin: .init(numerator: 10))])
         let index = try TranscriptIndex(document: document, attachment: attachment)
@@ -276,7 +275,7 @@ final class TranscriptCodecTests: XCTestCase {
         let input = Data("1\n00:00:01,000 --> 00:00:02,000\nHello\n".utf8)
         let document = try TranscriptCodec.decode(input, format: .srt)
         let indexes = try ["left", "right"].map { name in
-            let attachment = TranscriptAttachment(id: name, asset: .init(file: "t.json", sha256: String(repeating: "a", count: 64)),
+            let attachment = TranscriptAttachment(id: name, asset: .init(sha256: String(repeating: "a", count: 64)),
                                                   bindings: [.init(trackID: "source", file: name + ".mov", streamIndex: 0)])
             return try TranscriptIndex(document: document, attachment: attachment)
         }
@@ -332,7 +331,7 @@ final class TranscriptCodecTests: XCTestCase {
             TranscriptWord(id: "one", text: "Hello", start: .zero, end: .init(numerator: 1), utteranceID: "u0"),
             TranscriptWord(id: "two", text: " again.", start: .init(numerator: 1), end: .init(numerator: 2), utteranceID: "u0")
         ])
-        let asset = TranscriptAsset(file: "words.json", sha256: String(repeating: "a", count: 64))
+        let asset = TranscriptAsset(sha256: String(repeating: "a", count: 64))
         let binding = TranscriptBinding(trackID: track.id, file: "media.mov", streamIndex: 1)
         let attachment = TranscriptAttachment(id: "attachment", asset: asset, bindings: [binding])
         let project = CutProject.sequence([
@@ -352,7 +351,7 @@ final class TranscriptCodecTests: XCTestCase {
     }
 
     func testCurrentCutExportCombinesIndependentAttachmentsInOutputOrder() throws {
-        let asset = TranscriptAsset(file: "words.json", sha256: String(repeating: "a", count: 64))
+        let asset = TranscriptAsset(sha256: String(repeating: "a", count: 64))
         let project = CutProject.sequence([
             .init(id: "first", file: "a.mov", from: .zero, to: .init(numerator: 2)),
             .init(id: "second", file: "b.mov", from: .zero, to: .init(numerator: 2))

@@ -7,12 +7,10 @@ struct SidecarGenerationRefresh {
     let preserving: Set<String>
     let force: Bool
     let preservingScenes: Bool
-    let preservingThresholdStreams: Set<Int>
 }
 
 extension AnalysisSidecar {
     static let evidenceKey = MediaRefreshEvidence.sectionKey
-    package static let silenceThresholdOverridesKey = "silence_threshold_overrides_db.v1"
     private static let evidenceLimit = 16 * 1024 * 1024
 
     func createManifest(_ db: SidecarDatabase) throws {
@@ -21,28 +19,6 @@ extension AnalysisSidecar {
                 id INTEGER PRIMARY KEY, stamp TEXT NOT NULL, reason TEXT NOT NULL
             );
             INSERT INTO source_generations(id, stamp, reason) SELECT 1, stamp, 'initial' FROM source;
-            CREATE TABLE archived_sections(
-                generation INTEGER NOT NULL, name TEXT NOT NULL, digest BLOB NOT NULL, value BLOB NOT NULL,
-                logical_size INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(generation, name)
-            );
-            CREATE TABLE scene_attempts(
-                ordinal INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, generation INTEGER NOT NULL,
-                scope TEXT NOT NULL, operation TEXT, owner TEXT, fence INTEGER NOT NULL,
-                expires REAL NOT NULL, state INTEGER NOT NULL DEFAULT 0,
-                covered REAL NOT NULL DEFAULT 0, marker_count INTEGER NOT NULL DEFAULT 0,
-                checkpoint BLOB, checkpoint_digest BLOB, logical_size INTEGER NOT NULL DEFAULT 0,
-                UNIQUE(generation, scope, operation)
-            );
-            CREATE INDEX scene_attempt_scope ON scene_attempts(generation, scope, ordinal);
-            CREATE TABLE scene_markers(
-                attempt TEXT NOT NULL, ordinal INTEGER NOT NULL, value BLOB NOT NULL, digest BLOB NOT NULL,
-                logical_size INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(attempt, ordinal)
-            );
-            CREATE TABLE scene_reports(
-                generation INTEGER NOT NULL, scope TEXT NOT NULL, attempt TEXT NOT NULL,
-                PRIMARY KEY(generation, scope)
-            );
-            CREATE INDEX scene_report_attempt ON scene_reports(attempt);
             PRAGMA user_version = \(Self.schemaVersion);
             """)
     }
@@ -98,8 +74,7 @@ extension AnalysisSidecar {
         let encoded = try evidence.encoded()
         let refresh = SidecarGenerationRefresh(evidence: encoded, expectedEvidence: previous,
                                                preserving: comparison.preservedSectionKeys(keys),
-                                               force: current && confirmedChange, preservingScenes: comparison.scenes,
-                                               preservingThresholdStreams: comparison.verifiedThresholdStreams)
+                                               force: current && confirmedChange, preservingScenes: comparison.scenes)
         return (refresh, encoded)
     }
 
@@ -124,7 +99,7 @@ extension AnalysisSidecar {
         try Self.pruneSilenceResults(in: db)
         try db.execute("DROP TABLE IF EXISTS temp.retained_sections; CREATE TEMP TABLE retained_sections(name TEXT PRIMARY KEY)")
         if let refresh {
-            for key in refresh.preserving.sorted() where key != Self.evidenceKey && key != Self.silenceThresholdOverridesKey {
+            for key in refresh.preserving.sorted() where key != Self.evidenceKey {
                 if let bytes = try verifiedSection(key, in: db, stamp: saved, maxBytes: nil, cancelled: cancelled) {
                     // Keep the stored representation and insertion order. Only the checksum
                     // depends on the source stamp, and a forced refresh can keep that too.
@@ -139,40 +114,37 @@ extension AnalysisSidecar {
         }
         // Archive inspectable reports at their original stamp. Preview and index
         // payloads can be rebuilt and are only kept when certified for reuse.
+        try db.execute("""
+            CREATE TABLE IF NOT EXISTS archived_sections(
+                generation INTEGER NOT NULL, name TEXT NOT NULL, digest BLOB NOT NULL, value BLOB NOT NULL,
+                logical_size INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(generation, name)
+            );
+            """)
         try db.update("""
             INSERT INTO archived_sections(generation, name, digest, value, logical_size)
             SELECT ?, name, digest, value, logical_size FROM sections
             WHERE name NOT IN (SELECT name FROM retained_sections)
-              AND (name IN (?, ?, ?, ?) OR name GLOB 'silence_pauses.*' OR name GLOB 'silence_automatic_threshold_db.*')
-            """, [String(previous), Self.evidenceKey, Self.sceneSectionKey, Self.viewNameSectionKey,
-                  Self.silenceThresholdOverridesKey])
+              AND (name IN (?, ?) OR name GLOB 'silence_pauses.*' OR name GLOB 'silence_automatic_threshold_db.*')
+            """, [String(previous), Self.evidenceKey, Self.sceneSectionKey])
         try db.execute("DELETE FROM sections WHERE name NOT IN (SELECT name FROM retained_sections)")
-        if let refresh, !refresh.preservingThresholdStreams.isEmpty,
-           let data = try verifiedSection(Self.silenceThresholdOverridesKey, in: db, stamp: saved, maxBytes: nil,
-                                          cancelled: cancelled, generation: String(previous)),
-           let overrides = try? JSONDecoder().decode([Int: Double].self, from: data) {
-            let retained = overrides.filter { refresh.preservingThresholdStreams.contains($0.key) }
-            if !retained.isEmpty {
-                try writeSection(Self.silenceThresholdOverridesKey, value: JSONEncoder().encode(retained), db: db, stamp: stamp,
-                                 cancelled: cancelled)
-            }
-        }
         try db.update("UPDATE source SET stamp = ? WHERE id = 1", [stamp])
         try db.update("INSERT INTO source_generations(stamp, reason) VALUES(?, ?)",
                       [stamp, current ? "content_changed" : "identity_changed"])
         let next = try generation(db)
-        if refresh?.preservingScenes == true {
-            try db.update("""
-                INSERT INTO scene_reports(generation, scope, attempt)
-                SELECT ?, scope, attempt FROM scene_reports WHERE generation = ?
-                """, [String(next), String(previous)])
-        }
         let oldestRetainedGeneration = String(next - 3)
         try db.update("DELETE FROM archived_sections WHERE generation < ?", [oldestRetainedGeneration])
-        try db.update("DELETE FROM scene_reports WHERE generation < ?", [oldestRetainedGeneration])
-        try db.update("UPDATE scene_attempts SET state = 2, owner = NULL WHERE generation < ? AND state = 0",
-                      [String(next)])
-        try pruneSceneHistory(db, generation: next)
+        if try db.hasSceneAttempts {
+            if refresh?.preservingScenes == true {
+                try db.update("""
+                    INSERT INTO scene_reports(generation, scope, attempt)
+                    SELECT ?, scope, attempt FROM scene_reports WHERE generation = ?
+                    """, [String(next), String(previous)])
+            }
+            try db.update("DELETE FROM scene_reports WHERE generation < ?", [oldestRetainedGeneration])
+            try db.update("UPDATE scene_attempts SET state = 2, owner = NULL WHERE generation < ? AND state = 0",
+                          [String(next)])
+            try pruneSceneHistory(db, generation: next)
+        }
         return stamp
     }
 
@@ -233,12 +205,11 @@ extension AnalysisSidecar {
 
     public func refreshGeneration(evidence: Data, preserving: Set<String>, expectedEvidence: Data? = nil,
                                   force: Bool = false, preservingScenes: Bool = false,
-                                  preservingThresholdStreams: Set<Int> = [], sections: [String: Data] = [:],
+                                  sections: [String: Data] = [:],
                                   cancelled: () -> Bool = { false }) throws {
         guard evidence.count <= Self.evidenceLimit else { throw sidecarError("Media evidence exceeds the size limit.") }
         let refresh = SidecarGenerationRefresh(evidence: evidence, expectedEvidence: expectedEvidence,
-                                               preserving: preserving, force: force, preservingScenes: preservingScenes,
-                                               preservingThresholdStreams: preservingThresholdStreams)
+                                               preserving: preserving, force: force, preservingScenes: preservingScenes)
         var writes = sections
         writes[Self.evidenceKey] = evidence
         try transact(writes, cancelled: cancelled, refresh: refresh) { _, _ in }

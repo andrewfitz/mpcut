@@ -22,8 +22,8 @@ final class SidecarLocationsTests: XCTestCase {
             let project = root.appendingPathComponent("edit.cut")
             try contents(source)
             let options = SidecarLocations(source: source, project: project)
-            XCTAssertEqual(options.destination, source.appendingPathExtension("cutdb"))
-            XCTAssertTrue(options.candidates.contains(source.appendingPathExtension("cutdb")))
+            XCTAssertEqual(options.destination, source.appendingPathExtension("cutcache"))
+            XCTAssertTrue(options.candidates.contains(source.appendingPathExtension("cutcache")))
             XCTAssertTrue(SidecarLocations.knownEntries().isEmpty)
             XCTAssertFalse(FileManager.default.fileExists(atPath: home.path))
             XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("MPCut Cache").path))
@@ -93,7 +93,7 @@ final class SidecarLocationsTests: XCTestCase {
                 XCTAssertFalse(SidecarLocations(source: source).candidates.contains(sidecar))
                 let skipped = try XCTUnwrap(SidecarCacheCleaner.preview().first { $0.url == sidecar })
                 XCTAssertNotNil(skipped.issue)
-                XCTAssertTrue(SidecarCacheCleaner.clear([skipped], wholeSidecars: true).cleared.isEmpty)
+                XCTAssertTrue(SidecarCacheCleaner.clear([skipped]).cleared.isEmpty)
                 try FileManager.default.moveItem(at: disconnected, to: disk)
                 XCTAssertTrue(SidecarLocations(source: source).candidates.contains(sidecar))
                 XCTAssertEqual(try AnalysisSidecar(source: source).read("test"), Data([7]))
@@ -108,7 +108,7 @@ final class SidecarLocationsTests: XCTestCase {
         try withFolders { root, home in
             let source = root.appendingPathComponent("recording.mov")
             try contents(source)
-            let adjacent = source.appendingPathExtension("cutdb")
+            let adjacent = source.appendingPathExtension("cutcache")
             try Data("ordinary file".utf8).write(to: adjacent)
             XCTAssertNil(try AnalysisSidecar(source: source).read("value"))
             XCTAssertTrue(SidecarLocations.knownEntries().isEmpty)
@@ -126,9 +126,9 @@ final class SidecarLocationsTests: XCTestCase {
             XCTAssertNil(invalid.destination)
             XCTAssertThrowsError(try invalid.checkWriteConfiguration())
             XCTAssertThrowsError(try invalid.prepareDestination())
-            XCTAssertTrue(invalid.candidates.contains(source.appendingPathExtension("cutdb")))
+            XCTAssertTrue(invalid.candidates.contains(source.appendingPathExtension("cutcache")))
             try SidecarLocations.setMode(.media)
-            XCTAssertEqual(try SidecarLocations(source: source).prepareDestination(), source.appendingPathExtension("cutdb"))
+            XCTAssertEqual(try SidecarLocations(source: source).prepareDestination(), source.appendingPathExtension("cutcache"))
         }
     }
 
@@ -163,17 +163,17 @@ final class SidecarLocationsTests: XCTestCase {
             try FileManager.default.createSymbolicLink(at: directoryAlias, withDestinationURL: source.deletingLastPathComponent())
             let throughDirectory = directoryAlias.appendingPathComponent("clip.mov")
             let directoryLocation = SidecarLocations(source: throughDirectory)
-            XCTAssertEqual(directoryLocation.candidates, [throughDirectory.appendingPathExtension("cutdb")])
+            XCTAssertEqual(directoryLocation.candidates, [throughDirectory.appendingPathExtension("cutcache")])
             XCTAssertEqual(directoryLocation.candidateEntries.map(\.url), directoryLocation.candidates)
             let fileAlias = directoryAlias.appendingPathComponent("other-name.mov")
             try FileManager.default.createSymbolicLink(at: fileAlias, withDestinationURL: source)
             let throughFile = SidecarLocations(source: fileAlias)
             XCTAssertEqual(throughFile.candidates.count, 2)
-            XCTAssertEqual(throughFile.candidates.first, fileAlias.appendingPathExtension("cutdb"))
-            XCTAssertEqual(throughFile.candidates.last?.lastPathComponent, "clip.mov.cutdb")
+            XCTAssertEqual(throughFile.candidates.first, fileAlias.appendingPathExtension("cutcache"))
+            XCTAssertEqual(throughFile.candidates.last?.lastPathComponent, "clip.mov.cutcache")
             // Exercise the same comparison with actual filesystem entries.
             for url in throughFile.candidates { try Data([1]).write(to: url) }
-            XCTAssertEqual(directoryLocation.candidates, [throughDirectory.appendingPathExtension("cutdb")])
+            XCTAssertEqual(directoryLocation.candidates, [throughDirectory.appendingPathExtension("cutcache")])
             XCTAssertEqual(throughFile.candidates.count, 2)
         }
     }

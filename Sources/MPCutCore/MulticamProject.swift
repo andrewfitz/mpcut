@@ -220,7 +220,7 @@ public struct MulticamSwitch: Codable, Hashable, Sendable {
 }
 
 public struct MulticamProject: Codable, Equatable, Sendable {
-    public static let schemaVersion = 4
+    public static let schemaVersion = CutProject.schemaVersion
     public var referenceAngle: String
     public var range: MulticamRange
     public var angles: [MulticamSource]
@@ -238,6 +238,7 @@ public struct MulticamProject: Codable, Equatable, Sendable {
     public var stillReplacements: [StillReplacement]
     public var programColorPolicy: StillProgramColorPolicy?
     public var transcripts: ProjectTranscripts
+    public var analysisAnnotations = ProjectAnalysisAnnotations()
     public var participants: ParticipantProject
     public var speakerAngles: [TileSpeakerAngle]
 
@@ -344,31 +345,34 @@ public struct MulticamProject: Codable, Equatable, Sendable {
         case audio, switches, assembly, history
         case groupTileLayouts = "group_tile_layouts"
         case mediaSnapshot = "media_snapshot"
+        case embeddedAssets = "embedded_assets"
         case fixedAudio = "fixed_audio"
         case mixLanes = "mix_lanes"
         case audioReplacements = "audio_replacements"
         case stillAssets = "still_assets"
         case stillReplacements = "still_replacements"
         case programColorPolicy = "program_color_policy"
+        case analysisAnnotations = "analysis_annotations"
         case transcripts, participants
         case speakerAngles = "speaker_angles"
     }
 
     public init(from decoder: Decoder) throws {
+        self = try ProjectEmbeddedAssets.decoding(from: decoder) { try Self(contentsOf: decoder) }
+    }
+
+    private init(contentsOf decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         guard try values.decode(String.self, forKey: .format) == CutProject.format else {
             throw Self.invalid("Expected an MPCut project document")
         }
         guard let version = try values.decodeIfPresent(Int.self, forKey: .schemaVersion),
-              [3, Self.schemaVersion, CutProject.tilesSchemaVersion].contains(version) else {
+              version == Self.schemaVersion else {
             throw CutError(code: "unsupported_multicam_version", message: "Unsupported MPCut multicam project schema version")
         }
         try ProjectField.rejectUnknown(CodingKeys.self, in: decoder)
         let mixFields: [CodingKeys] = [.fixedAudio, .mixLanes, .audioReplacements]
         let policy = try values.decode(MulticamAudioPolicy.self, forKey: .audio)
-        if version == 3, policy == .mix || mixFields.contains(where: values.contains) {
-            throw Self.invalid("Mix audio fields require project schema version 4")
-        }
         let optionalFields: [CodingKeys] = [.stillAssets, .stillReplacements, .programColorPolicy, .assembly] + mixFields
         for key in optionalFields where values.contains(key) {
             guard try !values.decodeNil(forKey: key) else {
@@ -392,34 +396,33 @@ public struct MulticamProject: Codable, Equatable, Sendable {
                   mixLanes: try values.decodeIfPresent([MulticamAudioLane].self, forKey: .mixLanes) ?? [],
                   audioReplacements: try values.decodeIfPresent([MulticamAudioReplacement].self, forKey: .audioReplacements) ?? [])
         groupTileLayouts = try values.decodeIfPresent([TileLayoutSpan].self, forKey: .groupTileLayouts) ?? []
+        if values.contains(.analysisAnnotations) {
+            analysisAnnotations = try values.decode(ProjectAnalysisAnnotations.self, forKey: .analysisAnnotations)
+        }
         if values.contains(.transcripts) {
             transcripts = try values.decode(ProjectTranscripts.self, forKey: .transcripts)
         }
         if values.contains(.participants) {
-            guard version >= 4 else { throw invalidParticipantProject("Participant metadata requires project schema version 4.") }
             participants = try values.decode(ParticipantProject.self, forKey: .participants)
         }
         speakerAngles = try values.decodeIfPresent([TileSpeakerAngle].self, forKey: .speakerAngles) ?? []
         syncFeedAngleRecordings()
-        guard version == CutProject.tilesSchemaVersion || !CutProject.multicam(self).usesTilesFormat else {
-            throw Self.invalid("Tiles fields require project schema version \(CutProject.tilesSchemaVersion).")
-        }
         try validate()
     }
 
     public func encode(to encoder: Encoder) throws {
-        try encode(to: encoder, requiresTilesSchema: false)
+        try ProjectEmbeddedAssets.encoding(to: encoder) { try encodeFields(to: encoder) }
     }
 
-    func encode(to encoder: Encoder, requiresTilesSchema: Bool) throws {
+    private func encodeFields(to encoder: Encoder) throws {
         try validate()
         var values = encoder.container(keyedBy: CodingKeys.self)
         try values.encode(CutProject.format, forKey: .format)
-        try values.encode(requiresTilesSchema || CutProject.multicam(self).usesTilesFormat ? CutProject.tilesSchemaVersion : Self.schemaVersion,
-                          forKey: .schemaVersion)
+        try values.encode(Self.schemaVersion, forKey: .schemaVersion)
         try values.encode("multicam", forKey: .kind)
         if !transcripts.isEmpty { try values.encode(transcripts, forKey: .transcripts) }
         if !participants.isEmpty { try values.encode(participants, forKey: .participants) }
+        if !analysisAnnotations.isEmpty { try values.encode(analysisAnnotations, forKey: .analysisAnnotations) }
         if !speakerAngles.isEmpty { try values.encode(speakerAngles, forKey: .speakerAngles) }
         try values.encode(referenceAngle, forKey: .referenceAngle)
         try values.encode(range, forKey: .range)
@@ -441,7 +444,6 @@ public struct MulticamProject: Codable, Equatable, Sendable {
     private static let streamIndices = 0...Int(Int32.max)
 
     /// The largest project document `load` reads, matching the CLI's request limit.
-    public static let maximumFileSize = 64 * 1024 * 1024
 
     public static func load(from url: URL) throws -> Self {
         try Self.decode(ProjectFile.readBytes(from: url, multicam: true))
@@ -457,15 +459,9 @@ public struct MulticamProject: Codable, Equatable, Sendable {
 
     public func save(to url: URL, mediaSnapshot: ProjectMediaSnapshot = .empty) throws {
         let (data, sources) = try CutProject.multicam(self).encodedArchive(
-            undo: [], redo: [], mediaSnapshot: mediaSnapshot, byteLimit: Self.maximumFileSize
+            undo: [], redo: [], mediaSnapshot: mediaSnapshot
         )
-        if transcripts.isEmpty, !TranscriptStore.hasStore(relativeTo: url) {
-            try ProjectFile.write(data, to: url, sources: sources, prefix: "multicam")
-        } else {
-            _ = try ProjectFile.writeRevision(data, to: url, sources: sources, prefix: "multicam", replacingExisting: true,
-                                              expected: nil, transcriptAssets: transcripts.attachments.map(\.asset),
-                                              hasTranscriptMetadata: !transcripts.isEmpty)
-        }
+        try ProjectFile.write(data, to: url, sources: sources, prefix: "multicam")
     }
 
     public func sourceURL(for source: MulticamSource, relativeTo projectURL: URL) -> URL {
@@ -479,6 +475,7 @@ public struct MulticamProject: Codable, Equatable, Sendable {
     public func validate() throws {
         try validateTileLayouts()
         try transcripts.validate()
+        try analysisAnnotations.validate()
         try participants.validate()
         guard range.from == .zero, range.to > range.from else {
             throw Self.invalid("The group must start at zero and have a positive duration")

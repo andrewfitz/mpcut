@@ -14,9 +14,7 @@ final class MediaRefreshTests: XCTestCase {
         XCTAssertNil(baseline.persistenceError)
         let cache = AnalysisSidecar(media: initial)
         let key = "silence_automatic_threshold_db.v1.0"
-        let settingsKey = "silence_threshold_overrides_db.v1"
-        let settings = try JSONEncoder().encode([0: -27.0])
-        try cache.save([key: Data([1, 2, 3]), settingsKey: settings])
+        try cache.save([key: Data([1, 2, 3])])
         let generation = try XCTUnwrap(cache.persistedGenerations().first?.id)
 
         try rewritePreservingStamp(file, with: wave(samples: 16_000, amplitude: 300))
@@ -29,7 +27,6 @@ final class MediaRefreshTests: XCTestCase {
         XCTAssertNil(check.persistenceError)
         let refreshed = try AnalysisSidecar(source: file)
         XCTAssertNil(refreshed.read(key))
-        XCTAssertEqual(refreshed.read(settingsKey), settings)
         let published = try XCTUnwrap(refreshed.persistedGenerations().first)
         XCTAssertGreaterThan(published.id, generation)
         XCTAssertEqual(published.reason, "content_changed")

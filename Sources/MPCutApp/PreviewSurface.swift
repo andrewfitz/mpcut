@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import Combine
 import QuartzCore
 
 final class PreviewSurface: NSView {
@@ -11,10 +12,12 @@ final class PreviewSurface: NSView {
     private var observations: [NSObjectProtocol] = []
     private var forceSDR = false
     private var cleanFeed = false
+    // Without preferences, as in a test host, the menu changes this surface only and nothing is saved.
+    private weak var preferences: EditorPreferences?
+    private var preferenceObservation: AnyCancellable?
     private(set) var isVideoMonitor = false
     var otherMonitorStatus: (() -> String?)?
     var presentationDescription: String? { badge.toolTip }
-    private var preferenceKey: String { isVideoMonitor ? "playback_monitor_force_sdr_enabled" : "playback_viewer_force_sdr_enabled" }
     private var cachedFormat: CMVideoFormatDescription?
     private var pictureTransform = CGAffineTransform.identity
     var windowChanged: ((PreviewSurface) -> Void)?
@@ -50,10 +53,25 @@ final class PreviewSurface: NSView {
         setStatus("Pending", frame: nil, reason: "Waiting for a program picture and display.")
     }
 
-    func setMonitor(_ isMonitor: Bool) {
+    /// Force SDR and clean feed follow the shared preferences, so a change from Settings, an agent or another
+    /// window's menu reaches every open surface.
+    func setMonitor(_ isMonitor: Bool, preferences: EditorPreferences? = nil) {
         isVideoMonitor = isMonitor
-        forceSDR = UserDefaults.standard.bool(forKey: preferenceKey)
-        cleanFeed = isMonitor && UserDefaults.standard.bool(forKey: "playback_monitor_clean_feed_enabled")
+        self.preferences = preferences
+        preferenceObservation = preferences?.observeChanges { [weak self] change in
+            switch change {
+            case .viewerForceSDR, .monitorForceSDR, .monitorCleanFeed: self?.applyPreferences()
+            default: break
+            }
+        }
+        applyPreferences()
+    }
+
+    private func applyPreferences() {
+        if let preferences {
+            forceSDR = isVideoMonitor ? preferences.monitorForceSDR : preferences.viewerForceSDR
+            cleanFeed = isVideoMonitor && preferences.monitorCleanFeed
+        }
         applyMonitorChrome()
         present()
     }
@@ -97,15 +115,21 @@ final class PreviewSurface: NSView {
     }
 
     @objc private func toggleSDR() {
-        forceSDR.toggle()
-        UserDefaults.standard.set(forceSDR, forKey: preferenceKey)
-        present()
+        guard let preferences else {
+            forceSDR.toggle()
+            present()
+            return
+        }
+        if isVideoMonitor { preferences.monitorForceSDR.toggle() } else { preferences.viewerForceSDR.toggle() }
     }
 
     @objc private func toggleCleanFeed() {
-        cleanFeed.toggle()
-        UserDefaults.standard.set(cleanFeed, forKey: "playback_monitor_clean_feed_enabled")
-        applyMonitorChrome()
+        guard let preferences else {
+            cleanFeed.toggle()
+            applyMonitorChrome()
+            return
+        }
+        preferences.monitorCleanFeed.toggle()
     }
 
     private func applyMonitorChrome() {

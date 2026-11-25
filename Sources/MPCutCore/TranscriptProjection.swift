@@ -587,20 +587,25 @@ private struct TranscriptProjection {
                                + localWords.values.reduce(0) { $0 + $1.count })
         let recognizedTracks = document.tracks.filter { $0.coverage == .recognized }.map(\.id).sorted()
         for word in document.words {
+            let exportedSource = word.projection?.clock == .presentation
+            // A standalone source export already includes the original binding's clock adjustment.
+            let exportedRange = exportedSource && attachmentID == nil
+                ? MulticamRange(from: word.start, to: word.end) : nil
             if !word.observations.isEmpty {
                 // Inferred-only stale associations retain no usable source observation.
                 for (index, observation) in word.observations.enumerated()
                 where !staleMatches || observation.evidence == .recognized {
                     guard let track = tracks[observation.trackID] else { continue }
                     let original = MulticamRange(from: observation.start, to: observation.end)
-                    let source = try original.projectionShifted(by: importOrigin.adding(track.binding?.offset ?? .zero))
+                    let source = try exportedRange ?? original.projectionShifted(by: importOrigin.adding(track.binding?.offset ?? .zero))
                     // A recording that read the word differently still recognized a word there.
                     let heard = observation.evidence == .recognized
                         || observation.wordID.map { trackWordText[observation.trackID]?[$0] != nil } ?? false
                     try result.append(occurrence(word, id: "source-\(index)", range: source, source: source,
                                                  original: original, group: groupRange(for: track, source: source),
                                                  track: track, observation: observation,
-                                                 audibility: heard ? .recognized : .inferred))
+                                                 audibility: heard ? .recognized : .inferred,
+                                                 useLocalText: !exportedSource))
                 }
                 continue
             }
@@ -609,7 +614,7 @@ private struct TranscriptProjection {
             if let exported = word.projection, let id = exported.trackID, let track = tracks[id],
                let from = exported.originalSourceStart, let to = exported.originalSourceEnd, from <= to {
                 let original = MulticamRange(from: from, to: to)
-                let source = try original.projectionShifted(by: importOrigin.adding(track.binding?.offset ?? .zero))
+                let source = try exportedRange ?? original.projectionShifted(by: importOrigin.adding(track.binding?.offset ?? .zero))
                 try result.append(occurrence(word, id: "source", range: source, source: source, original: original,
                                              group: groupRange(for: track, source: source), track: track, audibility: .source))
                 continue
@@ -694,12 +699,17 @@ private struct TranscriptProjection {
         } else {
             sequenceSourceRange = nil
         }
-        let originalSpeaker = word.projection.map(\.originalSpeakerID) ?? word.speakerID
+        let originalSpeaker = if let projection = word.projection, !useLocalText {
+            projection.originalSpeakerID
+        } else {
+            observation?.speakerID ?? word.projection.map(\.originalSpeakerID) ?? word.speakerID
+        }
+        let originalText = !useLocalText ? word.projection?.originalText : nil
         let lane = lane ?? track.flatMap { lanesByTrack[$0.track.id] }
         return try .init(id: "\(occurrencePrefix)\(id):\(word.id)", wordID: word.id,
                          attachmentID: attachmentID, text: text, speakerID: speaker,
-                         originalText: observedText ?? word.projection?.originalText ?? word.text,
-                         originalSpeakerID: observation?.speakerID ?? originalSpeaker, precision: word.precision,
+                         originalText: originalText ?? observedText ?? word.projection?.originalText ?? word.text,
+                         originalSpeakerID: originalSpeaker, precision: word.precision,
                          utteranceID: word.utteranceID,
                          observation: observation, candidateTrackIDs: candidates, file: file, binding: track?.binding, bindingStatus: track?.bindingStatus,
                          originalSourceRange: original, sequenceSourceRange: sequenceSourceRange,

@@ -1,6 +1,6 @@
 {
   "format": "mpcut",
-  "schema_version": 3,
+  "schema_version": 9,
   "kind": "sequence",
   "clips": [],
   "source_selects": [

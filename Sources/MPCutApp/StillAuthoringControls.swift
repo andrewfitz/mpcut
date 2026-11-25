@@ -230,19 +230,41 @@ enum StillPanels {
                       Int((rgb.greenComponent * 255).rounded()), Int((rgb.blueComponent * 255).rounded()))
     }
 
-    static func gap(cadence: RationalTime?, in window: NSWindow?,
+    /// Frames a starting still, gap or spacing duration may span. Wide enough for the longest Settings
+    /// duration (600 s) at 240 fps with room to spare, where the shared helper's default would stop at 1,000.
+    nonisolated static let startingDurationFrames: ClosedRange<Int64> = 1...1_000_000
+
+    /// The duration and cadence a still, gap or spacing panel opens with: `seconds` rounded to a whole
+    /// frame at `cadence`, or at 30 fps when the timeline has none.
+    nonisolated static func startingDuration(seconds: Double, cadence: RationalTime?) -> (duration: RationalTime, cadence: RationalTime) {
+        FrameAlignedDuration.duration(seconds: seconds, cadence: cadence, frames: startingDurationFrames)
+    }
+
+    /// The color well's starting color for a `#RRGGBB` Settings value. Anything else is black.
+    static func startingColor(_ hex: String) -> NSColor {
+        guard let value = EditorPreferences.hexColor(hex).flatMap({ UInt32($0.dropFirst(), radix: 16) }), value != 0 else {
+            return .black
+        }
+        return NSColor(srgbRed: CGFloat(value >> 16 & 0xFF) / 255, green: CGFloat(value >> 8 & 0xFF) / 255,
+                       blue: CGFloat(value & 0xFF) / 255, alpha: 1)
+    }
+
+    /// - Parameters:
+    ///   - seconds: the starting duration, Settings → Editing → Color gap duration.
+    ///   - color: the starting color as `#RRGGBB`, Settings → Editing → Gap color.
+    static func gap(cadence: RationalTime?, seconds: Double = 2, color: String = "#000000", in window: NSWindow?,
                     completion: @escaping (RationalTime, RationalTime, StillImageFraming) -> Void) {
         let well = NSColorWell()
-        well.color = .black
-        let (duration, interval) = defaultGapTiming(cadence: cadence)
+        well.color = startingColor(color)
+        let (duration, interval) = startingDuration(seconds: seconds, cadence: cadence)
         durationFields(title: "Insert Color Gap", duration: duration, cadence: interval, color: well, in: window) { length, rate in
             completion(length, rate, StillImageFraming(mode: .fit, background: rgbHex(well)))
         }
     }
 
-    static func spaceClips(cadence: RationalTime?, in window: NSWindow?,
+    static func spaceClips(cadence: RationalTime?, seconds: Double = 2, color background: String = "#000000", in window: NSWindow?,
                            completion: @escaping (ClipSpacingTiming, RationalTime, String) -> Void) {
-        let (duration, interval) = defaultGapTiming(cadence: cadence)
+        let (duration, interval) = startingDuration(seconds: seconds, cadence: cadence)
         let length = SpacingDurationField(string: duration.description)
         length.toolTip = "Set the same duration in seconds for every gap"
         let timing = NSPopUpButton()
@@ -253,7 +275,7 @@ enum StillPanels {
         timing.action = #selector(SpacingDurationField.updateAvailability(_:))
         let fps = frameRateField(cadence: interval)
         let color = NSColorWell()
-        color.color = .black
+        color.color = startingColor(background)
         present(title: "Space Clips", fields: [
             ("Gap timing", timing), ("Duration (seconds)", length), ("Frames per second", fps), ("Color", color)
         ], in: window) {
@@ -275,13 +297,6 @@ enum StillPanels {
                 completion(choice, RationalTime(numerator: rate.denominator, denominator: rate.numerator), rgbHex(color))
             } catch { ProjectPanels.present(NSAlert(error: error), in: window) }
         }
-    }
-
-    private static func defaultGapTiming(cadence: RationalTime?) -> (duration: RationalTime, cadence: RationalTime) {
-        let interval = cadence ?? RationalTime(numerator: 1, denominator: 30)
-        let frames = Int64(max(1, min(1_000, (2 / interval.seconds).rounded())))
-        let duration = (try? interval.multiplied(by: .init(numerator: frames))) ?? interval
-        return (duration, interval)
     }
 
     private static func frameRateField(cadence: RationalTime) -> NSTextField {

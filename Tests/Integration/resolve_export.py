@@ -53,7 +53,7 @@ class ResolveExportTests(unittest.TestCase):
         self.check_source_start(source, Fraction(172800001, 48000))
 
     def test_native_switches_in_assembly_order(self):
-        project = dict(format="mpcut", schema_version=3, kind="multicam", reference_angle_id="a",
+        project = dict(format="mpcut", schema_version=9, kind="multicam", reference_angle_id="a",
                        group_range={"from": "0", "to": "3"},
                        angles=[dict(id="a", name="Wide", file=self.camera.name),
                                dict(id="b", name="Close", file=self.camera.name, offset="-1")],
@@ -84,7 +84,7 @@ class ResolveExportTests(unittest.TestCase):
         ffmpeg("-f", "lavfi", "-i", "color=s=160x90:r=24:d=1", "-f", "lavfi", "-i",
                "sine=frequency=440:d=3", "-map", "0:v", "-map", "1:a", "-c:v", "prores_ks",
                "-c:a", "pcm_s16le", short_camera)
-        project = dict(format="mpcut", schema_version=3, kind="multicam", reference_angle_id="a",
+        project = dict(format="mpcut", schema_version=9, kind="multicam", reference_angle_id="a",
                        group_range={"from": "0", "to": "3"},
                        angles=[dict(id="a", file=self.camera.name), dict(id="b", file=short_camera.name)],
                        audio=dict(mode="fixed", source_id="b", audio_stream_index=1),

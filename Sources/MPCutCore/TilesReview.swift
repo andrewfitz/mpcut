@@ -205,7 +205,21 @@ public struct TilesReview: Sendable {
                   layoutSource: layoutSource)
     }
 
-    public init(scan: ParticipantScanResult, countHints: TilesCountHints? = nil) {
+    /// A source can be inspected as soon as its first scan is saved, before its tiles are accepted.
+    package init(reviewing project: CutProject, sourceID: String, document: URL, useSidecar: Bool,
+                 cancelled: @escaping @Sendable () -> Bool) throws {
+        if !project.participants.sources.contains(where: { $0.sourceID == sourceID }),
+           let pending = project.participants.pendingReviews.first(where: { $0.sourceID == sourceID }) {
+            let url = try project.participantRecording(sourceID, relativeTo: document)
+            let scan = try pending.load(recording: url, cancelled: cancelled)
+            let hints = TilesCountHints(expectedFeeds: Int(pending.choices.expectedFeeds), maxVisibleTiles: Int(pending.choices.expectedTiles))
+            self.init(scan: scan, countHints: hints, sourceID: sourceID)
+        } else {
+            self.init(project: project, sourceID: sourceID, document: document, useSidecar: useSidecar, cancelled: cancelled)
+        }
+    }
+
+    public init(scan: ParticipantScanResult, countHints: TilesCountHints? = nil, sourceID: String? = nil) {
         let analysis = scan.analysis
         let observations = analysis?.observations ?? []
         let ends = Dictionary(analysis?.appearances.map { ($0.id, $0.end) } ?? [], uniquingKeysWith: min)
@@ -296,7 +310,7 @@ public struct TilesReview: Sendable {
             }
             return ParticipantCoverage(range: .init(from: item.start, to: item.end), state: state)
         }
-        self.init(sourceID: scan.source.file, mediaURL: URL(fileURLWithPath: scan.source.file), appearances: appearances,
+        self.init(sourceID: sourceID ?? scan.source.file, mediaURL: URL(fileURLWithPath: scan.source.file), appearances: appearances,
                   people: people, preferences: [], coverage: coverage,
                   extent: scan.source.duration > .zero ? .init(from: .zero, to: scan.source.duration) : nil,
                   countHints: countHints ?? scan.countHints, events: events)

@@ -58,15 +58,32 @@ final class ReplacementAudioWorkflowTests: XCTestCase {
         let workingTracks = try await AVURLAsset(url: first).loadTracks(withMediaType: .audio)
         XCTAssertEqual(firstSegment.sourceTrackID, workingTracks[1].trackID)
         let reader = ScrubAudioReader()
-        let window = 1.5..<1.55
+        // Stay within the fixture's AAC packet at 1.472..<1.536. AVFoundation
+        // can split the resampled output at the next packet and insert a gap.
+        let window = 1.5..<1.53
         let playback = await reader.read(source: first, composition: composition, window: window,
                                          reverse: false, fadeEdges: false)
         let donorTracks = try await AVURLAsset(url: donor).loadTracks(withMediaType: .audio)
         let reference = await reader.read(source: donor, composition: nil, window: window,
                                           reverse: false, fadeEdges: false, presentationTrackID: donorTracks[1].trackID)
-        let audible = try XCTUnwrap(playback).stereo
+        let grain = try XCTUnwrap(playback)
+        XCTAssertEqual(grain.rate, 48_000)
+        let audible = grain.stereo
+        XCTAssertEqual(audible.count, 1_440 * 2)
         XCTAssertGreaterThan(audible.map(abs).max() ?? 0, 0)
         XCTAssertEqual(audible, try XCTUnwrap(reference).stereo)
+
+        // Compare the copied audio across the packet boundary at its source rate.
+        let packetWindow = 1.5..<1.55
+        let workingAudio = await reader.read(source: first, composition: nil, window: packetWindow,
+                                             reverse: false, fadeEdges: false, audioTrack: 1)
+        let donorAudio = await reader.read(source: donor, composition: nil, window: packetWindow,
+                                           reverse: false, fadeEdges: false, audioTrack: 1)
+        let workingGrain = try XCTUnwrap(workingAudio)
+        XCTAssertEqual(workingGrain.rate, 16_000)
+        XCTAssertEqual(workingGrain.stereo.count, 800 * 2)
+        XCTAssertGreaterThan(workingGrain.stereo.suffix(224 * 2).map(abs).max() ?? 0, 0)
+        XCTAssertEqual(workingGrain.stereo, try XCTUnwrap(donorAudio).stereo)
         model.chooseAnalysisTrack(0)
         XCTAssertEqual(model.preview.ranges.map(\.audioTrack), [0, 0, 0])
         model.monitorSourceAudio()

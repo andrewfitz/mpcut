@@ -312,7 +312,7 @@ public enum TileSwitches {
         if let expected, expected != (try revision(of: project)) { throw stale() }
     }
 
-    private static func stale() -> CutError {
+    package static func stale() -> CutError {
         .init(code: "stale_tile_switch", message: "The project changed. Propose switches again.")
     }
 }

@@ -72,7 +72,7 @@ def fixture(root, ffmpeg, duration):
     parts = [(start, min(start + 480, duration)) for start in range(0, duration, 480)]
     assembly = parts[1::2] + parts[::2]
     state = {
-        "format": "mpcut", "schema_version": 3, "kind": "multicam", "reference_angle_id": "wide",
+        "format": "mpcut", "schema_version": 9, "kind": "multicam", "reference_angle_id": "wide",
         "group_range": {"from": "0", "to": str(duration)},
         "angles": [{"id": name, "file": f"{name}.mov", "offset": "0", "audio_stream_index": stream}
                    for name, stream in TRACKS[:2]],
@@ -199,8 +199,15 @@ def exercise(cli, root, duration, ffmpeg, runs, editor_loader, progress):
     })
     require(not imported["unbound_tracks"], "all four tracks bound")
     attachment = imported["attachment"]
-    asset = root / attachment["asset"]["file"]
-    require(sha256(asset.read_bytes()).hexdigest() == attachment["asset"]["sha256"], "stored asset digest")
+    def expanded_project():
+        return json.loads(subprocess.check_output([cli, "project", "document", "print", project], timeout=600))
+
+    expanded = expanded_project()
+    digest = attachment["asset"]["sha256"]
+    stored = expanded["embedded_assets"]["transcripts"][digest]
+    # This deterministic fixture uses only integer numbers and ASCII text.
+    asset_bytes = json.dumps(stored, sort_keys=True, separators=(",", ":")).encode()
+    require(sha256(asset_bytes).hexdigest() == digest, "embedded transcript digest")
     sequences = ("projectOpenPlain", "projectOpenAttached", "transcriptOpen",
                  "readFirst", "readMiddle", "search", "searchPage", "correct",
                  "projectOpenWithHistory", "searchAfterCorrection")
@@ -216,7 +223,6 @@ def exercise(cli, root, duration, ffmpeg, runs, editor_loader, progress):
             label = "Warm-up pass" if run == 0 else f"Measured pass {run} of {runs}"
             print(f"{label}.", file=sys.stderr, flush=True)
         start_load = os.getloadavg()
-        # The attachment store is named after the saved project.
         if run:
             project.write_bytes(original_project)
 
@@ -302,14 +308,14 @@ def exercise(cli, root, duration, ffmpeg, runs, editor_loader, progress):
         first_word, last_word = result[0]["words"]
         selection = {"first_word_id": first_word["word_id"], "last_word_id": last_word["word_id"],
                      "first_occurrence_id": first_word["id"], "last_occurrence_id": last_word["id"]}
-        before = json.loads(project.read_text())
+        before = expanded
         corrected = transcript_call("correct", "words correct", in_place=True, selection=selection,
                                     change={"replace_text": {"text": REPLACEMENT}})
         require(corrected["history_action"] == "Correct Transcript", "correction returns history receipt")
         restored = project_open("projectOpenWithHistory", project)
         verify_project("projectOpenWithHistory", restored)
         measure_editor("withHistory", project, attachments=1, corrections=1)
-        after = json.loads(project.read_text())
+        after = expanded_project()
         previous = after["history"]["undo"]
         require(len(previous) == 1 and previous[0]["action"] == "Correct Transcript" and not after["history"].get("redo"),
                 "undo/redo stack on disk")
@@ -327,7 +333,7 @@ def exercise(cli, root, duration, ffmpeg, runs, editor_loader, progress):
     report = {
         "fixture": {"seconds": duration, "tracks": len(TRACKS), "words": len(order), "switches": switches,
                     "assemblyIntervals": intervals, "phraseMatches": len(hits), "guestTrackWords": len(guest),
-                    "routedTracks": sorted({source for _, source, _ in order}), "assetBytes": asset.stat().st_size,
+                    "routedTracks": sorted({source for _, source, _ in order}), "assetBytes": len(asset_bytes),
                     "assetSha256": attachment["asset"]["sha256"], "readPageSize": PAGE_SIZE,
                     "projectSha256": sha256(plain.read_bytes()).hexdigest(),
                     "inputTranscriptSha256": sha256(transcript.read_bytes()).hexdigest(),

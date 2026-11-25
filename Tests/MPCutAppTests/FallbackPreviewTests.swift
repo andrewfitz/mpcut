@@ -152,7 +152,9 @@ final class FallbackPreviewTests: XCTestCase {
                                                           subdirectory: "Fixtures"))
             let preview = SequencePreview()
             defer { preview.pause() }
-            preview.update([PreviewRange(url: source, exactStart: .zero, exactEnd: .init(numerator: 2))], at: 0.4)
+            // Leave enough timeline for the rate changes even if a display callback is delayed.
+            let clip = PreviewRange(url: source, exactStart: .zero, exactEnd: .init(numerator: 2))
+            preview.update(Array(repeating: clip, count: 32), at: 0.4)
             let deadline = clock.now + .seconds(3)
             while preview.playbackRate == 0, preview.issue == nil, clock.now < deadline {
                 preview.shuttle(1)
@@ -200,7 +202,8 @@ final class FallbackPreviewTests: XCTestCase {
                 if !preview.isPlaying { try await Task.sleep(for: .milliseconds(5)) }
             }
             XCTAssertEqual(preview.playbackRate, -1, ext)
-            while preview.isPlaying && .now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+            let drainDeadline = ContinuousClock.now + .seconds(4)
+            while preview.isPlaying && .now < drainDeadline { try await Task.sleep(for: .milliseconds(10)) }
             XCTAssertNil(preview.issue, ext)
             XCTAssertEqual(preview.time, 0, ext)
             XCTAssertFalse(preview.isPlaying, ext)

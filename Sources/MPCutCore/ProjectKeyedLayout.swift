@@ -42,6 +42,23 @@ enum ProjectKeyedLayout {
     private static let minimumText = 16
     private static let minimumValue = 24
 
+    /// Width of one JSON-encoded tilde at the given byte in a quoted string.
+    private static func tildeWidth(_ text: [UInt8], at index: Int) -> Int {
+        if text[index] == tilde { return 1 }
+        guard text[index] == 0x5c, text.count - index > 6,
+              text[index + 1] == 0x75, text[index + 2] == 0x30,
+              text[index + 3] == 0x30, text[index + 4] == 0x37,
+              text[index + 5] == 0x65 || text[index + 5] == 0x45 else { return 0 }
+        return 6
+    }
+
+    private static func decodedKey(_ body: ArraySlice<UInt8>) throws -> [UInt8] {
+        guard body.contains(0x5c) else { return Array(body) }
+        let quoted = Data([0x22] + body + [0x22])
+        guard let name = try? JSONDecoder().decode(String.self, from: quoted) else { throw Malformed() }
+        return Array(name.utf8)
+    }
+
     static func key(_ content: [UInt8]) -> [UInt8] {
         var bits: UInt64 = 0
         for byte in SHA256.hash(data: content).prefix(8) { bits = bits << 8 | UInt64(byte) }
@@ -102,11 +119,14 @@ enum ProjectKeyedLayout {
             case .object(let members):
                 mark = Mark(open: 0x7B)
                 for (position, member) in members.enumerated() {
+                    // Assets carry their own content keys and occupy one root field. They
+                    // cannot contribute to the mark of a shareable history value.
+                    if root && member.hasKey(ProjectSavedLayout.embeddedAssets) { continue }
                     mark.add(Mark(member.key), separated: position > 0)
                     // A snapshot is carried exactly as it is.
-                    let inner = member.key == ProjectSavedLayout.mediaSnapshot
+                    let inner = member.hasKey(ProjectSavedLayout.mediaSnapshot)
                         ? Mark(Array(ProjectSavedLayout.text(member.value, capacity: 64)))
-                        : count(member.value, inHistory: inHistory || (root && member.key == ProjectSavedLayout.history))
+                        : count(member.value, inHistory: inHistory || (root && member.hasKey(ProjectSavedLayout.history)))
                     mark.add(inner, separated: true)
                 }
             }
@@ -137,7 +157,7 @@ enum ProjectKeyedLayout {
                     return (.scalar([0x22, ProjectKeyedLayout.tilde] + key + [0x22]), Mark(text), ProjectKeyedLayout.textReference, true)
                 }
                 // A reference is told from text by its first character.
-                guard text.count > 2, text[1] == ProjectKeyedLayout.tilde else { return (node, Mark(text), text.count, false) }
+                guard text.count > 2, ProjectKeyedLayout.tildeWidth(text, at: 1) > 0 else { return (node, Mark(text), text.count, false) }
                 return (.scalar([0x22, ProjectKeyedLayout.tilde] + text.dropFirst()), Mark(text), text.count + 1, true)
             case .array(let items):
                 mark = Mark(open: 0x5B)
@@ -156,12 +176,13 @@ enum ProjectKeyedLayout {
                 mark = Mark(open: 0x7B)
                 var parts = members
                 for (position, member) in members.enumerated() {
+                    if root && member.hasKey(ProjectSavedLayout.embeddedAssets) { continue }
                     let part: (node: Node, mark: Mark, length: Int, changed: Bool)
-                    if member.key == ProjectSavedLayout.mediaSnapshot {
+                    if member.hasKey(ProjectSavedLayout.mediaSnapshot) {
                         let text = Array(ProjectSavedLayout.text(member.value, capacity: 64))
                         part = (member.value, Mark(text), text.count, false)
                     } else {
-                        part = replace(member.value, inHistory: inHistory || (root && member.key == ProjectSavedLayout.history))
+                        part = replace(member.value, inHistory: inHistory || (root && member.hasKey(ProjectSavedLayout.history)))
                     }
                     mark.add(Mark(member.key), separated: position > 0)
                     mark.add(part.mark, separated: true)
@@ -204,7 +225,7 @@ enum ProjectKeyedLayout {
 
     static func compactedDocument(_ original: Node) -> Node? {
         guard case .object(let members) = original,
-              !members.contains(where: { $0.key == table }) else { return nil }
+              !members.contains(where: { $0.hasKey(table) }) else { return nil }
         var writer = Writer()
         _ = writer.count(original, inHistory: false, root: true)
         writer.chooseTexts()
@@ -228,32 +249,36 @@ enum ProjectKeyedLayout {
     // MARK: Open
 
     /// The project document a saved project stands for, or nil for text with no `refs` table.
-    static func expanded(_ saved: Data, code: String = "invalid_cut_project") throws -> Data? {
-        try expandedDocument(saved, code: code).map { ProjectSavedLayout.text($0, capacity: saved.count * 2) }
-    }
-
-    private static func expandedDocument(_ saved: Data, code: String) throws -> Node? {
-        guard saved.range(of: Data(table)) != nil, let document = ProjectSavedLayout.parse(saved) else { return nil }
-        return try expandedDocument(document, code: code)
+    static func expanded(_ saved: Data, code: String = "invalid_cut_project", verifyingHistory: Bool = false) throws -> Data? {
+        guard ProjectSavedLayout.mayContain(Data(table), in: saved), let document = ProjectSavedLayout.parse(saved),
+              let expanded = try expansion(of: document, code: code) else { return nil }
+        return try ProjectSavedLayout.expandedBytes(expanded.node, size: expanded.size, verifyingHistory: verifyingHistory)
     }
 
     static func expandedDocument(_ document: Node, code: String) throws -> Node? {
+        try expansion(of: document, code: code)?.node
+    }
+
+    private static func expansion(of document: Node, code: String) throws -> (node: Node, size: Int)? {
         guard case .object(var root) = document,
-              let position = root.firstIndex(where: { $0.key == table }) else { return nil }
+              let position = root.firstIndex(where: { $0.hasKey(table) }) else { return nil }
         let damaged = CutError(code: code, message: "The project’s refs table is damaged.")
         guard case .object(let rows) = root[position].value else { throw damaged }
         root.remove(at: position)
-        guard !root.contains(where: { $0.key == table }) else { throw damaged }
+        guard !root.contains(where: { $0.hasKey(table) }) else { throw damaged }
         var entries: [[UInt8]: Node] = [:]
         for row in rows {
             // The same entry twice is what a merge of two branches that added it can leave.
-            let key = Array(row.key.dropFirst().dropLast())
+            guard let key = try? decodedKey(row.key.dropFirst().dropLast()) else { throw damaged }
             if let held = entries[key], held != row.value { throw damaged }
             entries[key] = row.value
         }
 
-        // Nothing a project holds expands past this, so a table built to grow without end is refused.
-        let limit = MulticamProject.maximumFileSize * 2
+        func add(_ amount: Int, to size: inout Int) throws {
+            guard amount <= Int.max - size else { throw POSIXError(.EOVERFLOW) }
+            size += amount
+        }
+
         // The CLI can expand a project on a Swift worker thread with a small stack.
         let maximumDepth = 128
         let maximumOpenReferences = 512
@@ -281,7 +306,7 @@ enum ProjectKeyedLayout {
                 let held = try entry(current)
                 if case .scalar = held { throw Malformed() }
                 guard open.count < maximumOpenReferences, open.insert(current).inserted else { throw Malformed() }
-                if case .object(let members) = held, members.count == 1, members[0].key == ProjectSavedLayout.marker {
+                if case .object(let members) = held, members.count == 1, members[0].hasKey(ProjectSavedLayout.marker) {
                     aliases.append(current)
                     current = try referenceKey(members[0].value)
                     continue
@@ -300,7 +325,7 @@ enum ProjectKeyedLayout {
         }
         func referenceKey(_ marker: Node) throws -> [UInt8] {
             guard case .scalar(let quoted) = marker, ProjectSavedLayout.isString(quoted) else { throw Malformed() }
-            return Array(quoted.dropFirst().dropLast())
+            return try decodedKey(quoted.dropFirst().dropLast())
         }
         func expand(_ node: Node, depth: Int, size: inout Int, opaque: Bool = false) throws
             -> (node: Node, changed: Bool, height: Int) {
@@ -310,22 +335,23 @@ enum ProjectKeyedLayout {
             var height = 1
             switch node {
             case .scalar(let text):
-                guard !opaque, ProjectSavedLayout.isString(text), text.count > 2, text[1] == tilde else {
-                    size += text.count + 1
+                guard !opaque, ProjectSavedLayout.isString(text), text.count > 2, tildeWidth(text, at: 1) > 0 else {
+                    try add(text.count, to: &size)
                     break
                 }
                 changed = true
-                if text.count > 3, text[2] == tilde {
-                    size += text.count
-                    result = .scalar([0x22] + text.dropFirst(2))
+                let prefix = tildeWidth(text, at: 1)
+                if tildeWidth(text, at: 1 + prefix) > 0 {
+                    try add(text.count - prefix, to: &size)
+                    result = .scalar([0x22] + text.dropFirst(1 + prefix))
                 } else {
-                    guard case .scalar(let literal) = try entry(Array(text.dropFirst(2).dropLast())),
+                    guard case .scalar(let literal) = try entry(decodedKey(text.dropFirst(1 + prefix).dropLast())),
                           ProjectSavedLayout.isString(literal) else { throw Malformed() }
-                    size += literal.count + 1
+                    try add(literal.count, to: &size)
                     result = .scalar(literal)
                 }
             case .array(let items):
-                size += 2
+                try add(2 + max(0, items.count - 1), to: &size)
                 var expanded = items
                 for (index, item) in items.enumerated() {
                     let child = try expand(item, depth: depth + 1, size: &size, opaque: opaque)
@@ -337,19 +363,20 @@ enum ProjectKeyedLayout {
                 }
                 if changed { result = .array(expanded) }
             case .object(let members):
-                if !opaque, members.count == 1, members[0].key == ProjectSavedLayout.marker {
+                if !opaque, members.count == 1, members[0].hasKey(ProjectSavedLayout.marker) {
                     let shared = try value(referenceKey(members[0].value), depth: depth)
-                    size += shared.size
+                    try add(shared.size, to: &size)
                     result = shared.node
                     changed = true
                     height = shared.height
                 } else {
-                    size += 2
+                    try add(2 + max(0, members.count - 1), to: &size)
                     var expanded = members
                     for (index, member) in members.enumerated() {
-                        size += member.key.count + 1
+                        try add(member.key.count + 1, to: &size)
                         let child = try expand(member.value, depth: depth + 1, size: &size,
-                                               opaque: opaque || member.key == ProjectSavedLayout.mediaSnapshot)
+                                               opaque: opaque || member.hasKey(ProjectSavedLayout.mediaSnapshot)
+                                                   || (depth == 0 && member.hasKey(ProjectSavedLayout.embeddedAssets)))
                         height = max(height, child.height + 1)
                         if child.changed {
                             expanded[index].value = child.node
@@ -359,12 +386,12 @@ enum ProjectKeyedLayout {
                     if changed { result = .object(expanded) }
                 }
             }
-            guard size <= limit else { throw Malformed() }
             return (result, changed, height)
         }
         do {
             var size = 0
-            return try expand(.object(root), depth: 0, size: &size).node
+            let node = try expand(.object(root), depth: 0, size: &size).node
+            return (node, size)
         } catch let missing as Missing {
             let name = String(decoding: missing.key, as: UTF8.self)
             throw CutError(code: code, message: "The project refers to ‘\(name)’, which its refs table does not hold. "

@@ -424,6 +424,15 @@ public struct ParticipantObservationRect: Codable, Equatable, Sendable {
     public let height: Double
 }
 
+extension ParticipantObservationRect {
+    /// TileTrail reports f32 edges, which may round just beyond the display.
+    var bounds: ParticipantBounds {
+        let w = x + width <= 1.0000001 ? min(width, 1 - x) : width
+        let h = y + height <= 1.0000001 ? min(height, 1 - y) : height
+        return .init(x: x, y: y, width: w, height: h)
+    }
+}
+
 public struct ParticipantIdentityMatch: Codable, Equatable, Sendable {
     public let participantID: UInt64
     public let confidence: Double

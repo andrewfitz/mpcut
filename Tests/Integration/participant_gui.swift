@@ -517,6 +517,7 @@ func run() throws {
         print("Verified overlapping speakers, appearance selection and override, offscreen roster, and participant transcript filter")
         if ProcessInfo.processInfo.environment["MPCUT_GUI_REQUIRE_SCAN"] == "1" {
             try editor.reviewScan(evidence: evidence)
+            try editor.save(project)
         }
     } catch {
         editor.dump()

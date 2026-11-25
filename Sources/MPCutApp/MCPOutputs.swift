@@ -25,9 +25,51 @@ private func outputEnum<T: RawRepresentable>(_ args: [String: Any], _ key: Strin
     return result
 }
 
+/// The Settings → Export values a live MCP export uses for an argument the call omits (Decision 8). File jobs and the
+/// CLI keep the factory values. Codec and quality apply to Re-encode with picture of an ordinary export; still and
+/// Tiles exports keep their own rules.
+struct MCPEncodingDefaults: Equatable {
+    var codec = ExportRules.defaultCodec
+    var standardQuality = ExportRules.defaultQuality(.h264)
+    var proResQuality = ExportRules.defaultQuality(.prores)
+    var container = ExportContainerChoice.automatic
+    var multicamAudio = MulticamAudioOutput.separateTracks
+
+    static let factory = MCPEncodingDefaults()
+
+    init() {}
+
+    @MainActor
+    init(preferences: EditorPreferences) {
+        codec = preferences.reencodeCodec
+        standardQuality = preferences.reencodeQuality
+        proResQuality = preferences.proresQuality
+        container = preferences.reencodeContainer
+        multicamAudio = preferences.multicamAudioLayout
+    }
+
+    func quality(for codec: ReencodeCodec) -> ReencodeQuality {
+        let chosen = codec == .prores ? proResQuality : standardQuality
+        return ExportRules.qualities(codec).contains(chosen) ? chosen : ExportRules.defaultQuality(codec)
+    }
+
+    static func writes(_ codec: ReencodeCodec, to container: String, source: ExportSourceKind) -> Bool {
+        (source == .multicam ? ExportRules.multicamReencodeContainers(codec) : ExportRules.reencodeContainers(codec)).contains(container)
+    }
+
+    /// The container an omitted `container` argument takes for a Re-encode of H.264 or HEVC picture. Nil keeps the route's
+    /// own fallback, which is what Automatic means.
+    func container(for options: ExportSheetOptions, source: ExportSourceKind) -> String? {
+        guard container != .automatic, options.placements == .none, !options.requiresPictureProcessing,
+              options.tracks != .audio, options.effectiveMode == .encode, options.codec != .prores,
+              Self.writes(options.codec, to: container.rawValue, source: source) else { return nil }
+        return container.rawValue
+    }
+}
+
 private func exportOptions(_ args: [String: Any], container: String, source: ExportSourceKind,
                            defaultMode: ExportMode, placements: ExportPlacementScope = .none,
-                           requiresPictureProcessing: Bool = false) throws -> ExportSheetOptions {
+                           requiresPictureProcessing: Bool = false, encoding: MCPEncodingDefaults = .factory) throws -> ExportSheetOptions {
     guard !container.isEmpty, container.utf8.allSatisfy({ (97...122).contains($0) || (48...57).contains($0) }) else {
         throw MCPCommandError("invalid_arguments", "Supply a container filename extension.")
     }
@@ -47,12 +89,18 @@ private func exportOptions(_ args: [String: Any], container: String, source: Exp
     options.requiresPictureProcessing = requiresPictureProcessing
     options.tracks = requiresPictureProcessing ? tracks : cell.tracks
     options.mode = requiresPictureProcessing ? mode : cell.resolvedMode
-    options.codec = try outputEnum(args, "codec", .h264)
+    // Settings values reach only a Re-encode with picture, and a Settings codec the destination cannot hold keeps the factory one.
+    let encodesPicture = placements == .none && !requiresPictureProcessing && options.tracks != .audio && options.mode == .encode
+    let codecFallback = encodesPicture && MCPEncodingDefaults.writes(encoding.codec, to: container, source: source)
+        ? encoding.codec : ReencodeCodec.h264
+    options.codec = try outputEnum(args, "codec", codecFallback)
     options.audio = try outputEnum(args, "audio", .auto)
     guard source == .multicam || args["audio_output"] == nil else {
         throw MCPCommandError("invalid_arguments", "Audio delivery applies to multicam projects.")
     }
-    let quality = try outputEnum(args, "quality", options.codec == .prores ? ReencodeQuality.prores422 : .balanced)
+    let qualityFallback = encodesPicture ? encoding.quality(for: options.codec)
+        : options.codec == .prores ? ReencodeQuality.prores422 : .balanced
+    let quality = try outputEnum(args, "quality", qualityFallback)
     options.standardQuality = quality
     options.proResQuality = quality
     options.qualityChosen = args["quality"] != nil
@@ -309,10 +357,13 @@ extension ProjectSessions {
             let document = session.isMulticam ? session.multicam.projectURL : session.editor.projectURL
             let mode = try outputEnum(args, "mode", ExportMode.encode)
             let tracks = try outputEnum(args, "tracks", ExportTracks.all)
-            let codec = try outputEnum(args, "codec", ReencodeCodec.h264)
-            let quality = try outputEnum(args, "quality", ReencodeSettings(codec: codec).quality)
+            // A Tiles export always writes MOV, which every Settings codec can use.
+            let encoding = MCPEncodingDefaults(preferences: preferences)
+            let codec = try outputEnum(args, "codec", encoding.codec)
+            let quality = try outputEnum(args, "quality", encoding.quality(for: codec))
             let audio = try outputEnum(args, "audio", ReencodeAudio.auto)
-            let audioOutput = try outputEnum(args, "audio_output", MulticamAudioOutput.separateTracks)
+            let audioOutput = try outputEnum(args, "audio_output",
+                                             session.isMulticam ? encoding.multicamAudio : MulticamAudioOutput.separateTracks)
             let settings = ReencodeSettings(codec: codec, quality: quality, audio: audio, qualityIsExplicit: args["quality"] != nil)
             let requireCopy = args["require_camera_copy"] as? Bool ?? false
             let useReviewedCuts = args["use_reviewed_cuts"] as? Bool ?? false
@@ -363,8 +414,9 @@ extension ProjectSessions {
            (try? project.plan().intervals.contains(where: { $0.pictureSourceID == nil })) == true {
             placements = .replacement
         } else { placements = .none }
+        let encoding = MCPEncodingDefaults(preferences: preferences)
         let options = try exportOptions(args, container: output.pathExtension.lowercased(), source: source,
-                                        defaultMode: preferences.defaultExportMode, placements: placements)
+                                        defaultMode: preferences.defaultExportMode, placements: placements, encoding: encoding)
         guard !options.requireCameraCopy || options.tracks == .audio || options.effectiveMode == .copy else {
             throw MCPCommandError("invalid_arguments", "Select Lossless Copy to preserve camera samples.")
         }
@@ -374,7 +426,7 @@ extension ProjectSessions {
         }
         if session.isMulticam {
             let model = session.multicam
-            let audioOutput = try outputEnum(args, "audio_output", MulticamAudioOutput.separateTracks)
+            let audioOutput = try outputEnum(args, "audio_output", encoding.multicamAudio)
             let audioAction: ReencodeAudio? = args["audio"] == nil ? nil : options.audio
             let selection = scope == "selection" ? model.selectedExportRanges : nil
             guard selection?.isEmpty != true || model.assemblySelection != nil else {
@@ -519,11 +571,13 @@ extension ProjectSessions {
         let ordinaryMode: ExportMode = tracks == .audio && snapshot.stillSoundtrack != nil ? .encode :
             (tracks == .all ? preferences.defaultExportMode : .copy)
         let mode = try outputEnum(args, "mode", ExportRules.defaultStillMode(tracks: tracks, placements: placements, otherwise: ordinaryMode))
-        let codec = try outputEnum(args, "codec", snapshot.stillFormat?.codec ?? ReencodeCodec.h264)
+        // A still project's own format comes first, as in the export sheet; otherwise Settings → Export.
+        let encoding = MCPEncodingDefaults(preferences: preferences)
+        let codec = try outputEnum(args, "codec", snapshot.stillFormat?.codec ?? encoding.codec)
         let explicitCodec: ReencodeCodec? = args["codec"] == nil ? nil : codec
         let timing = try args["still_timing"].map { _ in try outputEnum(args, "still_timing", StillPictureTiming.cadence) }
         let container = try MCPFileRequest.Fields(values: args).string("container")
-        let quality = try outputEnum(args, "quality", codec == .prores ? ReencodeQuality.prores422 : .balanced)
+        let quality = try outputEnum(args, "quality", encoding.quality(for: codec))
         let audio = try outputEnum(args, "audio", ReencodeAudio.auto)
         if args["codec"] != nil || args["quality"] != nil {
             guard mode != .copy, tracks != .audio else {
@@ -532,7 +586,8 @@ extension ProjectSessions {
         }
         let settings = ReencodeSettings(codec: codec, quality: quality, audio: audio, qualityIsExplicit: args["quality"] != nil)
         let requireCameraCopy = args["require_camera_copy"] as? Bool ?? false
-        let audioOutput = try outputEnum(args, "audio_output", MulticamAudioOutput.separateTracks)
+        let audioOutput = try outputEnum(args, "audio_output",
+                                         session.isMulticam ? encoding.multicamAudio : MulticamAudioOutput.separateTracks)
         let audioAction = args["audio"] != nil ? audio : nil
         guard session.isMulticam || args["audio_output"] == nil else {
             throw MCPCommandError("invalid_arguments", "Audio delivery applies to multicam projects.")
@@ -738,8 +793,9 @@ extension ProjectSessions {
     }
 
     fileprivate func mcpQueueExport(session: ProjectSession, output: URL, args: [String: Any], dryRun: Bool) throws -> MCPLiveOutputJobs.Work {
-        let container = (args["container"] as? String ?? "mov").lowercased()
+        let requestedContainer = (args["container"] as? String ?? "mov").lowercased()
         let multi = session.isMulticam
+        let encoding = MCPEncodingDefaults(preferences: preferences)
         let protected = multi ? session.multicam.protectedMediaPaths : session.editor.mcpOutputProtectedMedia
         let ranges = session.editor.readyQueuedRanges
         let groups = session.multicam.readyQueuedRanges
@@ -766,9 +822,19 @@ extension ProjectSessions {
             }
             if placements == .insertion { break }
         }
-        var configured = try exportOptions(args, container: container, source: source,
+        var configured = try exportOptions(args, container: requestedContainer, source: source,
                                            defaultMode: preferences.defaultExportMode, placements: placements,
-                                           requiresPictureProcessing: hasPictureProcessing)
+                                           requiresPictureProcessing: hasPictureProcessing, encoding: encoding)
+        // An omitted container is Settings' H.264 and HEVC container for a Re-encode with picture; Automatic keeps MOV.
+        let container: String
+        if args["container"] == nil, let preferred = encoding.container(for: configured, source: source), preferred != requestedContainer {
+            container = preferred
+            configured = try exportOptions(args, container: container, source: source,
+                                           defaultMode: preferences.defaultExportMode, placements: placements,
+                                           requiresPictureProcessing: hasPictureProcessing, encoding: encoding)
+        } else {
+            container = requestedContainer
+        }
         if args["still_timing"] != nil {
             guard placements != .none else {
                 throw MCPCommandError("invalid_arguments", "Still timing applies to queued ranges with generated picture.")
@@ -783,7 +849,7 @@ extension ProjectSessions {
         }
         configured.organization = .init(subfolder: args["subfolder"] as? String ?? "", baseName: args["base_name"] as? String ?? "")
         let options = configured
-        let audioOutput = try outputEnum(args, "audio_output", MulticamAudioOutput.separateTracks)
+        let audioOutput = try outputEnum(args, "audio_output", multi ? encoding.multicamAudio : MulticamAudioOutput.separateTracks)
         let audioAction: ReencodeAudio? = args["audio"] == nil ? nil : options.audio
         let mode = try (args["mode"] as? String).map { _ in try outputEnum(args, "mode", ExportMode.copy) }
         let sidecars = multi ? session.multicam.useAnalysisSidecars : session.editor.useAnalysisSidecars

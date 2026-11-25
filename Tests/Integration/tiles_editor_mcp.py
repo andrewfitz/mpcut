@@ -35,7 +35,7 @@ def fixture(binary, directory):
     gallery, _, _ = generate(directory)
     base = directory / "Source.cut"
     base.write_text(json.dumps({
-        "format": "mpcut", "schema_version": 4, "kind": "sequence",
+        "format": "mpcut", "schema_version": 9, "kind": "sequence",
         "clips": [{"id": "gallery", "file": str(gallery), **interval(0, 1)}],
     }))
     project = directory / "Live.cut"
@@ -193,11 +193,49 @@ def scan(client, binary, directory, target, revision):
     assert report["tiles"] == saved_report["tiles"], (report, saved_report)
     issues = client.call("tiles_editor_inspect", **target, analysis_file=output, issues=True)["issues"]
     assert result["review_issue_count"] == len(issues), (result, issues)
-    pending = client.call("tiles_editor_scan", **target, expected_revision=revision, backend="cpu-only",
-                          sampling="every-frame", feed_layout="2x1", no_sidecar=True)
-    artifact = wait_job(client, "analysis_job_status_read", pending["job_id"], **target)["analysis_file"]
-    assert cli(binary, "tiles", "inspect", artifact, "--at", "0")["tiles"] == report["tiles"]
-    print("Live scan and inspection verified without changing the editor revision.", flush=True)
+    pending_scan = dict(target, expected_revision=revision, operation_id=operation(), backend="cpu-only",
+                        sampling="every-frame", feed_layout="2x1", no_sidecar=True)
+    pending = client.call("tiles_editor_scan", **pending_scan)
+    assert client.call("tiles_editor_scan", **pending_scan)["job_id"] == pending["job_id"]
+    reviewed = wait_job(client, "analysis_job_status_read", pending["job_id"], **target)
+    assert reviewed["revision"] > revision and "analysis_file" not in reviewed, reviewed
+    assert reviewed["counts"] == result["counts"], reviewed
+    live = client.call("tiles_editor_pending_read", **target)
+    first_feed, second_feed = live["feed_ids"]
+    choices = dict(live["choices"], names={first_feed: "Host"}, unchecked=[second_feed])
+    request = dict(target, expected_revision=reviewed["revision"], operation_id=operation(),
+                   review_token=live["review_token"], choices=choices)
+    staged = client.call("tiles_editor_pending_stage", **request)
+    assert client.call("tiles_editor_pending_stage", **request) == staged
+    assert staged["pending_review"]["choices"] == choices, staged
+
+    saved = directory / "Pending.cut"
+    save = client.call("project_save", **target, expected_revision=staged["revision"],
+                       operation_id=operation(), project_path=str(saved))
+    on_disk = cli(binary, "tiles", "pending", "read", str(saved))
+    assert on_disk["choices"] == staged["pending_review"]["choices"], on_disk
+
+    def file_job(tool, **fields):
+        receipt = client.call(tool, operation_id=operation(), **fields)
+        return wait_job(client, "file_job_status_read", receipt["job_id"])
+
+    assert file_job("tiles_file_pending_read", project_path=str(saved)) == on_disk
+    file_choices = dict(choices, names={first_feed: "Alex"})
+    staged_copy = directory / "Pending File Edit.cut"
+    file_stage = file_job("tiles_file_pending_stage", project_path=str(saved), out_project=str(staged_copy),
+                          review_token=on_disk["review_token"], choices=file_choices)
+    assert file_stage["pending_review"] == cli(binary, "tiles", "pending", "read", str(staged_copy))
+    assert file_stage["pending_review"]["choices"] == file_choices, file_stage
+    file_discard = file_job("tiles_file_pending_discard", project_path=str(staged_copy), in_place=True,
+                            review_token=file_stage["pending_review"]["review_token"])
+    assert file_discard["operation_count"] == 1 and "pending_review" not in file_discard, file_discard
+
+    discarded = client.call("tiles_editor_pending_discard", **target, expected_revision=save["revision"],
+                            operation_id=operation(), review_token=staged["pending_review"]["review_token"])
+    undone = client.call("history_undo", **target, expected_revision=discarded["revision"], operation_id=operation())
+    assert undone["revision"] > discarded["revision"], undone
+    assert client.call("tiles_editor_pending_read", **target)["choices"] == choices
+    print("Verified pending scan, choice staging, replay and discard across the editor, CLI and file MCP.", flush=True)
 
 
 def main():
@@ -208,13 +246,14 @@ def main():
     args = parser.parse_args()
     bundle = args.app.resolve(strict=True)
     binary = args.cli.resolve(strict=True)
+    helpers = bundle / "Contents" / "Helpers" if bundle.suffix == ".app" else bundle.parent
     signal.signal(signal.SIGALRM, timed_out)
     with tempfile.TemporaryDirectory(prefix="mpcut-tiles-mcp-") as scratch:
         directory = Path(scratch).resolve()
         project = fixture(binary, directory)
         with hidden_editor(bundle, project, directory) as env:
             env["MPCUT_TEST_SOCKET_DIRECTORY"] = env["BACKSTAGE_SESSION"]
-            client = Client(bundle / "Contents" / "Helpers" / "mpcut-mcp", env=env, poll_interval=0.1)
+            client = Client(helpers / "mpcut-mcp", env=env, poll_interval=0.1)
             try:
                 signal.alarm(180)
                 target, revision = exercise(client, binary, directory, project)

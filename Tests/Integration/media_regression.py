@@ -432,7 +432,7 @@ class MediaRegression(unittest.TestCase):
         self.assertEqual(report["error"]["code"], "output_exists")
         self.assertEqual(output.read_bytes(), b"preserve this destination")
         inputs = {source, other, audio_mismatch}
-        self.assertEqual(set(self.root.iterdir()), inputs | {output} | {Path(str(p) + ".cutdb") for p in inputs})
+        self.assertEqual(set(self.root.iterdir()), inputs | {output} | {Path(str(p) + ".cutcache") for p in inputs})
 
     def test_prores_alpha_color_and_orientation(self):
         for profile in ["4", "5"]:
@@ -1044,7 +1044,7 @@ class MediaRegression(unittest.TestCase):
         source = self.h264("angle.mov", width=320, rate="25", frame_count=50)
         project = self.root / "switches.cut"
         project.write_text(json.dumps({
-            "format": "mpcut", "schema_version": 3, "kind": "multicam",
+            "format": "mpcut", "schema_version": 9, "kind": "multicam",
             "angles": [{"id": "a", "file": source.name}], "reference_angle_id": "a",
             "group_range": {"from": "0", "to": "2"}, "audio": {"mode": "none"},
             "switches": [{"group_time": "0", "angle_id": "a"}],

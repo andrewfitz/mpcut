@@ -9,6 +9,7 @@ Use `mpcut` to inspect and edit recordings, render saved projects, and review th
 | Find installed commands or check the version | [Help and version](#help-and-version) |
 | Identify streams, cut points, or still-image metadata | [Inspect media and projects](#inspect-media-and-projects) |
 | Cut or join an edit, extract tracks, or replace audio | [Render one output](#render-one-output) |
+| Review or edit a saved project’s export settings | [Set project export options](#set-project-export-options) |
 | Export several separate clips | [Export a batch](#export-a-batch) |
 | Find, review, and shorten pauses | [Find pauses and shorten recordings](#find-pauses-and-shorten-recordings) |
 | Detect cuts and recurring views | [Find scenes and export clips by view](#find-scenes-and-export-clips-by-view) |
@@ -33,6 +34,17 @@ mpcut --version --json
 
 Global `mpcut help --json` includes command references and export option lists. A single-topic request returns a smaller reference. `mpcut help multicam` includes a project template.
 
+`mpcut --version` prints the release version. Its JSON form and the completed MCP `cli_version_read` job return:
+
+| Field | Meaning |
+| --- | --- |
+| `version` | Release version. Multiple builds can share it. |
+| `build_id` | Mach-O UUID of the running CLI binary slice. It stays the same when that binary is copied or signed. |
+| `project_schema_versions` | Saved-project versions this build reads and writes. The current build supports only schema 9. |
+| `detector_capabilities` | Availability flags for this build and host. |
+
+`detector_capabilities` reports `tile_trail` for meeting detection, `auto_feed_layout` for automatic generic feed detection, `gallery_grid` for meeting gallery hints, and `adaptive_sampling` for TileTrail's adaptive scanning. `standalone_fixed_grid` covers explicit grids without TileTrail. `auto_backend` and `cpu_only_backend` include that fallback. `gpu_required_backend` reports whether TileTrail can initialize its GPU backend on this host. A standalone fixed grid accepts only `auto` and `cpu-only`.
+
 From a source checkout with a built app, keep the first three frames of the included 29.97 fps ProRes clip. The temporary directory gives the media and export fresh paths on each run.
 
 ```sh
@@ -45,6 +57,8 @@ cp Tests/MPCutAppTests/Fixtures/ProRes-2997.mov "$work/source.mov"
 "$cli" export clips join --json --clip "$work/source.mov" --to 1001/10000 \
   --output "$work/three-frames.mov"
 ```
+
+A dry run of `export project render --project FILE --output MOVIE --dry-run --json` returns a `plan_token`. To render the exact project and settings that were reviewed, pass that value with `--plan-token TOKEN` on the render. Repeat preflight after `stale_render_plan`.
 
 ## Inspect media and projects
 
@@ -67,7 +81,11 @@ Use `timeline range map` for every occurrence intersecting a source or program i
 ```sh
 mpcut timeline range map --project interview.cut --space sequence --from 4 --to 7 --json
 mpcut history compare --before-project review.cut --project interview.cut --json
+mpcut history compare --project interview.cut --history-index 0 --json
+mpcut history restore-copy --project interview.cut --history-index 0 --out-project earlier.cut
 ```
+
+For a mask or tile edit, inspect `participant_changes` in the comparison. It identifies the physical source, affected tile and source-clock interval or point. Sample the corresponding occurrence in the rendered program to check the picture. Use `project document print` to see the retained undo and redo steps. History index zero selects the oldest retained state. The number of undo steps gives the saved cursor. Restore Copy writes a new project with the cursor at the selected state and carries forward both history branches.
 
 For a saved sequence, `project edit` accepts `source_select_save`, `source_select_remove` and `source_ranges_apply` operations. The apply operation takes sequence `from` and `to` and ordered `ranges`. Use equal bounds to insert. A range can specify `file`, `from` and `to` or reference a saved `select_id`. [Sequence format](CUT-FORMAT.md#sequence)
 
@@ -109,6 +127,16 @@ mpcut multicam sync suggest --project interview.cut --reference-source-id close 
 Review `metadata_relative_offset` and `waveform_relative_offset` when the report has matching evidence. An optional `--seed TIME` centers the waveform search on a known relative offset. Supply the chosen exact offset as `relative_offset` in `audio_replacement_set`.
 
 Add `--program` to check coverage across the entire cut for an external program replacement. In this mode `--reference-stream` is optional. To apply the confirmed alignment, submit an `audio_set` operation with `mode: "replace"`, `path`, a new `replacement_source_id`, `replacement_stream_index`, `reference_source_id` and `relative_offset`. MPCut uses the replacement as the Fixed soundtrack and clears switch overrides in the saved copy.
+
+## Set project export options
+
+```sh
+mpcut project output read interview.cut --json
+mpcut project output set interview.cut --width 1080 --height 1920 --frame-rate 30000/1001 \
+  --background 0x101010 --audio-mode program --unresolved-privacy cover --out-project portrait.cut --json
+```
+
+The read returns the effective canvas, soundtrack and unchecked-coverage policy in `output.settings`. When the canvas follows the source, `output.has_stored_canvas` is false. Set accepts partial edits and records one undo step when settings change. Use `--in-place` to update the original file. A still-only timeline accepts dimensions and frame rate here. Use the [still soundtrack commands](#work-with-still-images) to manage its attached audio.
 
 ## Render one output
 
@@ -188,6 +216,8 @@ For a sequence or multicam project, repeat `--retain-pause ID=SECONDS` to overri
 
 A multicam project scan analyzes the routed program audio in assembly order. If it has no assembly, the scan uses the whole group range. Mix treats an interval as silent only when all selected lanes are silent. Use `silence plan --output FILE` to review the shortened program and `silence export --output FILE` to write it. Both preserve inserted stills and accept the multicam `--audio-output` and `--audio` delivery choices. Export modes are `smart` and `copy`.
 
+To keep a reviewed multicam pause across future edits, use `silence pause protect --project interview.cut --out-project protected.cut --protect-pause ID` with the same detector settings used for the scan. If the reviewed timeline, audio routing, source evidence or detection settings have changed, scan again and review the new ID. Use `silence room-tone calibrate` to save thresholds from a group or assembly interval containing the room tone.
+
 ## Find scenes and export clips by view
 
 ```sh
@@ -200,6 +230,8 @@ mpcut scenes export --input scenes.json --export-to shots --group-by view --dry-
 The file report includes `scenes` with timings and view labels. `views` groups scenes with recurring compositions. A file scan takes a source window with both `--from` and `--to`. A project scan defaults to all referenced video sources. Choose `--clip-id ID` for a sequence clip's source interval or `--camera-id ID` for one multicam recording.
 
 Scans default to `--policy reuse`. Use `--policy resume` to continue a replacement scan or `--policy restart` to start a replacement. A restart can carry an `--operation-id` for retries. `--progress none|stderr|jsonl` controls progress output. Cancelling leaves scan coverage available for resumption when sidecar saving is enabled.
+
+To name a recurring view, run a full-source project scan and take the recording path, report ID and view ID from the same result. Run `scenes view rename --project interview.cut --out-project named.cut --source MEDIA --report-id REPORT_ID --view ID --name Wide`. Pass an empty name to restore the default. Export the recording’s report to use its saved labels in filenames.
 
 For export, replay the saved file report or pass the file and `--scenes-file LIST`. Keep a report subset in source order if you only want selected scenes. `--group-by scene` writes individual files and is the default. `--group-by view` joins each view's scenes in source order. Create the destination directory before exporting. `--container`, `--subfolder`, `--base-name` and `--tracks` control the outputs.
 
@@ -227,7 +259,16 @@ mpcut analysis sidecar build --project Edit.cut --only audio interview.mov
 mpcut project media refresh --project interview.cut --deep --progress stderr --json
 ```
 
-MPCut and the CLI share the storage choice in **Settings → Analysis**. The default is `FILE.cutdb` beside the media. Supply `--project Edit.cut` to build in project-folder mode or to include that project in a lookup. A configured cache disk serves every project. Inspection searches every available location. Its `read_location` identifies the primary inventory, `read_locations` lists all copies contributing to it, and `write_location` names the selected destination when available. Bare `analysis sidecar build FILE` saves the editing index, available scene analysis, and audio analyses. `--only` or `--only-file` chooses sections. `analysis sidecar inspect` reads the inventory and reports source generations, stale reasons and persisted scene attempts when available. Use `--no-sidecar` to bypass automatic cache reads and writes during analysis. For a manual save, it can force fresh analysis.
+MPCut and the CLI share the storage choice in **Settings → Analysis**. The default is `FILE.cutcache` beside the media. Supply `--project Edit.cut` to build in project-folder mode or to include that project in a lookup. A configured cache disk serves every project. Inspection searches every available location. Its `read_location` identifies the primary inventory, `read_locations` lists all copies contributing to it, and `write_location` names the selected destination when available. Bare `analysis sidecar build FILE` saves the editing index, available scene analysis, and audio analyses. `--only` or `--only-file` chooses sections. `analysis sidecar inspect` reads the inventory and reports source generations, stale reasons and persisted scene attempts when available. Use `--no-sidecar` to bypass automatic cache reads and writes during analysis. For a manual save, it can force fresh analysis. The inspection result lists each copy’s database size, section payloads, SQLite overhead and reclaimable bytes under `cache_copies`. It reports `duplicate_copies` and, when you supply a saved project, its `project_bytes`.
+
+```sh
+mpcut analysis cache settings --json
+mpcut analysis cache configure --mode disk --folder /Volumes/Cache --json
+mpcut analysis cache preview --folder /Volumes/Recordings --project Edit.cut --json
+mpcut analysis cache clear --folder /Volumes/Recordings --project Edit.cut --select "$clear_token" --confirm --json
+```
+
+Storage mode can be `media`, `project` or `disk`. Disk mode keeps the configured folder when you omit `--folder`. The preview searches the chosen folder and its subfolders. Use `--location media|project|disk` to filter copies and `--project` to protect the saved project and its retained media references. Pass only the desired `clear_token` values to `clear` with the same options and a separate `--select` for each copy. If a selected cache changed or became unavailable, preview the folder again. The clear result reports removed paths, skipped paths and reclaimed bytes.
 
 `refresh` checks referenced source identity and reindexes changed files. `--deep` verifies contents even when file identity matches. The `sources` report includes preserved analysis and references that need review. The `media` report lists project references and their current availability. Refresh reads the saved project and updates analysis.
 
@@ -239,6 +280,8 @@ mpcut project media locate interview.cut --folder /Volumes/Archive --json
 mpcut project media locate interview.cut --folder /Volumes/Archive --apply-matches --out-project found.cut
 mpcut project media relink interview.cut --from camera.mov --to relocated/camera.mov --in-place
 mpcut project media relink interview.cut --map-prefix /Volumes/Shoot=/Volumes/Archive --out-project moved.cut
+mpcut project media leave-offline interview.cut --source camera.mov --in-place
+mpcut project media revert moved.cut --source /Volumes/Archive/camera.mov --out-project reverted.cut
 mpcut project media replace interview.cut --source camera.mov --with alternate.mov --conform trim --json
 mpcut project media replace interview.cut --source camera.mov --with alternate.mov --conform trim --allow-loss --out-project edited.cut
 ```
@@ -246,6 +289,8 @@ mpcut project media replace interview.cut --source camera.mov --with alternate.m
 List and Locate show paths used by the current edit. Add `--include-history` to include paths used only in retained undo and redo states. Use a listed path or the absolute location of the old file in `--from` or `--source`. Candidates and prefix folders resolve from the working directory. Repeat `--from` and `--to` to pair several paths by their order, or repeat `--map-prefix` for several roots. Relink changes the path in the current edit and retained history. `still asset relink` uses the same operation and identifies the old image path by asset ID.
 
 Locate searches the selected folder and its subfolders. With `--apply-matches`, it applies unique verified or matched candidates. Review ambiguous, different and pending candidates in the result. For a batch, `sources` reports the outcome of each mapping and `out_project` names the file when a write succeeds.
+
+Leave Offline marks a current media reference as intentionally offline and excludes it from Locate. Revert restores a previous location when every current and retained use still traces to the original relink. The list reports whether Revert is available.
 
 Replace previews the ripple report when you omit a destination. To apply, choose `--in-place` or a new `--out-project` path. The default conform mode `trim` trims uses that overrun the candidate. Use `--conform keep` to preserve their timeline timing. When a use is entirely out of range, `--allow-loss` removes it in trim mode or retains it offline in keep mode. Use `--loss remove` or `--loss keep-offline` to select that behavior explicitly.
 
@@ -276,7 +321,7 @@ When a multicam boundary fails, read `error.multicam` and `error.nearest`. If `m
 
 ## Edit camera feeds and recorded calls
 
-Use `mpcut tiles` to scan a recording, correct the assignments, or deliver synchronized movies. Automatic scanning requires a TileTrail-enabled build. Inspection and delivery can start from accepted tiles in a saved project.
+Run `mpcut help tiles` to find commands for scanning a recording, correcting assignments and delivering synchronized movies. Automatic scanning requires a TileTrail-enabled build. Inspection and delivery can start from accepted tiles in a saved project.
 
 ```sh
 mpcut tiles scan gallery.mov --output gallery-scan.json --progress stderr --json
@@ -328,9 +373,27 @@ mpcut tiles switches propose angles.cut --attachment-id TRANSCRIPT_ID --voice-an
 
 `switches propose` reports proposed cuts. Apply the chosen cuts as ordinary multicam switches.
 
+### Review pending Tiles
+
+Start with a project saved while a Check Tiles review was pending. The example uses a source ID of `gallery`. Substitute your source ID, or omit `--source-id` when the project has just one pending review. The response includes `feed_ids`, `choices` and `review_token`. To stage a change, start with the returned choices object and edit the relevant fields. Staging replaces the entire object, including names, unchecked feeds, merges and grid corrections.
+
+```sh
+mpcut tiles pending read meeting.cut --source-id gallery --json > pending.json
+jq '.choices' pending.json > choices.json
+```
+
+Edit `choices.json` using the reported feed IDs, then stage it in a new project. Inspect the choices in that copy before accepting them.
+
+```sh
+mpcut tiles pending stage meeting.cut --source-id gallery --choices "$(cat choices.json)" --review-token "$(jq -er '.review_token' pending.json)" --out-project staged.cut --json
+mpcut tiles pending read staged.cut --source-id gallery --json > staged-review.json
+```
+
+After approval, run `mpcut tiles accept --project staged.cut --source-id gallery --review-token "$(jq -er '.review_token' staged-review.json)" --out-project accepted.cut`. To discard a pending review, use `tiles pending discard` with its current token. If you get `stale_tile_review`, read the pending choices again. The same workflow is available through the `tiles_file_pending_*` and `tiles_editor_pending_*` tools. [Tiles editing guide](PARTICIPANTS.md)
+
 ### Existing participant commands
 
-The `mpcut participants` entry points continue to accept their existing requests. `mpcut help participants --json` lists their request fields.
+Run `mpcut help participants --json` to see the existing participant commands and their request fields.
 
 For projects that fit the legacy format, `participants project inspect` returns the familiar roster, source geometry and timed shots, and `participants project apply` accepts that JSON. Projects with clip layouts that cannot be translated to timed shots, arranged layouts, grids of more than four cells, screen-share feeds or live feed angles return `unsupported_legacy_participant_edit` and leave the project file untouched.
 

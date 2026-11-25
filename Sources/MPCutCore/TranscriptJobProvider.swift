@@ -246,7 +246,10 @@ struct TranscriptProviderCommand {
 }
 
 extension TranscriptJobStore {
-    public static func helperURL() throws -> URL {
+    /// The Transcriberrr helper. `MPCUT_TRANSCRIBERRR_HELPER` comes first, so a script or test launch
+    /// keeps its own helper. `chosen` is the helper the desktop app's Settings name; the CLI and the
+    /// file worker never pass one. Without either, the installed Transcriberrr app supplies it.
+    public static func helperURL(chosen: String? = nil) throws -> URL {
         let manager = FileManager.default
         if let path = ProcessInfo.processInfo.environment["MPCUT_TRANSCRIBERRR_HELPER"] {
             guard path.hasPrefix("/"), manager.isExecutableFile(atPath: path) else {
@@ -254,6 +257,14 @@ extension TranscriptJobStore {
                                       code: "transcript_helper_unavailable")
             }
             return URL(fileURLWithPath: path)
+        }
+        if let chosen, !chosen.isEmpty {
+            guard chosen.hasPrefix("/"), manager.isExecutableFile(atPath: chosen) else {
+                throw transcriptError("The Transcriberrr helper chosen in Settings is missing or cannot run. Choose it again in "
+                                      + "Settings → Transcripts, or set Helper location to Automatic.",
+                                      code: "transcript_helper_unavailable")
+            }
+            return URL(fileURLWithPath: chosen)
         }
         if let application = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.transcriberrr.app") {
             let helper = application.appendingPathComponent("Contents/Helpers/transcriberrr")

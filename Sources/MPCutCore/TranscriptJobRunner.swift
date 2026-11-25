@@ -20,6 +20,7 @@ extension TranscriptJobStore {
                             progress: @escaping (TranscriptJobRecord) -> Void) throws -> TranscriptJobRecord {
         var record = initial
         let id = record.id
+        let jobResults = resultDirectory(id)
         progress(record)
 
         let poll = TranscriptJobPoll(record: recordURL(id))
@@ -77,13 +78,9 @@ extension TranscriptJobStore {
             for track in wanted {
                 if let key = settings.key(for: track, revisions: revisions) {
                     keys[track.id] = key
-                    if AnalysisSidecar.readsEnabled, track.hasReusableEvidence,
-                       let stream = track.streamIndex, let stamp = stamps[track.file] {
-                        let sidecar = AnalysisSidecar(source: track.file, identity: stamp)
-                        if !sidecar.isExcluded {
-                            caches[track.id] = .init(sidecar: sidecar, key: key, evidence: track.evidence, stream: stream, channel: track.stagedChannel,
-                                                     providerExchangeVersion: settings.sharedExchangeVersion)
-                        }
+                    if track.hasReusableEvidence {
+                        caches[track.id] = .init(key: key, evidence: track.evidence,
+                                                 providerExchangeVersion: settings.sharedExchangeVersion)
                     }
                 }
             }
@@ -115,6 +112,7 @@ extension TranscriptJobStore {
                     continue
                 }
                 let policy = record.policy
+                try preserveHandoff(session, jobID: record.id)
                 var activityHits = Set<String>()
                 var blockedErrors: [String: String] = [:]
                 for trackIndex in session.tracks.indices {
@@ -144,15 +142,19 @@ extension TranscriptJobStore {
                     let candidate = key ?? (scope != nil && scope == track.recognitionSettingsKey ? track.recognitionKey : nil)
                     if policy != .restart, let candidate,
                        let prior = TranscriptRecognitionCache.Artifacts(job: result, activity: track.activity),
+                       prior.belongs(to: track),
                        prior.matches(key: candidate, evidence: track.evidence, needsActivity: track.activity != nil) {
                         track.recognitionKey = candidate
                         track.recognitionSettingsKey = scope
                         track.state = .recognized
-                    } else if policy != .restart, let cache = caches[track.id],
-                              let hit = cache.read(cancelled: cancelled),
+                    } else if policy != .restart, let candidate,
+                              let hit = TranscriptRecognitionCache.readPreserved(
+                                track: track, key: candidate, in: jobResults, cancelled: cancelled
+                              ) ?? caches[track.id]?.read(cancelled: cancelled), hit.belongs(to: track),
                               track.activity == nil || hit.activity != nil {
+                        try TranscriptRecognitionCache.preserve(track: track, in: jobResults, cancelled: cancelled)
                         try hit.write(result: result, activity: track.activity)
-                        track.recognitionKey = cache.key
+                        track.recognitionKey = candidate
                         track.recognitionSettingsKey = scope
                         track.state = .cached
                     } else {
@@ -166,6 +168,7 @@ extension TranscriptJobStore {
                             session.tracks[trackIndex] = track
                             continue
                         }
+                        try TranscriptRecognitionCache.preserve(track: track, in: jobResults, cancelled: cancelled)
                         track.recognitionKey = key
                         track.recognitionSettingsKey = scope
                         track.state = .staged
@@ -221,15 +224,12 @@ extension TranscriptJobStore {
                         }
                         guard let trackID = event.track_id,
                               let trackIndex = session.tracks.firstIndex(where: { $0.id == trackID }) else { return }
-                        let track = session.tracks[trackIndex]
                         switch event.event {
                         case "track_finished":
                             let state = TranscriptJobTrackState(rawValue: event.status) ?? .failed
-                            session.tracks[trackIndex].state = track.state == .cached && state == .recognized ? .cached : state
+                            let cached = session.tracks[trackIndex].state == .cached && state == .recognized
+                            session.tracks[trackIndex].state = cached ? .cached : state
                             session.tracks[trackIndex].message = event.error ?? event.warning
-                            if state == .recognized || state == .skipped {
-                                cacheActivity(track, stamp: stamps[track.file], cancelled: cancelled, warnings: &record.warnings)
-                            }
                         case "track_progress":
                             let percent = event.progress.map { " \(Int(max(0, min(1, $0)) * 100))%" } ?? ""
                             session.tracks[trackIndex].message = event.phase.map { $0 + percent }
@@ -298,6 +298,7 @@ extension TranscriptJobStore {
                         let detail = output.tracks.compactMap(\.error).first ?? "No selected track completed recognition."
                         throw jobError("transcript_recognition_failed", detail)
                     }
+                    session.resultSHA256 = try saveResult(output, jobID: jobID)
                     recognizedCount += recognized
                     failures = failures || output.tracks.contains { $0.coverage == .failed }
                     outputCount += 1
@@ -309,6 +310,9 @@ extension TranscriptJobStore {
                     }
                 } catch is CancellationError {
                     throw CancellationError()
+                } catch let error as CutError where error.code == "transcript_job_storage" {
+                    // Keep the provider's original output in place until a verified copy exists.
+                    throw error
                 } catch let error as CutError where error.code == "stale_transcript_job" {
                     allValid = false
                     try change {
@@ -317,6 +321,9 @@ extension TranscriptJobStore {
                     }
                 } catch {
                     failures = true
+                    // A provider can write a complete handoff and then fail its final
+                    // protocol step. Preserve that result before cleaning up the attempt.
+                    try preserveHandoff(session, jobID: jobID)
                     try? FileManager.default.removeItem(at: session.output)
                     let detail = (error as? CutError)?.message ?? error.localizedDescription
                     for index in session.tracks.indices
@@ -335,10 +342,7 @@ extension TranscriptJobStore {
             if cancelled() { throw CancellationError() }
             let next: TranscriptJobState
             if !allValid { next = .stale }
-            else if outputCount == 0 || (!selected.isEmpty && recognizedCount == 0) {
-                for session in record.sessions { try? FileManager.default.removeItem(at: session.output) }
-                next = .failed
-            }
+            else if outputCount == 0 || (!selected.isEmpty && recognizedCount == 0) { next = .failed }
             else if failures { next = .partial }
             else { next = .completed }
             record = try finishRun(id, token: token, state: next)
@@ -394,15 +398,12 @@ extension TranscriptJobStore {
 
     private func cacheTrack(_ track: TranscriptJobTrack, cache: TranscriptRecognitionCache?,
                             cancelled: @escaping @Sendable () -> Bool, warnings: inout [String]) {
-        guard !cancelled(), AnalysisSidecar.automaticWritesEnabled, let cache, let result = track.result,
+        guard !cancelled(), track.sourceIsCurrent, let cache, let result = track.result,
               let artifacts = TranscriptRecognitionCache.Artifacts(job: result, activity: track.activity),
+              artifacts.belongs(to: track),
               artifacts.matches(key: cache.key, evidence: cache.evidence, needsActivity: track.activity != nil) else { return }
         do {
-            if cache.read(cancelled: cancelled) == nil {
-                let media = try CutEngine(cancelled: cancelled).inspectMulticamSource(track.file)
-                guard track.sourceIsCurrent else { return }
-                try cache.save(artifacts, media: media, cancelled: cancelled)
-            }
+            try cache.save(artifacts, cancelled: cancelled)
         } catch {
             let warning = "Could not share recognition for \(track.name). The job will retain its track result."
             if !warnings.contains(warning) { warnings.append(warning) }
@@ -427,30 +428,10 @@ extension TranscriptJobStore {
         return false
     }
 
-    private func cacheActivity(_ track: TranscriptJobTrack, stamp: SourceIdentity?,
-                               cancelled: @escaping @Sendable () -> Bool, warnings: inout [String]) {
-        guard AnalysisSidecar.readsEnabled, AnalysisSidecar.automaticWritesEnabled,
-              track.hasReusableEvidence, let stamp, let stream = track.streamIndex, let activity = track.activity,
-              let data = TranscriptJobArtifact.read(activity),
-              TranscriptRecognitionCache.Artifacts.matchesActivity(data, evidence: track.evidence) else { return }
-        let key = TranscriptActivityKey(stream: stream, channel: track.stagedChannel)
-        let sidecar = AnalysisSidecar(source: track.file, identity: stamp)
-        guard !sidecar.isExcluded else { return }
-        do {
-            if sidecar.readTranscriptActivity(key, cancelled: cancelled) == nil {
-                let media = try CutEngine(cancelled: cancelled).inspectMulticamSource(track.file)
-                try sidecar.saveTranscriptActivity(data, key: key, media: media, cancelled: cancelled)
-            }
-        } catch {
-            let warning = "Could not share audio activity for \(track.name). The job will retain its track result."
-            if !warnings.contains(warning) { warnings.append(warning) }
-        }
-    }
-
     func validatedSessionOutput(_ session: TranscriptJobSession, jobID: UUID,
                                 stamps: [URL: SourceIdentity]? = nil,
                                 blockedErrors: [String: String] = [:]) throws -> TranscriptDocument {
-        var output = try TranscriptCodec.decode(Data(contentsOf: session.output, options: .mappedIfSafe), format: .json)
+        var output = try session.transcript(from: Data(contentsOf: session.output, options: .mappedIfSafe))
         guard output.clock == .session, output.jobID.flatMap(UUID.init(uuidString:)) == jobID,
               output.fingerprint == session.fingerprint,
               Set(output.tracks.map(\.id)) == Set(session.tracks.map(\.id)) else {

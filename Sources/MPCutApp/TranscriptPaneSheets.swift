@@ -360,15 +360,29 @@ struct TranscriptEditOptionsForm: View {
     @State private var name = ""
     @State private var leading = ""
     @State private var trailing = ""
-    @State private var retained = "0.20"
+    @State private var retained: String
     @State private var startNudge = ""
     @State private var endNudge = ""
     @State private var reviewTask: Task<Void, Never>?
-    @State private var boundary = TranscriptEditRequest.BoundaryPolicy.nearestFrame
+    @State private var boundary: TranscriptEditRequest.BoundaryPolicy
     @State private var edge = TranscriptEditRequest.Edge.start
     @State private var angleID: String?
     @State private var kind = TranscriptWordSelection.Kind.phrase
     @State private var error: String?
+
+    /// `defaults` seeds the boundary and the pause to keep, read from Settings when the form is made.
+    init(action: TranscriptEditRequest.Action, queueName: String, startAngles: [TranscriptAngleChoice] = [],
+         endAngles: [TranscriptAngleChoice] = [], defaults: TranscriptSheetDefaults = .factory,
+         commit: @escaping (String, RationalTime?, RationalTime?, RationalTime?, Int?, Int?, TranscriptEditRequest.BoundaryPolicy,
+                            TranscriptEditRequest.Edge, TranscriptWordSelection.Kind, String?) async throws -> Void) {
+        self.action = action
+        self.queueName = queueName
+        self.startAngles = startAngles
+        self.endAngles = endAngles
+        self.commit = commit
+        _retained = State(initialValue: defaults.retainedPause)
+        _boundary = State(initialValue: defaults.boundary)
+    }
 
     private var angles: [TranscriptAngleChoice] { edge == .start ? startAngles : endAngles }
 
@@ -510,14 +524,16 @@ struct TranscriptExportForm: View {
     @State private var format: TranscriptFormat
     @State private var space: TranscriptSpace
 
+    /// Export Transcript starts from the Settings format. Export Captions is always SubRip.
     init(space: TranscriptSpace, isMulticam: Bool, captions: Bool, tracks: [TranscriptTrack], privacyWarning: String?,
+         defaultFormat: TranscriptFormat = TranscriptSheetDefaults.factory.exportFormat,
          export: @escaping (TranscriptFormat, TranscriptSpace, String?) -> Void) {
         self.isMulticam = isMulticam
         self.privacyWarning = privacyWarning
         self.captions = captions
         self.tracks = tracks
         _trackID = State(initialValue: tracks.first?.id)
-        _format = State(initialValue: captions ? .srt : .json)
+        _format = State(initialValue: captions ? .srt : defaultFormat)
         self.export = export
         _space = State(initialValue: space)
     }
@@ -606,11 +622,14 @@ func transcriptAuditionRange(media: MediaInfo, presentation: MulticamRange, stre
 final class TranscriptAuditionPanel: NSObject, NSWindowDelegate {
     private var panel: NSPanel?
     private var preview: SequencePreview?
+    private weak var preferences: EditorPreferences?
     private var content: NSHostingController<TranscriptSourceAudition>?
     private var startup: Task<Void, Never>?
     private var retarget: Task<Void, Never>?
 
-    func show(_ clip: PreviewRange, streamIndex: Int, parent: NSWindow?, autoplay: Bool, clockOffset: RationalTime) {
+    func show(_ clip: PreviewRange, streamIndex: Int, parent: NSWindow?, autoplay: Bool, clockOffset: RationalTime,
+              preferences: EditorPreferences? = nil) {
+        self.preferences = preferences
         let sourceStart = clip.start + (clip.assetClockOrigin == nil ? clockOffset.seconds : 0)
         let title = "Source Context · \(clip.url.lastPathComponent) · Stream \(streamIndex)"
         startup?.cancel()
@@ -623,7 +642,7 @@ final class TranscriptAuditionPanel: NSObject, NSWindowDelegate {
             panel.title = title
             let move = {
                 preview.update([clip], at: 0)
-                content.rootView = TranscriptSourceAudition(clip: clip, preview: preview, sourceStart: sourceStart)
+                content.rootView = TranscriptSourceAudition(clip: clip, preview: preview, preferences: preferences, sourceStart: sourceStart)
             }
             if autoplay {
                 move()
@@ -649,7 +668,7 @@ final class TranscriptAuditionPanel: NSObject, NSWindowDelegate {
         panel.isReleasedWhenClosed = false
         panel.title = title
         panel.delegate = self
-        let content = NSHostingController(rootView: TranscriptSourceAudition(clip: clip, preview: preview,
+        let content = NSHostingController(rootView: TranscriptSourceAudition(clip: clip, preview: preview, preferences: preferences,
                                                                              sourceStart: sourceStart))
         panel.contentViewController = content
         self.content = content
@@ -703,12 +722,13 @@ final class TranscriptAuditionPanel: NSObject, NSWindowDelegate {
 private struct TranscriptSourceAudition: View {
     let clip: PreviewRange
     @ObservedObject var preview: SequencePreview
+    let preferences: EditorPreferences?
     let sourceStart: Double
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             if !clip.isAudioOnly {
-                PreviewView(preview: preview)
+                PreviewView(preview: preview, preferences: preferences)
                     .frame(width: 480, height: 270)
                     .background(.black)
             }

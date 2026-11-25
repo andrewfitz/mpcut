@@ -20,7 +20,7 @@ func checkSequenceSourceRangesAndQueue(t *testing.T, call func(string, object, s
 		t.Fatal(err)
 	}
 	path := filepath.Join(dir, "Source range workflow.cut")
-	doc := `{"format":"mpcut","schema_version":3,"kind":"sequence","clips":[{"id":"original","file":"media.mov","from":"0","to":"1001/2500"}]}`
+	doc := `{"format":"mpcut","schema_version":9,"kind":"sequence","clips":[{"id":"original","file":"media.mov","from":"0","to":"1001/2500"}]}`
 	if err := os.WriteFile(path, []byte(doc), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +201,7 @@ func checkNativeCutMovementPrompt(t *testing.T, call func(string, object, string
 		t.Fatal(err)
 	}
 	path := filepath.Join(dir, "Cut movement prompt.cut")
-	doc := `{"format":"mpcut","schema_version":3,"kind":"sequence","clips":[{"id":"gop","file":"gop.mp4","from":"0","to":"2"}]}`
+	doc := `{"format":"mpcut","schema_version":9,"kind":"sequence","clips":[{"id":"gop","file":"gop.mp4","from":"0","to":"2"}]}`
 	if err := os.WriteFile(path, []byte(doc), 0600); err != nil {
 		t.Fatal(err)
 	}

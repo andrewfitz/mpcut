@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MPCut stored transcript v4",
+  "description": "Canonical UTF-8 JSON for an immutable transcript asset. MPCut encodes compact JSON with sorted object keys and unescaped slashes. Word rows, observations and source-clock activity use exact rational times. A word’s projection and the provenance keep the version 2 representation.",
+  "$ref": "#/$defs/document",
+  "$defs": {
+    "time": {
+      "type": "string",
+      "pattern": "^-?[0-9]+(/[0-9]+)?$",
+      "description": "The numerator and the denominator each fit a signed 64-bit integer. The denominator is positive and is left out when it is 1."
+    },
+    "track_position": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "A position in `tracks`."
+    },
+    "speaker": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" }
+      },
+      "required": ["id", "name"]
+    },
+    "observation": {
+      "type": "object",
+      "description": "Where a field is shared, it comes from the word with ID `w` among the track's own `words` or, when the track keeps no such word, from the word this observation belongs to.",
+      "properties": {
+        "r": { "$ref": "#/$defs/track_position", "description": "track_id" },
+        "w": { "type": "string", "description": "word_id" },
+        "x": {
+          "type": ["string", "null"],
+          "description": "text. Left out when it is the shared word's text. Null when the observation has none."
+        },
+        "s": { "$ref": "#/$defs/time", "description": "start, in the track presentation clock. Left out with `e` when both are the shared word's bounds." },
+        "e": { "$ref": "#/$defs/time", "description": "end" },
+        "v": { "enum": ["recognized", "inferred"], "description": "evidence. Left out when recognized." },
+        "b": { "type": "string", "description": "basis" },
+        "p": {
+          "type": ["string", "null"],
+          "description": "speaker_id. Left out when it is that of the word this observation belongs to. Null when the observation has none and that word has one."
+        },
+        "c": { "type": "number", "minimum": 0, "maximum": 1, "description": "confidence" }
+      },
+      "required": ["r"],
+      "dependentRequired": { "s": ["e"], "e": ["s"] }
+    },
+    "word": {
+      "type": "object",
+      "properties": {
+        "i": { "type": "string", "description": "id" },
+        "t": { "type": "string", "description": "text" },
+        "s": { "$ref": "#/$defs/time", "description": "start" },
+        "e": { "$ref": "#/$defs/time", "description": "end" },
+        "u": { "type": "string", "description": "utterance_id" },
+        "p": { "type": "string", "description": "speaker_id" },
+        "q": { "enum": ["word", "cue"], "description": "precision. Left out when word." },
+        "o": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/observation" },
+          "description": "observations. Left out when there are none. A track's own words have none."
+        },
+        "k": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/track_position" },
+          "description": "candidate_track_ids. An empty list is kept apart from none."
+        },
+        "c": { "type": "number", "minimum": 0, "maximum": 1, "description": "confidence" },
+        "j": {
+          "$ref": "transcript-document-v2.schema.json#/$defs/word_projection",
+          "description": "projection, as in the version 2 document."
+        }
+      },
+      "required": ["i", "t", "s", "e"]
+    },
+    "provider_activity_frame": {
+      "type": "object",
+      "properties": {
+        "start": { "$ref": "#/$defs/time" },
+        "end": { "$ref": "#/$defs/time" },
+        "level": { "type": "number", "minimum": 0 }
+      },
+      "required": ["start", "end", "level"],
+      "additionalProperties": false
+    },
+    "track": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "source_id": { "type": "string" },
+        "audio_stream_index": { "type": "integer", "minimum": 0 },
+        "channel": { "type": "integer", "minimum": 0 },
+        "origin": { "$ref": "#/$defs/time" },
+        "session_start": { "$ref": "#/$defs/time" },
+        "coverage": { "enum": ["recognized", "skipped", "failed", "coverage_only"] },
+        "role": { "enum": ["isolated_mic", "mixed_audio", "unknown"] },
+        "provider_activity": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/provider_activity_frame" }
+        },
+        "words": { "type": "array", "items": { "$ref": "#/$defs/word" } },
+        "speakers": { "type": "array", "items": { "$ref": "#/$defs/speaker" } },
+        "stream_evidence": {},
+        "error": { "type": "string" },
+        "warning": { "type": "string" },
+        "approximate_clock": { "type": "boolean" }
+      },
+      "required": ["id", "name", "origin", "session_start", "coverage", "role"],
+      "additionalProperties": false
+    },
+    "document": {
+      "type": "object",
+      "properties": {
+        "schema_version": { "const": 4 },
+        "clock": { "enum": ["presentation", "session", "group", "current_cut"] },
+        "tracks": { "type": "array", "items": { "$ref": "#/$defs/track" } },
+        "speakers": { "type": "array", "items": { "$ref": "#/$defs/speaker" } },
+        "words": { "type": "array", "items": { "$ref": "#/$defs/word" } },
+        "approximate_clock": { "type": "boolean" },
+        "job_id": { "type": "string" },
+        "fingerprint": { "type": "string" },
+        "provenance": { "$ref": "transcript-document-v2.schema.json#/$defs/provenance" }
+      },
+      "required": ["schema_version", "clock", "tracks", "speakers", "words", "approximate_clock"],
+      "additionalProperties": false
+    }
+  }
+}

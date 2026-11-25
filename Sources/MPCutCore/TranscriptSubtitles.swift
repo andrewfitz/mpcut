@@ -1,5 +1,24 @@
 import Foundation
 
+/// How captions break into cues and lines. The standard limits are the ones the CLI and agents
+/// always use; the desktop app passes the editor's Settings values.
+public struct TranscriptCaptionLimits: Equatable, Sendable {
+    public var lineCharacters: Int
+    public var lines: Int
+    public var longestCue: RationalTime
+    public var speakerLabels: Bool
+
+    public init(lineCharacters: Int = 42, lines: Int = 2, longestCue: RationalTime = .init(numerator: 6),
+                speakerLabels: Bool = true) {
+        self.lineCharacters = max(1, lineCharacters)
+        self.lines = max(1, lines)
+        self.longestCue = longestCue
+        self.speakerLabels = speakerLabels
+    }
+
+    public static let standard = TranscriptCaptionLimits()
+}
+
 enum TranscriptSubtitles {
     // Editors and converters also write one-digit hours and a period before the milliseconds.
     private static let srtClock = #"^[0-9]+:[0-5][0-9]:[0-5][0-9][,.][0-9]{3}$"#
@@ -162,8 +181,8 @@ enum TranscriptSubtitles {
         case file(String), source(String), unbound(Int, String?)
     }
 
-    static func captionExport(_ indexes: [TranscriptIndex], space: TranscriptSpace,
-                                      filter: TranscriptFilter) throws -> (data: Data, wordCount: Int) {
+    static func captionExport(_ indexes: [TranscriptIndex], space: TranscriptSpace, filter: TranscriptFilter,
+                              limits: TranscriptCaptionLimits = .standard) throws -> (data: Data, wordCount: Int) {
         var words: [Cue] = []
         var recording: Recording?
         var count = 0
@@ -199,14 +218,15 @@ enum TranscriptSubtitles {
                 }
                 let lane = CueLane(attachment: position, speaker: row.speakerID, track: row.trackID,
                                    clip: row.clipID, assembly: row.assemblyIndex)
+                let speakerName = limits.speakerLabels ? row.speakerID.flatMap { speakers[$0] } : nil
                 words.append(Cue(text: row.text, start: range.from, end: range.to, precision: row.precision,
-                                 utteranceID: row.utteranceID, speakerName: row.speakerID.flatMap { speakers[$0] }, lane: lane))
+                                 utteranceID: row.utteranceID, speakerName: speakerName, lane: lane))
             }
         }
         // Index rows are ordered on the selected clock. Separate attachments need a merge.
         if indexes.count > 1 { words.sort { $0.start == $1.start ? $0.end < $1.end : $0.start < $1.start } }
-        let cues = groupWords(words, captions: true)
-        let text = try encodeTimed(cues, format: .srt, singleTrack: true, clock: "")
+        let cues = groupWords(words, captions: limits)
+        let text = try encodeTimed(cues, format: .srt, singleTrack: true, clock: "", limits: limits)
         guard !text.isEmpty else { throw TranscriptDocument.invalid("No captions are available on the selected clock.") }
         return (Data(text.utf8), count)
     }
@@ -220,7 +240,7 @@ enum TranscriptSubtitles {
             return Cue(text: word.text, start: word.start, end: word.end, precision: word.precision,
                        utteranceID: word.utteranceID, speakerName: word.speakerID.flatMap { speakers[$0] }, lane: lane)
         }
-        let cues = groupWords(words, captions: false)
+        let cues = groupWords(words, captions: nil)
         if format == .text {
             let lines = cues.map { renderText($0.text, speaker: $0.speakerName, isVTT: false) }
             return (["Transcript (\(clockLabel(document)))"] + lines).joined(separator: "\n") + "\n"
@@ -228,7 +248,8 @@ enum TranscriptSubtitles {
         return try encodeTimed(cues, format: format, singleTrack: false, clock: clockLabel(document))
     }
 
-    private static func encodeTimed(_ cues: [Cue], format: TranscriptFormat, singleTrack: Bool, clock: String) throws -> String {
+    private static func encodeTimed(_ cues: [Cue], format: TranscriptFormat, singleTrack: Bool, clock: String,
+                                    limits: TranscriptCaptionLimits = .standard) throws -> String {
         let isVTT = format == .vtt
         var output = isVTT ? "WEBVTT\n\nNOTE Clock: \(clock)\n\n" : ""
         var index = 0
@@ -262,7 +283,8 @@ enum TranscriptSubtitles {
                 throw TranscriptDocument.invalid("Subtitle timestamp exceeds the supported millisecond range")
             }
             let payload = renderText(cue.text, speaker: cue.speakerName, isVTT: isVTT)
-            let text = singleTrack && cue.precision == .word ? captionLines(payload).joined(separator: "\n") : payload
+            let text = singleTrack && cue.precision == .word
+                ? captionLines(payload, width: limits.lineCharacters).joined(separator: "\n") : payload
             if singleTrack {
                 flush(until: start)
                 active.append((cueEnd, text))
@@ -289,7 +311,8 @@ enum TranscriptSubtitles {
     /// order their words alternate; each speaker's cue carries on across the other's words
     /// instead of ending at every one. The cues stay in the order they begin, so overlapping
     /// speech reads as whole lines and as cues that overlap.
-    private static func groupWords(_ words: [Cue], captions: Bool) -> [Cue] {
+    /// `captions` holds the caption limits, or nil for a transcript export.
+    private static func groupWords(_ words: [Cue], captions: TranscriptCaptionLimits?) -> [Cue] {
         var result: [Cue] = []
         // The cue each lane is still adding to, and the last word of every cue.
         var open: [CueLane: Int] = [:]
@@ -303,9 +326,9 @@ enum TranscriptSubtitles {
             if let cue, word.precision == .word, result[cue].precision == .word,
                word.start >= result[cue].start,
                (try? word.start.subtracting(result[cue].end)).map({ $0 <= pauseLimit }) == true,
-               (word.utteranceID != nil && words[tails[cue]].utteranceID != nil || captions),
+               (word.utteranceID != nil && words[tails[cue]].utteranceID != nil || captions != nil),
                word.utteranceID == words[tails[cue]].utteranceID || wasTalkedOver(result[cue], before: position, after: tails[cue], in: words),
-               !captions || fitsCaption(result[cue], adding: word) {
+               captions.map({ fitsCaption(result[cue], adding: word, limits: $0) }) ?? true {
                 result[cue].text += word.text
                 result[cue].end = max(result[cue].end, word.end)
                 tails[cue] = position
@@ -320,25 +343,28 @@ enum TranscriptSubtitles {
         return result
     }
 
-    private static func fitsCaption(_ cue: Cue, adding word: Cue) -> Bool {
+    private static func fitsCaption(_ cue: Cue, adding word: Cue, limits: TranscriptCaptionLimits) -> Bool {
         guard let duration = try? max(cue.end, word.end).subtracting(cue.start),
-              duration <= RationalTime(numerator: 6) else { return false }
+              duration <= limits.longestCue else { return false }
         let body = (cue.text + word.text).trimmingCharacters(in: .whitespacesAndNewlines)
         let text = cue.speakerName.map { "[\($0)] " + body } ?? body
         let length = text.count
-        return length <= 42 || length <= 85 && captionLines(text).count <= 2
+        // Every line full, with a space between each pair.
+        let longest = limits.lineCharacters * limits.lines + limits.lines - 1
+        return length <= limits.lineCharacters
+            || length <= longest && captionLines(text, width: limits.lineCharacters).count <= limits.lines
     }
 
-    private static func captionLines(_ text: String) -> [String] {
+    private static func captionLines(_ text: String, width: Int) -> [String] {
         var lines: [String] = []
         var line = ""
         for token in text.split(whereSeparator: \.isWhitespace) {
             var word = token
-            if !line.isEmpty && line.count + 1 + word.count > 42 {
+            if !line.isEmpty && line.count + 1 + word.count > width {
                 lines.append(line)
                 line = ""
             }
-            while let split = word.index(word.startIndex, offsetBy: 42, limitedBy: word.endIndex), split < word.endIndex {
+            while let split = word.index(word.startIndex, offsetBy: width, limitedBy: word.endIndex), split < word.endIndex {
                 lines.append(String(word[..<split]))
                 word = word[split...]
             }

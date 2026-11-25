@@ -97,6 +97,34 @@ def exercise(cli, folder):
     assert authored["mix_lanes"][0]["target"] == {"kind": "camera", "angle_id": "A"}
     assert authored["audio_replacements"][0]["relative_offset"] == "1/8000"
 
+    configured = folder / "configured.cut"
+    assert author("create", {"kind": "multicam", "out_project": str(configured),
+                             "angles": [{"id": "A", "file": str(with_sound)},
+                                        {"id": "B", "file": str(camera)}],
+                             "group_end": "1/5", "operations": [
+                                 {"action": "camera_rename", "source_id": "A", "name": "Wide"},
+                                 {"action": "camera_offset_set", "source_id": "B", "offset": "-1/10"},
+                                 {"action": "camera_move", "angle_id": "B", "to_index": 0},
+                                 {"action": "camera_microphone_set", "source_id": "A", "audio_stream_index": 1},
+                                 {"action": "group_end_set", "to": "3/10"},
+                                 {"action": "switch_audio_set", "at": "0", "source_id": "A", "audio_stream_index": 1},
+                             ]})["ok"]
+    setup = read_project(configured)
+    b, a = setup["angles"]
+    assert (b["id"], b["offset"], a["id"], a["name"], a["audio_stream_index"]) == ("B", "-1/10", "A", "Wide", 1)
+    assert setup["group_range"]["to"] == "3/10"
+    assert setup["switches"][0]["audio"] == {"source_id": "A", "audio_stream_index": 1}
+
+    cleared_setup = folder / "cleared-setup.cut"
+    assert author("edit", {"project_path": str(configured), "out_project": str(cleared_setup), "operations": [
+        {"action": "camera_rename", "source_id": "A", "name": ""},
+        {"action": "camera_microphone_set", "source_id": "A"},
+        {"action": "switch_audio_clear", "at": "0"},
+    ]})["ok"]
+    cleared = read_project(cleared_setup)
+    assert "name" not in cleared["angles"][1] and "audio_stream_index" not in cleared["angles"][1]
+    assert "audio" not in cleared["switches"][0]
+
     silence_plan = subprocess.run([
         str(cli), "silence", "plan", "--project", str(mix), "--output", str(folder / "short.mov"),
         "--mode", "copy", "--audio", "pcm", "--audio-output", "downmix_mono", "--json"

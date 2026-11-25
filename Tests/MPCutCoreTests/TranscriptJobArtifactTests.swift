@@ -7,6 +7,7 @@ final class TranscriptJobArtifactTests: XCTestCase {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent("MPCut-artifacts-\(UUID())", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
         addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+        isolateRecognitionResults(in: folder)
         return folder
     }
 
@@ -288,12 +289,10 @@ final class TranscriptJobArtifactTests: XCTestCase {
         // The three-second track's files are too short to be worth packing.
         XCTAssertTrue(exists(try XCTUnwrap(short.result)))
 
-        // The packed result still makes the session output a copy, and a second read of the job says so.
+        // The canonical result can restore the handoff without unpacking the provider track files.
         _ = try editor.markAttached(finished.id, expectedPreparationID: finished.preparationID)
         XCTAssertFalse(exists(finished.sessions[0].output))
-        XCTAssertThrowsError(try editor.verifiedDocuments(finished.id, project: .multicam(group))) {
-            XCTAssertEqual(($0 as? CutError)?.code, "transcript_output_removed")
-        }
+        XCTAssertEqual(try editor.verifiedDocuments(finished.id, project: .multicam(group)).count, 1)
         XCTAssertEqual(try editor.status(finished.id).state, .completed)
         XCTAssertEqual(files.map(exists), [false, false])
 

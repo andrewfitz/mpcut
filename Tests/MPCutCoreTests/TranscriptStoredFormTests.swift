@@ -12,7 +12,7 @@ final class TranscriptStoredFormTests: XCTestCase {
     }
 
     private func json(_ data: Data) throws -> [String: Any] {
-        try XCTUnwrap(JSONSerialization.jsonObject(with: TranscriptStoredForm.expanded(data) ?? data) as? [String: Any])
+        try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
     }
 
     /// Every way an observation can agree with or differ from the words beside it.
@@ -74,11 +74,20 @@ final class TranscriptStoredFormTests: XCTestCase {
         XCTAssertEqual(try stored(TranscriptDocument(clock: .presentation)), TranscriptDocument(clock: .presentation))
     }
 
+    func testCanonicalProviderActivityFixture() throws {
+        let bytes = try Data(contentsOf: Self.fixture("stored-v4.json"))
+        let transcript = try TranscriptCodec.decode(bytes, format: .json)
+        XCTAssertEqual(transcript.tracks.first?.activity, [.init(start: time(-1, 16_000),
+                                                                  end: time(319, 16_000), level: 0.0625)])
+        XCTAssertEqual(try TranscriptCodec.encodeStored(transcript), bytes)
+        XCTAssertEqual(TranscriptStore.digest(bytes), "764425695167689881c7de216c9506ddec58bba0c16484394fd99ed09153b352")
+    }
+
     func testStoredFormSharesWhatAnObservationRepeats() throws {
         let root = try json(TranscriptCodec.encodeStored(mixed()))
-        XCTAssertEqual(root["schema_version"] as? Int, 3)
+        XCTAssertEqual(root["schema_version"] as? Int, 4)
         let tracks = try XCTUnwrap(root["tracks"] as? [[String: Any]])
-        XCTAssertNil(tracks[0]["activity"])
+        XCTAssertNil(tracks[0]["provider_activity"])
         XCTAssertEqual(tracks[0]["origin"] as? String, "-1/3000")
         XCTAssertEqual(tracks[1]["origin"] as? String, "0")
         let own = try XCTUnwrap((tracks[0]["words"] as? [[String: Any]])?.first)
@@ -103,30 +112,32 @@ final class TranscriptStoredFormTests: XCTestCase {
         XCTAssertNil(words[2]["k"])
     }
 
-    func testWritersLeaveActivityBehind() throws {
+    func testWritersPreserveProviderActivity() throws {
         var document = mixed()
         document.tracks[0].activity = [.init(start: time(0), end: time(1, 50), level: 0.25),
                                        .init(start: time(1, 50), end: time(1, 25), level: 0)]
         try document.validate()
-        XCTAssertEqual(try stored(document), mixed())
+        XCTAssertEqual(try stored(document), document)
         let exported = try TranscriptCodec.encode(document, format: .json)
-        XCTAssertEqual(try TranscriptCodec.decode(exported, format: .json), mixed())
+        XCTAssertEqual(try TranscriptCodec.decode(exported, format: .json), document)
         let root = try json(exported)
         XCTAssertEqual(root["schema_version"] as? Int, 2)
-        XCTAssertEqual(((root["tracks"] as? [[String: Any]])?.first?["activity"] as? [Any])?.count, 0)
+        XCTAssertEqual(((root["tracks"] as? [[String: Any]])?.first?["activity"] as? [Any])?.count, 2)
         // A document written before still reads with its levels.
         let encoder = JSONEncoder()
         XCTAssertEqual(try TranscriptCodec.decode(encoder.encode(document), format: .json), document)
     }
 
-    func testProviderLevelsAreCheckedAndNotKept() throws {
+    func testNativeProviderLevelsUseTheSourceClockAndSurviveStorage() throws {
         let session = try String(contentsOf: Self.fixture("session-result-v1.json"), encoding: .utf8)
         var root = try json(Data(session.utf8))
         var tracks = try XCTUnwrap(root["tracks"] as? [[String: Any]])
         tracks[0]["activity"] = [["start_sample": 0, "end_sample": 320, "level": 0.5]]
         root["tracks"] = tracks
         let document = try TranscriptCodec.decode(JSONSerialization.data(withJSONObject: root), format: .json)
-        XCTAssertTrue(document.tracks.allSatisfy(\.activity.isEmpty))
+        let origin = time(1, 48_000)
+        XCTAssertEqual(document.tracks[0].activity, [.init(start: origin, end: try origin.adding(time(1, 50)), level: 0.5)])
+        XCTAssertEqual(try stored(document), document)
         for frame in [["start_sample": 320, "end_sample": 320, "level": 0.5],
                       ["start_sample": -1, "end_sample": 320, "level": 0.5],
                       ["start_sample": 0, "end_sample": 320, "level": -0.5]] {
@@ -138,7 +149,7 @@ final class TranscriptStoredFormTests: XCTestCase {
         }
     }
 
-    func testLongTranscriptIsCompressedAndReadsBack() throws {
+    func testLongTranscriptUsesCanonicalCompactJSONAndReadsBack() throws {
         let track = "t-" + String(repeating: "0123456789abcdef", count: 4)
         var own: [TranscriptWord] = []
         var words: [TranscriptWord] = []
@@ -158,28 +169,29 @@ final class TranscriptStoredFormTests: XCTestCase {
                                           speakers: [.init(id: "s1", name: "Host")], words: words)
         let exported = try TranscriptCodec.encode(document, format: .json)
         let kept = try TranscriptCodec.encodeStored(document)
-        XCTAssertEqual(kept.first, 0)
-        XCTAssertLessThan(kept.count * 10, exported.count)
+        XCTAssertEqual(kept.first, Character("{").asciiValue)
+        XCTAssertLessThan(kept.count * 3, exported.count)
         XCTAssertEqual(try TranscriptCodec.decode(kept, format: .json), document)
-        XCTAssertEqual(try TranscriptCodec.encodeStored(document), kept)
+        XCTAssertEqual(try TranscriptCodec.encodeStored(TranscriptCodec.decode(kept, format: .json)), kept)
+    }
 
-        let plain = try XCTUnwrap(TranscriptStoredForm.expanded(kept))
-        XCTAssertLessThan(plain.count * 3, exported.count)
-        XCTAssertEqual(try TranscriptCodec.decode(plain, format: .json), document)
-
-        // The declared size is one byte off, the stream stops early, or there is no stream.
-        var resized = kept
-        resized[8] ^= 0x01
-        for bytes in [resized, kept.prefix(kept.count / 2), kept.prefix(16), kept.prefix(12)] {
-            XCTAssertThrowsError(try TranscriptCodec.decode(Data(bytes), format: .json)) {
-                XCTAssertEqual(($0 as? CutError)?.code, "invalid_transcript")
-            }
+    func testStandaloneV3ImportReadsPlainAndCompressedDocuments() throws {
+        let source = Data(#"{"schema_version":3,"clock":"session","tracks":[],"speakers":[],"words":[],"approximate_clock":false}"#.utf8)
+        var wrapped = Data([0, 0x4d, 0x50, 0x43, 0x54, 0x5a, 0x31, 0x0a])
+        withUnsafeBytes(of: UInt64(source.count).littleEndian) { wrapped.append(contentsOf: $0) }
+        wrapped.append(try (source as NSData).compressed(using: .lzfse) as Data)
+        for input in [source, wrapped] {
+            XCTAssertEqual(try TranscriptCodec.decode(input, format: .json), TranscriptDocument(clock: .session))
+        }
+        wrapped[8] ^= 1
+        XCTAssertThrowsError(try TranscriptCodec.decode(wrapped, format: .json)) {
+            XCTAssertEqual(($0 as? CutError)?.code, "invalid_transcript")
         }
     }
 
     func testStoredFormRefusesWhatItDoesNotWrite() throws {
         let word = #"{"i":"w","t":"t","s":"0","e":"1/2"}"#
-        func document(words: String = "", tracks: String = "", version: Int = 3) -> Data {
+        func document(words: String = "", tracks: String = "", version: Int = 4) -> Data {
             Data(#"{"schema_version":\#(version),"clock":"presentation","approximate_clock":false,"speakers":[],"tracks":[\#(tracks)],"words":[\#(words)]}"#.utf8)
         }
         let track = #"{"id":"a","name":"A","origin":"0","session_start":"0","coverage":"recognized","role":"unknown"}"#
@@ -188,7 +200,7 @@ final class TranscriptStoredFormTests: XCTestCase {
                                                            tracks: track), format: .json).words[0].observations[0].end,
                        time(1))
         let refused = [
-            document(words: word, version: 4),
+            document(words: word, version: 5),
             document(words: #"{"i":"w","t":"t","s":"0","e":"1/0"}"#),
             document(words: #"{"i":"w","t":"t","s":"0","e":"0.5"}"#),
             document(words: #"{"i":"w","t":"t","s":"0","e":" 1"}"#),

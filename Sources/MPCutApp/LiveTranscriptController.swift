@@ -22,18 +22,11 @@ final class LiveTranscriptController: ObservableObject {
         let indexed: Bool
     }
 
-    private struct AssetSnapshot: Equatable, Sendable {
-        let location: URL
-        let identity: SourceIdentity
-        let changeTime: SourceIdentity.ChangeTime?
-    }
-
     private struct IndexKey: Equatable, Sendable {
         let attachment: TranscriptAttachment
         let revision: TranscriptEditRevision
         let project: CutProject
         let context: URL
-        let assetSnapshot: AssetSnapshot?
         let mediaRevision: UInt64?
         let media: [String: IndexedMedia]
     }
@@ -73,7 +66,6 @@ final class LiveTranscriptController: ObservableObject {
     /// Builds a reader caused by reading a clock it had not asked for, which it waited for
     /// where it stood. A reader that names its clocks when it asks for an index causes none.
     let unrequestedClockBuilds = TranscriptWorkCounter()
-    private var importedDocument: (asset: TranscriptAsset, context: URL, document: TranscriptDocument)?
     /// Keyed by result ID, which names the stored bytes, so an entry never goes out of date.
     private var lineages: [String: ResultOrigin] = [:]
     private static var active: [UUID: LiveTranscriptController] = [:]
@@ -86,6 +78,7 @@ final class LiveTranscriptController: ObservableObject {
     private var jobHandle: String?
     private var publishedResults: [UUID: (preparationID: UUID?, resultIDs: Set<String>)] = [:]
     private var cancellation: EditCancellation?
+    private var windowEnded = false
     private var stopRequested = false
     private var explicitlyCancelled = false
     private var startIntent: (options: TranscriptJobOptions, policy: TranscriptJobPolicy, download: Bool)?
@@ -194,9 +187,6 @@ final class LiveTranscriptController: ObservableObject {
         let media = (session.isMulticam ? session.multicam.media : session.editor.transcriptMedia)
             .mapValues { IndexedMedia(identity: $0.identity, changeTime: $0.identity.changeTime, indexed: $0.hasFullEditIndex) }
         let context = try assetContext()
-        let assetSnapshot = TranscriptStore.assetLocation(attachment.asset, relativeTo: context).flatMap { url in
-            (try? SourceIdentity(url)).map { AssetSnapshot(location: url, identity: $0, changeTime: $0.changeTime) }
-        }
         // An index for an earlier revision or a detached result can never be asked for again.
         let (timeline, transcript) = (timelineRevision, state.revision)
         let attached = Set(state.attachments.map(\.id))
@@ -205,7 +195,7 @@ final class LiveTranscriptController: ObservableObject {
                 && attached.contains($0.attachment.id)
         }
         return IndexKey(attachment: attachment, revision: revision(of: attachment), project: project,
-                        context: context, assetSnapshot: assetSnapshot,
+                        context: context,
                         mediaRevision: session.isMulticam ? session.multicam.transcriptMediaRevision : nil,
                         media: media)
     }
@@ -225,7 +215,10 @@ final class LiveTranscriptController: ObservableObject {
 
     private func planAttachments(_ request: TranscriptEditRequest, defaultID: String?) throws
         -> (primary: TranscriptAttachment, required: [String], review: [String]) {
-        let ids = request.selections.compactMap(\.attachmentID) + (request.target?.attachmentID.map { [$0] } ?? [])
+        let attachmentIDs = state.attachments.map(\.id)
+        let ids = try (request.selections + [request.target].compactMap { $0 }).compactMap {
+            try $0.attachmentOwner(in: attachmentIDs)
+        }
         let primary = try attachment(id: defaultID ?? ids.first)
         let required = Set(ids).subtracting([primary.id])
         let review: [String]
@@ -285,13 +278,11 @@ final class LiveTranscriptController: ObservableObject {
         return { try excerpt.save(to: destination) }
     }
 
-    func select(_ selection: TranscriptWordSelection, attachmentID: String? = nil) throws -> TranscriptResolvedSelection {
-        // An occurrence ID begins with the attachment that produced it.
-        let owner = selection.firstOccurrenceID.flatMap { occurrence in
-            state.attachments.first { occurrence.hasPrefix("\($0.id.count):\($0.id):") }?.id
-        }
-        return try TranscriptEditPlanner.select(selection, in: index(attachmentID: selection.attachmentID ?? owner ?? attachmentID,
-                                                                     clocks: [selection.space]))
+    func select(_ selection: TranscriptWordSelection, attachmentID: String? = nil,
+                expansion: TranscriptSelectionExpansion? = nil) throws -> TranscriptResolvedSelection {
+        let owner = try selection.attachmentOwner(in: state.attachments.map(\.id))
+        return try TranscriptEditPlanner.select(selection, expansion: expansion,
+                                                 in: index(attachmentID: owner ?? attachmentID, clocks: [selection.space]))
     }
 
     @discardableResult
@@ -301,6 +292,10 @@ final class LiveTranscriptController: ObservableObject {
             guard !session.multicam.isBusy else { throw busyEditor() }
             switch result.space {
             case .currentCut:
+                guard let duration = session.multicam.assemblyRangeEnds.last,
+                      result.range.from >= .zero, result.range.from < result.range.to, result.range.to <= duration else {
+                    throw CutError(code: "invalid_transcript_selection", message: "The range is outside the editable assembly.")
+                }
                 session.multicam.preview.pause()
                 session.multicam.seekAssembly(at: result.range.from, scrubbing: false)
                 session.multicam.assemblySelection = AudioSpan(from: result.range.from, to: result.range.to)
@@ -317,17 +312,13 @@ final class LiveTranscriptController: ObservableObject {
         } else if result.space == .currentCut {
             try session.editor.setTranscriptMarks(result.range)
         } else {
-            let index = try index(attachmentID: selection.attachmentID ?? attachmentID, clocks: [.currentCut])
+            let index = try index(attachmentID: result.attachmentID, clocks: [.currentCut])
             let first = try retainedOccurrence(result.first, in: index)
             let last = try retainedOccurrence(result.last, in: index)
             guard first.clipID == last.clipID else {
                 throw CutError(code: "ambiguous_transcript_selection", message: "Select the intended occurrence in Current Cut.")
             }
-            let from = result.kind == .gap ? first.range.to : first.range.from
-            let to = result.kind == .gap ? last.range.from : last.range.to
-            let lower = try from.subtracting(selection.leadingPadding ?? .zero)
-            let upper = try to.adding(selection.trailingPadding ?? .zero)
-            try session.editor.setTranscriptMarks(MulticamRange(from: lower, to: upper))
+            try session.editor.setTranscriptMarks(TranscriptEditPlanner.range(selection, from: first, to: last))
         }
         return result
     }
@@ -399,7 +390,7 @@ final class LiveTranscriptController: ObservableObject {
         session.multicam.preview.pause()
         session.editor.preview.pause()
         sourceAudition.show(clip, streamIndex: stream, parent: session.window?.attachedSheet ?? session.window,
-                            autoplay: last != nil, clockOffset: clockOffset)
+                            autoplay: last != nil, clockOffset: clockOffset, preferences: session.editor.preferences)
     }
 
     func closeSourceAudition() {
@@ -436,7 +427,7 @@ final class LiveTranscriptController: ObservableObject {
         let snapshot = project
         let stamped = bindings.isEmpty && previous != nil
             ? candidates : candidates.map { $0.stamped(in: snapshot, relativeTo: context, confirmed: confirmed) }
-        let asset = try store(transcript)
+        let asset = try TranscriptStore.put(transcript)
         let attachment = TranscriptAttachment(id: previous?.id ?? ProjectIdentifier.make(), asset: asset, bindings: stamped,
                                               importOrigin: origin ?? previous?.importOrigin, fingerprint: nil)
         var next = state
@@ -456,12 +447,10 @@ final class LiveTranscriptController: ObservableObject {
         let context = try assetContext()
         let owner = session.mcpHandle
         let snapshot = project
-        let draft = session.isMulticam ? session.multicam.projectURL == nil : session.editor.projectURL == nil
         let stamped = candidates.map { $0.stamped(in: snapshot, relativeTo: context, confirmed: !bindings.isEmpty) }
         let worker = Task.detached(priority: .userInitiated) {
-            let data = try TranscriptCodec.encodeStored(transcript)
             try Task.checkCancellation()
-            return try TranscriptStore.put(data, relativeTo: context, draft: draft)
+            return try TranscriptStore.put(transcript)
         }
         let asset = try await withTaskCancellationHandler {
             try await worker.value
@@ -469,7 +458,7 @@ final class LiveTranscriptController: ObservableObject {
             worker.cancel()
         }
         try Task.checkCancellation()
-        guard session.mcpHandle == owner, try assetContext() == context, project == snapshot else {
+        guard !windowEnded, session.mcpHandle == owner, try assetContext() == context, project == snapshot else {
             throw CutError(code: "stale_transcript", message: "The project changed while the transcript was attaching. Review the bindings again.")
         }
         guard TranscriptStore.assetStatus(asset, relativeTo: context) == .available else {
@@ -480,7 +469,6 @@ final class LiveTranscriptController: ObservableObject {
         var next = state
         next.attachments.append(attachment)
         try setState(next)
-        importedDocument = (asset, context, transcript)
         return attachment
     }
 
@@ -519,23 +507,10 @@ final class LiveTranscriptController: ObservableObject {
         try setState(next)
     }
 
-    func recoverAttachment(id: String, from directory: URL) throws {
-        let attachment = try attachment(id: id)
-        let context = try assetContext()
-        let draft = session.isMulticam ? session.multicam.projectURL == nil : session.editor.projectURL == nil
-        let asset = try TranscriptStore.recover(attachment.asset, from: directory, relativeTo: context, draft: draft)
-        var next = state
-        guard let index = next.attachments.firstIndex(where: { $0.id == id }) else {
-            throw CutError(code: "missing_transcript", message: "Choose an attached transcript.")
-        }
-        next.attachments[index].asset = asset
-        try setState(next, forceRevision: true)
-    }
-
     func detach(attachmentID: String) throws {
         let removed = try attachment(id: attachmentID)
-        if let fingerprint = removed.fingerprint {
-            for record in try jobs() where isAttached(record)
+        if let fingerprint = removed.fingerprint, let id = removed.asset.recognitionJobID {
+            for record in try jobs() where record.id == id && isAttached(record)
                 && record.sessions.contains(where: { $0.fingerprint == fingerprint }) {
                 try jobStore.markAttached(record.id, expectedPreparationID: record.preparationID)
             }
@@ -551,23 +526,14 @@ final class LiveTranscriptController: ObservableObject {
         try setState(next, action: action)
     }
 
-    private func setState(_ next: ProjectTranscripts, action: String? = nil, forceRevision: Bool = false) throws {
+    private func setState(_ next: ProjectTranscripts, action: String? = nil) throws {
         if session.isMulticam {
-            try session.multicam.setTranscriptState(next, action: action, forceRevision: forceRevision)
+            try session.multicam.setTranscriptState(next, action: action)
         } else {
-            try session.editor.setTranscriptState(next, action: action, forceRevision: forceRevision)
+            try session.editor.setTranscriptState(next, action: action)
         }
         indexes.keep { _ in false }
-        if let importedDocument, !next.attachments.contains(where: { $0.asset == importedDocument.asset }) {
-            self.importedDocument = nil
-        }
         objectWillChange.send()
-    }
-
-    private func store(_ document: TranscriptDocument) throws -> TranscriptAsset {
-        let context = try assetContext()
-        let draft = session.isMulticam ? session.multicam.projectURL == nil : session.editor.projectURL == nil
-        return try TranscriptStore.put(TranscriptCodec.encodeStored(document), relativeTo: context, draft: draft)
     }
 
     private func inferredBindings(_ document: TranscriptDocument) -> [TranscriptBinding] {
@@ -751,10 +717,7 @@ extension LiveTranscriptController {
 }
 
 extension LiveTranscriptController {
-    /// Job folders and shared recognition results that nothing has written for a month can be
-    /// staged or recognized again from the media. Nothing else removes them, and each
-    /// transcribed recording leaves some behind. A finished result its project has not
-    /// attached is kept however old it is.
+    /// Reclaim abandoned job scratch and claim files while retaining provider results.
     nonisolated static func pruneAbandonedWork(olderThan age: TimeInterval = 30 * 86_400) {
         Task.detached(priority: .utility) {
             for directory in [jobsDirectory, TranscriptJobStore.defaultDirectory] {
@@ -837,10 +800,38 @@ extension LiveTranscriptController {
                         .union(CutProject.sidecarExclusions(absoluteSources: protected, candidates: candidates, projectURL: projectURL)))
     }
 
+    var preferences: EditorPreferences { session.editor.preferences }
+
+    /// The helper desktop jobs use: the environment variable, then Settings → Transcripts → Helper location,
+    /// then the installed Transcriberrr. Read when a job or query starts.
+    func helperURL() throws -> URL {
+        try TranscriptJobStore.helperURL(chosen: preferences.transcriptHelperPath)
+    }
+
+    /// Keeps the Mac awake while a job runs. Tests replace it to watch the activity.
+    static var activityProvider: ActivityProviding = ProcessInfo.processInfo
+
+    /// Decision 8: a live start that names no engine uses Settings → Transcripts → Preferred engine,
+    /// resolved to a named engine as job setup resolves it. Nil when no engine can run, which leaves
+    /// the provider to report it.
+    func settingsEngine() async throws -> String? {
+        let catalog = try TranscriptEngineCatalog.read(await capabilities())
+        return catalog.resolve(preferred: preferences.transcriptEngine).engine
+    }
+
+    /// The options a start with this operation ID already asked for, so a repeated start that omits
+    /// the engine matches the job it started.
+    func requestedOptions(for operationID: UUID) -> TranscriptJobOptions? {
+        if activeJobID == operationID, let startIntent { return startIntent.options }
+        guard let record = try? jobStore.status(operationID), (try? status(record.id)) != nil else { return nil }
+        return record.options
+    }
+
     func capabilities(opening: ((String) -> Void)? = nil) async throws -> Data {
-        let helper = try TranscriptJobStore.helperURL()
-        if let opening, ProcessInfo.processInfo.environment["MPCUT_TRANSCRIBERRR_HELPER"] == nil {
-            let app = helper.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let helper = try helperURL()
+        let app = helper.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        // Only a helper inside an app bundle has an app to open. One chosen elsewhere runs on its own.
+        if let opening, ProcessInfo.processInfo.environment["MPCUT_TRANSCRIBERRR_HELPER"] == nil, app.pathExtension == "app" {
             let running = NSRunningApplication.runningApplications(withBundleIdentifier: "com.transcriberrr.app")
                 .contains { $0.bundleURL?.standardizedFileURL.path == app.standardizedFileURL.path && !$0.isTerminated }
             if !running {
@@ -862,8 +853,9 @@ extension LiveTranscriptController {
     /// Whether a helper is installed and can run a session. Preparation extracts every
     /// recording's audio, which a missing or outdated helper would leave staged for nothing.
     func checkHelper() async throws {
+        let helper = try helperURL()
         try await Task.detached(priority: .userInitiated) {
-            _ = try TranscriptJobStore.capabilities(helper: TranscriptJobStore.helperURL())
+            _ = try TranscriptJobStore.capabilities(helper: helper)
         }.value
     }
 
@@ -888,7 +880,8 @@ extension LiveTranscriptController {
             return !expected.resultIDs.isEmpty && expected.resultIDs.isSubset(of: Set(state.attachments.map(\.resultID)))
         }
         return record.attached && state.attachments.contains { attachment in
-            record.sessions.contains { $0.fingerprint == attachment.fingerprint }
+            attachment.asset.recognitionJobID == record.id
+                && record.sessions.contains { $0.fingerprint == attachment.fingerprint }
         }
     }
 
@@ -989,6 +982,9 @@ extension LiveTranscriptController {
             throw CutError(code: "transcript_job_busy", message: "Wait for the active transcript job or cancel it first.")
         }
         guard Self.active[id] == nil else { throw operationConflict() }
+        // The job keeps the helper Settings named when it started, so a change applies to the next job.
+        // It is found with the job's other work, so a missing helper is reported as the job's error.
+        let chosenHelper = preferences.transcriptHelperPath
         cancelJobDiscovery()
         let store = jobStore
         let initialSidecars = sidecarPolicy
@@ -1005,8 +1001,11 @@ extension LiveTranscriptController {
         explicitlyCancelled = false
         Self.active[id] = self
         let session = session
+        // Held for the whole job, through preparation, recognition, retries and attachment.
+        let awake = SleepPrevention(reason: "Transcribing audio", provider: Self.activityProvider)
         worker = Task { [self, session] in
             defer {
+                awake.end()
                 Self.active[id] = nil
                 worker = nil
                 activeJobID = nil
@@ -1021,11 +1020,12 @@ extension LiveTranscriptController {
                         self.job = record
                     }
                 }
-                let prepared = try await Task.detached(priority: .userInitiated) {
+                let (helper, prepared) = try await Task.detached(priority: .userInitiated) {
                     // Ask the helper before any audio is extracted for it.
-                    _ = try TranscriptJobStore.capabilities(helper: TranscriptJobStore.helperURL())
+                    let helper = try TranscriptJobStore.helperURL(chosen: chosenHelper)
+                    _ = try TranscriptJobStore.capabilities(helper: helper)
                     if token.isCancelled { throw CancellationError() }
-                    return try initialSidecars.run { try preparation(token, publish) }
+                    return (helper, try initialSidecars.run { try preparation(token, publish) })
                 }.value
                 if stopRequested {
                     job = try explicitlyCancelled ? store.cancel(prepared.id) : store.interrupt(prepared.id)
@@ -1036,7 +1036,7 @@ extension LiveTranscriptController {
                     guard !stopRequested else { return }
                     let sidecars = sidecarPolicy
                     let result = try await Task.detached(priority: .userInitiated) {
-                        try sidecars.run { try store.run(prepared.id, download: download, progress: publish) }
+                        try sidecars.run { try store.run(prepared.id, helper: helper, download: download, progress: publish) }
                     }.value
                     job = result
                     guard !stopRequested, session.mcpHandle == jobHandle else { return }
@@ -1070,6 +1070,7 @@ extension LiveTranscriptController {
     }
 
     private func documentPathChanged() {
+        guard !windowEnded else { return }
         closeSourceAudition()
         guard let context = existingDocument else {
             cancelJobDiscovery()
@@ -1123,8 +1124,8 @@ extension LiveTranscriptController {
                 documentPathChanged()
                 return
             }
-            recoverJobs(result, context: context, owner: owner, handle: handle,
-                        isNewDocument: !sameDocument || previousContext != context)
+            await recoverJobs(result, context: context, owner: owner, handle: handle,
+                              isNewDocument: !sameDocument || previousContext != context)
         }
         jobDiscovery = (context, handle, owner, task)
     }
@@ -1135,7 +1136,7 @@ extension LiveTranscriptController {
     }
 
     private func recoverJobs(_ discovery: Result<[TranscriptJobRecord], Error>, context: URL, owner: UUID?,
-                             handle: String, isNewDocument: Bool) {
+                             handle: String, isNewDocument: Bool) async {
         jobDocument = context
         let sameDocument = jobHandle == handle
         jobHandle = handle
@@ -1157,33 +1158,28 @@ extension LiveTranscriptController {
             }
             if !sameDocument { stopRequested = false }
             let completed = records.reversed().filter { !$0.attached && ($0.state == .completed || $0.state == .partial) }
-            if completed.contains(where: { publishedResults[$0.id] != nil }),
-               let saved = try? CutProject.load(from: context) {
-                for record in completed {
-                    try acknowledge(record.id, ifPersistedIn: saved)
-                }
-            }
+            try await acknowledge(completed.map(\.id), ifPersistedAt: context)
             guard isNewDocument, let latest = records.first else { return }
-            guard !completed.isEmpty || latest.state == .stale else { return }
-            Task { [weak session] in
-                guard let session else { return }
-                var needsReconciliation = !latest.attached && latest.state == .stale
-                for record in completed {
-                    guard !stopRequested, session.mcpHandle == handle, activeJobID == nil else { return }
-                    guard (try? jobStore.status(record.id).attached) == false else { continue }
-                    do {
-                        try await attach(record)
-                    } catch let issue as CutError where issue.code == "stale_transcript_job" {
-                        if record.id == latest.id { needsReconciliation = true }
-                    } catch {
-                        if record.id == latest.id, !stopRequested { jobError = error.localizedDescription }
-                    }
-                }
-                guard needsReconciliation, !stopRequested, session.mcpHandle == handle, activeJobID == nil else { return }
-                do { try retry(latest.id) }
-                catch { jobError = error.localizedDescription }
+            func canRecover() -> Bool {
+                !windowEnded && !stopRequested && session.mcpHandle == handle && activeJobID == nil
             }
-        } catch { jobError = error.localizedDescription }
+            var needsReconciliation = !latest.attached && latest.state == .stale
+            for record in completed {
+                guard canRecover() else { return }
+                guard (try? jobStore.status(record.id).attached) == false else { continue }
+                do {
+                    try await attach(record)
+                } catch let issue as CutError where issue.code == "stale_transcript_job" {
+                    if record.id == latest.id { needsReconciliation = true }
+                } catch {
+                    if record.id == latest.id, canRecover() { jobError = error.localizedDescription }
+                }
+            }
+            guard needsReconciliation, canRecover() else { return }
+            try retry(latest.id)
+        } catch {
+            if !windowEnded, session.mcpHandle == handle, activeJobID == nil { jobError = error.localizedDescription }
+        }
     }
 
     private func migrateJob(_ old: String) {
@@ -1196,6 +1192,13 @@ extension LiveTranscriptController {
     }
 
     private func attach(_ record: TranscriptJobRecord) async throws {
+        let handle = session.mcpHandle
+        let active = activeJobID
+        func canAttach() -> Bool {
+            !windowEnded && !stopRequested && existingDocument != nil && session.mcpHandle == handle
+                && jobHandle == handle && activeJobID == active
+        }
+        guard canAttach() else { return }
         let store = jobStore
         let snapshot = project
         let revision = timelineRevision
@@ -1219,7 +1222,7 @@ extension LiveTranscriptController {
             }
             return (outputs, origins)
         }.value
-        guard !stopRequested, existingDocument != nil, session.mcpHandle == jobHandle else { return }
+        guard canAttach() else { return }
         // A timeline-only edit can arrive during verification. Reverify against the new snapshot.
         guard revision == timelineRevision, transcriptRevision == state.revision else {
             return try await attach(record)
@@ -1271,15 +1274,14 @@ extension LiveTranscriptController {
         }
         guard !accepted.isEmpty else { return }
         let destination = try assetContext()
-        let draft = session.isMulticam ? session.multicam.projectURL == nil : session.editor.projectURL == nil
         let documents = accepted.map(\.transcript)
         let stored = try await Task.detached(priority: .userInitiated) {
             try documents.map {
-                try TranscriptStore.put(TranscriptCodec.encodeStored($0), relativeTo: destination, draft: draft)
+                try TranscriptStore.put($0)
             }
         }.value
         // Writing the results takes time. Everything checked before it is checked again.
-        guard !stopRequested, existingDocument != nil, session.mcpHandle == jobHandle else { return }
+        guard canAttach() else { return }
         guard revision == timelineRevision, transcriptRevision == state.revision, (try? assetContext()) == destination else {
             return try await attach(record)
         }
@@ -1296,8 +1298,6 @@ extension LiveTranscriptController {
                                                   fingerprint: result.transcript.fingerprint)
             if let existing { next.attachments[existing] = attachment }
             else { next.attachments.append(attachment) }
-            // The reader opens this result next. It need not decode what was just encoded.
-            importedDocument = (asset, destination, result.transcript)
         }
         let verifiedOutputs = Set(outputs.map(\.url))
         let verifiedTracks = verifiedRecord.sessions.filter { verifiedOutputs.contains($0.output) }.flatMap(\.tracks)
@@ -1306,16 +1306,39 @@ extension LiveTranscriptController {
         }
         try setState(next)
         publishedResults[record.id] = (verifiedRecord.preparationID, resultIDs)
-        if let context = existingDocument, let saved = try? CutProject.load(from: context) {
-            try acknowledge(record.id, ifPersistedIn: saved)
+        if let context = existingDocument {
+            try await acknowledge([record.id], ifPersistedAt: context)
         }
     }
 
-    private func acknowledge(_ id: UUID, ifPersistedIn project: CutProject) throws {
-        guard let expected = publishedResults[id], !expected.resultIDs.isEmpty,
-              expected.resultIDs.isSubset(of: Set(project.transcripts.attachments.map(\.resultID))) else { return }
-        try jobStore.markAttached(id, expectedPreparationID: expected.preparationID)
-        publishedResults[id] = nil
+    private func acknowledge(_ ids: [UUID], ifPersistedAt document: URL) async throws {
+        let expected = publishedResults.filter { ids.contains($0.key) && !$0.value.resultIDs.isEmpty }
+        guard !expected.isEmpty else { return }
+        let handle = session.mcpHandle
+        let store = jobStore
+        // Loading a project verifies every embedded result. Releasing a handoff also
+        // verifies its durable copy. Neither operation needs the editor's main actor.
+        let acknowledged = try await Task.detached(priority: .utility) {
+            guard let snapshot = try? SourceIdentity(document), let saved = try? CutProject.load(from: document) else {
+                return [UUID]()
+            }
+            let assets = Set(saved.transcripts.attachments.map(\.resultID))
+            var ids: [UUID] = []
+            for (id, result) in expected where result.resultIDs.isSubset(of: assets) {
+                let record = try store.markAttached(id, expectedPreparationID: result.preparationID,
+                                                    persisted: (document, snapshot))
+                if record.attached, record.documentID == document.path,
+                   record.preparationID == result.preparationID { ids.append(id) }
+            }
+            return ids
+        }.value
+        guard !windowEnded, session.mcpHandle == handle, existingDocument == document else { return }
+        for id in acknowledged {
+            if let current = publishedResults[id], let earlier = expected[id],
+               current.preparationID == earlier.preparationID, current.resultIDs == earlier.resultIDs {
+                publishedResults[id] = nil
+            }
+        }
     }
 
     private struct TranscriptJobScope: Equatable {
@@ -1378,13 +1401,13 @@ extension LiveTranscriptController {
     }
 
     func prepareForWindowEnd(preservingDraft: Bool = false) {
+        windowEnded = true
         closeSourceAudition()
         cancelJobDiscovery()
         indexes.keep { _ in false }
         indexLoads.values.forEach { $0.task.cancel() }
         indexLoads.removeAll()
         guard let context = existingDocument else { return }
-        TranscriptStore.releaseDecoded(relativeTo: context)
         if let old = jobDocument, old != context, !ProjectDraft.isManaged(context) {
             migrateJob(old.path)
         }
@@ -1443,9 +1466,6 @@ extension LiveTranscriptController {
         let sequenceMedia = session.editor.transcriptMedia
         let multicamMedia = session.multicam.media
         let records = state.authoring
-        let staged = importedDocument.flatMap {
-            $0.asset == key.attachment.asset && $0.context == key.context ? $0.document : nil
-        }
         let builds = indexBuilds
         let unrequested = unrequestedClockBuilds
         // A review sheet asks for every attachment's index each time it opens. Whoever builds
@@ -1463,8 +1483,7 @@ extension LiveTranscriptController {
             }
             try Task.checkCancellation()
             builds.increment()
-            // The document just imported is already decoded. Its stored copy is still verified.
-            let document = try TranscriptStore.decoded(key.attachment.asset, relativeTo: key.context, known: staged)
+            let document = try TranscriptStore.decoded(key.attachment.asset, relativeTo: key.context)
             try Task.checkCancellation()
             guard let shelf else {
                 return try TranscriptIndex(document: document, attachment: key.attachment,

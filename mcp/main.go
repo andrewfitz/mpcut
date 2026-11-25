@@ -84,7 +84,7 @@ func configuredServer(exe, path string, filesOnly bool) (*mcp.Server, error) {
 	}
 	instructions := "Use project_windows_list and project_editor_state_read for live edits. Target the returned project and revision. Preserve the operation ID when retrying an edit. File tools operate on saved files. Enable local control in MPCut Settings. Read mpcut://docs/agent-guide for workflows and recovery."
 	if filesOnly {
-		instructions = "Read mpcut://docs/headless for saved-project workflows. Poll file_job_status_read and retain the operation ID for retries within this server session."
+		instructions = "Read mpcut://docs/headless for saved-project workflows. Retain the operation ID to recover the job across files-only sessions with file_job_status_read."
 	}
 	server := mcp.NewServer(&mcp.Implementation{Name: "mpcut", Version: version}, &mcp.ServerOptions{
 		Instructions: instructions,

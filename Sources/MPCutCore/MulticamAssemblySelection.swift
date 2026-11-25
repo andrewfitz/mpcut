@@ -6,6 +6,7 @@ extension MulticamProject {
         var cursor = RationalTime.zero
         var items: [StillAssemblyItem] = []
         var occurrences: [Int: Int] = [:]
+        var cardOffsets: [String: MulticamRange] = [:]
         for (index, item) in (assemblyItems ?? [.group(range)]).enumerated() {
             let length: RationalTime
             switch item {
@@ -30,6 +31,7 @@ extension MulticamProject {
                           (upper == length || (try? insert.frameCount()) != nil) else {
                         throw CutError(code: "invalid_still_time", message: "Select complete frames of card ‘\(insert.id)’.")
                     }
+                    cardOffsets["still/" + insert.id] = .init(from: lower, to: upper)
                     items.append(.still(insert))
                 }
             }
@@ -39,7 +41,11 @@ extension MulticamProject {
             throw CutError(code: "invalid_range", message: "Select increasing bounds within the assembly duration.")
         }
         var snapshot = self
-        snapshot.assemblyItems = items
+        snapshot.replaceAssembly(items, carryingPauseReviewsFrom: occurrences.keys.sorted())
+        snapshot.analysisAnnotations.pauseReviews = try snapshot.analysisAnnotations.pauseReviews.compactMap { row in
+            guard let id = row.occurrenceID, let cut = cardOffsets[id] else { return row }
+            return try row.retained(by: id, within: cut, onCard: true)
+        }
         if var render = participants.render {
             render.shots = try render.shots.compactMap { authored in
                 guard authored.clock == .output, let range = authored.range else { return authored }

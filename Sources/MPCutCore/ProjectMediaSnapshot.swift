@@ -4,7 +4,6 @@ import Foundation
 public struct ProjectMediaSnapshot: Codable, Equatable, Sendable {
     public static let empty = Self()
     private static let version = 1
-    static let maximumBytes = 4 * 1024 * 1024
     public var entries: [Entry]
 
     public init(entries: [Entry] = []) {
@@ -100,13 +99,12 @@ public struct ProjectMediaSnapshot: Codable, Equatable, Sendable {
         return merging(Self(entries: refreshed + stills))
     }
 
-    /// Preserve the existing history selection and append only whole entries that fit.
-    func appending(to base: Data, current: Set<String>, retained: Set<String>, byteLimit: Int) throws -> Data {
+    /// Carry the evidence referenced by the live edit and its retained history.
+    func appending(to base: Data, current: Set<String>, retained: Set<String>) throws -> Data {
         guard !entries.isEmpty else { return base }
         let prefix = Data(",\"media_snapshot\":{\"version\":\(Self.version),\"entries\":[".utf8)
         let suffix = Data("]}}".utf8)
-        let budget = min(Self.maximumBytes, byteLimit - base.count + 1) - prefix.count - suffix.count
-        guard budget > 0, base.last == 0x7D else { return base }
+        guard base.last == 0x7D else { return base }
 
         let ordered = entries.filter { current.contains($0.path) || retained.contains($0.path) }.sorted {
             let firstCurrent = current.contains($0.path)
@@ -117,9 +115,7 @@ public struct ProjectMediaSnapshot: Codable, Equatable, Sendable {
         var seen = Set<String>()
         for entry in ordered where seen.insert(entry.path).inserted {
             let bytes = try ProjectFile.encoded(entry, compact: true)
-            let separator = payload.isEmpty ? 0 : 1
-            guard bytes.count + separator <= budget - payload.count else { continue }
-            if separator > 0 { payload.append(0x2C) }
+            if !payload.isEmpty { payload.append(0x2C) }
             payload.append(bytes)
         }
         guard !payload.isEmpty else { return base }

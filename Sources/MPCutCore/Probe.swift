@@ -353,8 +353,8 @@ package struct SourceIdentity: Codable, Hashable, Sendable {
     // Keep the filesystem change time only for live jobs. Tags and permissions can
     // change it, so it must never invalidate an analysis stored across sessions.
     package struct ChangeTime: Hashable, Sendable {
-        let seconds: Int
-        let nanoseconds: Int
+        package let seconds: Int
+        package let nanoseconds: Int
     }
     package private(set) var changeTime: ChangeTime?
 
@@ -437,6 +437,7 @@ enum Probe {
                      audioAnalysis: Bool = false, forcePayload: Bool = false,
                      expectedIdentity: SourceIdentity? = nil,
                      progress: ((Double) -> Void)? = nil, cancelled: (() -> Bool)? = nil) throws -> MediaInfo {
+        try CutProject.rejectLegacyCache(url)
         do {
             return try readOnce(url, keyframes: keyframes, conversion: conversion, previewOnly: previewOnly,
                                 audioAnalysis: audioAnalysis, forcePayload: forcePayload,

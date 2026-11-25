@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Exercise transcript recovery across packaged macOS app processes.
 
-Use a logged-in desktop with Accessibility access for the test terminal.
+Use Backstage on a logged-in desktop with Accessibility access for the test terminal.
 """
 
 import argparse
@@ -46,27 +46,32 @@ class Desktop:
     def __init__(self, app, folder, endpoint, helper):
         self.endpoint = endpoint
         self.quit_tool = folder / "native-quit"
-        self.pid = None
-        args = ["/usr/bin/open", "-g", "-n", "-W", "-a", str(app),
+        self.env = dict(os.environ, BACKSTAGE_SESSION=endpoint.name)
+        args = ["backstage", "launch", str(app), "--timeout", "45",
                 "--env", f"CFFIXED_USER_HOME={folder}",
                 "--env", f"MPCUT_TEST_SOCKET_DIRECTORY={endpoint.name}",
                 "--env", f"MPCUT_TRANSCRIBERRR_HELPER={helper}",
-                "--args", "-automation_local_mcp_enabled", "YES", "-history_max_steps", "50",
+                "--env", "MPCUT_MUTED=1",
+                "--", "-automation_local_mcp_enabled", "YES", "-history_max_steps", "50",
                 "-analysis_sidecar_reuse_enabled", "NO", "-timeline_snap_target", "off",
                 "-ApplePersistenceIgnoreState", "YES", "-NSQuitAlwaysKeepsWindows", "NO"]
-        self.launch = subprocess.Popen(args)
+        launch = subprocess.run(args, env=self.env, capture_output=True, text=True, timeout=60)
+        if launch.returncode:
+            raise RuntimeError(f"Backstage launch failed: {launch.stdout} {launch.stderr}")
+        self.pid = json.loads(launch.stdout)["pid"]
         try:
             def listener():
                 try:
                     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
                         conn.connect(str(self.endpoint / "control.sock"))
-                        return self.peer_pid(conn)
+                        assert self.peer_pid(conn) == self.pid, "A different process acquired the test socket"
+                        return True
                 except OSError:
                     return None
 
-            self.pid = eventually("the isolated desktop listener", listener)
+            eventually("the isolated desktop listener", listener)
             eventually("the initial project window", lambda: self.call("project_windows_list")["projects"])
-            print(f"Background desktop launched (PID {self.pid})", flush=True)
+            print(f"Backstage editor launched (PID {self.pid})", flush=True)
         except Exception:
             self.cleanup()
             raise
@@ -90,22 +95,15 @@ class Desktop:
 
     def quit(self):
         # NSRunningApplication sends the native Quit event to this specific PID.
-        # Wait for the process started by Launch Services to exit naturally.
+        # Wait for the managed process to exit without using Backstage cleanup.
         subprocess.run([self.quit_tool, str(self.pid)], check=True, timeout=25)
-        assert self.launch.wait(timeout=35) == 0
-        # Launch Services reports the exit a few milliseconds before the kernel reaps the process.
-        eventually(f"MPCut PID {self.pid} to exit", lambda: not process_alive(self.pid), timeout=5)
+        eventually(f"MPCut PID {self.pid} to exit", lambda: not process_alive(self.pid), timeout=35)
         print(f"Native Quit completed (PID {self.pid})", flush=True)
 
     def cleanup(self):
-        if self.launch.poll() is None:
-            if self.pid is not None and process_alive(self.pid):
-                os.kill(self.pid, 9)
-            try:
-                self.launch.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.launch.kill()
-                self.launch.wait()
+        if process_alive(self.pid):
+            subprocess.run(["backstage", "quit", "--pid", str(self.pid), "--force"],
+                           env=self.env, check=True, timeout=20)
 
 
 def process_alive(pid):

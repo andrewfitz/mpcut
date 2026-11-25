@@ -38,7 +38,7 @@ class MulticamSyncTests(unittest.TestCase):
     def write_project(self, reference, target, recorder=None):
         sources = [{"id": "recorder", "file": recorder, "offset": "0"}] if recorder else []
         self.project.write_text(json.dumps({
-            "format": "mpcut", "schema_version": 3, "kind": "multicam",
+            "format": "mpcut", "schema_version": 9, "kind": "multicam",
             "reference_angle_id": "wide", "group_range": {"from": "0", "to": "6"},
             "angles": [{"id": "wide", "file": reference, "offset": "1"},
                        {"id": "close", "file": target, "offset": "0"}],

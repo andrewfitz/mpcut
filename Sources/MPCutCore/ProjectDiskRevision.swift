@@ -7,13 +7,18 @@ import Foundation
 package struct ProjectDiskRevision: Equatable, Sendable {
     private let openedPath: URL
     private let destination: URL
+    private let byteCount: Int
     private let digest: SHA256.Digest
 
     fileprivate init(url: URL, destination: URL, bytes: Data) {
         openedPath = url.absoluteURL
         self.destination = destination
+        byteCount = bytes.count
         digest = SHA256.hash(data: bytes)
     }
+
+    package var resolvedPath: String { destination.path }
+    package var contentDigest: String { digest.map { String(format: "%02x", $0) }.joined() }
 
     package func matchesDestination(_ url: URL) -> Bool {
         openedPath == url.absoluteURL || Self.sameDestination(destination, Self.saveDestination(url))
@@ -35,29 +40,28 @@ package struct ProjectDiskRevision: Equatable, Sendable {
         guard descriptor >= 0 else { return nil }
         defer { close(descriptor) }
 
-        let limit = MulticamProject.maximumFileSize
         var info = stat()
         guard fstat(descriptor, &info) == 0, info.st_mode & S_IFMT == S_IFREG,
-              info.st_size <= limit else { return nil }
+              info.st_size == byteCount else { return nil }
 
         // Only the digest is needed here. Keep the old archive out of memory while
         // the new archive is waiting to be published.
         var hash = SHA256()
-        var remaining = limit
-        let bufferSize = min(1 << 20, max(4 << 10, Int(info.st_size) + 1))
+        var remaining = byteCount
+        let bufferSize = min(1 << 20, max(4 << 10, byteCount))
         var buffer = [UInt8](repeating: 0, count: bufferSize)
         let matches = buffer.withUnsafeMutableBytes { bytes in
-            while true {
-                let count = read(descriptor, bytes.baseAddress, min(bytes.count, remaining + 1))
-                if count == 0 { return hash.finalize() == digest }
+            while remaining > 0 {
+                let count = read(descriptor, bytes.baseAddress, min(bytes.count, remaining))
+                if count == 0 { return false }
                 if count < 0 {
                     if errno == EINTR { continue }
                     return false
                 }
-                guard count <= remaining else { return false }
                 hash.update(bufferPointer: UnsafeRawBufferPointer(rebasing: bytes[..<count]))
                 remaining -= count
             }
+            return hash.finalize() == digest
         }
         var afterward = stat()
         guard matches, fstat(descriptor, &afterward) == 0, Self.sameFile(info, afterward) else { return nil }
@@ -105,6 +109,9 @@ extension ProjectFile {
     static func readSnapshot<T: Decodable>(_ type: T.Type, from url: URL, multicam: Bool = false)
         throws -> (T, ProjectDiskRevision) {
         let destination = ProjectDiskRevision.saveDestination(url)
+        if destination.pathExtension.lowercased() != "cutdb" {
+            try CutProject.rejectLegacyCache(url)
+        }
         let bytes = try readBytes(from: destination, multicam: multicam)
         let document = try decode(type, data: bytes, multicam: multicam)
         return (document, ProjectDiskRevision(url: url, destination: destination, bytes: bytes))

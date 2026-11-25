@@ -69,13 +69,13 @@ struct TranscriptNativeSession: Decodable {
         let warning: String?
 
         func value(rate: Int64) throws -> TranscriptTrack {
-            // The levels are checked and left behind. The recording's analysis sidecar keeps them,
-            // and a document that carried them held a frame for every 20 ms of every track.
-            for item in activity ?? [] {
-                guard item.start_sample >= 0, item.start_sample < item.end_sample, item.level.isFinite,
-                      item.level >= 0 else {
+            let frames = try (activity ?? []).map { item in
+                guard item.start_sample >= 0, item.start_sample < item.end_sample,
+                      item.level.isFinite, item.level >= 0 else {
                     throw TranscriptDocument.invalid("Invalid activity on track \(id)")
                 }
+                let bounds = try Bounds(start: item.start_sample, end: item.end_sample, rate: rate, origin: origin)
+                return TranscriptActivityFrame(start: bounds.start, end: bounds.end, level: item.level)
             }
             let localWords = try words?.map { item in
                 guard item.observations?.isEmpty != false else {
@@ -86,7 +86,7 @@ struct TranscriptNativeSession: Decodable {
             }
             return TranscriptTrack(id: id, name: name, sourceID: source_id, streamIndex: stream_index, channel: channel,
                                    origin: origin, sessionStart: session_start, coverage: coverage, role: role,
-                                   words: localWords, speakers: speakers, streamEvidence: stream_evidence,
+                                   activity: frames, words: localWords, speakers: speakers, streamEvidence: stream_evidence,
                                    error: error, warning: warning)
         }
     }

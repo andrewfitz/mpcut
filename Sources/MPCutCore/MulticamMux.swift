@@ -99,7 +99,7 @@ struct MulticamMux {
         guard chmod(partial.path, try publicationPermissions(0o666)) == 0 else {
             throw CutError(code: "write_failed", message: String(cString: strerror(errno)))
         }
-        let failure = publishExclusively(from: partial, to: destination)
+        let failure = try MediaExportPublication.publish(from: partial, to: destination)
         guard failure == 0 else {
             if failure == EEXIST {
                 throw CutError(code: "output_exists", message: "A file already exists at the destination.")

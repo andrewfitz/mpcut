@@ -15,6 +15,20 @@ final class MCPFileJobTests: XCTestCase {
         XCTAssertEqual(list.arguments, ["project", "media", "list", "--json", "/tmp/project.cut"])
         let locate = try request("locate", ["folder": "/tmp/moved"])
         XCTAssertEqual(locate.arguments.suffix(2), ["--folder", "/tmp/moved"])
+        let retained = try request("list", ["include_history": true])
+        XCTAssertEqual(retained.arguments.last, "--include-history")
+        let locatedCopy: [String: Any] = [
+            "folder": "/tmp/moved", "include_history": true, "apply_matches": true, "out_project": "/tmp/located.cut"
+        ]
+        let located = try request("locate", locatedCopy)
+        XCTAssertEqual(located.arguments.suffix(2), ["--include-history", "--apply-matches"])
+        XCTAssertThrowsError(try request("locate", locatedCopy.filter { $0.key != "out_project" }))
+        XCTAssertThrowsError(try request("locate", locatedCopy.filter { $0.key != "apply_matches" }))
+        let ignored = try request("leave_offline", ["source": "old.wav", "in_place": true])
+        XCTAssertEqual(ignored.arguments.suffix(3), ["--source", "old.wav", "--in-place"])
+        let reverted = try request("revert", ["source": "moved.wav", "out_project": "/tmp/reverted.cut"])
+        XCTAssertEqual(reverted.arguments.suffix(2), ["--source", "moved.wav"])
+        XCTAssertThrowsError(try request("revert", ["source": "moved.wav", "in_place": true, "out_project": "/tmp/reverted.cut"]))
 
         let mapping = ["from": "old.wav", "to": "/tmp/moved/copy.wav"]
         let relink = try request("relink", ["mappings": [mapping], "in_place": true])
@@ -31,6 +45,22 @@ final class MCPFileJobTests: XCTestCase {
         XCTAssertThrowsError(try request("replace", source.merging(["confirm": true]) { _, new in new }))
         let apply = try request("replace", source.merging(["confirm": true, "in_place": true]) { _, new in new })
         XCTAssertTrue(apply.arguments.contains("--in-place"))
+    }
+
+    func testSavedHistoryRoutesSelectOneStateAndRequireANewRestoreDestination() throws {
+        func request(_ tool: String, _ fields: [String: Any] = [:]) throws -> MCPFileRequest {
+            let base: [String: Any] = ["operation_id": UUID().uuidString, "project_path": "/tmp/project.cut"]
+            return try MCPFileRequest(tool: tool, fields: base.merging(fields) { _, new in new })
+        }
+        let compare = try request("history_file_compare", ["history_index": 1])
+        XCTAssertEqual(compare.arguments, ["history", "compare", "--json", "--project", "/tmp/project.cut", "--history-index", "1"])
+        XCTAssertThrowsError(try request("history_file_compare", ["history_index": 0, "before_project_path": "/tmp/before.cut"]))
+        XCTAssertThrowsError(try request("history_file_restore_copy", ["history_index": 0]))
+        let restore = try request("history_file_restore_copy", ["history_index": 0, "out_project": "/tmp/restored.cut"])
+        XCTAssertEqual(restore.arguments, ["history", "restore-copy", "--json", "--project", "/tmp/project.cut",
+                                           "--out-project", "/tmp/restored.cut", "--history-index", "0"])
+        let print = try request("project_file_document_print")
+        XCTAssertEqual(print.arguments, ["project", "document", "print", "--json", "/tmp/project.cut"])
     }
 
     func testFileSilenceForwardsBlipDurationOnlyForNewScans() throws {
@@ -235,7 +265,12 @@ final class MCPFileJobTests: XCTestCase {
                                     "tracks": "audio", "audio_stream_index": Int.max]
         _ = try schema.validate(tool: "export_file_ranges_join", arguments: args)
         let request = try MCPFileRequest(tool: "export_file_ranges_join", fields: args)
-        XCTAssertEqual(request.arguments.suffix(3), ["--", path, "9007199254740993/9223372036854775807-1"])
+        XCTAssertEqual(request.arguments.prefix(3), ["export", "clips", "join"])
+        XCTAssertEqual(request.arguments.suffix(5), ["--mode", "smart", "--snap", "nearest", "--stdin"])
+        let joined = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(request.input)) as? [String: Any])
+        XCTAssertEqual(joined["file"] as? String, path)
+        XCTAssertEqual(joined["output"] as? String, output)
+        XCTAssertEqual(joined["clips"] as? [[String: String]], [["from": "9007199254740993/9223372036854775807", "to": "1"]])
         XCTAssertTrue(request.arguments.contains("9223372036854775807"))
         XCTAssertThrowsError(try schema.validate(tool: "export_file_ranges_join", arguments: args.merging(["ranges_file": "/tmp/list.csv"]) { _, new in new }))
         XCTAssertThrowsError(try schema.validate(tool: "export_file_ranges_join", arguments: args.merging(["audio_stream_index": true]) { _, new in new }))
@@ -282,6 +317,24 @@ final class MCPFileJobTests: XCTestCase {
             let request = try MCPFileRequest(tool: tool, fields: schemas.validate(tool: tool, arguments: fields))
             XCTAssertEqual(request.arguments, ["analysis", "sidecar", action, "--json", "--project", "/tmp/A.cut", "--", "/tmp/B.mov"])
         }
+    }
+
+    func testCacheClearRequiresConfirmationAndForwardsTheScopeAndLiveProtection() throws {
+        let schemas = try MCPSchemas.loaded.get()
+        let tool = "analysis_file_cache_clear"
+        let token = String(repeating: "1", count: 64)
+        var fields: [String: Any] = ["operation_id": UUID().uuidString, "folder": "/tmp/Caches",
+                                    "project_path": "/tmp/A.cut", "location": "media", "clear_tokens": [token]]
+        XCTAssertThrowsError(try MCPFileRequest(tool: tool, fields: fields))
+        fields["confirm"] = true
+        let protectedPath = URL(fileURLWithPath: "/tmp/Live recording.mov")
+        let request = try MCPFileRequest(tool: tool, validatedFields: schemas.validate(tool: tool, arguments: fields),
+                                         cacheProtection: [protectedPath])
+        XCTAssertEqual(request.arguments, ["analysis", "cache", "clear", "--json", "--folder", "/tmp/Caches",
+                                           "--project", "/tmp/A.cut", "--location", "media", "--confirm", "--select", token, "--stdin"])
+        XCTAssertEqual(try JSONDecoder().decode([String].self, from: XCTUnwrap(request.input)), [protectedPath.path])
+        fields["clear_tokens"] = [token, token]
+        XCTAssertThrowsError(try MCPFileRequest(tool: tool, fields: fields))
     }
 
     func testSceneAndRefreshRequestsForwardNativeScopeAndPolicy() throws {
@@ -370,6 +423,32 @@ final class MCPFileJobTests: XCTestCase {
     }
 
     @MainActor
+    func testLargeRangeJoinUsesStructuredStandardInput() async throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let mock = folder.appendingPathComponent("range-cli")
+        try """
+        #!/bin/sh
+        [ "$*" = 'export clips join --json --mode smart --snap nearest --stdin' ] || exit 2
+        bytes=$(/usr/bin/wc -c)
+        [ "$bytes" -gt 1048576 ] || exit 3
+        """.write(to: mock, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: mock.path)
+
+        let jobs = MCPFileJobs(executable: mock)
+        defer { jobs.disable() }
+        let id = UUID()
+        var ranges = Array(repeating: ["from": "1/9007199254740993", "to": "2/9007199254740993"], count: 29_999)
+        ranges.append(["from": "0", "to": "1"])
+        _ = try jobs.start(tool: "export_file_ranges_join", arguments: [
+            "operation_id": id.uuidString, "file": "/tmp/input.mov", "output": "/tmp/out.mov", "ranges": ranges
+        ])
+        let status = try await wait(jobs, id: id)
+        XCTAssertEqual(status["state"] as? String, "succeeded", String(describing: status))
+    }
+
+    @MainActor
     func testFileJobReplayResultAndCleanup() async throws {
         let cli = productsDirectory.appendingPathComponent("mpcut")
         XCTAssertTrue(FileManager.default.isExecutableFile(atPath: cli.path))
@@ -382,8 +461,22 @@ final class MCPFileJobTests: XCTestCase {
         XCTAssertThrowsError(try jobs.start(tool: "cli_help_read", arguments: args))
         let completed = try await wait(jobs, id: id)
         XCTAssertEqual(completed["state"] as? String, "succeeded")
-        let report = try XCTUnwrap(completed["result"] as? [String: String])
-        XCTAssertFalse(try XCTUnwrap(report["version"]).isEmpty)
+        let report = try XCTUnwrap(completed["result"] as? [String: Any])
+        XCTAssertEqual(report["version"] as? String, MPCutRelease.version)
+        XCTAssertNotNil(UUID(uuidString: try XCTUnwrap(report["build_id"] as? String)))
+        XCTAssertEqual(report["project_schema_versions"] as? [Int], [9])
+        let capabilities = try XCTUnwrap(report["detector_capabilities"] as? [String: Bool])
+        XCTAssertEqual(capabilities["standalone_fixed_grid"], true)
+        XCTAssertEqual(capabilities["auto_backend"], true)
+        XCTAssertEqual(capabilities["cpu_only_backend"], true)
+        XCTAssertEqual(capabilities["tile_trail"], ParticipantAnalysis.isAvailable)
+        XCTAssertEqual(capabilities["auto_feed_layout"], ParticipantAnalysis.supportsFeedLayouts)
+        XCTAssertEqual(capabilities["gallery_grid"], ParticipantAnalysis.supportsGalleryHint)
+        XCTAssertEqual(capabilities["adaptive_sampling"], ParticipantAnalysis.supportsAdaptiveSampling)
+        XCTAssertNotNil(capabilities["gpu_required_backend"])
+        if !ParticipantAnalysis.isAvailable {
+            XCTAssertEqual(capabilities["gpu_required_backend"], false)
+        }
         let page = try jobs.read(id: id, offset: 0, limit: 4)
         let decoded = try XCTUnwrap(Data(base64Encoded: XCTUnwrap(page["base64"] as? String)))
         XCTAssertEqual(decoded.count, 4)

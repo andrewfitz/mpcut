@@ -3,6 +3,39 @@ import Darwin
 import Foundation
 import SQLite3
 
+extension SidecarDatabase {
+    var hasSceneAttempts: Bool {
+        get throws {
+            try integer("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'scene_attempts')") != 0
+        }
+    }
+
+    /// The caller holds the database write transaction. Publish the entire scene schema with its first attempt.
+    func ensureSceneTables() throws {
+        guard try !hasSceneAttempts else { return }
+        try execute("""
+            CREATE TABLE scene_attempts(
+                ordinal INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, generation INTEGER NOT NULL,
+                scope TEXT NOT NULL, operation TEXT, owner TEXT, fence INTEGER NOT NULL,
+                expires REAL NOT NULL, state INTEGER NOT NULL DEFAULT 0,
+                covered REAL NOT NULL DEFAULT 0, marker_count INTEGER NOT NULL DEFAULT 0,
+                checkpoint BLOB, checkpoint_digest BLOB, logical_size INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(generation, scope, operation)
+            );
+            CREATE INDEX scene_attempt_scope ON scene_attempts(generation, scope, ordinal);
+            CREATE TABLE scene_markers(
+                attempt TEXT NOT NULL, ordinal INTEGER NOT NULL, value BLOB NOT NULL, digest BLOB NOT NULL,
+                logical_size INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(attempt, ordinal)
+            );
+            CREATE TABLE scene_reports(
+                generation INTEGER NOT NULL, scope TEXT NOT NULL, attempt TEXT NOT NULL,
+                PRIMARY KEY(generation, scope)
+            );
+            CREATE INDEX scene_report_attempt ON scene_reports(attempt);
+            """)
+    }
+}
+
 struct SceneAttemptClaim: Sendable {
     let database: URL
     let attemptID: String
@@ -16,6 +49,7 @@ struct SceneAttemptClaim: Sendable {
 
 struct SceneAttemptSnapshot: Sendable {
     let attemptID: String
+    let operationID: String?
     let fence: Int64
     let checkpoint: Data
     let markerBatches: [Data]
@@ -55,6 +89,7 @@ extension AnalysisSidecar {
     }
 
     static func persistedSceneAttempts(in db: SidecarDatabase, current: Bool) throws -> [PersistedSceneAttempt] {
+        guard try db.hasSceneAttempts else { return [] }
         let generation = try self.generation(db)
         return try db.statement("""
             SELECT id, scope, generation, state, covered, owner, expires, EXISTS(
@@ -322,6 +357,7 @@ extension AnalysisSidecar {
                 registrationWritten = true
             }
             let generation = try generation(db)
+            try db.ensureSceneTables()
             let context = [String(generation), scope]
             if let operation, let attempt = try attemptRow(db, condition: "generation = ? AND scope = ? AND operation = ?",
                                                            bindings: context + [operation]) {
@@ -579,6 +615,7 @@ extension AnalysisSidecar {
 
     private func strictSceneSnapshot<T>(_ read: (SidecarDatabase, Int64) throws -> T?) throws -> T? {
         guard Self.readsEnabled, let db = try openReadSnapshot(), try currentStamp(db) != nil else { return nil }
+        guard try db.hasSceneAttempts else { return nil }
         let result = try read(db, generation(db))
         try checkSource()
         return result
@@ -586,6 +623,7 @@ extension AnalysisSidecar {
 
     private struct AttemptRow {
         let id: String
+        let operationID: String?
         let owner: String?
         let fence: Int64
         let expires: Double
@@ -618,13 +656,14 @@ extension AnalysisSidecar {
 
     private func attemptRow(_ db: SidecarDatabase, condition: String, bindings: [String]) throws -> AttemptRow? {
         try db.statement("""
-            SELECT id, owner, fence, expires, state, covered, marker_count, generation FROM scene_attempts
+            SELECT id, owner, fence, expires, state, covered, marker_count, generation, operation FROM scene_attempts
             WHERE \(condition) ORDER BY ordinal DESC LIMIT 1
             """, bindings) { query in
             let step = sqlite3_step(query)
             if step == SQLITE_DONE { return nil }
             guard step == SQLITE_ROW, let id = sqlite3_column_text(query, 0) else { throw db.error() }
-            return AttemptRow(id: String(cString: id), owner: sqlite3_column_text(query, 1).map(String.init(cString:)),
+            return AttemptRow(id: String(cString: id), operationID: sqlite3_column_text(query, 8).map(String.init(cString:)),
+                              owner: sqlite3_column_text(query, 1).map(String.init(cString:)),
                               fence: sqlite3_column_int64(query, 2), expires: sqlite3_column_double(query, 3),
                               state: sqlite3_column_int(query, 4), covered: sqlite3_column_double(query, 5),
                               generation: sqlite3_column_int64(query, 7), markerCount: Int(sqlite3_column_int64(query, 6)))
@@ -632,7 +671,7 @@ extension AnalysisSidecar {
     }
 
     private func checkpoint(_ attempt: AttemptRow, db: SidecarDatabase) throws -> Data? {
-        try db.statement("SELECT checkpoint, checkpoint_digest, \(db.logicalSizeColumn) FROM scene_attempts WHERE id = ?",
+        try db.statement("SELECT checkpoint, checkpoint_digest, logical_size FROM scene_attempts WHERE id = ?",
                          [attempt.id]) { query in
             guard sqlite3_step(query) == SQLITE_ROW else { throw db.error() }
             return Self.readVerifiedSceneBlob(query, context: attempt.checkpointContext(attempt.markerCount))
@@ -642,6 +681,7 @@ extension AnalysisSidecar {
     /// Scope reports consist of an attempt plus its ordered marker batches. The
     /// current source generations can have different local IDs in the two databases.
     func mergeCompletedSceneAttempts(from peer: CopySnapshot, into db: SidecarDatabase, cancelled: () -> Bool) throws {
+        guard try peer.db.hasSceneAttempts else { return }
         let theirs = try generation(peer.db), ours = try generation(db)
         try peer.db.statement("SELECT scope, attempt FROM scene_reports WHERE generation = ?", [String(theirs)]) { query in
             var step = sqlite3_step(query)
@@ -652,17 +692,18 @@ extension AnalysisSidecar {
                 }
                 let scope = String(cString: rawScope), id = String(cString: rawID)
                 let key = Self.sceneRevision(scope: scope, completed: true)
+                try db.ensureSceneTables()
                 let local = try activeAttempt(db, generation: ours, scope: scope)
                 if local?.id != id {
-                    let incoming = try changeTime(key, in: peer.db, at: peer.store.url)
-                    let current = try changeTime(key, in: db, at: url)
+                    let incoming = try changeTime(key, in: peer.db)
+                    let current = try changeTime(key, in: db)
                     if local == nil || incoming > current {
                         try db.execute("SAVEPOINT import_scene")
                         if try importCompletedAttempt(id, from: peer.db, to: db, generation: ours, cancelled: cancelled) {
                             try db.update("INSERT OR REPLACE INTO scene_reports(generation, scope, attempt) VALUES(?, ?, ?)",
                                           [String(ours), scope, id])
                             try db.update("INSERT OR REPLACE INTO sidecar_changes(name, changed) VALUES(?, ?)",
-                                          [key, String(incoming.recorded ? incoming.time : -incoming.time)])
+                                          [key, String(incoming)])
                             try pruneSceneHistory(db, generation: ours)
                         } else { try db.execute("ROLLBACK TO import_scene") }
                         try db.execute("RELEASE import_scene")
@@ -693,7 +734,7 @@ extension AnalysisSidecar {
             }
         }
         let hasCheckpoint = try source.statement("""
-            SELECT checkpoint, checkpoint_digest, \(source.logicalSizeColumn), scope, operation, fence, covered, marker_count
+            SELECT checkpoint, checkpoint_digest, logical_size, scope, operation, fence, covered, marker_count
             FROM scene_attempts WHERE id = ?
             """, [id]) { row in
             guard sqlite3_step(row) == SQLITE_ROW,
@@ -707,7 +748,7 @@ extension AnalysisSidecar {
         }
         guard hasCheckpoint else { return false }
         return try source.statement("""
-            SELECT value, digest, \(source.logicalSizeColumn), ordinal FROM scene_markers WHERE attempt = ? ORDER BY ordinal
+            SELECT value, digest, logical_size, ordinal FROM scene_markers WHERE attempt = ? ORDER BY ordinal
             """, [id]) { row in
             var count = 0
             var step = sqlite3_step(row)
@@ -728,7 +769,7 @@ extension AnalysisSidecar {
 
     private func snapshot(_ attempt: AttemptRow, db: SidecarDatabase) throws -> SceneAttemptSnapshot? {
         guard let checkpoint = try checkpoint(attempt, db: db) else { return nil }
-        return try db.statement("SELECT value, digest, \(db.logicalSizeColumn) FROM scene_markers WHERE attempt = ? ORDER BY ordinal", [attempt.id]) { query in
+        return try db.statement("SELECT value, digest, logical_size FROM scene_markers WHERE attempt = ? ORDER BY ordinal", [attempt.id]) { query in
             var markers: [Data] = []
             var step = sqlite3_step(query)
             while step == SQLITE_ROW {
@@ -740,7 +781,7 @@ extension AnalysisSidecar {
             }
             guard step == SQLITE_DONE else { throw db.error() }
             guard markers.count == attempt.markerCount else { return nil }
-            return SceneAttemptSnapshot(attemptID: attempt.id, fence: attempt.fence,
+            return SceneAttemptSnapshot(attemptID: attempt.id, operationID: attempt.operationID, fence: attempt.fence,
                                         checkpoint: checkpoint, markerBatches: markers,
                                         coveredThrough: attempt.covered, completed: attempt.state == 1)
         }

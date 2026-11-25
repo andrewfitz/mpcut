@@ -1,0 +1,177 @@
+[
+  {
+    "name": "analysis_file_cache_settings_read",
+    "description": "Read where MPCut writes new cutcaches and whether the configured shared folder is available. Poll file_job_status_read with the returned job_id.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Fresh UUID for a distinct file job. Reuse it to retry identical arguments."
+        }
+      },
+      "required": [
+        "operation_id"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "analysis_file_cache_settings_set",
+    "description": "Select where MPCut writes new cutcaches. Poll file_job_status_read with the returned job_id.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Fresh UUID for a distinct file job. Reuse it to retry identical arguments."
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "media",
+            "project",
+            "disk"
+          ]
+        },
+        "folder": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Optional writable shared folder when selecting disk mode. Omit it to retain the configured folder."
+        }
+      },
+      "required": [
+        "operation_id",
+        "mode"
+      ],
+      "if": {
+        "required": [
+          "folder"
+        ]
+      },
+      "then": {
+        "properties": {
+          "mode": {
+            "const": "disk"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "analysis_file_cache_preview",
+    "description": "Discover cutcaches within an explicit folder. Review cache details, reclaimable bytes and clear tokens before selecting copies. Poll file_job_status_read with the returned job_id.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Fresh UUID for a distinct file job. Reuse it to retry identical arguments."
+        },
+        "folder": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to the folder to search recursively."
+        },
+        "project_path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Optional saved project whose media and history are protected."
+        },
+        "location": {
+          "type": "string",
+          "enum": [
+            "media",
+            "project",
+            "disk"
+          ],
+          "description": "Limit results to this cache location."
+        }
+      },
+      "required": [
+        "operation_id",
+        "folder"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "analysis_file_cache_clear",
+    "description": "Remove only the confirmed cache copies using tokens from a preview with the same folder, project and location. A changed selection requires a fresh preview. Poll file_job_status_read with the returned job_id.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Fresh UUID for a distinct file job. Reuse it to retry identical arguments."
+        },
+        "folder": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to the folder to search recursively."
+        },
+        "project_path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Optional saved project whose media and history are protected."
+        },
+        "location": {
+          "type": "string",
+          "enum": [
+            "media",
+            "project",
+            "disk"
+          ],
+          "description": "Limit results to this cache location."
+        },
+        "clear_tokens": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 500,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "confirm": {
+          "type": "boolean",
+          "const": true,
+          "description": "Confirm removal of the selected cache copies."
+        }
+      },
+      "required": [
+        "operation_id",
+        "folder",
+        "clear_tokens",
+        "confirm"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "openWorldHint": false
+    }
+  }
+]

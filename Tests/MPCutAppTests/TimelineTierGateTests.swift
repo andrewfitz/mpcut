@@ -378,7 +378,7 @@ final class TimelineTierGateTests: XCTestCase {
             let sidecarStageNameLength = ".mpcut-XXXXXX".utf8.count
             while true {
                 let files = try FileManager.default.contentsOfDirectory(atPath: directory.path)
-                    .filter { $0 != donor.lastPathComponent && !$0.hasSuffix(".cutdb") }.sorted()
+                    .filter { $0 != donor.lastPathComponent && !$0.hasSuffix(".cutcache") }.sorted()
                 // Background analysis may still be publishing its sidecar after the edit settles.
                 // Wait for its mkstemp staging file, then assert against the full listing.
                 guard ContinuousClock.now < deadline,

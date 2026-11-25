@@ -210,7 +210,7 @@
         },
         "mode": {
           "type": "string",
-          "description": "Defaults to Smart Trim for visible still picture. Other outputs use the native defaults.",
+          "description": "Defaults to Smart Trim for visible still picture. Other outputs use Settings → Export → Default movie export mode, or their native defaults.",
           "enum": [
             "smart",
             "copy",
@@ -224,11 +224,12 @@
             "hevc",
             "prores",
             "jpeg"
-          ]
+          ],
+          "description": "Video codec for Re-encode. When omitted in a live editor, the export uses Settings → Export → Re-encode video: an ordinary or multicam Re-encode falls back to H.264 when the destination extension cannot hold it, and a still project keeps its own format's codec. File jobs and the CLI use the factory value, H.264."
         },
         "quality": {
           "type": "string",
-          "description": "Use smaller, balanced or high for H.264 and HEVC. Use 422-lt, 422 or 422-hq for ProRes. For ordinary movie export, requires Re-encode. Still picture also supports these settings in Smart Trim.",
+          "description": "Use smaller, balanced or high for H.264 and HEVC. Use 422-lt, 422 or 422-hq for ProRes. For ordinary movie export, requires Re-encode. Still picture also supports these settings in Smart Trim. When omitted in a live editor, the export uses Settings → Export → Quality or ProRes quality for the chosen codec. File jobs and the CLI use balanced or 422.",
           "enum": [
             "smaller",
             "balanced",
@@ -268,7 +269,7 @@
             "downmix_mono",
             "downmix_stereo"
           ],
-          "description": "Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track."
+          "description": "Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track. When omitted in a live multicam editor, the export uses Settings → Export → Multicam audio. File jobs and the CLI use separate tracks."
         },
         "still_timing": {
           "type": "string",
@@ -351,7 +352,7 @@
         },
         "mode": {
           "type": "string",
-          "description": "Defaults to Smart Trim for visible still picture. Other outputs use the native defaults.",
+          "description": "Defaults to Smart Trim for visible still picture. Other outputs use Settings → Export → Default movie export mode, or their native defaults.",
           "enum": [
             "smart",
             "copy",
@@ -365,11 +366,12 @@
             "hevc",
             "prores",
             "jpeg"
-          ]
+          ],
+          "description": "Video codec for Re-encode. When omitted in a live editor, the export uses Settings → Export → Re-encode video: an ordinary or multicam Re-encode falls back to H.264 when the destination extension cannot hold it, and a still project keeps its own format's codec. File jobs and the CLI use the factory value, H.264."
         },
         "quality": {
           "type": "string",
-          "description": "Use smaller, balanced or high for H.264 and HEVC. Use 422-lt, 422 or 422-hq for ProRes. For ordinary movie export, requires Re-encode. Still picture also supports these settings in Smart Trim.",
+          "description": "Use smaller, balanced or high for H.264 and HEVC. Use 422-lt, 422 or 422-hq for ProRes. For ordinary movie export, requires Re-encode. Still picture also supports these settings in Smart Trim. When omitted in a live editor, the export uses Settings → Export → Quality or ProRes quality for the chosen codec. File jobs and the CLI use balanced or 422.",
           "enum": [
             "smaller",
             "balanced",
@@ -409,7 +411,7 @@
             "downmix_mono",
             "downmix_stereo"
           ],
-          "description": "Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track."
+          "description": "Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track. When omitted in a live multicam editor, the export uses Settings → Export → Multicam audio. File jobs and the CLI use separate tracks."
         },
         "still_timing": {
           "type": "string",
@@ -625,7 +627,8 @@
         },
         "container": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "description": "Container for every queued file. When omitted in a live editor, an H.264 or HEVC Re-encode of ordinary ranges uses Settings → Export → H.264 and HEVC container unless it is Automatic; otherwise MOV, or each still project's own format. ProRes stays MOV."
         },
         "tracks": {
           "type": "string",
@@ -654,7 +657,8 @@
             "hevc",
             "prores",
             "jpeg"
-          ]
+          ],
+          "description": "Video codec for Re-encode. When omitted in a live editor, Re-encode with picture of ordinary queued ranges uses Settings → Export → Re-encode video. Ranges with still picture or Tiles keep their own format or H.264."
         },
         "quality": {
           "type": "string",
@@ -665,7 +669,8 @@
             "422-lt",
             "422",
             "422-hq"
-          ]
+          ],
+          "description": "When omitted in a live editor, Re-encode with picture of ordinary queued ranges uses Settings → Export → Quality or ProRes quality for the chosen codec; other outputs use balanced or 422."
         },
         "audio": {
           "type": "string",
@@ -703,7 +708,7 @@
             "downmix_mono",
             "downmix_stereo"
           ],
-          "description": "Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track."
+          "description": "Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track. When omitted in a live multicam editor, the queue uses Settings → Export → Multicam audio; other callers use separate tracks."
         },
         "still_timing": {
           "type": "string",
@@ -750,7 +755,8 @@
         },
         "container": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "description": "Container for every queued file. When omitted in a live editor, an H.264 or HEVC Re-encode of ordinary ranges uses Settings → Export → H.264 and HEVC container unless it is Automatic; otherwise MOV, or each still project's own format. ProRes stays MOV."
         },
         "tracks": {
           "type": "string",
@@ -779,7 +785,8 @@
             "hevc",
             "prores",
             "jpeg"
-          ]
+          ],
+          "description": "Video codec for Re-encode. When omitted in a live editor, Re-encode with picture of ordinary queued ranges uses Settings → Export → Re-encode video. Ranges with still picture or Tiles keep their own format or H.264."
         },
         "quality": {
           "type": "string",
@@ -790,7 +797,8 @@
             "422-lt",
             "422",
             "422-hq"
-          ]
+          ],
+          "description": "When omitted in a live editor, Re-encode with picture of ordinary queued ranges uses Settings → Export → Quality or ProRes quality for the chosen codec; other outputs use balanced or 422."
         },
         "audio": {
           "type": "string",
@@ -828,7 +836,7 @@
             "downmix_mono",
             "downmix_stereo"
           ],
-          "description": "Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track."
+          "description": "Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track. When omitted in a live multicam editor, the queue uses Settings → Export → Multicam audio; other callers use separate tracks."
         },
         "still_timing": {
           "type": "string",

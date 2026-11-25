@@ -48,7 +48,8 @@ final class MCPLifecycleTests: XCTestCase {
         let editable = try XCTUnwrap(properties["key"]?["enum"] as? [String])
         let current = try await call("preferences_read", [:])
         XCTAssertEqual(Set(current.keys), Set(EditorPreferences.Key.allCases.map(\.rawValue)))
-        XCTAssertEqual(Set(current.keys), Set(editable + ["automation_local_mcp_enabled"]))
+        XCTAssertEqual(Set(current.keys), Set(editable + EditorPreferences.Key.agentReadOnly.map(\.rawValue)))
+        XCTAssertTrue(Set(editable).isDisjoint(with: EditorPreferences.Key.agentReadOnly.map(\.rawValue)))
         for key in editable {
             let value = try XCTUnwrap(current[key], key)
             let arguments: [String: Any] = ["key": key, "value": value, "operation_id": UUID().uuidString]
@@ -191,4 +192,180 @@ final class MCPLifecycleTests: XCTestCase {
         XCTAssertTrue(session.editor.historyActions.isEmpty)
         XCTAssertEqual(session.editor.mcpRevision, 0)
     }
+
+    // MARK: Preference contract
+
+    private func preferenceCall(_ sessions: ProjectSessions, _ name: String, _ arguments: [String: Any] = [:]) async throws -> [String: Any] {
+        let result = try await sessions.mcpLifecycle(tool: name, arguments: arguments, session: nil, checkAccess: {})
+        return try XCTUnwrap(result)
+    }
+
+    func testPreferencesReadListsTheWholeScheduleWithItsFactoryValues() async throws {
+        let sessions = ProjectSessions(preferences: EditorPreferences())
+        let values = try await preferenceCall(sessions, "preferences_read")
+        let schedule: [String: Any] = [
+            "automation_local_mcp_enabled": false, "media_auto_refresh_enabled": false, "analysis_sidecar_reuse_enabled": true,
+            "history_max_steps": 50, "timeline_source_time_ticks_enabled": false, "timeline_snap_target": "off",
+            "timeline_large_previews_enabled": false, "playback_preview_volume_fraction": 1, "playback_preview_muted": false,
+            "playback_scrub_audio_enabled": true, "export_movie_default_mode": "smart", "export_jpeg_default_preset": "review",
+            "export_tier_downgrade_warning_enabled": true, "silence_min_pause_seconds": 1.5,
+            "silence_max_blip_seconds": AudioWaveform.defaultMaxBlip, "silence_padding_per_side_seconds": 0.2,
+            "open_multiple_recordings_default_action": "ask", "recent_files_max_count": 10, "draft_recovery_prompt_enabled": false,
+            "scene_rescan_confirmation_enabled": true, "project_export_completion_message_enabled": true,
+            "timeline_cut_sections_default_enabled": true, "workspace_full_height_sidebar_enabled": false,
+            "multicam_track_label_width_points": 172, "still_placement_default_duration_seconds": 2, "gap_default_duration_seconds": 2,
+            "gap_default_color": "#000000", "still_timeline_default_width_pixels": 1920, "still_timeline_default_height_pixels": 1080,
+            "still_timeline_default_frame_rate": 30, "still_timeline_default_codec": "h264", "timeline_time_display": "milliseconds",
+            "playback_default_speed": 1, "playback_cut_preview_preroll_seconds": 1, "playback_cut_preview_postroll_seconds": 1,
+            "playback_viewer_force_sdr_enabled": false, "playback_monitor_force_sdr_enabled": false,
+            "playback_monitor_clean_feed_enabled": false, "playback_monitor_placement": "other_display",
+            "analysis_scene_auto_scan_enabled": false, "analysis_silence_auto_scan_enabled": false,
+            "tiles_scan_default_layout": "video_call", "tiles_scan_default_grid_columns": 2, "tiles_scan_default_grid_rows": 2,
+            "tiles_scan_default_detail": "adaptive", "tiles_dialogue_default_min_hold_seconds": 1,
+            "tiles_dialogue_default_overlap_policy": "hold", "tiles_dialogue_default_offscreen_policy": "hold",
+            "transcript_default_engine": "", "transcript_default_speaker_identification_enabled": false,
+            "transcript_default_model_download_enabled": false, "transcript_follow_playback_default_enabled": true,
+            "transcript_reader_text_size_points": 14, "transcript_edit_default_boundary_policy": "nearest_frame",
+            "transcript_tighten_default_retained_pause_seconds": 0.2, "transcript_default_filler_terms": "",
+            "transcript_export_default_format": "json", "transcript_caption_max_line_characters": 42, "transcript_caption_max_lines": 2,
+            "transcript_caption_max_cue_seconds": 6, "transcript_caption_speaker_labels_enabled": true,
+            "export_reencode_default_codec": "h264", "export_reencode_default_quality": "balanced", "export_prores_default_quality": "422",
+            "export_reencode_default_container": "automatic", "export_multicam_default_audio_layout": "separate_tracks",
+            "export_result_json_default_enabled": false, "resolve_send_open_timeline_default_enabled": true,
+            "export_start_folder_mode": "automatic", "export_finished_reveal_enabled": false,
+            "export_finished_notification_enabled": false, "export_finished_sound_enabled": false,
+            "analysis_shared_cache_max_bytes": 0, "draft_retention_days": 0, "automation_preferences_write_enabled": true,
+            "automation_file_replace_enabled": true
+        ]
+        XCTAssertEqual(Set(values.keys), Set(schedule.keys))
+        XCTAssertEqual(values.count, 76)
+        for (key, expected) in schedule {
+            let actual = try XCTUnwrap(values[key], key)
+            switch expected {
+            case let text as String: XCTAssertEqual(actual as? String, text, key)
+            case let flag as Bool:
+                XCTAssertEqual((actual as? NSNumber).map { CFGetTypeID($0) == CFBooleanGetTypeID() }, true, key)
+                XCTAssertEqual(actual as? Bool, flag, key)
+            default:
+                let number = try XCTUnwrap(actual as? NSNumber, key)
+                XCTAssertNotEqual(CFGetTypeID(number), CFBooleanGetTypeID(), key)
+                XCTAssertEqual(number.doubleValue, (expected as? NSNumber)?.doubleValue ?? .nan, accuracy: 1e-9, key)
+            }
+        }
+    }
+
+    func testPreferencesSetValidatesTypesAndRangesAndRefusesReadOnlyKeys() async throws {
+        let prefs = EditorPreferences()
+        let sessions = ProjectSessions(preferences: prefs)
+        let schemas = try MCPSchemas.loaded.get()
+        let accepted: [(String, Any)] = [
+            ("recent_files_max_count", 30), ("gap_default_color", "#a0b1c2"), ("still_timeline_default_width_pixels", 3840),
+            ("playback_default_speed", 0.125), ("export_reencode_default_codec", "prores"), ("export_prores_default_quality", "422-hq"),
+            ("export_reencode_default_quality", "smaller"), ("tiles_dialogue_default_overlap_policy", "visible_speaker"),
+            ("transcript_default_filler_terms", "um, uh"), ("transcript_default_engine", ""),
+            ("multicam_track_label_width_points", 106), ("workspace_full_height_sidebar_enabled", true),
+            ("transcript_edit_default_boundary_policy", "copy_safe"), ("tiles_scan_default_detail", "every_frame")
+        ]
+        for (key, value) in accepted {
+            let arguments: [String: Any] = ["operation_id": UUID().uuidString, "key": key, "value": value]
+            _ = try await preferenceCall(sessions, "preferences_set", try schemas.validate(tool: "preferences_set", arguments: arguments))
+        }
+        XCTAssertEqual(prefs.recentFilesLimit, 30)
+        XCTAssertEqual(prefs.gapColor, "#A0B1C2")
+        XCTAssertEqual(prefs.playbackSpeed, .eighth)
+        XCTAssertEqual(prefs.proresQuality, .proresHQ)
+        XCTAssertEqual(prefs.dialogueOverlap, .visibleSpeaker)
+        XCTAssertTrue(prefs.fullHeightSidebar)
+
+        let rejected: [(String, Any)] = [
+            ("recent_files_max_count", 31), ("recent_files_max_count", 2.5), ("recent_files_max_count", true),
+            ("still_timeline_default_height_pixels", 8194),
+            ("still_timeline_default_codec", "jpeg"), ("export_reencode_default_codec", "jpeg"),
+            ("export_reencode_default_quality", "422"), ("export_prores_default_quality", "balanced"),
+            ("playback_default_speed", 3), ("playback_cut_preview_preroll_seconds", 0.2), ("gap_default_color", "black"),
+            ("multicam_track_label_width_points", 400), ("tiles_scan_default_layout", "meeting"),
+            ("tiles_dialogue_default_overlap_policy", "visibleSpeaker"), ("transcript_reader_text_size_points", "14"),
+            ("transcript_caption_max_lines", 4), ("export_start_folder_mode", "desktop"), ("timeline_time_display", "timecode")
+        ]
+        for (key, value) in rejected {
+            XCTAssertThrowsError(try schemas.validate(tool: "preferences_set", arguments: [
+                "operation_id": UUID().uuidString, "key": key, "value": value
+            ]), "\(key) \(value)") { XCTAssertEqual(($0 as? MCPFailure)?.code, "invalid_arguments") }
+            do {
+                _ = try await preferenceCall(sessions, "preferences_set", ["key": key, "value": value])
+                XCTFail("\(key) accepted \(value)")
+            } catch let failure as MCPFailure {
+                XCTAssertEqual(failure.code, "invalid_arguments", key)
+                XCTAssertFalse(failure.message.isEmpty)
+            }
+        }
+        // The schema has no evenness keyword, so the app refuses an odd pixel count itself.
+        do {
+            _ = try await preferenceCall(sessions, "preferences_set", ["key": "still_timeline_default_width_pixels", "value": 1921])
+            XCTFail("An odd width was accepted")
+        } catch let failure as MCPFailure { XCTAssertTrue(failure.message.contains("even"), failure.message) }
+        XCTAssertEqual(prefs.recentFilesLimit, 30)
+        XCTAssertEqual(prefs.stillTimelineWidth, 3840)
+
+        for key in EditorPreferences.Key.agentReadOnly.map(\.rawValue) {
+            let value: Any = key.hasPrefix("automation_") ? false as Any : 1 as Any
+            XCTAssertThrowsError(try schemas.validate(tool: "preferences_set", arguments: [
+                "operation_id": UUID().uuidString, "key": key, "value": value
+            ]), key)
+            do {
+                _ = try await preferenceCall(sessions, "preferences_set", ["key": key, "value": value])
+                XCTFail("Agents cannot set \(key)")
+            } catch let failure as MCPFailure { XCTAssertEqual(failure.code, "invalid_arguments", key) }
+        }
+        XCTAssertTrue(prefs.agentsChangeSettings)
+        XCTAssertEqual(prefs.draftRetentionDays, 0)
+        XCTAssertEqual(prefs.sharedCacheLimitBytes, 0)
+    }
+
+    func testTurningOffAgentSettingsRefusesEveryWriteAndKeepsReads() async throws {
+        let prefs = EditorPreferences()
+        let sessions = ProjectSessions(preferences: prefs)
+        prefs.agentsChangeSettings = false
+        let before = try await preferenceCall(sessions, "preferences_read")
+        XCTAssertEqual(before["automation_preferences_write_enabled"] as? Bool, false)
+        for key in EditorPreferences.Key.allCases.map(\.rawValue) {
+            let value = try XCTUnwrap(before[key], key)
+            do {
+                _ = try await preferenceCall(sessions, "preferences_set", ["key": key, "value": value])
+                XCTFail("\(key) changed with agent settings off")
+            } catch let failure as MCPFailure {
+                XCTAssertEqual(failure.code, "settings_write_disabled", key)
+                XCTAssertTrue(failure.message.contains("Let agents change settings"), failure.message)
+            }
+        }
+        do {
+            _ = try await preferenceCall(sessions, "preferences_set", ["key": "history_max_steps", "value": 9])
+            XCTFail("History changed with agent settings off")
+        } catch let failure as MCPFailure { XCTAssertEqual(failure.code, "settings_write_disabled") }
+        XCTAssertEqual(prefs.historyLimit, 50)
+        XCTAssertThrowsError(try prefs.checkAgentWrite())
+        prefs.agentsChangeSettings = true
+        XCTAssertNoThrow(try prefs.checkAgentWrite())
+        _ = try await preferenceCall(sessions, "preferences_set", ["key": "history_max_steps", "value": 9])
+        XCTAssertEqual(prefs.historyLimit, 9)
+    }
+
+    func testLayoutCommandsWriteTheSharedPreferences() async throws {
+        let prefs = EditorPreferences()
+        let sessions = ProjectSessions(preferences: prefs)
+        let session = sessions.session(for: UUID())
+        defer { session.end() }
+        let set = try await sessions.mcpPresentation(
+            tool: "workspace_layout_set", arguments: ["action": "set_full_height_panel", "enabled": true],
+            session: session, checkAccess: {})
+        let state = try XCTUnwrap(set)
+        XCTAssertTrue(prefs.fullHeightSidebar)
+        XCTAssertEqual(state["full_height_panel"] as? Bool, true)
+        prefs.fullHeightSidebar = false
+        let layout = try await sessions.mcpPresentation(tool: "workspace_layout_read", arguments: [:],
+                                                        session: session, checkAccess: {})
+        let read = try XCTUnwrap(layout)
+        XCTAssertEqual(read["full_height_panel"] as? Bool, false)
+    }
 }
+

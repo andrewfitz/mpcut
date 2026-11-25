@@ -40,7 +40,7 @@ struct TranscriptEditorialForm: View {
     @State private var ordered: [Candidate] = []
     @State private var dismissed: Set<String> = []
     @State private var error: String?
-    @State private var boundary = TranscriptEditRequest.BoundaryPolicy.nearestFrame
+    @State private var boundary: TranscriptEditRequest.BoundaryPolicy
     @State private var isWorking = false
     @State private var hasSearched = false
     @State private var visibleLimit = 80
@@ -66,7 +66,8 @@ struct TranscriptEditorialForm: View {
     init(mode: TranscriptEditorialMode, indexes: [TranscriptIndex], attachmentLabels: [String: String], space: TranscriptSpace,
          startingText: String, playhead: RationalTime?, hasTarget: Bool, play: @escaping (TranscriptTake) -> Void,
          select: @escaping (TranscriptTake) -> Void, save: @escaping (TranscriptTake, String) throws -> Void,
-         addToOrdered: @escaping (TranscriptTake) -> Void, review: @escaping (TranscriptEditRequest.Action, [TranscriptTake], TranscriptEditRequest.BoundaryPolicy) async throws -> Void) {
+         addToOrdered: @escaping (TranscriptTake) -> Void, defaults: TranscriptSheetDefaults = .factory,
+         review: @escaping (TranscriptEditRequest.Action, [TranscriptTake], TranscriptEditRequest.BoundaryPolicy) async throws -> Void) {
         self.mode = mode
         self.indexes = indexes
         self.attachmentLabels = attachmentLabels
@@ -78,7 +79,17 @@ struct TranscriptEditorialForm: View {
         self.save = save
         self.addToOrdered = addToOrdered
         self.review = review
-        _text = State(initialValue: mode == .takes ? startingText : "")
+        _text = State(initialValue: Self.startingText(mode, selected: startingText, defaults: defaults))
+        _boundary = State(initialValue: defaults.boundary)
+    }
+
+    /// Compare Takes starts from the selection, Review Restarts and Fillers from the Settings filler terms.
+    static func startingText(_ mode: TranscriptEditorialMode, selected: String, defaults: TranscriptSheetDefaults) -> String {
+        switch mode {
+        case .takes: selected
+        case .script: ""
+        case .suggestions: defaults.fillerTerms
+        }
     }
 
     var body: some View {
@@ -299,8 +310,16 @@ struct TranscriptAuthoredForm: View {
     let apply: (TranscriptEditRequest.Action, [TranscriptAuthoredReview], TranscriptEditRequest.BoundaryPolicy) async throws -> Void
     @State private var order: [String] = []
     @State private var reviewTask: Task<Void, Never>?
-    @State private var policy = TranscriptEditRequest.BoundaryPolicy.nearestFrame
+    @State private var policy: TranscriptEditRequest.BoundaryPolicy
     @State private var error: String?
+
+    init(records: [TranscriptAuthoredReview], attachmentLabels: [String: String], defaults: TranscriptSheetDefaults = .factory,
+         apply: @escaping (TranscriptEditRequest.Action, [TranscriptAuthoredReview], TranscriptEditRequest.BoundaryPolicy) async throws -> Void) {
+        self.records = records
+        self.attachmentLabels = attachmentLabels
+        self.apply = apply
+        _policy = State(initialValue: defaults.boundary)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -400,11 +419,22 @@ struct TranscriptOrderedForm: View {
     let hasPlayhead: Bool
     let copy: ([TranscriptOrderedSelect]) async throws -> Void
     let review: (TranscriptEditRequest.Action, [TranscriptOrderedSelect], TranscriptEditRequest.BoundaryPolicy, String?) async throws -> Void
-    @State private var boundary = TranscriptEditRequest.BoundaryPolicy.nearestFrame
+    @State private var boundary: TranscriptEditRequest.BoundaryPolicy
     @State private var action = TranscriptEditRequest.Action.assemble
     @State private var name = ""
     @State private var error: String?
     @State private var task: Task<Void, Never>?
+
+    init(selects: Binding<[TranscriptOrderedSelect]>, hasTarget: Bool, hasPlayhead: Bool, defaults: TranscriptSheetDefaults = .factory,
+         copy: @escaping ([TranscriptOrderedSelect]) async throws -> Void,
+         review: @escaping (TranscriptEditRequest.Action, [TranscriptOrderedSelect], TranscriptEditRequest.BoundaryPolicy, String?) async throws -> Void) {
+        _selects = selects
+        self.hasTarget = hasTarget
+        self.hasPlayhead = hasPlayhead
+        self.copy = copy
+        self.review = review
+        _boundary = State(initialValue: defaults.boundary)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {

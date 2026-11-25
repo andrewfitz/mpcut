@@ -28,16 +28,16 @@ struct TranscriptExternalCacheDescriptor: Encodable {
     let restart: Bool
 
     init?(track: TranscriptJobTrack, restart: Bool) {
-        guard track.recognize, track.unavailable == nil, let stream = track.streamIndex,
+        guard track.recognize, track.unavailable == nil, track.streamIndex != nil,
               let source = Snapshot(track.file), track.sourceIsCurrent, source.isCurrent else { return nil }
         self.source = source
         audio = track.stagedAudioSnapshot.flatMap { $0.isCurrent ? $0 : nil }
         self.restart = restart
-        if AnalysisSidecar.readsEnabled, track.hasReusableEvidence, !AnalysisSidecar.isExcluded(track.file, in: AnalysisSidecar.excludedSources),
+        if track.hasReusableEvidence,
            let directory = try? TranscriptRecognitionClaims.directory() {
-            scope = Self.scope(for: track.file, stream: stream)
+            scope = track.evidence
             self.directory = directory.path
-            write = AnalysisSidecar.automaticWritesEnabled
+            write = true
             // The provider publishes the exchange version that this folder says MPCut reads.
             TranscriptRecognitionExchange.declareReader(in: directory)
         } else {
@@ -45,11 +45,6 @@ struct TranscriptExternalCacheDescriptor: Encodable {
             directory = nil
             write = false
         }
-    }
-
-    static func scope(for source: URL, stream: Int) -> String {
-        let path = AnalysisSidecar.canonicalSource(source).path
-        return TranscriptStore.digest(Data("\(path)\u{0}\(stream)".utf8))
     }
 
     static func claimID(scope: String, key: String) -> String {

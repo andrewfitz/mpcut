@@ -12,7 +12,7 @@ struct EditorView: View {
     @State private var sourceRangesPresented = false
 
     var body: some View {
-        EditorWorkspace(viewer: viewer, transport: transport, timeline: timeline, status: status,
+        EditorWorkspace(viewer: viewer, transport: transport, timeline: timeline, status: status, preferences: editor.preferences,
                         showsTimeline: !editor.isEmpty || editor.hasHistory,
                         showsStatus: !editor.isEmpty || editor.hasHistory || editor.isBusy || editor.lastExportedURL != nil,
                         showsSidebar: (presentation.sequenceTranscriptVisible || presentation.sequenceParticipantsVisible) &&
@@ -34,7 +34,7 @@ struct EditorView: View {
             }
         }
         .sheet(item: $editor.projectMediaRequest, onDismiss: openReplacementTranscription) { request in
-            ProjectMediaSheet(jobs: editor.projectMediaJobs, request: request, archive: { editor.projectMediaArchive },
+            ProjectMediaSheet(jobs: editor.projectMediaJobs, preferences: editor.preferences, request: request, archive: { editor.projectMediaArchive },
                               revision: { .init(generation: editor.mcpGeneration, edit: editor.mcpRevision) }, isMulticam: false,
                               status: editor.mediaStatus(for:),
                               relinkBatch: { try await editor.relinkProjectMedia($0) },
@@ -146,7 +146,7 @@ struct EditorView: View {
                         AudioPreviewNotice(preview: editor.preview)
                     }
             } else {
-                ViewerPanel(preview: editor.preview, isEmpty: editor.isEmpty, isBusy: editor.isBusy,
+                ViewerPanel(preview: editor.preview, preferences: editor.preferences, isEmpty: editor.isEmpty, isBusy: editor.isBusy,
                             canAddMulticam: multicam.canChooseSources, add: editor.chooseFiles,
                             addMulticam: addMulticam)
                     .overlay {
@@ -248,6 +248,7 @@ struct EditorView: View {
                 await editor.outputThumbnail(at: time, size: size, revision: revision)
             }
         }
+        timeline.cutSectionsHidden = $presentation.cutSectionsHidden
         timeline.tileContent = editor.tileTimeline
         timeline.showTileFeeds = $showTileFeeds
         if editor.canEdit {
@@ -509,6 +510,7 @@ struct AudioPreviewNotice: View {
 
 private struct ViewerPanel: View {
     @ObservedObject var preview: SequencePreview
+    let preferences: EditorPreferences
     let isEmpty: Bool
     let isBusy: Bool
     let canAddMulticam: Bool
@@ -538,7 +540,7 @@ private struct ViewerPanel: View {
             } else {
                 EditorPreview(accessibilityTitle: "Movie preview", issue: preview.issue,
                               audioWarning: preview.audioWarning, pictureNotice: preview.pictureNotice) {
-                    PreviewView(preview: preview)
+                    PreviewView(preview: preview, preferences: preferences)
                 }
             }
         }

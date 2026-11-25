@@ -176,7 +176,7 @@ final class StillEditorModelTests: XCTestCase {
         try await waitUntil { !editor.isBusy }
         XCTAssertNil(editor.alert, editor.alert?.message ?? "")
         let attached = try XCTUnwrap(editor.stillProject.stillSoundtrack)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: media.url.appendingPathExtension("cutdb").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: media.url.appendingPathExtension("cutcache").path))
         XCTAssertEqual(attached.file, media.url.resolvingSymlinksInPath().path)
         XCTAssertEqual(attached.to - attached.from, soundtrackDuration)
         XCTAssertEqual(editor.mcpDuration, originalDuration)

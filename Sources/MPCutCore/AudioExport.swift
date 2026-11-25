@@ -446,7 +446,7 @@ public struct AudioExportEngine: Sendable {
         if progress?(1) == false { cancellation.cancel() }
         try engine.checkCancellation()
         // The helper creates the file with the caller's ordinary creation mask.
-        let failure = publishExclusively(from: partial, to: destination)
+        let failure = try MediaExportPublication.publish(from: partial, to: destination)
         if failure == EEXIST { throw CutError(code: "output_exists", message: "A file already exists at the destination.") }
         if failure != 0 { throw CutError(code: "write_failed", message: String(cString: strerror(failure))) }
     }

@@ -213,7 +213,7 @@
   },
   {
     "name": "still_editor_placement_insert",
-    "description": "Insert the source image at the requested time, extending the timeline.",
+    "description": "Insert the source image at the requested time, extending the timeline. Supply initial_format to start a still-only timeline in a blank sequence window.",
     "annotations": {
       "readOnlyHint": false,
       "openWorldHint": false
@@ -292,6 +292,56 @@
         "background": {
           "type": "string",
           "pattern": "^#[0-9A-Fa-f]{6}$"
+        },
+        "initial_format": {
+          "type": "object",
+          "description": "Required for the first still or gap in a blank sequence, with at set to zero.",
+          "properties": {
+            "width": {
+              "type": "integer",
+              "minimum": 2,
+              "maximum": 8192
+            },
+            "height": {
+              "type": "integer",
+              "minimum": 2,
+              "maximum": 8192
+            },
+            "cadence": {
+              "type": "string",
+              "description": "Exact frame interval in seconds, for example 1001/30000."
+            },
+            "codec": {
+              "type": "string",
+              "enum": [
+                "h264",
+                "hevc",
+                "prores",
+                "jpeg"
+              ]
+            },
+            "container": {
+              "type": "string",
+              "minLength": 1
+            },
+            "color": {
+              "type": "string",
+              "enum": [
+                "sdr",
+                "pq",
+                "hlg"
+              ],
+              "description": "Program color. Defaults to SDR."
+            }
+          },
+          "required": [
+            "width",
+            "height",
+            "cadence",
+            "codec",
+            "container"
+          ],
+          "additionalProperties": false
         }
       },
       "required": [
@@ -399,7 +449,7 @@
   },
   {
     "name": "timeline_gap_insert",
-    "description": "Insert a generated color gap at the requested timeline time.",
+    "description": "Insert a generated color gap at the requested timeline time. Supply initial_format to start a still-only timeline in a blank sequence window.",
     "annotations": {
       "readOnlyHint": false,
       "openWorldHint": false
@@ -441,6 +491,56 @@
         "background": {
           "type": "string",
           "pattern": "^#[0-9A-Fa-f]{6}$"
+        },
+        "initial_format": {
+          "type": "object",
+          "description": "Required for the first still or gap in a blank sequence, with at set to zero.",
+          "properties": {
+            "width": {
+              "type": "integer",
+              "minimum": 2,
+              "maximum": 8192
+            },
+            "height": {
+              "type": "integer",
+              "minimum": 2,
+              "maximum": 8192
+            },
+            "cadence": {
+              "type": "string",
+              "description": "Exact frame interval in seconds, for example 1001/30000."
+            },
+            "codec": {
+              "type": "string",
+              "enum": [
+                "h264",
+                "hevc",
+                "prores",
+                "jpeg"
+              ]
+            },
+            "container": {
+              "type": "string",
+              "minLength": 1
+            },
+            "color": {
+              "type": "string",
+              "enum": [
+                "sdr",
+                "pq",
+                "hlg"
+              ],
+              "description": "Program color. Defaults to SDR."
+            }
+          },
+          "required": [
+            "width",
+            "height",
+            "cadence",
+            "codec",
+            "container"
+          ],
+          "additionalProperties": false
         }
       },
       "required": [

@@ -20,6 +20,19 @@ public struct ParticipantScanProgress: Sendable {
     public let time: RationalTime
 }
 
+extension ParticipantScanResult {
+    package var savedProgress: ParticipantScanProgress {
+        switch state {
+        case .completed, .upToDate:
+            return .init(phase: state == .completed ? .completed : .upToDate, percent: 100, time: source.duration)
+        case .paused, .incomplete:
+            let time = analysis?.resumeAt ?? .zero
+            return .init(phase: state == .paused ? .paused : .incomplete,
+                         percent: min(99, time.wholePercent(of: source.duration)), time: time)
+        }
+    }
+}
+
 private final class ParticipantScanReporter {
     let notify: (ParticipantScanProgress) -> Void
     var duration: RationalTime = .zero
@@ -41,6 +54,22 @@ public enum ParticipantAnalysis {
     public static var isAvailable: Bool {
         #if canImport(CTileTrail)
         tiletrail_abi_version() == TILETRAIL_ABI_VERSION
+        #else
+        false
+        #endif
+    }
+
+    package static var isGPUBackendAvailable: Bool {
+        #if canImport(CTileTrail)
+        guard isAvailable else { return false }
+        var config = tiletrail_config_t(mode: UInt32(TILETRAIL_MODE_GPU_REQUIRED),
+                                      sampling: UInt32(TILETRAIL_SAMPLING_EVERY_FRAME))
+        var analyzer: OpaquePointer?
+        let start = tiletrail_timestamp_t(pts: 0, numerator: 1, denominator: 1)
+        guard tiletrail_analyzer_create(&config, start, &analyzer, nil) == TILETRAIL_OK,
+              let analyzer else { return false }
+        tiletrail_analyzer_free(analyzer)
+        return true
         #else
         false
         #endif
@@ -167,7 +196,17 @@ public enum ParticipantAnalysis {
         let transform = source.transform
         reporter?.duration = source.duration
         let configuration = ParticipantScanConfiguration(options)
-        let key = ParticipantCacheKey(inode: identity.inode, stamp: source.stamp, stream: source.stream,
+        // Pending scans can resume after the document and its media move to another volume.
+        let digest: String
+        if let saved = cachedParticipantSourceDigest(identity, in: cache, cancelled: cancelled) {
+            digest = saved
+        } else {
+            digest = try participantSourceDigest(file, identity: identity, cancelled: cancelled)
+            cache?.saveAutomatically([identity.participantDigestSection: Data(digest.utf8)],
+                                     retainingLatest: ["participant_content_sha256.v1.": 2], cancelled: cancelled)
+        }
+        source.contentSHA256 = digest
+        let key = ParticipantCacheKey(contentSHA256: digest, stream: source.stream,
                                       origin: source.origin, timeBase: source.timeBase, duration: source.duration,
                                       transform: transform, backend: options.backend, sampling: options.sampling,
                                       feedLayout: options.feedLayout == .meeting ? nil : options.feedLayout,
@@ -187,22 +226,6 @@ public enum ParticipantAnalysis {
         func verifySource() throws {
             guard identity.isCurrentSnapshot(at: file) else {
                 throw CutError(code: "source_changed", message: "The source changed during participant analysis.")
-            }
-        }
-
-        var earlyDigest: ParticipantDigestRun?
-        defer { earlyDigest?.stop() }
-        func loadSourceDigest() throws {
-            guard source.contentSHA256 == nil else { return }
-            let digestPrefix = "participant_content_sha256.v1."
-            if let saved = cachedParticipantSourceDigest(identity, in: cache, cancelled: cancelled) {
-                source.contentSHA256 = saved
-            } else {
-                let digest = try earlyDigest?.value()
-                    ?? participantSourceDigest(file, identity: identity, cancelled: cancelled)
-                source.contentSHA256 = digest
-                cache?.saveAutomatically([identity.participantDigestSection: Data(digest.utf8)],
-                                         retainingLatest: [digestPrefix: 2], cancelled: cancelled)
             }
         }
 
@@ -244,17 +267,11 @@ public enum ParticipantAnalysis {
             progress?(source.duration)
             try verifySource()
             if cancelled() { return try paused(nil) }
-            do { try loadSourceDigest() }
-            catch is CancellationError { return try paused(nil) }
-            try verifySource()
             if saved.contentSHA256 == source.contentSHA256 {
                 if let verifiedClock {
                     cache?.saveAutomatically([AnalysisSidecar.sceneClockKey: verifiedClock], cancelled: cancelled)
                 }
-                let report = saved.sceneReport.map {
-                    let report = $0.forSource(file)
-                    return cache?.restoringViewNames(to: report, cancelled: cancelled) ?? report
-                }
+                let report = saved.sceneReport?.forSource(file)
                 if cancelled() { return try paused(nil) }
                 try verifySource()
                 return ParticipantScanResult(state: .upToDate, source: source, configuration: configuration, analysis: saved.analysis,
@@ -264,10 +281,6 @@ public enum ParticipantAnalysis {
 
         try verifySource()
         if cancelled() { return try paused(partial?.analysis) }
-        if source.contentSHA256 == nil,
-           cachedParticipantSourceDigest(identity, in: cache, cancelled: cancelled) == nil {
-            earlyDigest = ParticipantDigestRun(file, identity: identity, cancelled: cancelled)
-        }
         let checkpoint: ParticipantScanCheckpoint?
         if let directory = options.checkpointDirectory, !options.includeScenes, mpcut_tiletrail_has_checkpoints() != 0 {
             checkpoint = try ParticipantScanCheckpoint(directory: directory, fingerprint: fingerprint,
@@ -304,7 +317,7 @@ public enum ParticipantAnalysis {
                                message: "The saved participant scan extends beyond the replayed source.")
             }
         }
-        let sceneReport = result.sceneReport.map { cache?.restoringViewNames(to: $0, cancelled: cancelled) ?? $0 }
+        let sceneReport = result.sceneReport
         if result.state == .completed {
             func pauseAfterDecode() throws -> ParticipantScanResult {
                 var checkpoint = result.analysis
@@ -312,8 +325,6 @@ public enum ParticipantAnalysis {
                 return try paused(checkpoint)
             }
             if cancelled() { return try pauseAfterDecode() }
-            do { try loadSourceDigest() }
-            catch is CancellationError { return try pauseAfterDecode() }
             let cached = ParticipantCachedScan(analysis: result.analysis, sceneReport: result.sceneReport,
                                               contentSHA256: source.contentSHA256)
             // A dense history can exceed the cache's practical size. Long jobs
@@ -370,58 +381,13 @@ public enum ParticipantAnalysis {
 }
 
 #if canImport(CTileTrail)
-/// Hashes the recording while its pictures decode. Both read the same file,
-/// so a completed scan does not wait for a second pass over it.
-private final class ParticipantDigestRun {
-    private let finished = DispatchSemaphore(value: 0)
-    private let lock = NSLock()
-    private var stopped = false
-    private var outcome: Result<String, Error>?
-
-    init(_ file: URL, identity: SourceIdentity, cancelled: @escaping () -> Bool) {
-        let thread = Thread { [self] in
-            let result = Result {
-                try participantSourceDigest(file, identity: identity, cancelled: { self.isStopped || cancelled() })
-            }
-            lock.lock()
-            outcome = result
-            lock.unlock()
-            finished.signal()
-        }
-        thread.qualityOfService = .userInitiated
-        thread.start()
-    }
-
-    private var isStopped: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return stopped
-    }
-
-    /// Abandon the hash. A scan that did not complete has no use for it.
-    func stop() {
-        lock.lock()
-        stopped = true
-        lock.unlock()
-    }
-
-    func value() throws -> String {
-        finished.wait()
-        finished.signal()
-        lock.lock()
-        defer { lock.unlock() }
-        return try outcome!.get()
-    }
-}
-
 private struct ParticipantCacheKey: Encodable {
     let detector = "tiletrail-0.1.0"
     // The release candidate changed layout and identity decisions after the
     // initial 0.1.0 scans. Cached machine results must use the final model.
     let detectorRevision = 2
     let displayGeometry = 3
-    let inode: UInt64
-    let stamp: SceneSourceStamp
+    let contentSHA256: String
     let stream: Int
     let origin: RationalTime
     let timeBase: RationalTime

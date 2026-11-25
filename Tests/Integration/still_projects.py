@@ -55,7 +55,7 @@ class StillProjectCLI(unittest.TestCase):
         return reply
 
     def sequence(self):
-        return {"format": "mpcut", "schema_version": 3, "kind": "sequence",
+        return {"format": "mpcut", "schema_version": 9, "kind": "sequence",
                 "clips": [{"id": identity, "file": "offline.mov", "from": "0", "to": "6"}
                           for identity in ("first", "second")]}
 
@@ -71,7 +71,7 @@ class StillProjectCLI(unittest.TestCase):
         self.assertEqual(cover["placements"][0]["authored_fragments"][0]["clip_id"], "second")
         self.assertEqual(cover["assets"][0]["file"], "../photo.png")
         saved = read_project(destination)
-        self.assertIn(saved["schema_version"], (4, 5))
+        self.assertEqual(saved["schema_version"], 9)
         self.assertEqual([entry["id"] for entry in saved["clips"]], ["first", "second"])
         before = destination.read_bytes()
         issue = self.run_json("still", "picture", "replace", "--project", destination, "--asset", cover["asset_id"],
@@ -150,12 +150,12 @@ class StillProjectCLI(unittest.TestCase):
         saved = read_project(copy)
         saved_asset = saved["transcripts"]["attachments"][0]["asset"]
         self.assertEqual(asset, saved_asset)
-        self.assertEqual((self.root / asset["file"]).parent.name, copy.name + ".transcripts")
-        self.assertTrue((self.root / asset["file"]).is_file())
+        self.assertTrue(saved["embedded_assets"]["transcripts"][asset["sha256"]]["words"])
+        self.assertFalse(copy.with_name(copy.name + ".transcripts").exists())
         self.assertEqual(self.project.read_bytes(), original)
 
     def test_group_replacement_repeats_while_assembly_insert_appears_once(self):
-        project = {"format": "mpcut", "schema_version": 3, "kind": "multicam",
+        project = {"format": "mpcut", "schema_version": 9, "kind": "multicam",
                    "reference_angle_id": "wide", "group_range": {"from": "0", "to": "8"},
                    "angles": [{"id": "wide", "file": "camera.mov", "offset": "0"}],
                    "audio": {"mode": "none"}, "switches": [{"group_time": "0", "angle_id": "wide"}],
@@ -174,7 +174,7 @@ class StillProjectCLI(unittest.TestCase):
 
     def test_insert_checks_the_overridden_occurrence_camera(self):
         camera = Path(__file__).resolve().parents[1] / "MPCutAppTests" / "Fixtures" / "ProRes-2997.mov"
-        project = {"format": "mpcut", "schema_version": 3, "kind": "multicam",
+        project = {"format": "mpcut", "schema_version": 9, "kind": "multicam",
                    "reference_angle_id": "wide", "group_range": {"from": "0", "to": "1/10"},
                    "angles": [{"id": "wide", "file": "offline.mov"}, {"id": "close", "file": str(camera)}],
                    "audio": {"mode": "none"}, "switches": [{"group_time": "0", "angle_id": "wide"}],

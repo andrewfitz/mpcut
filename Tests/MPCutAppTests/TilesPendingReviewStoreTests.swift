@@ -23,130 +23,198 @@ final class TilesPendingReviewStoreTests: XCTestCase {
         XCTAssertEqual(preview.boxes(at: .zero).count, 2)
         XCTAssertEqual(preview.boxes(at: one), [CGRect(x: 0.5, y: 0, width: 0.5, height: 1)])
         XCTAssertTrue(preview.boxes(at: two).isEmpty)
+        let source = ParticipantScanSource(file: media.path, stamp: stamp, inode: nil, stream: 0, origin: .zero,
+            timeBase: .init(numerator: 1, denominator: 30), duration: three,
+            transform: .init(rotation: .r0, pixelAspectNum: 1, pixelAspectDen: 1))
+        let scan = ParticipantScanResult(state: .paused, source: source, configuration: .init(.init(sampling: .sparse)),
+            analysis: analysis, sceneReport: nil, analysisIdentity: "preview")
+        var choices = TilesReviewChoices(scan: scan)
+        choices.grids = [.init(range: .init(from: .zero, to: one), columns: 1, rows: 1)]
+        XCTAssertEqual(choices.maximumVisibleTiles(in: scan, rawMaximum: 2), 1)
+        choices.grids.append(.init(range: .init(from: two, to: three), columns: 2, rows: 2))
+        XCTAssertEqual(choices.maximumVisibleTiles(in: scan, rawMaximum: 2), 4)
     }
 
-    func testPendingArtifactAndChoicesMoveWithCut() throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        let original = directory.appendingPathComponent("Original")
-        let moved = directory.appendingPathComponent("Moved")
+    func testPendingScanMovesWithProjectAndHistoryBindsItToOnePictureSource() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let original = root.appendingPathComponent("Original")
+        let moved = root.appendingPathComponent("Moved")
         try FileManager.default.createDirectory(at: original, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-
-        let cut = original.appendingPathComponent("Project.cut")
+        defer { try? FileManager.default.removeItem(at: root) }
         let media = original.appendingPathComponent("Gallery.mp4")
-        let movie = try XCTUnwrap(Bundle.module.url(forResource: "SmartTrim-GOP", withExtension: "mp4",
-                                                     subdirectory: "Fixtures"))
+        let movie = try XCTUnwrap(Bundle.module.url(forResource: "SmartTrim-GOP", withExtension: "mp4", subdirectory: "Fixtures"))
         try FileManager.default.copyItem(at: movie, to: media)
-        var project = CutProject.sequence([
-            .init(id: "gallery", file: "Gallery.mp4", from: .zero, to: .init(numerator: 1))
-        ])
-        project.participants = .init(people: [.init(id: "accepted", name: "Accepted Feed")])
+        let cut = original.appendingPathComponent("Project.cut")
+        let scan = try ParticipantAnalysis.scan(media, options: .init(sampling: .everyFrame, useSidecar: false,
+                                                                     feedLayout: .fixed(columns: 2, rows: 1)))
+        let first = "left", second = "right"
+        let group = MulticamProject(referenceAngle: first, range: .init(from: .zero, to: .init(numerator: 1)),
+                                    angles: [.init(id: first, file: "Gallery.mp4"), .init(id: second, file: "Gallery.mp4")],
+                                    audio: .follow, switches: [.init(at: .zero, angle: first)])
+        var project = CutProject.multicam(group)
+        var pending = try PendingTileReview(scan: scan, sourceID: second, file: "Gallery.mp4")
+        let feed = try XCTUnwrap(TilesReviewCard.list(scan).cards.first?.id)
+        pending.choices.names = [feed: "Alex"]
+        project.participants.setPendingReview(pending)
+        // Every destination must survive: a feed cannot itself be merged away.
+        for invalidMerges in [["a": "a"], ["a": "b", "b": "a"], ["a": "b", "b": "c"]] {
+            var invalid = project
+            var choices = pending
+            choices.choices.merged = invalidMerges
+            invalid.participants.setPendingReview(choices)
+            XCTAssertThrowsError(try invalid.validate())
+        }
+        let one = RationalTime(numerator: 1)
+        for range in [MulticamRange(from: .init(numerator: -1), to: .zero),
+                      MulticamRange(from: scan.source.duration, to: try scan.source.duration.adding(one))] {
+            var invalid = project
+            var choices = pending
+            choices.choices.grids = [.init(range: range, columns: 1, rows: 1)]
+            invalid.participants.setPendingReview(choices)
+            XCTAssertThrowsError(try invalid.validate())
+        }
         try project.save(to: cut)
-        let bytes = try Data(contentsOf: cut)
-        let store = TilesPendingReviewStore(project: cut, recordingID: media.path)
-        let file = AnalysisSidecar.canonicalSource(media)
-        let identity = try SourceIdentity(file)
-        let clock = try SceneAnalysis.inspectSceneClock(file, identity: identity, cancelled: { false })
-        var source = try ParticipantScanSource(file: file.path, media: clock, video: XCTUnwrap(clock.videoStream))
-        source.contentSHA256 = try participantSourceDigest(file, identity: identity)
-        let configuration = try JSONDecoder().decode(ParticipantScanConfiguration.self,
-            from: Data(#"{"backend":"automatic","sampling":"sparse","include_scenes":false}"#.utf8))
-        let scan = ParticipantScanResult(state: .incomplete, source: source, configuration: configuration,
-                                         analysis: nil, sceneReport: nil, analysisIdentity: "pending")
-        let concurrent = TilesPendingReviewStore(project: original.appendingPathComponent("Concurrent.cut"),
-                                                 recordingID: media.path)
-        _ = try concurrent.save(scan)
-        DispatchQueue.concurrentPerform(iterations: 100) { index in
-            do {
-                if index.isMultiple(of: 3) {
-                    _ = try concurrent.save(scan)
-                } else {
-                    XCTAssertEqual(try concurrent.load()?.0.analysisIdentity, scan.analysisIdentity)
-                }
-            } catch { XCTFail("Concurrent pending review failed: \(error)") }
+        var expanded = try XCTUnwrap(JSONSerialization.jsonObject(with: CutProject.documentJSON(at: cut)) as? [String: Any])
+        var assets = try XCTUnwrap(expanded["embedded_assets"] as? [String: Any])
+        let scans = try XCTUnwrap(assets["tile_scans"] as? [String: [String: Any]])
+        var encodedScan = try XCTUnwrap(scans[pending.scanSHA256])
+        let encodedSource = try XCTUnwrap(encodedScan["source"] as? [String: Any])
+        XCTAssertNil(encodedSource["file"])
+        XCTAssertNil(encodedSource["inode"])
+        XCTAssertEqual(encodedSource["content_sha256"] as? String, scan.source.contentSHA256)
+        var participantFields = try XCTUnwrap(expanded["participants"] as? [String: Any])
+        var reviews = try XCTUnwrap(participantFields["pending_reviews"] as? [[String: Any]])
+        reviews[0]["choices"] = ["names": [feed: "Alex"]]
+        participantFields["pending_reviews"] = reviews
+        expanded["participants"] = participantFields
+        let shorthand = try JSONSerialization.data(withJSONObject: expanded)
+        XCTAssertEqual(try CutProject.decode(shorthand).participants.pendingReviews, [pending])
+        func branch(_ edit: (inout TilesReviewChoices) -> Void) throws -> Data {
+            var branch = project
+            var review = pending
+            edit(&review.choices)
+            branch.participants.setPendingReview(review)
+            return try JSONEncoder().encode(branch)
         }
-        let generations = try FileManager.default.contentsOfDirectory(atPath: concurrent.scanURL.deletingLastPathComponent().path)
-            .filter { UUID(uuidString: String($0.dropLast(5))) != nil }
-        XCTAssertEqual(generations.count, 1)
-        var staleChoices = TilesReviewChoices(scan: scan)
-        staleChoices.analysisIdentity += "-stale"
-        XCTAssertThrowsError(try concurrent.save(staleChoices))
-        let published = try store.save(scan)
-        let exported = try JSONDecoder().decode(ParticipantScanResult.self, from: Data(contentsOf: published))
-        XCTAssertEqual(exported.analysisIdentity, scan.analysisIdentity)
-        var choices = TilesReviewChoices(scan: scan)
-        choices.names = ["feed-1": "Pending Name"]
-        try store.save(choices)
-        XCTAssertEqual(try Data(contentsOf: cut), bytes)
-        let savedAs = directory.appendingPathComponent("Copy.cut")
-        let copied = TilesPendingReviewStore(project: savedAs, recordingID: media.path)
-        XCTAssertNil(try copied.load())
-        try copied.save(scan)
-        var oldChoices = choices
-        oldChoices.names = ["feed-1": "Old Destination"]
-        try copied.save(oldChoices)
-        XCTAssertThrowsError(try TilesPendingReviewStore.carryReviews(from: cut, to: savedAs, recordingIDs: [media.path]) {
-            throw CocoaError(.fileWriteFileExists)
-        } as Void)
-        XCTAssertEqual(try copied.load(recording: media)?.1.names, oldChoices.names)
-        try TilesPendingReviewStore.carryReviews(from: cut, to: savedAs, recordingIDs: [media.path]) {}
-        XCTAssertEqual(try copied.load(recording: media)?.1.names, choices.names)
-
-        let draft = directory.appendingPathComponent("Untitled.cut")
-        let draftStore = TilesPendingReviewStore(project: draft, recordingID: media.path)
-        XCTAssertNil(try draftStore.load())
-        try TilesPendingReviewStore.carryReviews(from: cut, to: draft, recordingIDs: [media.path]) {}
-        XCTAssertEqual(try draftStore.load(recording: media)?.1.names, choices.names)
-        TilesPendingReviewStore.discardDraft(at: draft)
-        XCTAssertNil(try draftStore.load())
-
-        try FileManager.default.moveItem(at: original, to: moved)
-        let movedCut = moved.appendingPathComponent(cut.lastPathComponent)
-        let movedMedia = moved.appendingPathComponent(media.lastPathComponent)
-        let reopened = TilesPendingReviewStore(project: movedCut, recordingID: movedMedia.path)
-        let rebound = try XCTUnwrap(reopened.load(recording: movedMedia))
-        XCTAssertEqual(rebound.0.analysisIdentity, "pending")
-        XCTAssertEqual(rebound.0.source.file, AnalysisSidecar.canonicalSource(movedMedia).path)
-        XCTAssertEqual(rebound.1.names, choices.names)
-        // A replacement may keep both the inode and the exact original mtime.
-        // Reload the same path saved by this companion to exercise that case.
-        try reopened.save(rebound.0)
-        let current = try SourceIdentity(movedMedia)
-        let writer = try FileHandle(forUpdating: movedMedia)
-        let firstByte = try XCTUnwrap(try writer.read(upToCount: 1)?.first)
-        try writer.seek(toOffset: 0)
-        try writer.write(contentsOf: Data([firstByte ^ 0xff]))
-        var times = [timespec(tv_sec: current.modifiedSeconds, tv_nsec: current.modifiedNanoseconds),
-                     timespec(tv_sec: current.modifiedSeconds, tv_nsec: current.modifiedNanoseconds)]
-        XCTAssertEqual(futimens(writer.fileDescriptor, &times), 0)
-        try writer.close()
-        XCTAssertEqual(current, try SourceIdentity(movedMedia))
-        XCTAssertThrowsError(try reopened.load(recording: movedMedia)) {
-            XCTAssertEqual(($0 as? CutError)?.code, "stale_scan")
+        let ancestor = try branch { _ in }
+        let renamed = try branch { $0.names[feed] = "Robin" }
+        let hinted = try branch { $0.expectedFeeds = "3" }
+        let independent = try ProjectMerge.sides(base: ancestor, ours: renamed, theirs: hinted)
+        for side in [independent.ours, independent.theirs] {
+            let merged = try CutProject.decode(independent.restoringAssets(in: side))
+            let choices = try XCTUnwrap(merged.participants.pendingReviews.first?.choices)
+            XCTAssertEqual(choices.names[feed], "Robin")
+            XCTAssertEqual(choices.expectedFeeds, "3")
+        }
+        let competing = try branch { $0.names[feed] = "Sam" }
+        let conflict = try ProjectMerge.sides(base: ancestor, ours: renamed, theirs: competing)
+        for (side, name) in [(conflict.ours, "Robin"), (conflict.theirs, "Sam")] {
+            let merged = try CutProject.decode(conflict.restoringAssets(in: side))
+            XCTAssertEqual(merged.participants.pendingReviews.first?.choices.names[feed], name)
+        }
+        let excludeLeft = try branch { $0.unchecked.insert("left") }
+        let excludeRight = try branch { $0.unchecked.insert("right") }
+        let exclusions = try ProjectMerge.sides(base: ancestor, ours: excludeLeft, theirs: excludeRight)
+        for side in [exclusions.base, exclusions.ours, exclusions.theirs] {
+            let merged = try CutProject.decode(exclusions.restoringAssets(in: side))
+            XCTAssertEqual(merged.participants.pendingReviews.first?.choices.unchecked, ["left", "right"])
+        }
+        let mergeLeft = try branch { $0.merged = ["left": "right"] }
+        let mergeRight = try branch { $0.merged = ["right": "third"] }
+        let overlapping = try ProjectMerge.sides(base: ancestor, ours: mergeLeft, theirs: mergeRight)
+        for (side, choices) in [(overlapping.ours, ["left": "right"]), (overlapping.theirs, ["right": "third"])] {
+            let merged = try CutProject.decode(overlapping.restoringAssets(in: side))
+            XCTAssertEqual(merged.participants.pendingReviews.first?.choices.merged, choices)
+        }
+        encodedScan["analysis_identity"] = "changed"
+        assets["tile_scans"] = [pending.scanSHA256: encodedScan]
+        expanded["embedded_assets"] = assets
+        XCTAssertThrowsError(try CutProject.decode(JSONSerialization.data(withJSONObject: expanded))) {
+            XCTAssertEqual(($0 as? CutError)?.code, "invalid_embedded_asset")
+        }
+        expanded.removeValue(forKey: "embedded_assets")
+        XCTAssertThrowsError(try CutProject.decode(JSONSerialization.data(withJSONObject: expanded))) {
+            XCTAssertEqual(($0 as? CutError)?.code, "missing_embedded_asset")
         }
 
-        try Data("other media".utf8).write(to: movedMedia, options: .atomic)
-        XCTAssertThrowsError(try reopened.load(recording: movedMedia)) {
-            XCTAssertEqual(($0 as? CutError)?.code, "stale_scan")
+        // Move just the document and its recording, leaving every other file behind.
+        try FileManager.default.createDirectory(at: moved, withIntermediateDirectories: true)
+        let copy = moved.appendingPathComponent("Copy.cut")
+        let copiedMedia = moved.appendingPathComponent("Gallery.mp4")
+        try FileManager.default.copyItem(at: cut, to: copy)
+        try FileManager.default.copyItem(at: media, to: copiedMedia)
+        let reopened = try CutProject.load(from: copy)
+        XCTAssertEqual(reopened.participants.pendingReviews, [pending])
+        let reviewed = try XCTUnwrap(reopened.participants.pendingReviews.first)
+        XCTAssertEqual(try reviewed.load(recording: copiedMedia).source.file, AnalysisSidecar.canonicalSource(copiedMedia).path)
+        let preview = try TilesReview(reviewing: reopened, sourceID: second, document: copy, useSidecar: false, cancelled: { false })
+        XCTAssertEqual(preview.sourceID, second)
+        XCTAssertEqual(preview.counts.feedCount, 2)
+        var accepted = reopened
+        XCTAssertThrowsError(try accepted.acceptPendingTileReview(sourceID: first, relativeTo: copy))
+        try accepted.acceptPendingTileReview(sourceID: second, relativeTo: copy)
+        XCTAssertTrue(accepted.participants.pendingReviews.isEmpty)
+        XCTAssertEqual(accepted.participants.sources.map(\.sourceID), [second])
+        XCTAssertTrue(accepted.participants.people.contains { $0.name == "Alex" })
+        var staging = accepted
+        staging.participants.setPendingReview(reviewed)
+        let pendingRead = try staging.pendingTileReview(nil).report()
+        XCTAssertEqual(pendingRead.sourceID, second)
+        XCTAssertEqual(pendingRead.choices.value.names[feed], "Alex")
+        XCTAssertTrue(pendingRead.feedIDs.contains(feed))
+        var stagedChoices = pendingRead.choices.value
+        stagedChoices.names[feed] = "Robin"
+        stagedChoices.expectedFeeds = "2"
+        stagedChoices.expectedTiles = "2"
+        stagedChoices.editedHints = true
+        let secondFeed = try XCTUnwrap(pendingRead.feedIDs.first { $0 != feed })
+        stagedChoices.unchecked.insert(secondFeed)
+        stagedChoices.merged = [secondFeed: feed]
+        stagedChoices.grids = [.init(range: .init(from: .zero, to: one), columns: 2, rows: 1)]
+        let staged = try staging.stagePendingTileChoices(sourceID: second, token: pendingRead.reviewToken, choices: stagedChoices)
+        let newReview = try staged.report()
+        XCTAssertEqual(newReview.choices.value, stagedChoices)
+        XCTAssertEqual(newReview.scanSHA256, pendingRead.scanSHA256)
+        XCTAssertEqual(newReview.reviewID, pendingRead.reviewID)
+        XCTAssertNotEqual(newReview.reviewToken, pendingRead.reviewToken)
+        XCTAssertEqual(staging.participants.people, accepted.participants.people)
+        XCTAssertEqual(staging.participants.sources, accepted.participants.sources)
+        XCTAssertThrowsError(try staging.discardPendingTileReview(sourceID: second, token: pendingRead.reviewToken)) {
+            XCTAssertEqual(($0 as? CutError)?.code, "stale_tile_review")
         }
+        XCTAssertThrowsError(try staging.acceptPendingTileReview(sourceID: second, relativeTo: copy, token: pendingRead.reviewToken)) {
+            XCTAssertEqual(($0 as? CutError)?.code, "stale_tile_review")
+        }
+        var invalidChoices = stagedChoices
+        invalidChoices.names["unknown-feed"] = "Unbound"
+        XCTAssertThrowsError(try staging.stagePendingTileChoices(sourceID: second, token: newReview.reviewToken, choices: invalidChoices))
+        XCTAssertEqual(staging.participants.pendingReviews, [staged])
+        try staging.discardPendingTileReview(sourceID: second, token: newReview.reviewToken)
+        XCTAssertEqual(staging, accepted)
 
-        let package = reopened.scanURL.deletingLastPathComponent()
-        let generation = try XCTUnwrap(FileManager.default.contentsOfDirectory(atPath: package.path).first {
-            UUID(uuidString: String($0.dropLast(5))) != nil
-        })
-        let artifact = package.appendingPathComponent(generation)
-        try Data("changed".utf8).write(to: artifact)
-        XCTAssertThrowsError(try reopened.load()) {
-            XCTAssertEqual(($0 as? CutError)?.code, "invalid_pending_tile_scan")
-        }
-        XCTAssertThrowsError(try TilesPendingReviewStore.carryReviews(from: movedCut, to: savedAs,
-                                                                      recordingIDs: [movedMedia.path]) {
-            XCTFail("A corrupt review cannot replace a destination project")
-        })
-        try FileManager.default.removeItem(at: artifact)
-        XCTAssertThrowsError(try reopened.load()) {
-            XCTAssertEqual(($0 as? CutError)?.code, "missing_pending_tile_scan")
-        }
-        XCTAssertEqual(try CutProject.load(from: movedCut).participants.people.first?.id, "accepted")
+        var reconciling = accepted
+        reconciling.participants.setPendingReview(reviewed)
+        let (replacement, reboundScan) = try reconciling.pendingTileScan(sourceID: second, relativeTo: copy)
+        let report = try reconciling.participantReconciliation(reboundScan, sourceID: second, relativeTo: copy)
+        let token = try replacement.reconciliationToken(for: report, scan: reboundScan)
+        var changed = replacement
+        changed.choices.names[feed] = "Robin"
+        reconciling.participants.setPendingReview(changed)
+        XCTAssertThrowsError(try reconciling.reconcilePendingTileReview(sourceID: second, relativeTo: copy, token: token))
+        XCTAssertEqual(reconciling.participants.pendingReviews, [changed])
+        let currentToken = try changed.reconciliationToken(for: report, scan: reboundScan)
+        try reconciling.reconcilePendingTileReview(sourceID: second, relativeTo: copy, token: currentToken)
+        XCTAssertTrue(reconciling.participants.pendingReviews.isEmpty)
+        try accepted.save(to: copy, undo: [.init(action: "Accept Tiles", project: reopened)], redo: [])
+        let history = try CutProject.loadHistory(from: copy, limit: 10)
+        let restored = try XCTUnwrap(history.undo.last?.project)
+        XCTAssertEqual(restored.participants.pendingReviews, [pending])
+        XCTAssertEqual(try restored.participants.pendingReviews.first?.load(recording: copiedMedia).analysisIdentity,
+                       scan.analysisIdentity)
+        try restored.save(to: copy, undo: [], redo: [.init(action: "Accept Tiles", project: accepted)])
+        XCTAssertEqual(try CutProject.loadHistory(from: copy, limit: 10).redo.last?.project.participants, accepted.participants)
+        try accepted.save(to: copy)
+        let saved = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: copy)) as? [String: Any])
+        XCTAssertNil((saved["embedded_assets"] as? [String: Any])?["tile_scans"])
     }
 }

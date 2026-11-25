@@ -17,9 +17,9 @@ extension ProjectSessions {
         let fallback = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(session.id.uuidString + ".cut")
         let document = savedDocument ?? draftDocument ?? fallback
         let mutates = !["inspect", "preview", "feeds_list", "feeds_inspect", "angles_plan", "angles_render",
-                        "angles_verify", "export_isos", "switches_propose", "layout_list"].contains(operation)
+                        "angles_verify", "export_isos", "switches_propose", "layout_list", "pending_read"].contains(operation)
             && (operation != "reconcile" || (arguments["apply"] as? Bool ?? false))
-            && (operation != "scan" || (arguments["accept"] as? Bool ?? false))
+            && (operation != "scan" || arguments["output"] == nil || (arguments["accept"] as? Bool ?? false))
         if mutates {
             guard let expected = arguments["expected_revision"] as? Int else {
                 throw MCPCommandError("invalid_arguments", "Supply expected_revision for a Tiles edit.")
@@ -67,7 +67,7 @@ extension ProjectSessions {
                 do {
                     let result = try await work.value
                     if receipt.cancellationRequested {
-                        let partial = try JSONSerialization.jsonObject(with: result.response)
+                        let partial = try finish(result)
                         receipt.finish("cancelled", detail: ["result": partial])
                     } else {
                         let detail = try finish(result)
@@ -233,6 +233,8 @@ private enum MCPTilesWork {
             return try scan(input, project: project, document: document, progress: progress, useSidecar: useSidecar)
         case "inspect", "preview", "feeds_list", "feeds_inspect":
             return try review(operation, input, project: project, document: document, useSidecar: useSidecar)
+        case "pending_read", "pending_stage", "pending_discard":
+            return try pending(operation, input, project: project)
         case "feeds_add":
             var updated = project
             let id = try updated.participants.addFeed(name: input.optional("name", as: String.self))
@@ -257,10 +259,36 @@ private enum MCPTilesWork {
         }
     }
 
-    static func sourceID(_ input: Input, project: CutProject, scanned: Bool = true) throws -> String {
+    static func pending(_ operation: String, _ input: Input, project: CutProject) throws -> Result {
+        let requested = try input.optional("source_id", as: String.self)
+        if operation == "pending_read" {
+            return try Result(project.pendingTileReview(requested).report())
+        }
+        let sourceID = try project.pendingTileSourceID(requested)
+        let token = try input.required("review_token", as: String.self)
+        var next = project
+        let pendingReview: TilesPendingReviewReport?
+        let action: String
+        if operation == "pending_stage" {
+            guard let choices: TilesPendingReviewChoices = try input.decode("choices") else {
+                throw input.invalid("Supply choices.")
+            }
+            pendingReview = try next.stagePendingTileChoices(sourceID: sourceID, token: token, choices: choices.value).report()
+            action = "Stage Tile Review Choices"
+        } else {
+            try next.discardPendingTileReview(sourceID: sourceID, token: token)
+            pendingReview = nil
+            action = "Discard Pending Tile Review"
+        }
+        return try Result(TilesPendingReviewEdit(sourceID: sourceID, operationCount: next == project ? 0 : 1,
+                                                pendingReview: pendingReview), update: next, action: action)
+    }
+
+    static func sourceID(_ input: Input, project: CutProject, scanned: Bool = true, includingPending: Bool = false) throws -> String {
         let ids: [String]
         if scanned {
-            ids = project.participants.sources.map(\.sourceID)
+            let sources = project.participants.sources.map(\.sourceID)
+            ids = includingPending ? Array(Set(sources + project.participants.pendingReviews.map(\.sourceID))).sorted() : sources
         } else {
             switch project {
             case .multicam(let project): ids = project.pictureSources.filter { $0.feedAngle == nil }.map(\.id)
@@ -297,7 +325,7 @@ private enum MCPTilesWork {
                      useSidecar: Bool) throws -> Result {
         let id = try sourceID(input, project: project, scanned: false)
         let source = try CheckedSource(sourceURL(id, project: project, document: document))
-        let store = TilesPendingReviewStore(project: document, recordingID: id)
+        let previous = project.participants.pendingReviews.first { $0.sourceID == id }
         let output = try input.url("output")
         let resumeFile = try input.url("resume_file")
         let resume = try input.flag("resume")
@@ -314,7 +342,7 @@ private enum MCPTilesWork {
             }
             partial = nil
         } else if resume {
-            guard let scan = try store.load(recording: source.url)?.0, scan.state == .paused || scan.state == .incomplete else {
+            guard let scan = try previous?.load(recording: source.url), scan.state == .paused || scan.state == .incomplete else {
                 throw input.invalid("This recording has no paused or incomplete scan to resume.")
             }
             partial = scan
@@ -375,10 +403,18 @@ private enum MCPTilesWork {
         }
         scan.countHints = hints
         let finished = scan.state == .completed || scan.state == .upToDate
+        let accept = try input.flag("accept")
         var updated: CutProject?
-        if !Task.isCancelled, finished, try input.flag("accept") {
+        if !Task.isCancelled, finished, accept {
             var next = project
             try acceptScan(scan, in: &next, sourceID: id, document: document, hints: hints)
+            if output == nil, let previous {
+                var choices = previous.choices
+                if let count = hints?.expectedFeeds { choices.expectedFeeds = String(count) }
+                if let count = hints?.maxVisibleTiles { choices.expectedTiles = String(count) }
+                try choices.apply(to: &next.participants, sourceID: id, analysisIdentity: scan.analysisIdentity)
+                next.participants.pendingReviews.removeAll { $0.id == previous.id }
+            }
             updated = next
         }
         let analysisFile: URL?
@@ -397,7 +433,19 @@ private enum MCPTilesWork {
                 checkpointDirectory = checkpoint
             }
         } else {
-            analysisFile = try store.save(scan, adoptingCountHints: true)
+            analysisFile = nil
+            if updated == nil {
+                var next = project
+                let path: String
+                if case let .multicam(group) = next, let recording = group.pictureSources.first(where: { $0.id == id }) {
+                    path = recording.file
+                } else { path = id }
+                var pending = try PendingTileReview(scan: scan, sourceID: id, file: path, previous: previous)
+                if let feeds = hints?.expectedFeeds { pending.choices.expectedFeeds = String(feeds) }
+                if let tiles = hints?.maxVisibleTiles { pending.choices.expectedTiles = String(tiles) }
+                next.participants.setPendingReview(pending)
+                updated = next
+            }
             checkpointDirectory = nil
         }
         let review = TilesReview(scan: scan, countHints: hints).report(issuesOnly: true)
@@ -405,7 +453,7 @@ private enum MCPTilesWork {
                                       state: scan.state, sourceID: id,
                                       source: scan.source, counts: review.counts, coverage: review.coverage,
                                       issues: review.issues.filter { $0.kind == .countMismatch }, reviewIssueCount: review.issues.count),
-                          update: updated, action: "Accept Tiles", source: source)
+                          update: updated, action: finished && accept ? "Accept Tiles" : "Find Tiles", source: source)
     }
 
     struct ScanReceipt: Encodable {
@@ -442,12 +490,21 @@ private enum MCPTilesWork {
         let hints = try countHints(input)
         let clear = try input.flag("clear_count_hints")
         guard !clear || hints == nil else { throw input.invalid("Use clear_count_hints without count values.") }
-        guard path != nil || (!reconcile && (hints != nil || clear)) else {
-            throw input.invalid(reconcile ? "Supply analysis_file." : "Supply analysis_file, count values or clear_count_hints.")
+        let usesPending = path == nil && hints == nil && !clear
+        let pendingToken = try input.optional("review_token", as: String.self)
+        guard pendingToken == nil || (usesPending && !reconcile) else {
+            throw input.invalid("Use review_token when accepting a pending review without a scan file or count overrides.")
         }
-        let id = try sourceID(input, project: project, scanned: reconcile || path == nil)
+        let id = try usesPending ? project.pendingTileSourceID(input.optional("source_id", as: String.self))
+            : sourceID(input, project: project, scanned: reconcile || path == nil)
         var next = project
-        guard let path else {
+        if usesPending, !reconcile {
+            let source = try CheckedSource(sourceURL(id, project: project, document: document))
+            try next.acceptPendingTileReview(sourceID: id, relativeTo: document, token: pendingToken,
+                                             cancelled: { Task.isCancelled })
+            return try Result(EditReceipt(operationCount: 1), update: next, action: "Accept Tiles", source: source)
+        }
+        if path == nil, !usesPending {
             let previous = project.participants.sources.first { $0.sourceID == id }?.countHints
             try next.participants.setTileCountHints(sourceID: id, hints: clear ? nil : merging(hints, into: previous))
             let review = TilesReview(project: next, sourceID: id, document: document, useSidecar: useSidecar,
@@ -456,25 +513,36 @@ private enum MCPTilesWork {
                               update: next, action: "Edit Tile Count Hints")
         }
         let source = try CheckedSource(sourceURL(id, project: project, document: document))
-        let scan = try readScan(path)
+        let scan: ParticipantScanResult
+        let pending = project.participants.pendingReviews.first { $0.sourceID == id }
+        if let path { scan = try readScan(path) }
+        else if let pending { scan = try pending.load(recording: source.url) }
+        else { throw input.invalid("Supply a scan file or choose a source with a pending tile review.") }
         if reconcile {
             let apply = try input.flag("apply")
             let token = try input.optional("review", as: String.self)
             guard apply == (token != nil) else { throw input.invalid("Use apply with the token from the reconciliation report.") }
             if let token {
-                try next.applyReviewedParticipantReconciliation(scan, sourceID: id, relativeTo: document,
-                                                                token: token, cancelled: { Task.isCancelled })
+                if usesPending {
+                    try next.reconcilePendingTileReview(sourceID: id, relativeTo: document, token: token,
+                                                        cancelled: { Task.isCancelled })
+                } else {
+                    try next.applyReviewedParticipantReconciliation(scan, sourceID: id, relativeTo: document,
+                                                                    token: token, cancelled: { Task.isCancelled })
+                }
                 return try Result(EditReceipt(operationCount: next == project ? 0 : 1), update: next,
                                   action: "Reconcile Tiles", source: source)
             }
             let report = try project.participantReconciliation(scan, sourceID: id, relativeTo: document,
                                                                cancelled: { Task.isCancelled })
-            return try Result(ReconciliationReceipt(report: report, review: report.reviewToken(for: scan)), source: source)
+            let reviewToken = try (usesPending ? pending : nil)?.reconciliationToken(for: report, scan: scan)
+                ?? report.reviewToken(for: scan)
+            return try Result(ReconciliationReceipt(report: report, review: reviewToken), source: source)
         }
         try acceptScan(scan, in: &next, sourceID: id, document: document, hints: hints, clear: clear)
         let review = TilesReview(project: next, sourceID: id, document: document, useSidecar: useSidecar,
                                  cancelled: { Task.isCancelled }).report(issuesOnly: true)
-        return try Result(ScanReceipt(analysisFile: path.path, state: scan.state, sourceID: id,
+        return try Result(ScanReceipt(analysisFile: path?.path, state: scan.state, sourceID: id,
                                       source: scan.source, counts: review.counts, coverage: review.coverage,
                                       issues: review.issues.filter { $0.kind == .countMismatch }, reviewIssueCount: review.issues.count),
                           update: next, action: "Accept Tiles", source: source)
@@ -711,6 +779,8 @@ private extension MCPTilesWork {
         }
         if try input.flag("dry_run") { return try Result(plan) }
         guard let output = try input.url("output") else { throw input.invalid("Supply output.") }
+        let awake = SleepPrevention(reason: "Exporting ISO movies")
+        defer { awake.end() }
         let manifest = try TilesISODelivery.render(plan, project: project, document: document, to: output, cancelled: cancelled) {
             progress.update($0)
             return !Task.isCancelled
@@ -907,7 +977,8 @@ private extension MCPTilesWork {
             let requested = try input.optional("source_id", as: String.self)
             let scanned = operation != "inspect"
                 || project.participants.sources.contains { requested == nil || requested == $0.sourceID }
-            model = try .init(project: project, sourceID: sourceID(input, project: project, scanned: scanned), document: document,
+                || project.participants.pendingReviews.contains { requested == nil || requested == $0.sourceID }
+            model = try .init(reviewing: project, sourceID: sourceID(input, project: project, scanned: scanned, includingPending: true), document: document,
                               useSidecar: useSidecar, cancelled: { Task.isCancelled })
         }
         if let clock = try input.optional("clock", as: String.self), clock != "source" {

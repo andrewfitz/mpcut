@@ -13,7 +13,7 @@ def _expand_refs(document):
     """A saved project lists what it repeats once, in a root `refs` table keyed by content.
 
     "~KEY" stands for a text entry, {"~": "KEY"} for an object or list entry, and "~~x" for
-    the text "~x". A `media_snapshot` is carried as it is.
+    the text "~x". The media snapshot and embedded assets are carried as written.
     """
     refs = document["refs"]
     done = {}
@@ -37,7 +37,7 @@ def _expand_refs(document):
         if isinstance(node, dict):
             if list(node) == ["~"]:
                 return value(node["~"])
-            return {key: item if key == "media_snapshot" else expand(item) for key, item in node.items()}
+            return {key: item if key in ("media_snapshot", "embedded_assets") else expand(item) for key, item in node.items()}
         return node
 
     return expand({key: item for key, item in document.items() if key != "refs"})

@@ -334,7 +334,7 @@ public struct AudioReplacementEngine: Sendable {
         guard identity.isCurrentSnapshot(at: partial) else {
             throw CutError(code: "write_failed", message: "The working copy changed before it could be saved.")
         }
-        let failure = publishExclusively(from: partial, to: destination)
+        let failure = try MediaExportPublication.publish(from: partial, to: destination)
         guard failure == 0 else {
             throw CutError(code: failure == EEXIST ? "output_exists" : "write_failed", message: String(cString: strerror(failure)))
         }

@@ -1,18 +1,16 @@
 # MPCut project files
 
-A `.cut` file contains one editable timeline. MPCut saves it as one UTF-8 JSON file, usually with one field to a line and a `refs` table for repeated values. The file can be kept in [version control and changed as text](#version-control). Use the expanded JSON shown below to author a project by hand. A project references media by path. When moving a project, take the referenced recordings, linked images and any sibling `.cut.transcripts` directory. The SQLite analysis sidecars (`.cutdb`) are optional caches.
+A `.cut` file contains one editable timeline, its transcript assets, recording annotations and unfinished Tiles reviews. MPCut saves one UTF-8 JSON object. To move a project, copy the document and its linked recordings and images. MPCut can rebuild a recording’s SQLite `.cutcache` from the media.
 
-Expanded sequence and multicam documents use the [version 4 JSON Schema](schema/cut-v4.schema.json) for the timeline, edit history, still placements and transcript attachments. MPCut also reads [version 3 documents](schema/cut-v3.schema.json). Opening a version 3 project leaves its file intact. Its next explicit save updates the format and retains the assembly, switch overrides, fixed soundtrack selection, attachments and edit history. Mix lanes and track replacements start empty in a version 3 project. Opening a version 1 or 2 document reports an unsupported version and preserves the file. Readers reject unknown fields, duplicate object keys in the expanded document and unknown versions. The maximum file size is 64 MiB. Timeline times are seconds stored as strings. Writers emit reduced fractions or integers. Readers also accept exact decimals and clock times. Reduced numerators and positive denominators must fit signed 64-bit integers. Relative paths resolve from the folder containing the document. Opening a symbolic link to a project uses the target document’s folder. A relative media path that traverses `..` requires its preceding directory to exist so MPCut can resolve symlinks to the intended recording. Spaces and `#` are literal path characters.
+Sequence, still and multicam timelines use schema version 9. Opening a document with an earlier version reports an unsupported version. To validate a saved project, expand it with `mpcut project document print interview.cut > interview.json` and validate the result against the version 9 schema. The command also accepts standard input with `-` and works offline. [Project JSON Schema](schema/cut-v9.schema.json)
 
-Still sequences use the [version 6 JSON Schema](schema/cut-v6.schema.json) if the current edit or retained history includes a soundtrack, an exact fitted duration, or a JPEG, M4V or MKV still format. Multicam projects and other sequences use version 4 when they use its fields. Projects with Tiles fields use the [version 8 JSON Schema](schema/cut-v8.schema.json). MPCut reads versions 3 through 8. To open a project in an older build that supports versions 4 and 5, use the expanded document when its `schema_version` is 4.
-
-To validate a saved file, expand it with `mpcut project document print interview.cut > interview.json`. Read `schema_version` from `interview.json` and validate that JSON against `docs/schema/cut-v3.schema.json`, `cut-v4.schema.json`, `cut-v6.schema.json` or `cut-v8.schema.json`, as indicated. The print command expands the `refs` table without opening the referenced media. It also accepts `-` for standard input.
+Timeline times are seconds stored as strings. Writers emit reduced fractions or integers. Readers also accept exact decimals and clock times. Reduced numerators and positive denominators must fit signed 64-bit integers. Relative paths resolve from the folder containing the document. Opening a symbolic link to a project uses the target document’s folder. A relative media path that traverses `..` requires its preceding directory to exist so MPCut can resolve symlinks to the intended recording. Spaces and `#` are literal path characters.
 
 ## Media snapshot
 
 The optional root `media_snapshot` stores descriptions and content evidence for referenced paths. Version 1 uses an `entries` array. Each entry has a `path`. Snapshot timing fields use integer `numerator` and `denominator` members. Readers preserve unknown entry fields and can open a project with no snapshot. A transcript fingerprint identifies the source generation used to collect the accompanying evidence. `evidence_sha256` is the SHA-256, in lowercase hex, of the recording's content evidence as JSON with sorted keys: digests of each stream's configuration, packets and timing, with the container's format, origin and duration. MPCut writes it only when that evidence covers every audio and video stream. Relink uses the two values to confirm that a file is the same recording before updating a binding.
 
-The current edit and retained history take priority under the 64 MiB document limit. Writers fit up to 4 MiB of complete snapshot entries into the remaining space, starting with paths in the current edit. A missing entry means the reader has less evidence for locating that source. Saved layouts preserve the snapshot as written.
+A missing snapshot entry means the reader has less evidence for locating that source. Saved layouts preserve the snapshot as written.
 
 ## Saved reference table
 
@@ -34,7 +32,7 @@ A project is one text file that Git, a text editor and MPCut can each change.
 
 **Editing as text.** Change the clips and other edit fields directly. A `file` can be a plain path or a `"~KEY"` reference; a new clip needs an `id` no other clip has. Leave `history`, `media_snapshot` and `refs` as they are, or delete `history`. Check the result with `mpcut project inspect --project FILE --json`.
 
-**History follows the edit.** An undo step describes its change by position in the timeline it was made on. A saved `history` therefore carries `base`, a key formed like a `refs` key from the document without `history`, `media_snapshot` and `refs`. When the edit no longer matches, as after a change made in the text or a merge, MPCut opens the project with an empty history and the next save starts a new one. `base` belongs to the saved layout: the expanded document has none, and a history without one is read as it is.
+**History follows the edit.** An undo step describes its change by position in the timeline it was made on. A saved `history` therefore carries `base`, a key formed like a `refs` key from the document without `history`, `media_snapshot`, `embedded_assets` and `refs`. When the edit no longer matches, as after a change made in the text or a merge, MPCut opens the project with an empty history and the next save starts a new one. `base` belongs to the saved layout: the expanded document has none, and a history without one is read as it is.
 
 **Merging.** Branches whose projects were changed only as text merge as any text does. Each save by MPCut also rewrites the `history` line and can add a recording line, so two branches saved by MPCut conflict in those lines under Git's own merge. Register MPCut's merge once in each clone:
 
@@ -43,18 +41,18 @@ git config merge.mpcut.driver "mpcut project merge %O %A %B"
 echo '*.cut merge=mpcut' >> .gitattributes
 ```
 
-Git then runs `mpcut project merge` for each project. It merges the edit line by line, merges the media snapshot recording by recording, and leaves the history out, since steps from two branches cannot be combined. When both branches changed the same clip, or each added clips in the same place, it leaves the project as plain JSON with Git's conflict markers around those lines only. A clone without the `git config` line uses Git's own merge.
+Git then runs `mpcut project merge` for each project. It merges the edit line by line, combines the media snapshot recording by recording and collects embedded assets by digest. The merged edit starts a new history. When both branches changed the same clip, or each added clips in the same place, it leaves the project as plain JSON with Git's conflict markers around those lines only. A clone without the `git config` line uses Git's own merge.
 
 `mpcut project document print FILE` writes the expanded project as readable JSON, with each path written out in full.
 
-Media files, analysis sidecars and the `.cut.transcripts` directory are binary and are stored as they are.
+Embedded payloads travel with the project in version control. Linked media remain separate files.
 
 ## Sequence
 
 ```json
 {
   "format": "mpcut",
-  "schema_version": 4,
+  "schema_version": 9,
   "kind": "sequence",
   "clips": [
     {"id": "opening", "file": "media/camera.mov", "from": "1001/30000", "to": "2"},
@@ -100,7 +98,7 @@ Undo and redo store an attachment change as a `still_soundtrack` list delta. An 
 ```json
 {
   "format": "mpcut",
-  "schema_version": 4,
+  "schema_version": 9,
   "kind": "multicam",
   "reference_angle_id": "wide",
   "group_range": {"from": "0", "to": "20"},
@@ -181,13 +179,13 @@ See the [still image guide](STILL-IMAGES.md) for authoring commands and export b
 
 ## Transcripts
 
-A sequence or multicam document can carry a `transcripts` object. Its stream offsets, sequence clock origins and import origins encode seconds as objects with signed 64-bit `numerator` and positive 64-bit `denominator` fields. Each attachment binds a content-addressed JSON asset to its media streams. A saved project named `Interview.cut` keeps its transcript assets in `Interview.cut.transcripts/` beside the document. Move that directory with the project. The asset reference includes its SHA-256 and a path relative to the document. Named selects, wording corrections, speaker changes, and their source anchors belong to the project. Imported subtitle cues retain cue-level precision.
+A sequence or multicam document can carry a `transcripts` object. Its stream offsets, sequence clock origins and import origins encode seconds as objects with signed 64-bit `numerator` and positive 64-bit `denominator` fields. Each attachment binds a transcript to its media streams. Named selects, wording corrections, speaker changes and source anchors belong to the project. Subtitle cues retain cue-level precision.
 
-After a Finder rename, MPCut looks for each referenced digest in the matching store beside the renamed project. It can also recover the asset from the former sibling store when the former project name is free. Saving moves verified content into the current project's store. If both project names exist, choose the intended store explicitly to recover a copy.
+An attachment’s `asset.sha256` selects an entry from the root `embedded_assets.transcripts` object. The value is a version 4 transcript document. It contains the words, speakers, provenance and any activity frames the provider supplied. Sample-timed imports retain their exact bounds as rational seconds on the track’s source clock. [Stored transcript schema](schema/transcript-document-v4.schema.json) · [Transcriberrr result schema](schema/transcript-result-v1.schema.json)
 
-The [Transcriberrr result schema](schema/transcript-result-v1.schema.json) describes the sample-timed JSON accepted by transcript import. MPCut normalizes those samples to rational seconds when it writes the referenced asset. The asset and transcript JSON exported by MPCut use the editor's rational clocks. The asset is the [compact stored form](schema/transcript-document-v3.schema.json), which may be compressed, and an export is the [version 2 document](schema/transcript-document-v2.schema.json). Assets written by earlier builds are version 2 documents and stay readable.
+Each embedded asset’s key is the lowercase SHA-256 of the canonical JSON written by its asset encoder, using sorted keys, compact separators and the original array order. A project writes each referenced digest once across the edit and its retained history. The reader checks the digest and the references. Copying or renaming the project preserves these assets.
 
-The attachment revision changes when the transcript data used for editing changes. A word-based edit must also match the timeline revision and the selected result identity. Authored changes participate in native undo through the `transcript_authoring` history field. An external timeline export reports transcript metadata as a conversion loss. [Transcript and history schema](schema/cut-v4.schema.json)
+The attachment revision changes when the transcript data used for editing changes. A word-based edit must also match the timeline revision and the selected result identity. Undo and redo restore changes to words and speakers through the `transcript_authoring` history field. All timeline revisions share the current attachment list, so a detached transcript stays detached when the editor undoes a timeline edit. An external timeline export reports transcript metadata as a conversion loss. [Transcript and history schema](schema/cut-v9.schema.json)
 
 ## Edit history
 
@@ -201,19 +199,23 @@ Changes to `mix_lanes` and `audio_replacements` also use literal-or-copy arrays.
 
 For example, if the current timeline has three clips, a history step `{"action":"Move Clip","clips":[[1,2],[0,1]]}` restores the second and third clips followed by the first. The project stores the media paths and time ranges once for this move. Conversion to another editor uses the current timeline. Export destinations and automatic analysis caches also respect recordings referenced by saved undo and redo steps, including offline originals and replacement audio. For example, if an offline recording has the name a cache would use, MPCut skips that recording’s conflicting cache and continues editing.
 
-MPCut trims the farthest history first when the combined history would exceed one million reconstructed array entries or the complete document would exceed 64 MiB. A reader checks that the stored deltas contain at most one million array entries in total before decoding their contents. The reconstruction budget counts timeline items, source records including additional camera files, named source selects, switches, Mix lanes, track bindings, the remembered Fixed selection, still records and transcript authoring records in every retained state, including unchanged records. This also bounds the memory used to rebase all history paths when a document moves. A project whose current timeline fits can therefore be saved even after a large paste.
+## Recording annotations
+
+The optional `analysis_annotations` object holds project-specific recording decisions. A named scene view carries its report with the original source-clock ranges and scene membership. A manual silence threshold identifies the recording and stream and accepts fractional dBFS values. The saved evidence identifies the stream content or the full file by SHA-256. Two projects using the same recording can retain different decisions.
+
+`pause_reviews` stores protected spans, retained silence durations and manual markers. Each entry names the occurrence when applicable and carries the source evidence and exact time it was reviewed against. These choices can appear in undo and redo history.
 
 ### Participant geometry and composition
 
-Version 4 sequence and multicam documents may include a `participants` object. Its `people` array holds durable person IDs, display names, optional ISO audio bindings and transcript speaker references scoped to their attachment. Each entry in `sources` carries source-relative, half-open appearance spans with normalized top-left display bounds and a separate coverage map. An appearance ID may recur in adjacent spans when bounds change. Multiple simultaneous appearances may name the same person. The project embeds accepted geometry so it travels with the edit when its analysis cache is removed.
+Version 9 sequence and multicam documents may include a `participants` object. Its `people` array holds durable person IDs, display names, optional ISO audio bindings and transcript speaker references scoped to their attachment. Each entry in `sources` carries source-relative, half-open appearance spans with normalized top-left display bounds and a separate coverage map. An appearance ID may recur in adjacent spans when bounds change. Multiple simultaneous appearances may name the same person. The project embeds accepted geometry so it travels with the edit when its analysis cache is removed.
 
-`appearance_overrides` pin a person to an appearance on a source-time interval. The optional `render` plan contains a canvas, a default shot and optional timed shots, audio delivery and participant redactions. Group-time shots apply to every use of that part of the group. An output-time shot can target an individual assembly occurrence. Source corrections and participant masks apply to every occurrence. See the [v4 schema](schema/cut-v4.schema.json) for field names and accepted values.
+`appearance_overrides` pin a person to an appearance on a source-time interval. The optional `render` plan contains a canvas, a default shot and optional timed shots, audio delivery and participant redactions. Group-time shots apply to every use of that part of the group. An output-time shot can target an individual assembly occurrence. Source corrections and participant masks apply to every occurrence. See the [project schema](schema/cut-v9.schema.json) for field names and accepted values.
 
 ### Tiles layouts, treatments and feed angles
 
-Version 8 stores `tile_layouts` on sequence clips, `group_tile_layouts` on the multicam group, and `tile_layouts` on multicam assembly occurrences with stable IDs. Layout ranges are half-open in the clip's source clock or multicam group clock. An occurrence layout takes precedence over the group layout. An explicit Original on an occurrence clears the group layout there. Sequence clips own their layouts independently, including clips cut from the same recording.
+The project stores `tile_layouts` on sequence clips, `group_tile_layouts` on the multicam group, and `tile_layouts` on multicam assembly occurrences with stable IDs. Layout ranges are half-open in the clip's source clock or multicam group clock. An occurrence layout takes precedence over the group layout. An explicit Original on an occurrence clears the group layout there. Sequence clips own their layouts independently, including clips cut from the same recording.
 
-Pending tile review remains separate from the saved edit. MPCut writes a sibling companion directory named after the cut with the extension `.tile-review`. Each recording’s manifest references a relative scan artifact and records its SHA-256 fingerprint. Move the cut and companion together to keep pending scans and review choices. The recording must still match the scan when reopened. If the artifact is missing or changed, find tiles again. Accepted tile data stays in the cut.
+Each entry in `participants.pending_reviews` names its target picture source, its linked recording and the `scan_sha256` of an immutable scan in `embedded_assets.tile_scans`. Two multicam sources can use the same file and retain distinct review choices. The review stores names, merges, exclusions and grid corrections separately from the scan. Accepting the review publishes the geometry and layouts to the edit. The document retains its scan while a pending review or retained history refers to it.
 
 A layout span stores the range and layout along with any ordered `slots`. An arranged slot can identify the destination tile in `destination_tile_id` and use target `empty` to leave a position blank. A feed's `treatment` lives on its entry in `participants.people` and applies in every layout, including Original. The `participants.tile_output` settings carry canvas, audio and unresolved-privacy policy. Migrated compositions can retain legacy `render` data for the participant command compatibility projection.
 
@@ -221,4 +223,4 @@ An unassigned legacy presentation becomes a feed with its own stable ID. Its `le
 
 A geometry source can store compact `scan_events`, `count_hints`, `historical_participant_ids` and `privacy_confirmations`. A confirmation refers to a feed, source-time range and the geometry's media and analysis identity. The confirmation's `review_digest` identifies the accepted geometry, review state and treatment. A multicam angle's `feed_angle` object points to its parent picture source and feed. `speaker_angles` links transcript voice references to angle IDs.
 
-Multicam history can edit `group_tile_layouts` and `speaker_angles` with the existing literal-or-copy array encoding. A conversion between sequence and multicam uses a `timeline` snapshot on the history step, optionally with `transcript_bindings`. That step stores any transcript authoring with the timeline, and the document retains the shared transcript attachments. [Version 8 JSON Schema](schema/cut-v8.schema.json)
+Multicam history can edit `group_tile_layouts` and `speaker_angles` with the existing literal-or-copy array encoding. A conversion between sequence and multicam uses a `timeline` snapshot on the history step, optionally with `transcript_bindings`. That step stores any transcript authoring with the timeline, and the document retains the shared transcript attachments. [Version 9 JSON Schema](schema/cut-v9.schema.json)

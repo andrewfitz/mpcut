@@ -217,7 +217,7 @@ final class ReplaceEdit {
                 && Self.comparisonURL(location).path == path.path)
         })
         let matching = sourcePaths
-        let allUses = references.filter { matching.contains($0.path) }
+        let allUses = references.filter { matching.contains($0.path) && $0.kind.canReplaceDirectly }
         var selectedID = options.useID
         if let id = selectedID, let use = allUses.first(where: { $0.id == id }) {
             if use.kind == .multicamSpan || use.kind == .multicamSelection ||
@@ -282,6 +282,7 @@ final class ReplaceEdit {
                 revised = .multicam(try replaceMulticam(value))
             }
             revised.transcripts = try replaceTranscripts(revised)
+            try rebindAnalysis(in: &revised)
         }
 
         report.lostUseIDs = Set(report.lostUseIDs).sorted()
@@ -669,11 +670,14 @@ extension ReplaceEdit {
         let participantUse = uses.contains { $0.kind == .participant || $0.kind == .participantAudio }
         if replacedPicture || participantUse {
             let retainsOldPicture = !replacesAtSameLocation && revisedClips.contains { sameSource($0.file) }
-            var paths = Set(sequence.participants.protectedMediaPaths.map { $0.1 }.filter(sameSource))
-            if replacedPicture, paths.isEmpty, sequence.participants.hasEffectiveTreatments {
-                paths.insert(source)
+            var sourceIDs = Set(sequence.participants.protectedMediaPaths.map { $0.1 }.filter(sameSource))
+            for review in sequence.participants.pendingReviews where sameSource(review.file) {
+                sourceIDs.insert(review.sourceID)
             }
-            for id in paths.sorted() {
+            if replacedPicture, sourceIDs.isEmpty, sequence.participants.hasEffectiveTreatments {
+                sourceIDs.insert(source)
+            }
+            for id in sourceIDs.sorted() {
                 try reviseParticipants(&sequence.participants, id: id, newID: destination, preserveOriginal: retainsOldPicture)
             }
         }
@@ -815,7 +819,7 @@ extension ReplaceEdit {
         result.audioSources = try value.audioSources.compactMap(reviseSource)
         let items = value.assemblyItems ?? [.group(value.range)]
         let intervalsByIndex = Dictionary(grouping: initialPlan.intervals, by: \.assemblyIndex)
-        let conformedItems = items.enumerated().flatMap { index, item -> [StillAssemblyItem] in
+        let piecesByOccurrence = items.enumerated().map { index, item -> [StillAssemblyItem] in
             guard let group = item.group else { return [item] }
             var ranges: [MulticamRange] = []
             for interval in intervalsByIndex[index] ?? [] {
@@ -843,11 +847,13 @@ extension ReplaceEdit {
                 item.groupPiece(range, from: range.from, to: range.to, keepingID: index == 0)
             }
         }
+        let conformedItems = piecesByOccurrence.flatMap { $0 }
         if items != conformedItems {
             if conformedItems.isEmpty {
                 report.blockers.append("Removing the affected spans would leave an empty assembly. Keep one use offline or edit the assembly first.")
             } else {
-                result.assemblyItems = conformedItems
+                let origin = piecesByOccurrence.enumerated().flatMap { index, pieces in pieces.map { _ in index } }
+                result.replaceAssembly(conformedItems, carryingPauseReviewsFrom: origin)
             }
         }
         func mapSelection(_ selection: MulticamAudioSelection) -> MulticamAudioSelection? {

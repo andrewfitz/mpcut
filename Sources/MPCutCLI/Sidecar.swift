@@ -58,6 +58,16 @@ struct SidecarResult: Encodable {
     let inventory: SidecarInventory
     let generations: [AnalysisSidecar.PersistedGeneration]?
     let staleReason: String?
+    let cacheCopies: [CacheCopy]?
+    let duplicateCopies: Int?
+    let projectBytes: Int64?
+
+    struct CacheCopy: Encodable {
+        let path: String
+        let reclaimableBytes: Int64
+        let usage: CutcacheUsage?
+        let issue: String?
+    }
 
     init(file: URL, snapshot: AnalysisSidecar.InventorySnapshot, writeLocation: URL?, saved: [String]? = nil) {
         self.file = file.path
@@ -65,6 +75,17 @@ struct SidecarResult: Encodable {
         self.readLocations = snapshot.locations.map(\.path)
         self.readLocation = readLocations.first
         self.writeLocation = writeLocation?.path
+        if saved == nil {
+            let entries = SidecarCacheCleaner.copies(for: file)
+            cacheCopies = entries.map { CacheCopy(path: $0.url.path, reclaimableBytes: $0.issue == nil ? $0.bytes : 0,
+                                                   usage: $0.usage, issue: $0.issue) }
+            duplicateCopies = max(0, entries.filter { $0.usage != nil }.count - 1)
+            projectBytes = SidecarLocations.projectURL.flatMap { try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize }.map(Int64.init)
+        } else {
+            cacheCopies = nil
+            duplicateCopies = nil
+            projectBytes = nil
+        }
         status = snapshot.status
         sections = snapshot.sections
         self.saved = saved

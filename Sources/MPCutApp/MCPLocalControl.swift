@@ -118,11 +118,17 @@ final class MCPLocalControl {
         let root = request as NSDictionary
         var integers = MCPSchemas.WireIntegers()
         var invalidProjectNumber = false
+        var checkReferencedNumbers = false
         if let issue = jsonInputIssue(data, inspectDecimal: { path, token in
             guard path.first == .key("arguments") || path == [.key("version")] else { return }
             let exact = exactJSONInteger(token)
             if exact == nil, path.starts(with: MCPSchemas.projectDataPath) {
-                invalidProjectNumber = true
+                let projectPath = Array(path.dropFirst(MCPSchemas.projectDataPath.count))
+                if projectPath.first == .key("refs") {
+                    checkReferencedNumbers = true
+                } else if !CutProject.allowsFraction(at: projectPath) {
+                    invalidProjectNumber = true
+                }
                 return
             }
             let value: Any? = path.reduce(root as Any?) { value, part in
@@ -139,6 +145,10 @@ final class MCPLocalControl {
         }
         guard !invalidProjectNumber else {
             throw MCPFailure("invalid_arguments", "project_data: Expected integers within the supported range.")
+        }
+        if checkReferencedNumbers {
+            do { try CutProject.validateInlineProjectNumbers(in: data, at: ["arguments", "project_data"]) }
+            catch { throw MCPFailure("invalid_arguments", "project_data: " + error.localizedDescription) }
         }
         let version: Int?
         if let wire = integers[[.key("version")]] { version = wire.exact }
@@ -304,7 +314,7 @@ final class MCPLocalControl {
 
     private func requireAccess(_ token: UUID) throws {
         guard running, generation == token, sessions?.preferences.localMCPEnabled == true else {
-            throw MCPFailure("control_disabled", "Enable local MCP control in MPCut Settings.")
+            throw MCPFailure("control_disabled", "Enable local MCP control in MPCut Settings → Automation.")
         }
         if sessions?.isDrainingMCPForQuit == true {
             throw MCPFailure("app_quitting", "MPCut is preparing to quit.")
@@ -458,13 +468,18 @@ final class MCPLocalControl {
         let hasMedia = session.mcpHasProjectMedia
         capability("project_editor_media_list", hasMedia, "Open a project to list its media.", allowsSheet: true)
         capability("project_editor_media_locate", hasMedia, "Open a project to locate its media.", allowsSheet: true)
-        for tool in ["project_editor_media_relink", "project_editor_media_replace"] {
+        for tool in ["project_editor_media_relink", "project_editor_media_replace",
+                     "project_editor_media_leave_offline", "project_editor_media_revert"] {
             capability(tool, hasMedia && session.mcpCanEditProjectMedia, "An idle project is required.")
         }
         capability("timeline_editor_range_map", hasTimeline, "Open a timeline to map a range.", allowsSheet: true)
         capability("history_editor_compare", hasTimeline, "Open a timeline to compare retained states.", allowsSheet: true)
         capability("still_editor_placements_list", session.mcpStillProject != nil, "Open a timeline to list still placements.", allowsSheet: true)
-        for tool in ["timeline_gap_insert", "still_editor_placement_insert", "still_editor_picture_replace", "still_editor_placement_update", "still_editor_placement_remove", "still_editor_asset_relink"] {
+        for tool in ["timeline_gap_insert", "still_editor_placement_insert"] {
+            capability(tool, session.mcpCanEditStills || session.mcpCanStartStillTimeline,
+                       "An editable picture timeline or a blank sequence with an explicit initial format is required.")
+        }
+        for tool in ["still_editor_picture_replace", "still_editor_placement_update", "still_editor_placement_remove", "still_editor_asset_relink"] {
             capability(tool, session.mcpCanEditStills, "An editable picture timeline is required.")
         }
         let stillProject = session.mcpStillProject

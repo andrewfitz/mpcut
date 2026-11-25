@@ -15,7 +15,7 @@ final class SourceIndexLoaderTests: XCTestCase {
             let loader = SourceIndexLoader()
             let unsaved = try await read(.init(url: file, sidecars: true, preview: false), using: loader)
             XCTAssertTrue(unsaved.ordinary.hasFullEditIndex)
-            XCTAssertFalse(FileManager.default.fileExists(atPath: file.appendingPathExtension("cutdb").path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: file.appendingPathExtension("cutcache").path))
             let project = directory.appendingPathComponent("edit.cut")
             let indexed = try await read(.init(url: file, sidecars: true, preview: false, project: project), using: loader)
             XCTAssertFalse(unsaved === indexed)

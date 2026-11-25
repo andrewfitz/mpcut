@@ -56,7 +56,7 @@ func callEditor(ctx context.Context, path, tool string, args json.RawMessage) (*
 		return failure("request_too_large", "Reduce the request to less than 4 MiB."), nil
 	}
 	unavailable := func() *mcp.CallToolResult {
-		return failure("app_unavailable", "Open MPCut and enable local MCP control in Settings → General → Automation.")
+		return failure("app_unavailable", "Open MPCut and enable local MCP control in Settings → Automation.")
 	}
 	dir, err := os.Lstat(filepath.Dir(path))
 	if err != nil {
@@ -119,7 +119,7 @@ func callEditor(ctx context.Context, path, tool string, args json.RawMessage) (*
 		}
 		body = response.Error
 		result = toolResult(body, true)
-	case hasObject(response.Result) && response.Error == nil && tool == "review_editor_frame_read":
+	case hasObject(response.Result) && response.Error == nil && (tool == "review_editor_frame_read" || tool == "review_file_frame_result_read"):
 		result, err = reviewFrameResult(response.Result)
 		if err != nil {
 			return failure("invalid_result", "MPCut did not return a valid review JPEG. Request the frame again."), nil

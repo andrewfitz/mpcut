@@ -100,7 +100,6 @@ final class ProjectDraft {
         } catch {
             if lease.ownsFolder {
                 unlinkat(lease.descriptor, document.lastPathComponent, 0)
-                TranscriptStore.discardDraft(relativeTo: document)
                 rmdir(folder.path)
             }
             throw error
@@ -200,8 +199,6 @@ final class ProjectDraft {
         reservation = nil
         guard lease.ownsFolder else { return }
         let folder = lease.url.deletingLastPathComponent()
-        TranscriptStore.discardDraft(relativeTo: lease.url)
-        TilesPendingReviewStore.discardDraft(at: lease.url)
         unlinkat(lease.descriptor, lease.url.lastPathComponent, 0)
         for name in (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
             where name.hasPrefix(".pending-") && name.hasSuffix(".cut")
@@ -316,15 +313,29 @@ extension ProjectSessions {
         let window = source?.window
         do {
             let files = try ProjectDraft.recoverable()
-            let alert = NSAlert()
             if files.isEmpty {
+                let alert = NSAlert()
                 alert.messageText = "No untitled projects to recover"
                 alert.informativeText = "If MPCut closes unexpectedly, you can recover untitled projects here."
                 ProjectPanels.present(alert, in: window)
                 return
             }
-            alert.messageText = "Recover an untitled project"
-            alert.informativeText = "Choose a draft by its last edit time."
+            presentDraftRecovery(files, in: source, atLaunch: false)
+        } catch {
+            ProjectPanels.present(NSAlert(error: error), in: window)
+        }
+    }
+
+    /// The File → Recover Untitled Project… chooser. At launch it is the offer that Settings → General turns on.
+    @MainActor
+    func presentDraftRecovery(_ files: [URL], in source: ProjectSession?, atLaunch: Bool) {
+        let window = source?.window
+        do {
+            let alert = NSAlert()
+            alert.messageText = atLaunch ? "Recover an untitled project?" : "Recover an untitled project"
+            alert.informativeText = atLaunch
+                ? "MPCut kept \(files.count == 1 ? "an untitled project" : "\(files.count) untitled projects") that \(files.count == 1 ? "was" : "were") not saved. Choose a draft by its last edit time, or recover it later with File → Recover Untitled Project…."
+                : "Choose a draft by its last edit time."
             let choices = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 340, height: 28))
             choices.toolTip = "Choose project draft"
             for file in files {
@@ -334,7 +345,7 @@ extension ProjectSessions {
             }
             alert.accessoryView = choices
             alert.addButton(withTitle: "Recover").toolTip = "Recover selected draft"
-            alert.addButton(withTitle: "Cancel").toolTip = "Cancel draft recovery"
+            alert.addButton(withTitle: atLaunch ? "Not Now" : "Cancel").toolTip = "Cancel draft recovery"
             let respond: (NSApplication.ModalResponse) -> Void = { [weak self] result in
                 guard result == .alertFirstButtonReturn, files.indices.contains(choices.indexOfSelectedItem) else { return }
                 let file = files[choices.indexOfSelectedItem]

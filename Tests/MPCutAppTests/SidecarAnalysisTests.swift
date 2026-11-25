@@ -79,12 +79,7 @@ final class SidecarAnalysisTests: XCTestCase {
         encoder.outputFormatting = [.sortedKeys]
         XCTAssertEqual(try encoder.encode(SceneAnalysis.scan(url)), try encoder.encode(scenes))
         XCTAssertEqual(try encoder.encode(XCTUnwrap(store.sceneReport(for: media))), try encoder.encode(scenes))
-        try store.save(AnalysisSidecar.viewNameSections([1: " Presenter "], for: scenes))
-        let named = try SceneAnalysis.scan(url)
-        XCTAssertEqual(named.views.first?.name, "Presenter")
-        XCTAssertEqual(named.views.first?.label, scenes.views.first?.label)
-        try store.save(AnalysisSidecar.viewNameSections([:], for: named))
-        XCTAssertNil(try SceneAnalysis.scan(url).views.first?.name)
+        XCTAssertNil(try XCTUnwrap(store.sceneReport(for: media)?.views.first).name)
         let restored = try XCTUnwrap(store.waveform(for: media, stream: stream))
         XCTAssertEqual(restored.count, wave.count)
         for bin in 0..<wave.count {

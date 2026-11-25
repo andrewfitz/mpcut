@@ -14,7 +14,7 @@ public enum ClipEditCSV {
         return try ranges(in: text, clip: clip, rangesOnly: rangesOnly, cancelled: cancelled)
     }
 
-    package static func readListData(_ url: URL, kind: String, maximumBytes: Int = MulticamProject.maximumFileSize,
+    package static func readListData(_ url: URL, kind: String, maximumBytes: Int? = nil,
                                      cancelled: () -> Bool = { false }) throws -> Data {
         try checkCancellation(cancelled, kind: kind)
         // A two-word kind such as "Transcript plan" still yields one error-code token.
@@ -30,21 +30,26 @@ public enum ClipEditCSV {
         defer { try? reader.close() }
         var info = stat()
         guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { throw expectedFile }
-        let tooLarge = CutError(code: "invalid_\(code)",
-                               message: "The \(kind) exceeds the \(maximumBytes / (1024 * 1024)) MB file limit.")
-        guard info.st_size <= maximumBytes else { throw tooLarge }
+        func checkSize(_ count: Int) throws {
+            if let maximumBytes, count > maximumBytes {
+                throw CutError(code: "invalid_\(code)", message: "The \(kind) exceeds the \(maximumBytes / (1024 * 1024)) MB file limit.")
+            }
+        }
+        try checkSize(Int(info.st_size))
         var data = Data()
-        while data.count <= maximumBytes {
+        while true {
             try checkCancellation(cancelled, kind: kind)
-            let length = min(1 << 20, maximumBytes + 1 - data.count)
+            let block: Data
             do {
-                guard let block = try reader.read(upToCount: length), !block.isEmpty else { break }
-                data.append(block)
+                guard let next = try reader.read(upToCount: 1 << 20), !next.isEmpty else { break }
+                block = next
             } catch {
                 throw CutError(code: "\(code)_read_failed", message: "Couldn’t read \(url.path): \(error.localizedDescription)")
             }
+            guard block.count <= Int.max - data.count else { throw POSIXError(.EOVERFLOW) }
+            try checkSize(data.count + block.count)
+            data.append(block)
         }
-        guard data.count <= maximumBytes else { throw tooLarge }
         return data
     }
 

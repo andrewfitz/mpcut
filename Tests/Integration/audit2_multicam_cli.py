@@ -31,7 +31,7 @@ class MulticamCLITests(unittest.TestCase):
         camera(cls.fixtures / "ntsc.mov", marker_base=0, frequency=419, rate="30000/1001", gop=30, length="4.004")
         (cls.fixtures / "interview.mov").symlink_to(cls.fixtures / "wide.mov")
         cls.base = {
-            "format": "mpcut", "schema_version": 3, "kind": "multicam", "reference_angle_id": "wide",
+            "format": "mpcut", "schema_version": 9, "kind": "multicam", "reference_angle_id": "wide",
             "group_range": {"from": "0", "to": "4"},
             "angles": [{"id": "wide", "file": "wide.mov", "offset": "0", "audio_stream_index": 1},
                        {"id": "close", "file": "close.mov", "offset": "0", "audio_stream_index": 1}],
@@ -48,7 +48,7 @@ class MulticamCLITests(unittest.TestCase):
     def listing(self):
         # Reusable analysis sidecars are saved beside sources by design.
         return sorted(str(path.relative_to(self.fixtures)) for path in self.fixtures.rglob("*")
-                      if path.suffix != ".cutdb")
+                      if path.suffix != ".cutcache")
 
     def run_cli(self, *args, request=None):
         text = request if request is None or isinstance(request, str) else json.dumps(request)
@@ -98,7 +98,7 @@ class MulticamCLITests(unittest.TestCase):
                 error = self.failure(*args, status=2, code="invalid_time")
                 self.assertIn("‘1x’ in switches[1].group_time", error["message"])
         sequence = self.fixtures / "sequence.cut"
-        sequence.write_text(json.dumps({"format": "mpcut", "schema_version": 3, "kind": "sequence", "clips": [
+        sequence.write_text(json.dumps({"format": "mpcut", "schema_version": 9, "kind": "sequence", "clips": [
             {"id": "a", "file": "wide.mov", "from": "0", "to": "1x"}]}))
         self.addCleanup(sequence.unlink)
         self.before = self.listing()
@@ -214,7 +214,7 @@ class MulticamCLITests(unittest.TestCase):
         self.assertEqual(direct["mode"], "smart")
         self.assertEqual(self.listing(), self.before)
 
-    def test_oversized_or_special_project_path_fails_promptly(self):
+    def test_binary_or_special_project_path_fails_promptly(self):
         recording = self.fixtures / "recording.mov"
         with open(recording, "wb") as file:
             file.truncate(64 * 1024 * 1024 + 1)
@@ -224,7 +224,7 @@ class MulticamCLITests(unittest.TestCase):
                      ["export", "project", "render", "--project", recording, "--output", "program.mov", "--json"],
                      ["review", "frames", "export", "--project", recording, "--at", "1", "--output", "review", "--json"]):
             error = self.failure(*args, status=1, code="invalid_cut_project")
-            self.assertIn("64 MB", error["message"])
+            self.assertIn("UTF-8 JSON", error["message"])
         self.failure("project", "inspect", "--project", "/dev/null", "--json", status=1, code="cut_project_read_failed")
         self.failure("project", "inspect", "--project", self.fixtures, "--json", status=1, code="cut_project_read_failed")
         self.failure("project", "inspect", "--project", "", "--json", status=2, code="invalid_path")
@@ -379,7 +379,7 @@ class MulticamCLITests(unittest.TestCase):
         self.assertEqual(coverage["group"], {"from": "1", "to": "2"})
         self.assertEqual(coverage["picture"]["status"], "covered")
 
-        sequence = {"format": "mpcut", "schema_version": 3, "kind": "sequence", "clips": [
+        sequence = {"format": "mpcut", "schema_version": 9, "kind": "sequence", "clips": [
             {"id": key, "file": "interview.mov", "from": "0", "to": "3"} for key in ["first", "second"]]}
         multicam.write_text(json.dumps(sequence))
         mapping = example("timeline range map")

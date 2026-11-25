@@ -702,12 +702,14 @@ final class SequencePreview: ObservableObject {
     private let tileWriter = FilmstripTileWriter()
     private let surfaces = NSHashTable<PreviewSurface>.weakObjects()
 
-    init(reverseAudioEngine: AVAudioEngine? = nil, scrubAudioEngine: AVAudioEngine? = nil,
+    init(reverseAudio: ReverseAudioPlayer? = nil, scrubAudioEngine: AVAudioEngine? = nil,
          preferences: EditorPreferences? = nil) {
         self.preferences = preferences
-        reverseAudio = ReverseAudioPlayer(engine: reverseAudioEngine)
+        self.reverseAudio = reverseAudio ?? ReverseAudioPlayer()
         scrubAudio = ScrubAudioPlayer(engine: scrubAudioEngine)
         guard let preferences else { return }
+        // A new window starts at the Settings speed once. Each window then keeps its own.
+        forwardSpeed = preferences.playbackSpeed
         volume = preferences.volume
         isMuted = preferences.isMuted
         scrubSoundEnabled = preferences.scrubSoundEnabled
@@ -1525,11 +1527,13 @@ final class SequencePreview: ObservableObject {
 
 struct PreviewView: NSViewRepresentable {
     let preview: SequencePreview
+    /// Force SDR and clean feed. Nil keeps the factory values for this surface.
+    let preferences: EditorPreferences?
     var isVideoMonitor = false
 
     func makeNSView(context: Context) -> PreviewSurface {
         let surface = PreviewSurface(frame: .zero)
-        surface.setMonitor(isVideoMonitor)
+        surface.setMonitor(isVideoMonitor, preferences: preferences)
         surface.windowChanged = { [weak preview] surface in
             if surface.window == nil { preview?.detach(surface) }
             else { preview?.attach(surface) }

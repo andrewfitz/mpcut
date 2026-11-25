@@ -56,7 +56,7 @@ final class TileFeedAnglesTests: XCTestCase {
         ])
         let digest = String(repeating: "0", count: 64)
         sequence.transcripts.attachments = [.init(id: voice.attachmentID,
-            asset: .init(file: "review.transcripts/\(digest).json", sha256: digest),
+            asset: .init(sha256: digest),
             bindings: [.init(trackID: "lav", file: galleryPath, streamIndex: 1)])]
         let converted = try TileFeedAngles.usingFeeds(in: sequence, document: fixtures.appendingPathComponent("review.cut"),
                                                       sourceID: gallery, useSidecar: false)

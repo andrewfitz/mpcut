@@ -168,6 +168,96 @@ final class TimelineReviewTests: XCTestCase {
         XCTAssertEqual(try after.mapTimelineRange(range(3, 4), clock: .group).pieces.map(\.id), ["second", "first"])
     }
 
+    func testComparisonReportsParticipantEditsBySourceTileAndInterval() throws {
+        let changed = clip("changed", "a.mov", 1, 3)
+        let repeated = clip("repeat", "a.mov", 0, 3)
+        let adjacent = clip("adjacent", "a.mov", 3, 4)
+        let other = clip("other", "b.mov", 1, 3)
+        var before = CutProject.sequence([changed, repeated, adjacent, other])
+        let tile = ParticipantAppearance(id: "tile-1", participantID: "speaker-a", range: range(1, 3),
+                                         bounds: .init(x: 0, y: 0, width: 0.5, height: 0.5))
+        let people = [ParticipantPerson(id: "speaker-a", name: "A"), .init(id: "speaker-b", name: "B")]
+        before.participants = .init(people: people, sources: [.init(sourceID: "a.mov", appearances: [tile])])
+        var updatedTile = tile
+        updatedTile.bounds.x = 0.25
+        updatedTile.participantID = "speaker-b"
+        var after = before
+        after.participants = .init(people: people, sources: [.init(sourceID: "a.mov", appearances: [updatedTile])])
+        let comparison = try TimelineComparison.compare(from: before, to: after)
+
+        XCTAssertEqual(comparison.projectFields, ["privacy_geometry", "tile_assignments"])
+        XCTAssertEqual(comparison.changes.map { $0.after?.id }, ["changed", "repeat"])
+        XCTAssertEqual(comparison.changes.map(\.fields), Array(repeating: comparison.projectFields, count: 2))
+        XCTAssertEqual(comparison.participantChanges.map(\.sourceID), ["a.mov", "a.mov"])
+        XCTAssertEqual(comparison.participantChanges.map(\.tileID), ["tile-1", "tile-1"])
+        XCTAssertEqual(comparison.participantChanges.map(\.kind), [.modified, .modified])
+        XCTAssertEqual(comparison.participantChanges.map(\.beforeRange), [range(1, 3), range(1, 3)])
+        XCTAssertEqual(comparison.participantChanges.map(\.afterRange), [range(1, 3), range(1, 3)])
+        XCTAssertEqual(comparison.participantChanges.map(\.fields), [["bounds"], ["participant_id"]])
+        XCTAssertEqual(comparison.participantChanges.last?.beforeParticipantID, "speaker-a")
+        XCTAssertEqual(comparison.participantChanges.last?.afterParticipantID, "speaker-b")
+
+        let first = comparison.page(offset: 0, limit: 3)
+        XCTAssertEqual(first.changes.count, 2)
+        XCTAssertEqual(first.participantChanges.map(\.category), [.geometry])
+        XCTAssertEqual(first.nextOffset, 3)
+        let remainder = comparison.page(offset: try XCTUnwrap(first.nextOffset), limit: 3)
+        XCTAssertTrue(remainder.changes.isEmpty)
+        XCTAssertEqual(remainder.participantChanges.map(\.category), [.assignment])
+        XCTAssertNil(remainder.nextOffset)
+        let data = try JSONEncoder().encode(remainder)
+        XCTAssertEqual(try JSONDecoder().decode(TimelineComparison.self, from: data), remainder)
+    }
+
+    func testComparisonTranslatesMulticamRecordingIntervalsAndReportsOffTimelineChanges() throws {
+        var project = MulticamProject(
+            referenceAngle: "camera", range: range(0, 12),
+            angles: [.init(id: "camera", file: "camera.mov", coverage: range(0, 7), additionalRecordings: [
+                .init(id: "pickup", file: "pickup.mov", offset: time(5), coverage: range(7, 12))
+            ]), .init(id: "other", file: "other.mov")],
+            audio: .none, switches: [.init(at: .zero, angle: "camera")],
+            assemblyItems: [.group(range(2, 4)), .group(range(7, 8)), .group(range(8, 9)),
+                            .group(range(7, 8), angle: "other", id: "other-view"),
+                            .group(range(7, 8), angle: "other", id: "pickup-layout", layouts: [
+                                .init(range: range(7, 8), layout: .solo, slots: [.init(target: .camera, id: "camera")])
+                            ]),
+                            .group(range(7, 8), id: "other-layout", layouts: [
+                                .init(range: range(7, 8), layout: .solo, slots: [.init(target: .camera, id: "other")])
+                            ])]
+        )
+        let tile = ParticipantAppearance(id: "tile-1", range: range(2, 3),
+                                         bounds: .init(x: 0, y: 0, width: 0.5, height: 0.5))
+        let outside = ParticipantAppearance(id: "tile-2", range: range(5, 6), bounds: tile.bounds)
+        project.participants = .init(sources: [.init(sourceID: "pickup", appearances: [tile, outside])])
+        let before = CutProject.multicam(project)
+        var moved = tile
+        var movedOutside = outside
+        moved.bounds.x = 0.25
+        movedOutside.bounds.y = 0.25
+        project.participants = .init(sources: [.init(sourceID: "pickup", appearances: [moved, movedOutside])])
+        let comparison = try TimelineComparison.compare(from: before, to: .multicam(project))
+        XCTAssertEqual(comparison.changes.map { $0.after?.index }, [1, 4])
+        XCTAssertEqual(comparison.participantChanges.map(\.tileID), ["tile-1", "tile-2"])
+        XCTAssertEqual(comparison.participantChanges.map(\.afterRange), [range(2, 3), range(5, 6)])
+    }
+
+    func testComparisonTracksRepeatedScanEventsAtAHalfOpenBoundary() throws {
+        let event = ParticipantTileScanEvent(time: time(2), kind: .cameraState, uncertain: false,
+                                             tileID: "tile-1", feedID: nil, candidates: nil)
+        var before = CutProject.sequence([
+            clip("ending", "a.mov", 0, 2), clip("starting", "a.mov", 2, 4)
+        ])
+        before.participants = .init(sources: [.init(sourceID: "a.mov", scanEvents: [event])])
+        var after = before
+        after.participants = .init(sources: [.init(sourceID: "a.mov", scanEvents: [event, event])])
+        let comparison = try TimelineComparison.compare(from: before, to: after)
+        XCTAssertEqual(comparison.changes.map { $0.after?.id }, ["starting"])
+        XCTAssertEqual(comparison.participantChanges.count, 1)
+        XCTAssertEqual(comparison.participantChanges.first?.kind, .added)
+        XCTAssertEqual(comparison.participantChanges.first?.time, time(2))
+        XCTAssertEqual(comparison.participantChanges.first?.tileID, "tile-1")
+    }
+
     private func clip(_ id: String, _ path: String, _ from: Int64, _ to: Int64) -> CutSequenceClip {
         CutSequenceClip(id: id, file: path, from: time(from), to: time(to))
     }

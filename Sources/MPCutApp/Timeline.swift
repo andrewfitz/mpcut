@@ -243,7 +243,10 @@ struct SequenceTimeline: View {
 
     @State private var revealTime: Double?
     @State private var revealRequest = 0
-    @State private var hidesCutSections = false
+    var cutSectionsHidden: Binding<Bool>?
+    @State private var localCutSectionsHidden = false
+
+    private var hidesCutSections: Bool { cutSectionsHidden?.wrappedValue ?? localCutSectionsHidden }
 
     var duration: Double { sequenceDuration ?? clips.reduce(0) { $0 + $1.duration } }
 
@@ -276,7 +279,8 @@ struct SequenceTimeline: View {
                 .layoutPriority(1)
             PaneIconButton(title: hidesCutSections ? "Show cut sections" : "Hide cut sections",
                            symbol: hidesCutSections ? "eye.slash" : "eye", active: hidesCutSections) {
-                hidesCutSections.toggle()
+                if let cutSectionsHidden { cutSectionsHidden.wrappedValue.toggle() }
+                else { localCutSectionsHidden.toggle() }
             }
             if hasTileFeeds {
                 Toggle("Feeds", isOn: showTileFeeds)

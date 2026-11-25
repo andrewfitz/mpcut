@@ -24,7 +24,6 @@ public struct AnalysisSidecar: Sendable {
 
     var isExcluded: Bool { Self.isExcluded(source, in: Self.excludedSources) }
 
-
     @TaskLocal public static var automaticWritesEnabled = true
 
     public func saveAutomatically(_ sections: @autoclosure () throws -> [String: Data],
@@ -41,10 +40,10 @@ public struct AnalysisSidecar: Sendable {
     let sourceEvidence: MediaRefreshEvidence?
     var clearEpoch: SidecarClearEpoch
     var physicalURL: URL?
-    public var url: URL { physicalURL ?? capturedDestination ?? source.appendingPathExtension("cutdb") }
+    public var url: URL { physicalURL ?? capturedDestination ?? source.appendingPathExtension(Self.fileExtension) }
 
     public static func url(for source: URL) -> URL {
-        SidecarLocations(source: source).destination ?? source.appendingPathExtension("cutdb")
+        SidecarLocations(source: source).destination ?? source.appendingPathExtension(Self.fileExtension)
     }
 
     package static func readURL(for source: URL) -> URL? {
@@ -53,6 +52,7 @@ public struct AnalysisSidecar: Sendable {
 
     public init(source: URL) throws {
         guard source.isFileURL else { throw CutError(code: "invalid_input", message: "Choose a local media file.") }
+        try CutProject.rejectLegacyCache(source)
         self.init(source: source, identity: try SourceIdentity(source))
     }
 
@@ -62,7 +62,7 @@ public struct AnalysisSidecar: Sendable {
         self.sourceEvidence = nil
         self.locations = SidecarLocations(source: source)
         self.capturedDestination = locations.destination
-        self.clearEpoch = SidecarClearEpoch.capture(sidecar: capturedDestination ?? source.appendingPathExtension("cutdb"))
+        self.clearEpoch = SidecarClearEpoch.capture(sidecar: capturedDestination ?? source.appendingPathExtension(Self.fileExtension))
     }
 
     public init(media: MediaInfo) {
@@ -75,7 +75,7 @@ public struct AnalysisSidecar: Sendable {
         sourceEvidence = media.refreshEvidence
         locations = media.sidecarWriteLocations ?? SidecarLocations(source: source, project: SidecarLocations.projectURL ?? media.sidecarProjectURL)
         capturedDestination = locations.destination
-        clearEpoch = media.sidecarClearEpoch ?? SidecarClearEpoch.capture(sidecar: capturedDestination ?? source.appendingPathExtension("cutdb"))
+        clearEpoch = media.sidecarClearEpoch ?? SidecarClearEpoch.capture(sidecar: capturedDestination ?? source.appendingPathExtension(Self.fileExtension))
     }
 
     func pinned(to url: URL) -> Self {
@@ -89,11 +89,9 @@ public struct AnalysisSidecar: Sendable {
         "\(identity.device):\(identity.inode):\(identity.size):\(identity.modifiedSeconds):\(identity.modifiedNanoseconds)"
     }
 
-    static let applicationID: Int32 = 0x4d504354 // MPCT
-    static let schemaVersion: Int32 = 5
-    // Formats 1 and 2 used other section names and encodings. A write replaces
-    // such a file instead of upgrading it in place (SidecarLegacyFormat.swift).
-    static let oldestReadableVersion: Int32 = 3
+    package static let fileExtension = "cutcache"
+    static let applicationID: Int32 = 0x4d504343 // MPCC
+    static let schemaVersion: Int32 = 1
 
     package func checkSource() throws {
         guard identity.isCurrentSnapshot(at: source) else {
@@ -126,22 +124,17 @@ public struct AnalysisSidecar: Sendable {
     static func validate(_ db: SidecarDatabase, at url: URL) throws {
         // The first SQLite query can replay a journal or open a write-ahead log.
         // Check the database header on SQLite's own descriptor first.
-        let unsupported = CutError(code: "unsupported_sidecar", message: "This file is not a supported MPCut analysis sidecar.")
+        let unsupported = CutError(code: "unsupported_sidecar", message: "Unsupported MPCut cutcache format.")
         guard let header = db.headerVersions() else {
             var info = stat()
             if lstat(url.path, &info) == 0 && info.st_size == 0 { throw unsupported }
             throw sidecarError("The sidecar has no readable SQLite header.")
         }
-        let readable = Self.oldestReadableVersion...Self.schemaVersion
         guard !header.usesWriteAheadLog, header.applicationID == Self.applicationID,
-              readable.contains(header.userVersion) else { throw unsupported }
+              header.userVersion == Self.schemaVersion else { throw unsupported }
         let kind = try db.integer("PRAGMA application_id")
         let version = try db.integer("PRAGMA user_version")
-        guard kind == Self.applicationID, readable.contains(version) else {
-            throw CutError(code: "unsupported_sidecar", message: "This file is not a supported MPCut analysis sidecar.")
-        }
-        db.hasCompactStorage = version >= 4
-        db.hasChangeTimes = version >= 5
+        guard kind == Self.applicationID, version == Self.schemaVersion else { throw unsupported }
     }
 
     func storedStamp(_ db: SidecarDatabase) throws -> String {
@@ -175,7 +168,7 @@ public struct AnalysisSidecar: Sendable {
         return saved.drop { $0 != ":" } == stamp.drop { $0 != ":" } ? saved : nil
     }
 
-    // A nonempty container can hold authored metadata even when SQLite cannot read it.
+    // A nonempty file with an unrecognized header may belong to another application.
     private func isEmptyPlaceholder() -> Bool {
         var info = stat()
         return lstat(url.path, &info) == 0 && info.st_mode & S_IFMT == S_IFREG &&
@@ -205,7 +198,8 @@ public struct AnalysisSidecar: Sendable {
             var names = [String]()
             var step = sqlite3_step(query)
             while step == SQLITE_ROW, let value = sqlite3_column_text(query, 0) {
-                names.append(String(cString: value))
+                let name = String(cString: value)
+                if validKey(name) { names.append(name) }
                 step = sqlite3_step(query)
             }
             guard step == SQLITE_DONE else { throw db.error() }
@@ -237,18 +231,11 @@ public struct AnalysisSidecar: Sendable {
     public func read(_ key: String, maxBytes: Int? = nil, cancelled: () -> Bool = { Task.isCancelled }) -> Data? {
         guard Self.readsEnabled, Self.validKey(key), !cancelled() else { return nil }
         let copies = readSnapshots(orderedBy: key)
-        if copies.count > 1, Self.isEditableSection(key),
-           let merged = try? resolvedFields(key, copies: copies, cancelled: cancelled),
-           maxBytes.map({ merged.count <= $0 }) ?? true, !cancelled(), identity.isCurrentSnapshot(at: source) {
-            copies.forEach(Self.repackRawStorage)
-            return merged
-        }
         var envelope: Data?
         for copy in copies {
             guard !cancelled() else { return nil }
             if let data = try? verifiedSection(key, in: copy.db, stamp: copy.stamp, maxBytes: maxBytes, cancelled: cancelled),
                identity.isCurrentSnapshot(at: source), !cancelled() {
-                Self.repackRawStorage(copy)
                 if copies.count == 1 || Self.savedEnvelopeStream(forKey: key) == nil { return data }
                 envelope = envelope.map { Self.preferredEnvelope($0, data) } ?? data
             }
@@ -269,7 +256,6 @@ public struct AnalysisSidecar: Sendable {
                 }
             }
             if let value, !cancelled(), identity.isCurrentSnapshot(at: source) {
-                Self.repackRawStorage(copy)
                 return value
             }
         }
@@ -292,7 +278,7 @@ public struct AnalysisSidecar: Sendable {
         let table = generation == nil ? "sections" : "archived_sections"
         let predicate = generation == nil ? "name = ?" : "name = ? AND generation = ?"
         let bindings = [key] + (generation.map { [$0] } ?? [])
-        return try db.statement("SELECT digest, rowid, \(db.logicalSizeColumn) FROM \(table) WHERE \(predicate) AND typeof(value) = 'blob'", bindings) { query in
+        return try db.statement("SELECT digest, rowid, logical_size FROM \(table) WHERE \(predicate) AND typeof(value) = 'blob'", bindings) { query in
             let step = sqlite3_step(query)
             if step == SQLITE_DONE { return nil }
             guard step == SQLITE_ROW else { throw db.error() }
@@ -319,6 +305,7 @@ public struct AnalysisSidecar: Sendable {
 
     static func validKey(_ key: String) -> Bool {
         !key.isEmpty && key.utf8.count <= 512 && !key.utf8.contains(0)
+            && key != "scenes_view_names.v1" && key != "silence_threshold_overrides_db.v1" && !key.hasPrefix("transcript_recognition.")
     }
 
     private func checksumSeed(_ key: String, stamp: String) -> SHA256 {
@@ -384,23 +371,7 @@ public struct AnalysisSidecar: Sendable {
         }
 
         let destination = try prepareWriteLocation()
-        var superseded: SupersededSidecar?
-        if try exists() && !isEmptyPlaceholder() {
-            do {
-                let result = try write(sections, updating: updating, to: url, create: false, retainingLatest: retainingLatest,
-                                       cancelled: cancelled, refresh: refresh, change)
-                locations.registerSaved(destination)
-                return result
-            } catch let error as CutError where error.code == "unsupported_sidecar" {
-                // The format is rejected before any of the caller's closures run. No build reads
-                // formats 1 and 2 in place, so nothing could ever be saved beside such a file.
-                // Stage a current database holding what the old one can still supply, and swap
-                // the two. A newer, foreign or unreadable file stays as it is.
-                guard let older = try supersededSidecar(cancelled: cancelled) else { throw error }
-                superseded = older
-            }
-        }
-        if try superseded != nil || !exists() || isEmptyPlaceholder() {
+        if try !exists() || isEmptyPlaceholder() {
             // Stage beside the media. Exclusive publication prevents a race with
             // a second writer and leaves no empty database behind on cancellation.
             let parent = destination.deletingLastPathComponent()
@@ -422,14 +393,14 @@ public struct AnalysisSidecar: Sendable {
             }
             defer { if isOurStagingFile() { unlinkat(directory, name, 0) } }
             guard isOurStagingFile() else { throw sidecarError("The cache directory changed while creating the database.") }
-            let seeded = try superseded == nil && seed(staging, allowStale: refresh != nil, cancelled: cancelled)
+            let seeded = try seed(staging, allowStale: refresh != nil, cancelled: cancelled)
             let result = try write(sections, updating: updating, to: staging, create: !seeded, retainingLatest: retainingLatest,
-                                   cancelled: cancelled, refresh: refresh, carrying: superseded, change)
+                                   cancelled: cancelled, refresh: refresh, change)
             try checkSource()
             try checkSidecarCancellation(cancelled)
             _ = try prepareWriteLocation()
             guard isOurStagingFile(), fchmodat(directory, name, try publicationPermissions(0o666), AT_SYMLINK_NOFOLLOW) == 0 else { throw sidecarError(String(cString: strerror(errno))) }
-            if try publish(staging, replacing: superseded, cancelled: cancelled) {
+            if try publish(staging, cancelled: cancelled) {
                 locations.registerSaved(destination)
                 return result
             }
@@ -453,7 +424,7 @@ public struct AnalysisSidecar: Sendable {
     /// Empty placeholders have no SQLite write lock that all publishers can use.
     /// Serialize the final destination check and rename across processes without
     /// creating another file beside the recording. Healthy writers use SQLite.
-    private func publish(_ staging: URL, replacing superseded: SupersededSidecar?, cancelled: () -> Bool) throws -> Bool {
+    private func publish(_ staging: URL, cancelled: () -> Bool) throws -> Bool {
         let directory = open(url.deletingLastPathComponent().path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
         guard directory >= 0 else { throw sidecarError(String(cString: strerror(errno))) }
         defer { close(directory) }
@@ -469,15 +440,10 @@ public struct AnalysisSidecar: Sendable {
         _ = try prepareWriteLocation()
         try checkSidecarCancellation(cancelled)
         if try exists() {
-            // Only an empty placeholder, or the older file this writer converted and still
-            // holds a read lock on, gives way. Anything else was published by another writer.
-            guard superseded?.isInPlace(at: url) ?? isEmptyPlaceholder() else { return false }
+            guard isEmptyPlaceholder() else { return false }
             try checkSidecarCancellation(cancelled)
             try requireClearJournalPath()
-            // The lock must outlive the rename, so that no older build commits in between.
-            try withExtendedLifetime(superseded) {
-                guard rename(staging.path, url.path) == 0 else { throw sidecarError(String(cString: strerror(errno))) }
-            }
+            guard rename(staging.path, url.path) == 0 else { throw sidecarError(String(cString: strerror(errno))) }
             return true
         }
         try requireClearJournalPath()
@@ -490,7 +456,6 @@ public struct AnalysisSidecar: Sendable {
     private func write<T>(_ sections: [String: Data], updating: [String: (Data?) throws -> Data],
                        to destination: URL, create: Bool, retainingLatest: [String: Int],
                        cancelled: () -> Bool, refresh: SidecarGenerationRefresh?,
-                       carrying superseded: SupersededSidecar? = nil,
                        _ change: (SidecarDatabase, String) throws -> T) throws -> T {
         let db = try SidecarDatabase(destination, writing: true)
         return try db.whileWaitingForLocks(cancelled) {
@@ -509,19 +474,14 @@ public struct AnalysisSidecar: Sendable {
                 try db.update("INSERT INTO source(id, stamp) VALUES(1, ?)", [stamp])
                 try createManifest(db)
             } else {
-                // Re-read under the writer lock in case another process upgraded first.
-                let version = try db.integer("PRAGMA user_version")
-                if version == 3 {
-                    try db.upgradePayloadStorage(cancelled: cancelled)
-                } else if version != 4 && version != Self.schemaVersion {
-                    throw CutError(code: "unsupported_sidecar", message: "The sidecar format changed while saving.")
+                guard try db.integer("PRAGMA user_version") == Self.schemaVersion,
+                      try db.integer("PRAGMA application_id") == Self.applicationID else {
+                    throw CutError(code: "unsupported_sidecar", message: "The cutcache format changed while saving.")
                 }
             }
-            db.hasCompactStorage = true
             try configureFreshness(in: db, isNew: create, file: destination)
-            // Before the merge and the caller's transforms, which must see the earlier values.
-            if create, let superseded { try adopt(superseded, into: db, stamp: stamp, cancelled: cancelled) }
-            try reconcile(in: db, validatingSeed: !create && destination != url, cancelled: cancelled)
+            try reconcile(in: db, validatingSeed: !create && destination != url,
+                          updateKeys: Array(updating.keys), cancelled: cancelled)
             let indexUpdate = try refresh == nil
                 ? prepareIndexEvidence(sections[Self.evidenceKey], in: db, cancelled: cancelled)
                 : (refresh: nil, evidence: sections[Self.evidenceKey])
@@ -551,6 +511,9 @@ public struct AnalysisSidecar: Sendable {
             try checkSidecarCancellation(cancelled)
             try clearEpoch.check()
             _ = try prepareWriteLocation()
+            guard try Self.exists(destination, sourceIdentity: identity), db.isAtOriginalPath else {
+                throw sidecarError("The cache file changed while saving.")
+            }
             try db.execute("COMMIT")
             return result
         }
@@ -618,7 +581,7 @@ public struct AnalysisSidecar: Sendable {
     // Bounded caches and custom keys retain their insertion/use order for future pruning.
     // Other built-in analyses have no eviction policy. Equal input does not dirty their pages.
     private static func keepsRecency(_ key: String) -> Bool {
-        if indexKeys.contains(key) || key == evidenceKey || key == sceneClockKey || key == sceneSectionKey || isEditableSection(key) {
+        if indexKeys.contains(key) || key == evidenceKey || key == sceneClockKey || key == sceneSectionKey {
             return false
         }
         return savedWaveformStream(forKey: key) == nil && savedEnvelopeStream(forKey: key) == nil
@@ -645,10 +608,6 @@ public struct AnalysisSidecar: Sendable {
             return
         }
         try checkSidecarCancellation(cancelled)
-        if Self.isEditableSection(key) {
-            let old = try verifiedSection(key, in: db, stamp: saved, maxBytes: nil, cancelled: cancelled)
-            try recordFieldChanges(key, old: old, new: value, in: db)
-        }
         try recordChange(key, in: db)
         let payload = try SidecarPayload.encode(value, key: key, cancelled: cancelled)
         try payload.bytes.withUnsafeBytes { bytes in
@@ -711,9 +670,6 @@ private enum SidecarReadVFS {
 
 final class SidecarDatabase {
     let handle: OpaquePointer
-    var hasChangeTimes = false
-    var hasCompactStorage = false
-    var logicalSizeColumn: String { hasCompactStorage ? "logical_size" : "0" }
 
     init(_ url: URL, writing: Bool) throws {
         var connection: OpaquePointer?
@@ -805,12 +761,15 @@ final class SidecarDatabase {
     func replicaCookie(generation: Int64) throws -> (file: String, version: String)? {
         guard let path = sqlite3_db_filename(handle, "main"), let data = header() else { return nil }
         var info = stat()
-        var moved: Int32 = 0
-        guard lstat(path, &info) == 0,
-              sqlite3_file_control(handle, "main", SQLITE_FCNTL_HAS_MOVED, &moved) == SQLITE_OK, moved == 0 else { return nil }
+        guard lstat(path, &info) == 0, isAtOriginalPath else { return nil }
         let counter = data[24..<28].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
         return ("\(info.st_dev):\(info.st_ino)",
                 "\(counter):\(info.st_ctimespec.tv_sec):\(info.st_ctimespec.tv_nsec):\(generation)")
+    }
+
+    var isAtOriginalPath: Bool {
+        var moved: Int32 = 0
+        return sqlite3_file_control(handle, "main", SQLITE_FCNTL_HAS_MOVED, &moved) == SQLITE_OK && moved == 0
     }
 
     func headerVersions() -> (applicationID: Int32, userVersion: Int32, usesWriteAheadLog: Bool)? {

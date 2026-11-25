@@ -28,7 +28,6 @@ extension AnalysisSidecar {
     private static let activityPrefix = "transcript_activity.v1."
 
     static func savedTranscriptStream(forKey name: String) -> Int? {
-        if let stream = TranscriptRecognitionCache.stream(forKey: name) { return stream }
         guard name.hasPrefix(activityPrefix) else { return nil }
         let parts = name.dropFirst(activityPrefix.count).split(separator: ".", omittingEmptySubsequences: false)
         guard parts.count == 2, let stream = Int(parts[0]), stream >= 0, TranscriptStore.validDigest(String(parts[1])) else { return nil }
@@ -58,23 +57,12 @@ extension AnalysisSidecar {
                                        replacing: Bool = false,
                                        cancelled: () -> Bool = { Task.isCancelled }) throws {
         let name = try Self.transcriptActivitySection(key)
-        try saveTranscript(data, name: name, media: media, replacing: replacing, cancelled: cancelled) { db, stamp in
-            guard replacing else { return }
-            try TranscriptRecognitionCache.retainReferencedLevels(at: name, stream: key.stream, replacement: data, in: self,
-                                                                  db: db, stamp: stamp, cancelled: cancelled)
-        }
-    }
-
-    /// `beforeUpdate` sees the section as it stands, in the transaction that updates it.
-    func saveTranscript(_ data: Data, name: String, media: MediaInfo, replacing: Bool = false,
-                        cancelled: () -> Bool,
-                        beforeUpdate: (SidecarDatabase, String) throws -> Void = { _, _ in }) throws {
         guard media.identity.matchesSnapshot(identity), let evidence = media.refreshEvidence else {
             throw transcriptError("Fully indexed stream evidence is required to cache transcript results.",
                                   code: "missing_stream_evidence")
         }
         try transact([Self.evidenceKey: evidence.encoded()],
                      updating: [name: { previous in replacing ? data : previous ?? data }],
-                     cancelled: cancelled, beforeUpdate)
+                     cancelled: cancelled) { _, _ in }
     }
 }

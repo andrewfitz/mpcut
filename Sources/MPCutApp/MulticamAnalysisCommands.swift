@@ -55,21 +55,36 @@ extension MulticamEditorModel {
         return project?.switches.first(where: { $0.at == marker })?.angle
     }
 
+    /// Restarting a paused scan discards its progress, so that always asks. Scanning finished scenes again asks
+    /// while Settings → General → Confirm before scanning scenes again is on.
     func confirmSceneRestart(camera: String? = nil, paused: Bool, repeatPrevious: Bool = false) {
-        guard !isBusy, let window else { return }
-        let prompt = NSAlert()
-        prompt.messageText = paused ? "Restart scene analysis?" : "Scan for scenes again?"
-        prompt.informativeText = "MPCut will start a new analysis for this footage."
-        prompt.addButton(withTitle: paused ? "Restart" : "Scan Again").toolTip = "Restart scene scan"
-        prompt.addButton(withTitle: "Cancel").toolTip = "Keep existing scene analysis"
-        prompt.beginSheetModal(for: window) { [weak self] response in
-            guard response == .alertFirstButtonReturn, let self, !self.isBusy else { return }
+        guard !isBusy else { return }
+        let restart = { [weak self] in
+            guard let self, !self.isBusy else { return }
             let policy = SceneScanPolicy.restart(operationID: UUID().uuidString)
             if repeatPrevious {
                 self.analysis.repeatSceneScan(policy: policy)
             } else {
                 self.analysis.scanScenes(camera: camera, policy: policy)
             }
+        }
+        if !paused, !preferences.asks(.sceneRescan) { return restart() }
+        guard let window else { return }
+        let prompt = NSAlert()
+        prompt.messageText = paused ? "Restart scene analysis?" : "Scan for scenes again?"
+        prompt.informativeText = "MPCut will start a new analysis for this footage."
+        prompt.addButton(withTitle: paused ? "Restart" : "Scan Again").toolTip = "Restart scene scan"
+        prompt.addButton(withTitle: "Cancel").toolTip = "Keep existing scene analysis"
+        if !paused {
+            prompt.showsSuppressionButton = true
+            prompt.suppressionButton?.title = "Don’t ask again"
+            prompt.suppressionButton?.toolTip = "Scan scenes again without asking"
+        }
+        prompt.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            // Cancelling changes nothing, including the preference.
+            if prompt.suppressionButton?.state == .on, !paused { self?.preferences.suppress(.sceneRescan) }
+            restart()
         }
     }
 
@@ -80,11 +95,25 @@ extension MulticamEditorModel {
         analysis.scan(target)
     }
 
-    func cancelAnalysis(_ target: TimelineSnapTarget) { analysis.cancel(target) }
+    func cancelAnalysis(_ target: TimelineSnapTarget) {
+        analysis.dropAutomaticScans(target)
+        analysis.cancel(target)
+    }
+
+    /// Settings → Media & Analysis: recordings just added to the project are scanned for scenes or pauses. Off keeps
+    /// scans on request only.
+    func requestAutomaticScans(for ids: Set<String>) {
+        let scenes = preferences.autoScanScenes, pauses = preferences.autoScanSilence
+        guard !ids.isEmpty, scenes || pauses else { return }
+        analysis.requestAutomaticScans(of: ids, scenes: scenes, pauses: pauses)
+    }
 
     func configureSilenceAnalysis(minimum: Double, threshold: Double?) {
         guard minimum.isFinite, minimum >= 1 / Double(AudioWaveform.rate),
               threshold.map({ (-120...0).contains($0) }) ?? true else { return }
+        if let project, project.analysisAnnotations.multicamThresholdDB != threshold {
+            guard edit("Set Silence Threshold", { $0.analysisAnnotations.multicamThresholdDB = threshold }) else { return }
+        }
         analysis.configureSilence(minimum: minimum, threshold: threshold)
         preferences.minimumPause = minimum
     }

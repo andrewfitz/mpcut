@@ -5,9 +5,11 @@
 """
 import argparse
 from array import array
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,6 +23,8 @@ import json
 import sys
 from pathlib import Path
 
+with Path(__file__).with_name("provider-calls").open("a") as log:
+    print(json.dumps(sys.argv[1:]), file=log)
 assert sys.argv[1] == "session"
 assert "--offline" in sys.argv
 manifest = json.loads(Path(sys.argv[sys.argv.index("--manifest") + 1]).read_text())
@@ -34,7 +38,8 @@ for source in manifest["tracks"]:
              "stream_index": binding["stream_index"], "origin": binding["origin"],
              "session_start": binding["session_start"], "role": source["role"],
              "stream_evidence": source["stream_evidence"], "channel": source.get("channel"),
-             "coverage": "recognized" if source["recognize"] else "skipped"}
+             "coverage": "recognized" if source["recognize"] else "skipped",
+             "activity": [{"start_sample": 0, "end_sample": 320, "level": 0.125}]}
     tracks.append(track)
     if source["recognize"]:
         with Path(source["audio"]).open("rb") as audio:
@@ -52,7 +57,8 @@ Path(manifest["output"]).write_text(json.dumps(result))
 
 
 def exercise(cli, directory):
-    env = os.environ | {"MPCUT_TRANSCRIBERRR_HELPER": str(directory / "provider"),
+    env = os.environ | {"MPCUT_SIDECAR_HOME": str(directory / "cache-settings"),
+                        "MPCUT_TRANSCRIBERRR_HELPER": str(directory / "provider"),
                         "MPCUT_TRANSCRIPT_CLAIMS_HOME": str(directory / "claims")}
 
     def call(verb, *args, request=None, fail=None):
@@ -77,7 +83,7 @@ def exercise(cli, directory):
     provider.write_text(PROVIDER)
     provider.chmod(0o700)
     project = directory / "interview.cut"
-    project.write_text(json.dumps({"format": "mpcut", "schema_version": 3, "kind": "sequence",
+    project.write_text(json.dumps({"format": "mpcut", "schema_version": 9, "kind": "sequence",
                                    "clips": [{"id": "first", "file": recording.name, "from": "0", "to": "3"},
                                              {"id": "repeat", "file": recording.name, "from": "1", "to": "3"}]}))
 
@@ -92,6 +98,9 @@ def exercise(cli, directory):
                "--progress", "jsonl")
     assert job["state"] == "prepared"
     assert not (directory / "provider-ran").exists()
+    listed = call("job list", "--project", project, "--job-directory", jobs, "--limit", 1)
+    assert listed["total"] == 1 and listed["items"][0]["id"] == job["id"] and not listed["items"][0]["attached"]
+    assert call("job list", "--project", project, "--job-directory", jobs, "--offset", 1)["items"] == []
     session = job["sessions"][0]
     assert session["manifest"] and session["output"]
     subprocess.run([provider, *session["command"][1:]], cwd=directory, check=True, timeout=90)
@@ -126,11 +135,63 @@ def exercise(cli, directory):
     assert len(inspected["attachments"]) == 1
     assert inspected["attachments"][0]["tracks"]["total"] == 1
 
+    # A copied project reopens with only its linked recording. Each CLI command opens
+    # a fresh document. Check the imported provider output and the call log after deletion.
+    subprocess.run([cli, "analysis", "sidecar", "build", "--only", "index", "--json", recording],
+                   env=env, cwd=directory, check=True, capture_output=True, timeout=90)
+    caches = list(directory.rglob("*.cutcache"))
+    assert caches, "Expected a recording cutcache before deletion"
+    for cache in caches:
+        cache.unlink()
+    transfer = directory / "transfer"
+    transfer.mkdir()
+    copied_project = transfer / project.name
+    shutil.copyfile(project, copied_project)
+    shutil.copyfile(recording, transfer / recording.name)
+    calls_before_reopen = (directory / "provider-calls").read_bytes()
+    copied = read_project(copied_project)
+    reference = copied["transcripts"]["attachments"][0]["asset"]
+    assert set(reference) == {"sha256"}
+    asset = copied["embedded_assets"]["transcripts"][reference["sha256"]]
+    canonical = json.dumps(asset, sort_keys=True, separators=(",", ":")).encode()
+    assert sha256(canonical).hexdigest() == reference["sha256"]
+    assert asset["tracks"][0]["provider_activity"] == [{"start": "0", "end": "1/50", "level": 0.125}]
+    recovered = call("attachment inspect", "--project", copied_project, "--track-id", track_id)["attachments"][0]
+    assert recovered["words"] == 2
+    frame = recovered["tracks"]["items"][0]["activity"]["items"][0]
+    assert frame == {"start": {"numerator": 0, "denominator": 1},
+                     "end": {"numerator": 1, "denominator": 50}, "level": 0.125}, frame
+    assert (directory / "provider-calls").read_bytes() == calls_before_reopen
+    listed = call("job list", "--project", copied_project, "--job-directory", jobs)
+    assert listed["items"][0]["id"] == job["id"] and listed["items"][0]["attached"]
+    original_copy = copied_project.read_bytes()
+    reconciled = call("job reconcile", "--project", copied_project, "--job-directory", jobs)
+    assert reconciled["id"] == job["id"] and copied_project.read_bytes() == original_copy
+    assert len(reconciled["sessions"]) == 1 and reconciled["sessions"][0]["id"] != session["id"]
+    subprocess.run([provider, *reconciled["sessions"][0]["command"][1:]], cwd=directory, check=True, timeout=90)
+    published = call("attachment import", "--project", copied_project, "--job-id", job["id"], "--job-directory", jobs,
+                     "--attachment-id", attached["attachment"]["id"], "--in-place")
+    assert published["attachment"]["id"] == attached["attachment"]["id"]
+    assert len(call("attachment inspect", "--project", copied_project)["attachments"]) == 1
+
+    damaged = transfer / "damaged.cut"
+    asset["words"][0]["t"] = "Changed"
+    damaged.write_text(json.dumps(copied))
+    call("words read", "--project", damaged, fail="invalid_embedded_asset")
+    del copied["embedded_assets"]["transcripts"][reference["sha256"]]
+    damaged.write_text(json.dumps(copied))
+    call("words read", "--project", damaged, fail="missing_embedded_asset")
+
     first, last = first_words
     selection = {"first_word_id": first["word_id"], "last_word_id": last["word_id"],
                  "first_occurrence_id": first["id"], "last_occurrence_id": last["id"]}
     resolved = call("words select", request={"project_path": str(project), "selection": selection})
     assert resolved["range"] == {"from": "1", "to": "7/4"}
+    repeat = second_page["items"][0]["words"]
+    for expansion in ("sentence", "speaker_turn"):
+        expanded = call("words select", "--project", project, "--first-word-id", repeat[1]["word_id"],
+                        "--first-occurrence-id", repeat[1]["id"], "--expansion", expansion)
+        assert expanded["first"]["id"] == repeat[0]["id"] and expanded["last"]["id"] == repeat[1]["id"]
     call("words select", "--project", project, "--first-word-id", "word-0", fail="ambiguous_transcript_occurrence")
 
     plan_path = directory / "review.json"
@@ -198,7 +259,7 @@ def exercise(cli, directory):
     call("attachment bind", request={"project_path": str(project), "in_place": True,
                           "bindings": [original_binding | {"audio_stream_index": 99}]}, fail="transcript_stream_missing")
     multi = directory / "takes.cut"
-    multi.write_text(json.dumps({"format": "mpcut", "schema_version": 3, "kind": "sequence",
+    multi.write_text(json.dumps({"format": "mpcut", "schema_version": 9, "kind": "sequence",
                                  "clips": [{"id": "left", "file": recording.name, "from": "0", "to": "3"},
                                            {"id": "right", "file": other.name, "from": "0", "to": "3"}]}))
     multi_job = call("job prepare", "--project", multi, "--job-directory", jobs)
@@ -225,7 +286,7 @@ def exercise(cli, directory):
     assert takes["total"] == 2
     choices = {take["words"][0]["attachment_id"]: take["words"][0] for take in takes["items"]}
     assert choices["right"]["word_id"] == choices["left"]["word_id"]
-    ordered = [{"attachment_id": name, "space": "source", "first_word_id": choices[name]["word_id"],
+    ordered = [{"space": "source", "first_word_id": choices[name]["word_id"],
                 "first_occurrence_id": choices[name]["id"]} for name in ["right", "left"]]
     order_plan = directory / "order-plan.json"
     call("edit plan", request={"project_path": str(multi), "output": str(order_plan),
@@ -303,8 +364,10 @@ def exercise(cli, directory):
     assert call("words read", "--project", renamed, "--attachment-id", "bare")["total"] == 1
     call("attachment bind", "--project", renamed, "--attachment-id", "bare", "--origin", "1/8", "--in-place")
     renamed_attachment = call("attachment inspect", "--project", renamed, "--attachment-id", "bare")["attachments"][0]["attachment"]
-    moved_asset = directory / renamed_attachment["asset"]["file"]
-    assert moved_asset.parent.name == renamed.name + ".transcripts" and moved_asset.is_file()
+    digest = renamed_attachment["asset"]["sha256"]
+    transcript = read_project(renamed)["embedded_assets"]["transcripts"][digest]
+    assert transcript["schema_version"] == 4 and transcript["words"]
+    assert not Path(str(renamed) + ".transcripts").exists()
 
     bare = call("job prepare", "--file", recording, "--job-directory", jobs)
     assert call("job cancel", "--job-id", bare["id"], "--job-directory", jobs)["state"] == "cancelled"

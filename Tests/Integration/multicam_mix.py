@@ -106,7 +106,7 @@ class MulticamMixTests(unittest.TestCase):
     def project(self, *, gap=False, replacement=True, second_peak=None, surround=False, still=False):
         payload = {
             "format": "mpcut",
-            "schema_version": 4,
+            "schema_version": 9,
             "kind": "multicam",
             "reference_angle_id": "a",
             "group_range": {"from": "0", "to": "4"},
@@ -540,12 +540,11 @@ class MulticamMixTests(unittest.TestCase):
                     source_frames = sample_hashes(self.a)
                     self.assertEqual(sample_hashes(output), source_frames[50:100] + source_frames[:25])
 
-    def test_legacy_multicam_modes_keep_the_same_routes_after_saving_v4(self):
+    def test_multicam_modes_keep_the_same_routes_after_saving(self):
         self.project(replacement=False)
         original_path = self.project_path
         payload = read_project(original_path)
         del payload["mix_lanes"]
-        payload["schema_version"] = 3
         for mode in ("fixed", "follow", "none"):
             with self.subTest(mode=mode):
                 payload["audio"] = {"mode": mode}
@@ -564,19 +563,19 @@ class MulticamMixTests(unittest.TestCase):
                 self.project_path = original_path
                 contents = json.dumps(payload).encode()
                 self.project_path.write_bytes(contents)
-                original_output, before = self.export(f"v3-{mode}.mov")
+                original_output, before = self.export(f"original-{mode}.mov")
                 self.assertEqual(self.project_path.read_bytes(), contents)
-                upgraded = self.root / f"v4-{mode}.cut"
+                upgraded = self.root / f"saved-{mode}.cut"
                 request = {"project_path": str(original_path), "out_project": str(upgraded), "operations": []}
                 command = [CLI, "project", "edit", "--stdin", "--json"]
                 saved = subprocess.run(command, input=json.dumps(request), capture_output=True, text=True, timeout=90)
                 self.assertEqual(saved.returncode, 0, saved.stdout + saved.stderr)
                 self.assertEqual(original_path.read_bytes(), contents)
                 reopened = read_project(upgraded)
-                self.assertEqual(reopened["schema_version"], 4)
+                self.assertEqual(reopened["schema_version"], 9)
                 self.assertEqual(reopened["switches"], payload["switches"])
                 self.project_path = upgraded
-                upgraded_output, after = self.export(f"v4-{mode}.mov")
+                upgraded_output, after = self.export(f"saved-{mode}.mov")
                 self.assertEqual(before["plan"], after["plan"])
                 self.assertEqual(timestamped_hashes(original_output), timestamped_hashes(upgraded_output))
                 if mode == "none":

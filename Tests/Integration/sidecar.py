@@ -34,7 +34,7 @@ class Sidecar(unittest.TestCase):
         self.addCleanup(isolated.stop)
         self.source = Path(temp.name) / "Interview.mov"
         shutil.copyfile(FIXTURES / "Pause-Quiet.mov", self.source)
-        self.sidecar = self.source.with_suffix(".mov.cutdb")
+        self.sidecar = self.source.with_suffix(".mov.cutcache")
 
     def cli(self, *args, success=True, cwd=None):
         run = subprocess.run([CLI, *args], cwd=cwd, capture_output=True, text=True, timeout=30)
@@ -52,10 +52,64 @@ class Sidecar(unittest.TestCase):
         (self.cache_home / "config.json").write_text(json.dumps({"mode": "project"}))
         project = self.source.parent / "Edit.cut"
         project.write_text(json.dumps({
-            "format": "mpcut", "schema_version": 3, "kind": "sequence",
+            "format": "mpcut", "schema_version": 9, "kind": "sequence",
             "clips": [{"id": "trim", "file": self.source.name, "from": "0", "to": "1"}],
         }))
         return Path(self.save("--project", project, "--only", "index")["write_location"])
+
+    def test_cache_storage_configuration_and_guarded_clear(self):
+        def cache(action, *args, success=True):
+            return self.cli("analysis", "cache", action, "--json", *args, success=success)
+
+        self.assertEqual(cache("settings")["mode"], "media")
+        cache("configure", "--mode", "disk", success=False)
+        self.assertEqual(cache("settings")["mode"], "media")
+        self.save("--only", "index")
+        disk = self.source.parent / "shared"
+        disk.mkdir()
+        settings = cache("configure", "--mode", "disk", "--folder", disk)
+        self.assertTrue(settings["folder_available"])
+        self.assertEqual(Path(settings["folder"]).resolve(), disk.resolve())
+        cache("configure", "--mode", "project")
+        self.assertEqual(cache("configure", "--mode", "disk")["mode"], "disk")
+        shared = Path(self.save("--only", "index")["write_location"])
+        listing = cache("preview", "--folder", disk, "--location", "disk")
+        entry, = listing["entries"]
+        self.assertEqual(Path(entry["path"]).resolve(), shared.resolve())
+        token = entry["clear_token"]
+        self.assertGreater(entry["reclaimable_bytes"], 0)
+        scope = ["--folder", disk, "--location", "disk"]
+        for options, code in [
+            ([*scope, "--select", token], "invalid_arguments"),
+            ([*scope, "--select", token, "--select", "0" * 64, "--confirm"], "stale_cache_preview"),
+            (["--folder", disk, "--select", token, "--confirm"], "stale_cache_preview"),
+        ]:
+            self.assertEqual(cache("clear", *options, success=False)["error"]["code"], code)
+            self.assertTrue(shared.is_file())
+        os.utime(shared, None)
+        self.assertEqual(cache("clear", *scope, "--select", token, "--confirm", success=False)["error"]["code"],
+                         "stale_cache_preview")
+        self.assertTrue(shared.is_file())
+        self.assertTrue(self.sidecar.is_file())
+
+    def test_inspection_accounts_for_every_copy_and_excludes_project_bytes(self):
+        other = self.project_index_copy()
+        project = self.source.parent / "Edit.cut"
+        result = self.cli("analysis", "sidecar", "inspect", "--project", project, "--json", self.source)
+        self.assertEqual(result["project_bytes"], project.stat().st_size)
+        self.assertEqual(result["duplicate_copies"], 1)
+        copies = {Path(copy["path"]).resolve(): copy for copy in result["cache_copies"]}
+        self.assertEqual(set(copies), {self.sidecar.resolve(), other.resolve()})
+        for path, copy in copies.items():
+            self.assertEqual(copy["reclaimable_bytes"], path.stat().st_blocks * 512)
+            usage = copy["usage"]
+            with sqlite3.connect(path) as db:
+                sections = dict(db.execute("SELECT name, length(value) FROM sections"))
+            self.assertEqual(usage["section_bytes"], sections)
+            payload = sum(sections.values()) + sum(usage["archived_section_bytes"].values())
+            payload += usage["checkpoint_bytes"] + usage["marker_bytes"]
+            self.assertEqual(usage["database_bytes"], path.stat().st_size)
+            self.assertEqual(usage["sqlite_overhead_bytes"], path.stat().st_size - payload)
 
     def test_inventory_requires_a_complete_index_in_one_copy(self):
         other = self.project_index_copy()
@@ -94,7 +148,7 @@ class Sidecar(unittest.TestCase):
         directory.mkdir()
         project = directory / "Edit.cut"
         project.write_text(json.dumps({
-            "format": "mpcut", "schema_version": 3, "kind": "sequence",
+            "format": "mpcut", "schema_version": 9, "kind": "sequence",
             "clips": [{"id": "trim", "file": str(self.source), "from": "0", "to": "1"}]
         }))
         self.assertEqual(self.status()["status"], "missing")
@@ -137,7 +191,7 @@ class Sidecar(unittest.TestCase):
             shutil.copyfile(self.source, directory / "cam.mov")
             project = directory / "edit.cut"
             project.write_text(json.dumps({
-                "format": "mpcut", "schema_version": 3, "kind": "multicam", "reference_angle_id": "wide",
+                "format": "mpcut", "schema_version": 9, "kind": "multicam", "reference_angle_id": "wide",
                 "group_range": {"from": "0", "to": "1"},
                 "angles": [{"id": "wide", "file": "cam.mov", "offset": "0", "audio_stream_index": 1}],
                 "audio": {"mode": "follow"}, "switches": [{"group_time": "0", "angle_id": "wide"}],
@@ -150,12 +204,12 @@ class Sidecar(unittest.TestCase):
         for project in projects:
             status = self.cli("analysis", "sidecar", "inspect", "--json", project.parent / "cam.mov")
             self.assertTrue(Path(status["read_location"]).resolve().is_relative_to((project.parent / "MPCut Cache").resolve()))
-            self.assertFalse((project.parent / "cam.mov.cutdb").exists())
+            self.assertFalse((project.parent / "cam.mov.cutcache").exists())
 
     def test_project_inspection_is_read_only_without_config_or_catalog(self):
         project = self.source.parent / "Edit.cut"
         project.write_text(json.dumps({
-            "format": "mpcut", "schema_version": 3, "kind": "sequence",
+            "format": "mpcut", "schema_version": 9, "kind": "sequence",
             "clips": [{"id": "trim", "file": self.source.name, "from": "0", "to": "1"}]
         }))
         result = self.cli("analysis", "sidecar", "inspect", "--project", project, "--json", self.source)
@@ -341,7 +395,7 @@ os._exit(0)
             stamp = db.execute("SELECT stamp FROM source WHERE id=1").fetchone()[0]
             digest = hashlib.sha256(stamp.encode() + b"\0" + key.encode() + b"\0" + names).digest()
             db.execute("INSERT INTO sections(name, value, digest) VALUES (?, ?, ?)", (key, names, digest))
-            original["views"][0]["name"] = "Camera A"
+            # An injected cache label cannot change project-owned view names.
             db.execute("UPDATE sections SET value = ? WHERE name = 'scenes_boundaries.v1'", (b"damaged",))
         self.assertEqual(self.cli("scenes", "scan", "--json", self.source), original)
         self.assertNotEqual(db.execute("SELECT value FROM sections WHERE name='scenes_boundaries.v1'").fetchone()[0], b"damaged")
@@ -473,7 +527,7 @@ os._exit(0)
         self.source.rename(named_like_flag)
         result = self.cli("analysis", "sidecar", "build", "--only", "scenes", "--json", "--", named_like_flag.name,
                           cwd=named_like_flag.parent)
-        self.assertEqual(Path(result["sidecar"]).name, "--no-sidecar.cutdb")
+        self.assertEqual(Path(result["sidecar"]).name, "--no-sidecar.cutcache")
         status = self.cli("analysis", "sidecar", "inspect", "--json", "--", named_like_flag.name, cwd=named_like_flag.parent)
         self.assertEqual(status["inventory"]["has_scenes"], True)
 

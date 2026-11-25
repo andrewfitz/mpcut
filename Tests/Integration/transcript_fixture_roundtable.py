@@ -130,7 +130,7 @@ def main(out):
                 "-c:v", "libx264", "-g", 25, "-bf", 0, "-pix_fmt", "yuv420p", "-preset", "veryfast",
                 "-c:a", "aac", "-b:a", "96k", "-ar", 44100, "-ac", 1, target)
     project = {
-        "format": "mpcut", "schema_version": 3, "kind": "multicam", "reference_angle_id": "wide",
+        "format": "mpcut", "schema_version": 9, "kind": "multicam", "reference_angle_id": "wide",
         "group_range": {"from": "0", "to": str(int(duration))},
         "angles": [{"id": "wide", "file": "wide.mov", "offset": TRACKS["wide"]["offset"]},
                    {"id": "close", "file": "close.mp4", "offset": TRACKS["close"]["offset"]}],

@@ -1,7 +1,7 @@
 import Foundation
 
 /// One directional transition between two retained edit states. Transcript assets and
-/// attachments created after the edit remain in the current transcript store.
+/// attachments created after the edit remain attached to the project.
 package struct TranscriptBindingChange: Codable, Equatable, Sendable {
     let attachmentID: String
     package let trackID: String

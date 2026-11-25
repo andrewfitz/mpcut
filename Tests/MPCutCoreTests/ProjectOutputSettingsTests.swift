@@ -59,4 +59,32 @@ final class ProjectOutputSettingsTests: XCTestCase {
         XCTAssertTrue(changed.hasStoredOutputCanvas)
         XCTAssertEqual(changed.participants.tileOutput?.canvas, ParticipantCanvas())
     }
+
+    func testSourceDefaultsAndAtomicPatchUseNativeCanvasAndAudioValidation() throws {
+        let clip = CutSequenceClip(id: "clip", file: "recording.mov", from: .zero, to: .init(numerator: 2))
+        let project = CutProject.sequence([clip])
+        let rate = RationalTime(numerator: 30_000, denominator: 1_001)
+        let source = try XCTUnwrap(project.sourceOutputCanvas(width: 1279, height: 719, frameRate: rate))
+        XCTAssertEqual(project.sourceOutputCanvas(width: 16_384, height: 8_192, frameRate: rate),
+                       .init(width: 8192, height: 4096, frameRate: rate))
+        let initial = ProjectOutputSettingsSnapshot(project: project, defaultCanvas: source)
+        XCTAssertFalse(initial.hasStoredCanvas)
+        XCTAssertEqual(initial.settings.canvas, .init(width: 1280, height: 720, frameRate: rate))
+        XCTAssertEqual(initial.settings.audio.mode, .program)
+
+        let edited = try project.settingProjectOutput(width: 960, height: nil, frameRate: nil, background: 0x123456,
+                                                       audio: .init(mode: .silence), privacy: .cover, defaultCanvas: source)
+        XCTAssertTrue(edited.hasStoredOutputCanvas)
+        XCTAssertEqual(edited.projectOutputSettings.canvas, .init(width: 960, height: 720, frameRate: rate, background: 0x123456))
+        XCTAssertEqual(edited.projectOutputSettings.audio.mode, .silence)
+        XCTAssertEqual(edited.projectOutputSettings.unresolvedPrivacy, .cover)
+        XCTAssertEqual(edited.sequenceClips, [clip])
+        XCTAssertEqual(try CutProject.decode(JSONEncoder().encode(edited)), edited)
+        XCTAssertThrowsError(try project.settingProjectOutput(width: 960, height: nil, frameRate: nil, background: nil,
+                                                               audio: .init(mode: .follow, ids: ["missing"]), privacy: nil, defaultCanvas: source)) {
+            XCTAssertEqual(($0 as? CutError)?.code, "invalid_project_output_audio")
+        }
+        XCTAssertEqual(try project.settingProjectOutput(width: nil, height: nil, frameRate: nil, background: nil,
+                                                         audio: .init(mode: .program), privacy: .stop, defaultCanvas: source), project)
+    }
 }

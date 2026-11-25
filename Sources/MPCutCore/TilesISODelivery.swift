@@ -609,7 +609,7 @@ extension TilesISODelivery {
     }
 
     private static func readJSON<T: Decodable>(_ type: T.Type, from url: URL) throws -> T {
-        guard isRegular(url), try SourceIdentity(url).size <= Int64(MulticamProject.maximumFileSize) else {
+        guard isRegular(url), try SourceIdentity(url).size <= Int64((64 << 20)) else {
             throw invalid("The delivery record is missing or invalid: \(url.lastPathComponent)")
         }
         return try JSONDecoder().decode(type, from: Data(contentsOf: url))
@@ -619,7 +619,7 @@ extension TilesISODelivery {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
         let bytes = try encoder.encode(value)
-        guard bytes.count <= MulticamProject.maximumFileSize else { throw invalid("The delivery record is too large.") }
+        guard bytes.count <= (64 << 20) else { throw invalid("The delivery record is too large.") }
         if let staging {
             let temporary = staging.appendingPathComponent(".manifest-\(UUID().uuidString)")
             defer { try? FileManager.default.removeItem(at: temporary) }

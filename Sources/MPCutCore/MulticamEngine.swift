@@ -651,7 +651,7 @@ public struct MulticamEngine: Sendable {
                                                          verifySources: verifySources)
         } else {
             try verifySources()
-            let failure = publishExclusively(from: hasPicture ? picture : sounds[0], to: destination)
+            let failure = try MediaExportPublication.publish(from: hasPicture ? picture : sounds[0], to: destination)
             if failure == EEXIST { throw CutError(code: "output_exists", message: "A file already exists at the destination.") }
             if failure != 0 { throw CutError(code: "write_failed", message: String(cString: strerror(failure))) }
         }

@@ -67,6 +67,39 @@ final class TranscriptEditorialTests: XCTestCase {
         XCTAssertTrue(resolution.words.isEmpty)
     }
 
+    func testFilteredSourceExportReopensWithCorrectedWordingAndAdjustedTiming() throws {
+        let track = TranscriptTrack(id: "mic", name: "Mic", words: [
+            .init(id: "first", text: "Original", start: .zero, end: .init(numerator: 1)),
+            .init(id: "second", text: "Separate", start: .init(numerator: 2), end: .init(numerator: 3))
+        ])
+        let document = TranscriptDocument(clock: .presentation, tracks: [track], speakers: [
+            .init(id: "host", name: "Host"), .init(id: "guest", name: "Guest")
+        ], words: try XCTUnwrap(track.words).enumerated().map { position, local in
+            let speakerID = position == 0 ? "host" : "guest"
+            return .init(id: "merged-\(local.id)", text: local.text, start: local.start, end: local.end,
+                         speakerID: speakerID, observations: [
+                            .init(trackID: track.id, wordID: local.id, text: local.text, start: local.start,
+                                  end: local.end, evidence: .recognized, speakerID: speakerID)
+                         ])
+        })
+        let binding = TranscriptBinding(trackID: track.id, file: "mic.wav", streamIndex: 0, offset: .init(numerator: 5))
+        let attachment = TranscriptAttachment(id: "test", asset: fixtureAsset, bindings: [binding])
+        let original = try TranscriptIndex(document: document, attachment: attachment)
+        let selected = Array(original.readAll(space: .source).prefix(1))
+        let anchor = try TranscriptEditorial.anchor(selected, binding: binding)
+        let record = TranscriptAuthoredRecord(attachmentID: attachment.id, change: .replaceText(text: "Corrected"),
+                                              anchors: [anchor])
+        let corrected = try TranscriptIndex(document: document, attachment: attachment, records: [record])
+        let bytes = try TranscriptCodec.encode(corrected, space: .source, format: .json, filter: .init(speakerID: "host"))
+        let exported = try TranscriptCodec.decode(bytes, format: .json)
+        XCTAssertEqual(exported.tracks.first?.words?.map(\.id), ["first"])
+        let reopened = try TranscriptIndex(document: exported)
+        let words = reopened.readAll(space: .source)
+        XCTAssertEqual(words.map(\.text), ["Corrected"])
+        XCTAssertEqual(words.map(\.originalText), ["Original"])
+        XCTAssertEqual(words.map(\.range), [.init(from: .init(numerator: 5), to: .init(numerator: 6))])
+    }
+
     func testSpeakerReferenceFollowsNativeIdentityChanges() throws {
         let original = try index([(0, "Yes"), (1, "Agreed")], prefix: "old", speakers: ["alice", "bob"])
         let first = try XCTUnwrap(original.readAll(space: .source).first)
@@ -213,7 +246,7 @@ final class TranscriptEditorialTests: XCTestCase {
 
     private var fixtureAsset: TranscriptAsset {
         let digest = String(repeating: "a", count: 64)
-        return .init(file: "test.cut.transcripts/\(digest).json", sha256: digest)
+        return .init(sha256: digest)
     }
 
     private func index(_ lines: [(Int, String)], prefix: String = "original", speakers: [String] = [],

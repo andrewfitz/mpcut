@@ -2,7 +2,7 @@
 
 This reference describes the inputs advertised by the bundled stdio helper. The connected host can retrieve the complete JSON Schemas through `tools/list`. Live tool calls use the running app and its local-control setting. The `--files-only` helper exposes saved-file tools through a private CLI worker. Results bound to a live project carry the `project_handle` and the current or applied revision. Starting a saved-file job returns a receipt with a `job_id`. Inspect `isError` first. MPCut domain errors carry a code and message in `structuredContent`. Invalid requests can also return an MCP protocol or SDK validation error. [Setup, clocks, history and recovery](MCP-AGENT-GUIDE.md)
 
-**293 tools.**
+**325 tools.**
 
 ## Live analysis
 
@@ -141,7 +141,7 @@ Returns `status: idle` or `status: cancel_requested` for the selected scan famil
 
 ### `scenes_view_rename`
 
-Set the name for every matching view in an analyzed source. An empty name restores the default.
+Set the name for every matching view in a full-source analysis. Supply the report_id from the source boundaries to guard the reviewed view. An empty name restores the default.
 
 Returns applied status and the current revision. Inspect `analysis_editor_state_read` or the relevant report for the new setting or result.
 
@@ -151,6 +151,7 @@ Returns applied status and the current revision. Inspect `analysis_editor_state_
 | `expected_revision` | required | integer, minimum `0` |  |
 | `operation_id` | required | string |  |
 | `source_id` | required | string |  |
+| `report_id` | required | string, pattern `^[a-f0-9]{64}$` | Report ID returned by scenes_editor_boundaries_list with source_id. |
 | `view` | required | integer, minimum `1` |  |
 | `name` | required | string, maximum length `1024` |  |
 
@@ -158,7 +159,7 @@ Returns applied status and the current revision. Inspect `analysis_editor_state_
 
 Seek, preview, protect or unprotect a pause by its silence_editor_pauses_list ID. Multicam protection applies to the group-time pause across repeated occurrences. Protecting the auditioned multicam pause closes its review. Done closes the review. Use set_retained with a nonnegative total duration in seconds, or reset_retained, for one detected pause in its occurrence. next_cut and keep_and_advance operate on an open detected-pause review.
 
-`review_open` reports whether a cut audition is active. Editing the requested retained duration returns the requested and achieved values. Read the pause list again to inspect protection and retained durations.
+`review_open` reports whether a cut audition is active. Setting a retained duration returns the requested and achieved values. Resetting it can combine the pause with its neighbors. When the original pause disappears, the response omits the duration fields. Read the pause list again for the updated intervals.
 
 | Action | Additional inputs or prerequisites |
 | --- | --- |
@@ -343,6 +344,77 @@ Returns source ID, stream, `source_from_seconds`, `source_to_seconds`, source cl
 | `source_from` | optional | string |  |
 | `source_to` | optional | string |  |
 
+## Cache
+
+### `analysis_file_cache_clear`
+
+Remove only the confirmed cache copies using tokens from a preview with the same folder, project and location. A changed selection requires a fresh preview. Poll file_job_status_read with the returned job_id.
+
+Returns a file job receipt. The completed result reports `cleared`, `cleared_sources`, `skipped` and `reclaimed_bytes`. If the selection changed, preview again before confirming a new request.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | Fresh UUID for a distinct file job. Reuse it to retry identical arguments. |
+| `folder` | required | string, pattern `^/` | Absolute path to the folder to search recursively. |
+| `project_path` | optional | string, pattern `^/` | Optional saved project whose media and history are protected. |
+| `location` | optional | `media` / `project` / `disk` | Limit results to this cache location. |
+| `clear_tokens` | required | array of string, pattern `^[0-9a-f]{64}$`, minimum items `1`, maximum items `500` |  |
+| `confirm` | required | `true` | Confirm removal of the selected cache copies. |
+
+### `analysis_file_cache_preview`
+
+Discover cutcaches within an explicit folder. Review cache details, reclaimable bytes and clear tokens before selecting copies. Poll file_job_status_read with the returned job_id.
+
+Returns a file job receipt. The completed result lists scoped copies with `path`, `source`, `folder`, `location`, reclaimable bytes and storage details. Use the eligible copies’ `clear_token` values with the same scope to clear selected copies.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | Fresh UUID for a distinct file job. Reuse it to retry identical arguments. |
+| `folder` | required | string, pattern `^/` | Absolute path to the folder to search recursively. |
+| `project_path` | optional | string, pattern `^/` | Optional saved project whose media and history are protected. |
+| `location` | optional | `media` / `project` / `disk` | Limit results to this cache location. |
+
+### `analysis_file_cache_settings_read`
+
+Read where MPCut writes new cutcaches and whether the configured shared folder is available. Poll file_job_status_read with the returned job_id.
+
+Returns a file job receipt. The completed result reports `mode`, the configured shared `folder` if any, and `folder_available`.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | Fresh UUID for a distinct file job. Reuse it to retry identical arguments. |
+
+### `analysis_file_cache_settings_set`
+
+Select where MPCut writes new cutcaches. Poll file_job_status_read with the returned job_id.
+
+Returns a file job receipt. The completed result reports `mode`, the configured shared `folder` if any, and `folder_available`.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | Fresh UUID for a distinct file job. Reuse it to retry identical arguments. |
+| `mode` | required | `media` / `project` / `disk` |  |
+| `folder` | optional | string, pattern `^/` | Optional writable shared folder when selecting disk mode. Omit it to retain the configured folder. |
+
+Additional schema rules
+
+```json
+{
+  "if": {
+    "required": [
+      "folder"
+    ]
+  },
+  "then": {
+    "properties": {
+      "mode": {
+        "const": "disk"
+      }
+    }
+  }
+}
+```
+
 ## File tools and jobs
 
 ### `analysis_file_sidecar_build`
@@ -353,7 +425,7 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `project_path` | optional | string, pattern `^/` | Optional absolute path to a saved project for project-folder cache lookup and storage. |
 | `file` | required | string, pattern `^/` | Absolute path to the source file. |
@@ -372,7 +444,7 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `project_path` | optional | string, pattern `^/` | Optional absolute path to a saved project for project-folder cache lookup and storage. |
 | `file` | required | string, pattern `^/` | Absolute path to the source file. |
@@ -386,7 +458,7 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `topic` | optional | string, minimum length `1` | Canonical CLI help topic, such as silence plan or transcript words search. Omit to list commands. |
 
@@ -394,11 +466,11 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 
 Identify the bundled file CLI build. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.
 
-Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+Returns a file job receipt. The completed result reports the CLI `version`, Mach-O UUID as `build_id`, `project_schema_versions`, and `detector_capabilities` for the bundled CLI and current host.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 
 ### `export_file_clips_join`
@@ -409,7 +481,7 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `space_clips` | optional | string, minimum length `1` | Set gaps between picture items for this render. Use source for source timing or a nonnegative gap duration in exact rational seconds. Applies to project timelines and ordered ranges from picture files. Saved project documents are preserved. |
 | `edit` | optional | object |  |
@@ -491,7 +563,7 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `project_path` | optional | string, pattern `^/` | Absolute path to a saved project. Unsaved GUI changes are excluded. |
 | `project_data` | optional | object | Inline .cut document. Use absolute media paths, or set working_directory for relative assets. |
@@ -510,6 +582,7 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 | `audio_output` | optional | `separate_tracks` / `downmix_mono` / `downmix_stereo` | Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track. |
 | `still_timing` | optional | `cadence` / `held` | Still picture timing. Held writes one independently decodable sample per visible hold. Cadence uses the authored frame schedule. |
 | `container` | optional | `mov` / `mp4` / `m4v` / `mkv` / `m4a` / `mka` / `wav` / `wave` / `caf` / `flac` | Explicit container for a still project export. Match the destination filename extension and selected tracks. |
+| `plan_token` | optional | string, minimum length `1` | Token from the approved dry run. Supply project_path and render with the same media, destination and options. |
 
 Additional schema rules
 
@@ -529,6 +602,23 @@ Additional schema rules
           ]
         }
       ]
+    },
+    {
+      "if": {
+        "required": [
+          "plan_token"
+        ]
+      },
+      "then": {
+        "required": [
+          "project_path"
+        ],
+        "properties": {
+          "dry_run": {
+            "const": false
+          }
+        }
+      }
     }
   ]
 }
@@ -542,7 +632,7 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `file` | required | string, pattern `^/` | Absolute path to the source file. |
 | `output` | required | string, pattern `^/` | Absolute destination path. Existing media outputs are protected. |
@@ -593,7 +683,7 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `file` | optional | string, pattern `^/` | Absolute path to the source file. |
 | `output_directory` | optional | string, pattern `^/` | Absolute path to an existing output directory. Each rendered file needs a new name. |
@@ -661,7 +751,7 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `space_clips` | optional | string, minimum length `1` | Set gaps between picture items for this render. Use source for source timing or a nonnegative gap duration in exact rational seconds. Applies to project timelines and ordered ranges from picture files. Saved project documents are preserved. |
 | `edit` | optional | object | Supply replace_audio for the full edit or for one or more file clips. |
@@ -724,13 +814,23 @@ Additional schema rules
 
 ### `file_job_cancel`
 
-Request cancellation. Poll status until completion to see any outputs the job already published.
+Request cancellation through the worker that started the job. Poll status until completion to see any outputs the job already published.
 
-Returns `job_id` and `state`. For scene scans, refreshes, and transcript session staging, `progress_event` contains the latest available CLI event. Scene events include durable coverage when it has been saved. Terminal results include `exit_code` and `result_bytes`. Small output is available as `result` for JSON or `output_text` for text. Tiles ISO delivery can also end in `needs_review` with a reviewable project. Poll a cancelling job until its terminal state.
+Returns `job_id` and `state`. For scene scans, refreshes, and transcript session staging, `progress_event` contains the latest available CLI event. Scene events include durable coverage when it has been saved. Finished jobs report `exit_code` and whether the payload is still available. Generic retained payloads include `result_bytes`, with small output available as `result` for JSON or `output_text` for text. Tiles ISO delivery can end in `needs_review` with a reviewable project. An interrupted standalone worker may leave `outcome_unknown`. Poll a cancelling job until its terminal state.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `job_id` | required | string, format `uuid` | The job UUID returned when the request was accepted. |
+
+### `file_job_release`
+
+Discard a terminal job's saved result payload while retaining the outcome and operation ID. Repeat safely after collecting all result pages.
+
+Returns the terminal job receipt with `result_available: false`. The operation UUID can still be used to look up or retry the same request while the receipt is retained.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `job_id` | required | string, format `uuid` | The operation UUID used as the job identifier. |
 
 ### `file_job_result_read`
 
@@ -746,9 +846,9 @@ Returns a base64 byte page, `next_offset`, `result_bytes` and `done`. Decode eac
 
 ### `file_job_status_read`
 
-Get state, native progress and the terminal JSON result. Scene scans, refreshes and Tiles delivery can include the latest available progress event. A Tiles ISO delivery job can finish in needs_review with exit code 3 and a reviewable project. For large results, read result_bytes using file_job_result_read.
+Get state, native progress and the terminal JSON result. Supply the original operation_id as job_id if the acceptance response was lost. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. An outcome_unknown receipt prevents an interrupted operation from running again. Scene scans, refreshes and Tiles delivery can include the latest available progress event. A Tiles ISO delivery job can finish in needs_review with exit code 3 and a reviewable project. For large results, read result_bytes using file_job_result_read.
 
-Returns `job_id` and `state`. For scene scans, refreshes, and transcript session staging, `progress_event` contains the latest available CLI event. Scene events include durable coverage when it has been saved. Terminal results include `exit_code` and `result_bytes`. Small output is available as `result` for JSON or `output_text` for text. Tiles ISO delivery can also end in `needs_review` with a reviewable project. Poll a cancelling job until its terminal state.
+Returns `job_id` and `state`. For scene scans, refreshes, and transcript session staging, `progress_event` contains the latest available CLI event. Scene events include durable coverage when it has been saved. Finished jobs report `exit_code` and whether the payload is still available. Generic retained payloads include `result_bytes`, with small output available as `result` for JSON or `output_text` for text. Tiles ISO delivery can end in `needs_review` with a reviewable project. An interrupted standalone worker may leave `outcome_unknown`. Poll a cancelling job until its terminal state.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -762,7 +862,7 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `file` | required | string, pattern `^/` | Absolute path to the source file. |
 | `detail` | optional | `metadata` / `frames` / `keyframes` / `audio_packets` |  |
@@ -781,7 +881,7 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `file` | required | string, pattern `^/` | Absolute path to the source file. |
 | `output` | required | string, pattern `^/` | Absolute destination path. Existing media outputs are protected. |
@@ -797,7 +897,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `request` | required | object |  |
 | `request.out_project` | required | string, pattern `^/` |  |
@@ -812,7 +912,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.operations[].file` | optional | string |  |
 | `request.operations[].new_id` | optional | string |  |
 | `request.operations[].angle_id` | optional | string |  |
-| `request.operations[].name` | optional | string, minimum length `1` |  |
+| `request.operations[].name` | optional | string |  |
 | `request.operations[].ranges` | optional | array of object or object, minimum items `1` |  |
 | `request.operations[].ranges[]` | when using this variant | object | object variant |
 | `request.operations[].ranges[].file` | required | string, minimum length `1` |  |
@@ -848,6 +948,10 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.operations[].relative_offset` | optional | string, minimum length `1` |  |
 | `request.operations[].uncovered` | optional | `keep_original` / `leave_uncovered` |  |
 | `request.operations[].reference_source_id` | optional | string, minimum length `1` | Camera recording ID for an aligned program replacement. |
+| `request.operations[].offset` | optional | string, minimum length `1` | Exact signed camera offset. |
+| `request.operations[].attachment_id` | optional | string, minimum length `1` | Transcript attachment identifier. |
+| `request.operations[].speaker_id` | optional | string, minimum length `1` | Speaker identifier within the attachment. |
+| `request.operations[].project_revision` | optional | string, minimum length `1` | Reviewed multicam revision for a switch operation. |
 | `request.kind` | required | `sequence` / `multicam` |  |
 | `request.angles` | optional | array of object, minimum items `1` |  |
 | `request.angles[].id` | required | string |  |
@@ -864,7 +968,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `request` | required | object |  |
 | `request.out_project` | required | string, pattern `^/` |  |
@@ -879,7 +983,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.operations[].file` | optional | string |  |
 | `request.operations[].new_id` | optional | string |  |
 | `request.operations[].angle_id` | optional | string |  |
-| `request.operations[].name` | optional | string, minimum length `1` |  |
+| `request.operations[].name` | optional | string |  |
 | `request.operations[].ranges` | optional | array of object or object, minimum items `1` |  |
 | `request.operations[].ranges[]` | when using this variant | object | object variant |
 | `request.operations[].ranges[].file` | required | string, minimum length `1` |  |
@@ -915,7 +1019,12 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.operations[].relative_offset` | optional | string, minimum length `1` |  |
 | `request.operations[].uncovered` | optional | `keep_original` / `leave_uncovered` |  |
 | `request.operations[].reference_source_id` | optional | string, minimum length `1` | Camera recording ID for an aligned program replacement. |
+| `request.operations[].offset` | optional | string, minimum length `1` | Exact signed camera offset. |
+| `request.operations[].attachment_id` | optional | string, minimum length `1` | Transcript attachment identifier. |
+| `request.operations[].speaker_id` | optional | string, minimum length `1` | Speaker identifier within the attachment. |
+| `request.operations[].project_revision` | optional | string, minimum length `1` | Reviewed multicam revision for a switch operation. |
 | `request.project_path` | required | string |  |
+| `request.project_revision` | optional | string, minimum length `1` | Revision from tiles switches propose. Checked against the saved multicam project before any operation. |
 
 ### `project_file_inspect`
 
@@ -925,7 +1034,7 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `project_path` | optional | string, pattern `^/` | Absolute path to a saved project. Unsaved GUI changes are excluded. |
 | `project_data` | optional | object | Inline .cut document. Use absolute media paths, or set working_directory for relative assets. |
@@ -962,7 +1071,7 @@ Returns a file job receipt. The completed result includes `media` rows with the 
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `project_path` | required | string, pattern `^/` | Absolute path to a saved project. Unsaved GUI changes are excluded. |
 | `deep` | optional | boolean | Verify stream content even when the file stamp is unchanged. |
@@ -976,7 +1085,7 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `project_path` | optional | string, pattern `^/` | Absolute path to a saved project. Unsaved GUI changes are excluded. |
 | `project_data` | optional | object | Inline .cut document. Use absolute media paths, or set working_directory for relative assets. |
@@ -1077,7 +1186,7 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `project_path` | optional | string, pattern `^/` | Absolute path to a saved project. Unsaved GUI changes are excluded. |
 | `project_data` | optional | object | Inline .cut document. Use absolute media paths, or set working_directory for relative assets. |
@@ -1178,12 +1287,12 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `file` | optional | string, pattern `^/` | Absolute path to the source file. |
 | `project_path` | optional | string, pattern `^/` | Absolute path to a saved project. Unsaved GUI changes are excluded. |
 | `project_data` | optional | object | Inline .cut document. Use absolute media paths, or set working_directory for relative assets. |
-| `output` | required | string, pattern `^/` | Absolute path to a new directory for the JPEGs and manifest. |
+| `output` | required | string, pattern `^/` | Absolute path to a new directory for the frame images and manifest. |
 | `at` | optional | array of string, minimum length `1`, minimum items `1` |  |
 | `preset` | optional | `review` / `full` |  |
 | `select` | optional | `scenes` / `non_silent` |  |
@@ -1195,6 +1304,7 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 | `no_sidecar` | optional | boolean |  |
 | `at_file` | optional | string, pattern `^/` | Absolute path to a native CLI input/list file. |
 | `clock` | optional | `sequence` / `assembly` / `group` | Project timebase. Sequence projects use sequence time. Multicam defaults to group time for angle comparisons. Select assembly for the edited program. Project frame exports require at or at_file. |
+| `format` | optional | `jpeg` / `png` / `tiff` | Image format. Lossless PNG and TIFF require a supported source. Defaults to JPEG. |
 
 Additional schema rules
 
@@ -1232,7 +1342,7 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `file` | optional | string, pattern `^/` | Absolute path to the source file. |
 | `report` | optional | object | Existing native CLI JSON report; retain its file, source stamp, and indices. |
@@ -1284,7 +1394,7 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `file` | optional | string, pattern `^/` | Absolute path to the source file. |
 | `no_sidecar` | optional | boolean |  |
@@ -1319,6 +1429,23 @@ Additional schema rules
 }
 ```
 
+### `scenes_file_view_rename`
+
+Rename a recurring view in a saved project. Use an empty name to restore the default. Returns a job_id. Poll file_job_status_read for the CLI result.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
+| `project_path` | required | string, pattern `^/` | Absolute path to the saved project. |
+| `out_project` | required | string, pattern `^/` | Absolute path to a new .cut file. |
+| `no_sidecar` | optional | boolean |  |
+| `file` | required | string, pattern `^/` | Absolute recording path from a full-source project scene scan. |
+| `report_id` | required | string, pattern `^[a-f0-9]{64}$` | Report ID returned by a full-source project scene scan. |
+| `view` | required | integer, minimum `1` |  |
+| `name` | required | string, maximum length `1024` |  |
+
 ### `silence_file_export`
 
 Write shortened media from a recording, project or pause report. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.
@@ -1327,7 +1454,7 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `file` | optional | string, pattern `^/` | Absolute path to the source file. |
 | `project_path` | optional | string, pattern `^/` | Absolute path to a saved project. Unsaved GUI changes are excluded. |
@@ -1430,6 +1557,23 @@ Additional schema rules
 }
 ```
 
+### `silence_file_pause_protect`
+
+Save protection for pauses identified by a multicam project silence scan, keeping the assembly intact. Returns a job_id. Poll file_job_status_read for the CLI result.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
+| `project_path` | required | string, pattern `^/` | Absolute path to the saved project. |
+| `out_project` | required | string, pattern `^/` | Absolute path to a new .cut file. |
+| `no_sidecar` | optional | boolean |  |
+| `protect_pauses` | required | array of string, minimum length `1`, minimum items `1` | Pause IDs from the same saved project and detector settings. |
+| `silence_threshold_db` | optional | number, minimum `-120`, maximum `0` |  |
+| `silence_min_pause_seconds` | optional | number, greater than `0` |  |
+| `silence_max_blip_seconds` | optional | number, minimum `0`, maximum `1` |  |
+
 ### `silence_file_plan`
 
 Plan shortened media from a recording, project or saved pause report. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.
@@ -1438,7 +1582,7 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `file` | optional | string, pattern `^/` | Absolute path to the source file. |
 | `project_path` | optional | string, pattern `^/` | Absolute path to a saved project. Unsaved GUI changes are excluded. |
@@ -1542,6 +1686,22 @@ Additional schema rules
 }
 ```
 
+### `silence_file_room_tone_calibrate`
+
+Set per-track silence thresholds from routed multicam audio inside the supplied room-tone range. Returns a job_id. Poll file_job_status_read for the CLI result.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
+| `project_path` | required | string, pattern `^/` | Absolute path to the saved project. |
+| `out_project` | required | string, pattern `^/` | Absolute path to a new .cut file. |
+| `no_sidecar` | optional | boolean |  |
+| `clock` | required | `group` / `assembly` |  |
+| `from` | required | string, minimum length `1` |  |
+| `to` | required | string, minimum length `1` |  |
+
 ### `silence_file_scan`
 
 Scan a recording or project for pauses. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.
@@ -1550,7 +1710,7 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `file` | optional | string, pattern `^/` | Absolute path to the source file. |
 | `project_path` | optional | string, pattern `^/` | Absolute path to a saved project. Unsaved GUI changes are excluded. |
@@ -1604,7 +1764,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `project_path` | required | string, pattern `^/` | Absolute path to a saved project. Unsaved GUI changes are excluded. |
 | `silence_threshold_db` | optional | number, minimum `-120`, maximum `0` |  |
@@ -1626,7 +1786,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `asset` | required | string |  |
 | `image` | required | string |  |
@@ -1665,7 +1825,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `image` | optional | string |  |
 | `asset` | optional | string |  |
@@ -1728,7 +1888,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `image` | optional | string |  |
 | `asset` | optional | string |  |
@@ -1808,7 +1968,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `placement` | required | string |  |
 | `project_path` | required | string |  |
@@ -1846,7 +2006,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `placement` | required | string |  |
 | `asset` | optional | string |  |
@@ -1902,7 +2062,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `placement` | optional | string |  |
 | `project_path` | required | string |  |
@@ -1915,7 +2075,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `out_project` | required | string |  |
 | `image` | optional | string |  |
@@ -1998,7 +2158,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `out_project` | optional | string |  |
 | `project_path` | required | string, pattern `^/` |  |
@@ -2036,7 +2196,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `out_project` | optional | string |  |
 | `project_path` | required | string, pattern `^/` |  |
@@ -2069,7 +2229,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `out_project` | optional | string |  |
 | `project_path` | required | string, pattern `^/` |  |
@@ -2102,7 +2262,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `source_timing` | optional | boolean |  |
 | `background` | optional | string |  |
@@ -2165,7 +2325,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `clock` | required | string |  |
 | `at` | required | string |  |
@@ -2224,7 +2384,7 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `file` | required | string, pattern `^/` | Absolute path to the source file. |
 | `audio_stream_index` | optional | integer, minimum `0` | Zero-based absolute stream index of the audio to analyze. |
@@ -2233,7 +2393,112 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 | `columns` | optional | integer, minimum `1`, maximum `65536` |  |
 | `no_sidecar` | optional | boolean |  |
 
+## Inline saved-file picture review
+
+### `review_file_frame_read`
+
+Start a job to read one exact frame from a source video or a saved project's program as a bounded review JPEG. Poll file_job_status_read and then call review_file_frame_result_read with the returned job_id.
+
+Returns a file job receipt. Poll `file_job_status_read` to check completion, then call `review_file_frame_result_read` with the same `job_id`.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Reuse for identical retries. |
+| `file` | optional | string, pattern `^/` | Absolute path to source video. Reads the source clock. |
+| `project_path` | optional | string, pattern `^/` | Absolute path to a saved project. |
+| `at` | required | string, minimum length `1` | Time in seconds, timecode, or exact rational seconds such as 1001/30000. |
+| `clock` | optional | `sequence` / `group` / `assembly` | Saved-project clock. Defaults to sequence for a sequence project and assembly for a multicam project. Group reads the group switch lane. |
+
+Additional schema rules
+
+```json
+{
+  "oneOf": [
+    {
+      "required": [
+        "file"
+      ],
+      "allOf": [
+        {
+          "not": {
+            "required": [
+              "project_path"
+            ]
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "clock"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "required": [
+        "project_path"
+      ],
+      "not": {
+        "required": [
+          "file"
+        ]
+      }
+    }
+  ]
+}
+```
+
+### `review_file_frame_result_read`
+
+Read the JPEG and frame metadata for a successful review_file_frame_read job. Returns one image/jpeg content block. The image is at most 640 pixels on either axis and 1 MiB before base64 encoding.
+
+Returns one JPEG image block in MCP `content` and the requested clock and time, dimensions, and available frame metadata in `structuredContent`. Camera renders can identify the source, while still and generated gap renders identify their placements or generated picture. Rendered participant and Tiles frames report `privacy_issue_count` and a bounded `privacy_issues` preview when issues affect the frame. The JPEG is bounded to 640 pixels per axis and 1 MiB.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `job_id` | required | string, format `uuid` | Job ID returned by review_file_frame_read. |
+
 ## Saved project media
+
+### `project_file_media_leave_offline`
+
+Mark a current media reference as deliberately offline. Poll file_job_status_read with the returned job_id.
+
+Returns a file job receipt. The completed result reports the published `out_project`.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_path` | required | string, pattern `^/` | Absolute path to a saved project. |
+| `operation_id` | required | string, format `uuid` | Fresh UUID for a distinct file job. Reuse it to retry an identical request. |
+| `working_directory` | optional | string, pattern `^/` | Existing working directory for the CLI job. |
+| `source` | required | string, minimum length `1` | Path returned by the project media list, or an absolute source path. |
+| `out_project` | optional | string, pattern `^/` | Write a new project at this path. |
+| `in_place` | optional | boolean | Update the input project. |
+
+Additional schema rules
+
+```json
+{
+  "oneOf": [
+    {
+      "required": [
+        "out_project"
+      ]
+    },
+    {
+      "required": [
+        "in_place"
+      ],
+      "properties": {
+        "in_place": {
+          "const": true
+        }
+      }
+    }
+  ]
+}
+```
 
 ### `project_file_media_list`
 
@@ -2246,12 +2511,13 @@ Returns a file job receipt. Poll `file_job_status_read` for `sources` containing
 | `project_path` | required | string, pattern `^/` | Absolute path to a saved project. |
 | `operation_id` | required | string, format `uuid` | Fresh UUID for a distinct file job. Reuse it to retry an identical request. |
 | `working_directory` | optional | string, pattern `^/` | Existing working directory for the CLI job. |
+| `include_history` | optional | boolean | Include media used only by retained undo or redo states. Defaults to false. |
 
 ### `project_file_media_locate`
 
-Search a folder for relink candidates. Use project_file_media_relink to apply your choices. Poll file_job_status_read with the returned job_id.
+Search a folder for relink candidates and optionally apply unique matches. Poll file_job_status_read with the returned job_id.
 
-Returns a file job receipt. Poll `file_job_status_read` for `sources` containing candidate rows. Use `project_file_media_relink` to apply selected mappings.
+Returns a file job receipt. A search reports candidate rows in `sources`. With `apply_matches`, the result reports candidate rows under `search`, outcomes under `sources`, `applied_count` and any published `out_project`. Use `project_file_media_relink` to apply selected mappings after review.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -2259,6 +2525,87 @@ Returns a file job receipt. Poll `file_job_status_read` for `sources` containing
 | `operation_id` | required | string, format `uuid` | Fresh UUID for a distinct file job. Reuse it to retry an identical request. |
 | `working_directory` | optional | string, pattern `^/` | Existing working directory for the CLI job. |
 | `folder` | required | string, pattern `^/` | Absolute path to the folder to search, including its subdirectories. |
+| `include_history` | optional | boolean | Include media used only by retained undo or redo states. Defaults to false. |
+| `apply_matches` | optional | boolean | Apply unique verified or matched candidates. Defaults to false. |
+| `out_project` | optional | string, pattern `^/` | Write a new project at this path. |
+| `in_place` | optional | boolean | Update the input project. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "apply_matches"
+        ],
+        "properties": {
+          "apply_matches": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "oneOf": [
+          {
+            "required": [
+              "out_project"
+            ]
+          },
+          {
+            "required": [
+              "in_place"
+            ],
+            "properties": {
+              "in_place": {
+                "const": true
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "if": {
+        "not": {
+          "required": [
+            "apply_matches"
+          ],
+          "properties": {
+            "apply_matches": {
+              "const": true
+            }
+          }
+        }
+      },
+      "then": {
+        "allOf": [
+          {
+            "not": {
+              "required": [
+                "out_project"
+              ]
+            }
+          },
+          {
+            "not": {
+              "required": [
+                "in_place"
+              ],
+              "properties": {
+                "in_place": {
+                  "const": true
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
+```
 
 ### `project_file_media_relink`
 
@@ -2509,19 +2856,91 @@ Additional schema rules
 }
 ```
 
+### `project_file_media_revert`
+
+Restore a previous media location when all current and retained uses trace to its relink. Poll file_job_status_read with the returned job_id.
+
+Returns a file job receipt. The completed result reports the published `out_project` and a `report` describing the restored location.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_path` | required | string, pattern `^/` | Absolute path to a saved project. |
+| `operation_id` | required | string, format `uuid` | Fresh UUID for a distinct file job. Reuse it to retry an identical request. |
+| `working_directory` | optional | string, pattern `^/` | Existing working directory for the CLI job. |
+| `source` | required | string, minimum length `1` | Path returned by the project media list, or an absolute source path. |
+| `out_project` | optional | string, pattern `^/` | Write a new project at this path. |
+| `in_place` | optional | boolean | Update the input project. |
+
+Additional schema rules
+
+```json
+{
+  "oneOf": [
+    {
+      "required": [
+        "out_project"
+      ]
+    },
+    {
+      "required": [
+        "in_place"
+      ],
+      "properties": {
+        "in_place": {
+          "const": true
+        }
+      }
+    }
+  ]
+}
+```
+
 ## Saved timeline review and multicam analysis
 
 ### `history_file_compare`
 
-Compare two saved .cut projects and report project fields and occurrence ranges that changed.
+Compare a saved .cut with another file or with one of its retained undo or redo states.
 
-Returns a file job receipt. Poll `file_job_status_read` for the comparison between the two saved projects. It reports changed project fields and before and after occurrence details. Use `file_job_result_read` for a large result.
+Returns a file job receipt. Poll `file_job_status_read` for changed project fields and before and after occurrence details. Inspect `participant_changes` for affected source and tile IDs, intervals or points. Select the before state with `before_project_path` or `history_index`. Use `file_job_result_read` for a large result.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
-| `before_project_path` | required | string | Absolute path to the earlier saved .cut. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
+| `before_project_path` | optional | string | Absolute path to the earlier saved .cut. |
 | `project_path` | required | string | Absolute path to the later saved .cut. |
+| `history_index` | optional | integer, minimum `0` | Zero-based index from oldest retained state through newest. The number of undo steps is the current cursor. |
+
+Additional schema rules
+
+```json
+{
+  "oneOf": [
+    {
+      "required": [
+        "before_project_path"
+      ]
+    },
+    {
+      "required": [
+        "history_index"
+      ]
+    }
+  ]
+}
+```
+
+### `history_file_restore_copy`
+
+Write a new .cut copy with its cursor at the selected retained state, carrying over its undo and redo history. Poll file_job_status_read with the returned job_id.
+
+Returns a file job receipt. The completed result reports the published `out_project` and selected `history_index`. The copy retains the history branches with its cursor at the selected state.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it to retry an identical request. |
+| `project_path` | required | string, pattern `^/` | Absolute path to the saved .cut project. |
+| `history_index` | required | integer, minimum `0` | Zero-based index from oldest retained state through newest. The number of undo steps is the current cursor. |
+| `out_project` | required | string, pattern `^/` | Absolute path for the new .cut copy. |
 
 ### `multicam_file_switch_coverage_read`
 
@@ -2531,7 +2950,7 @@ Returns a file job receipt. Poll `file_job_status_read` for the exact group inte
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `project_path` | required | string | Absolute path to the saved multicam .cut. |
 | `angle_id` | required | string, minimum length `1` | Camera angle ID for the proposed switch. |
 | `group_time` | required | string | Exact proposed group time in rational seconds. |
@@ -2544,7 +2963,7 @@ Returns a file job receipt. Poll `file_job_status_read` for timestamp evidence, 
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `project_path` | required | string | Absolute path to the saved multicam .cut. |
 | `source_id` | optional | string, minimum length `1` | Analyze one recording other than the reference. Defaults to all other recordings. |
 | `reference_source_id` | optional | string, minimum length `1` | Choose a recording on the reference camera for group sync, or any camera recording for replacement sync. |
@@ -2641,6 +3060,17 @@ Additional schema rules
 }
 ```
 
+### `project_file_document_print`
+
+Read the expanded JSON of a saved .cut without opening it, including retained history. Poll file_job_status_read and use file_job_result_read for larger documents.
+
+Returns a file job receipt. The completed output is the expanded saved document, including retained history. Use `file_job_result_read` to retrieve the original JSON bytes or a large document.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it to retry an identical request. |
+| `project_path` | required | string, pattern `^/` | Absolute path to the saved .cut project. |
+
 ### `timeline_file_range_map`
 
 Map an exact half-open range of a saved project between source and sequence or group and assembly clocks. Repeated occurrences appear separately.
@@ -2649,7 +3079,7 @@ Returns a file job receipt. Poll `file_job_status_read` for the saved project’
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
-| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `project_path` | required | string | Absolute path to the saved .cut project. |
 | `space` | required | `source` / `sequence` / `group` / `assembly` |  |
 | `from` | required | string | Inclusive rational time in the selected clock. |
@@ -2659,11 +3089,21 @@ Returns a file job receipt. Poll `file_job_status_read` for the saved project’
 
 ## Projects and preferences
 
+### `history_panel_close`
+
+Dismiss the target project’s history sheet and wait for the native sheet to close.
+
+Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pending`, `monitor_visible` and `history_visible`. Complete pending multicam setup before editing. Supply a destination path when saving an untitled project.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | Live handle returned by project_windows_list. |
+
 ### `history_panel_show`
 
 Show the native history sheet for the target project.
 
-Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pending` and `monitor_visible`. Complete pending multicam setup before editing. Supply a destination path when saving an untitled project.
+Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pending`, `monitor_visible` and `history_visible`. Complete pending multicam setup before editing. Supply a destination path when saving an untitled project.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -2673,7 +3113,7 @@ Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pe
 
 Confirm pending camera setup, optionally supplying source order, names, microphones and opening angle.
 
-Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pending` and `monitor_visible`. Complete pending multicam setup before editing. Supply a destination path when saving an untitled project.
+Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pending`, `monitor_visible` and `history_visible`. Complete pending multicam setup before editing. Supply a destination path when saving an untitled project.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -2693,7 +3133,7 @@ Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pe
 
 Dismiss the pending multicam setup in the target project.
 
-Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pending` and `monitor_visible`. Complete pending multicam setup before editing. Supply a destination path when saving an untitled project.
+Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pending`, `monitor_visible` and `history_visible`. Complete pending multicam setup before editing. Supply a destination path when saving an untitled project.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -2715,7 +3155,7 @@ Inspect the pending setup after a multicam import. Returns source IDs, picture/s
 
 Show or close the target window’s native video monitor.
 
-Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pending` and `monitor_visible`. Complete pending multicam setup before editing. Supply a destination path when saving an untitled project.
+Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pending`, `monitor_visible` and `history_visible`. Complete pending multicam setup before editing. Supply a destination path when saving an untitled project.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -2927,7 +3367,7 @@ Close this window. Specify what to do with unsaved edits; save requires a .cut p
 
 Create a new ordinary sequence or multicam project window. Supply local recording paths for initial import. Multicam requires a camera and opens the setup sheet.
 
-Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pending` and `monitor_visible`. Complete pending multicam setup before editing. Supply a destination path when saving an untitled project.
+Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pending`, `monitor_visible` and `history_visible`. Complete pending multicam setup before editing. Supply a destination path when saving an untitled project.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -2939,7 +3379,7 @@ Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pe
 
 Recover an unlocked draft from a path returned by project_drafts_list.
 
-Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pending` and `monitor_visible`. Complete pending multicam setup before editing. Supply a destination path when saving an untitled project.
+Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pending`, `monitor_visible` and `history_visible`. Complete pending multicam setup before editing. Supply a destination path when saving an untitled project.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -2958,7 +3398,7 @@ Pass an empty arguments object.
 
 Add local recordings using the native editor. In a sequence, append or insert at index; in a multicam editor this opens source setup. Read editor state after partial import.
 
-Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pending` and `monitor_visible`. Complete pending multicam setup before editing. Supply a destination path when saving an untitled project.
+Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pending`, `monitor_visible` and `history_visible`. Complete pending multicam setup before editing. Supply a destination path when saving an untitled project.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -2972,7 +3412,7 @@ Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pe
 
 Open a saved MPCut project and wait for native document loading. An already-open document is activated.
 
-Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pending` and `monitor_visible`. Complete pending multicam setup before editing. Supply a destination path when saving an untitled project.
+Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pending`, `monitor_visible` and `history_visible`. Complete pending multicam setup before editing. Supply a destination path when saving an untitled project.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -3005,7 +3445,7 @@ Inspect current native UI import/export/multicam workers for a specified project
 
 Save the live project with native history. Supply a new .cut path for Save As. Writing over another existing destination requires replace_existing.
 
-Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pending` and `monitor_visible`. Complete pending multicam setup before editing. Supply a destination path when saving an untitled project.
+Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pending`, `monitor_visible` and `history_visible`. Complete pending multicam setup before editing. Supply a destination path when saving an untitled project.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -3019,17 +3459,33 @@ Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pe
 
 Bring the specified project window to the front.
 
-Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pending` and `monitor_visible`. Complete pending multicam setup before editing. Supply a destination path when saving an untitled project.
+Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pending`, `monitor_visible` and `history_visible`. Complete pending multicam setup before editing. Supply a destination path when saving an untitled project.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project_handle` | required | string, minimum length `1` | Live handle returned by project_windows_list. |
 
+### `recent_files_clear`
+
+Clear the application’s Open Recent menu. Returns the remaining paths.
+
+Returns absolute local `paths[]` from Open Recent, newest first. Clearing returns an empty list.
+
+Pass an empty arguments object.
+
+### `recent_files_list`
+
+List the absolute local paths shown in Open Recent, newest first.
+
+Returns absolute local `paths[]` from Open Recent, newest first. Clearing returns an empty list.
+
+Pass an empty arguments object.
+
 ### `workspace_notice_dismiss`
 
 Dismiss a native informational or error notice after inspecting it. Use its exact message so a newer notice remains visible.
 
-Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pending` and `monitor_visible`. Complete pending multicam setup before editing. Supply a destination path when saving an untitled project.
+Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pending`, `monitor_visible` and `history_visible`. Complete pending multicam setup before editing. Supply a destination path when saving an untitled project.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -3038,11 +3494,24 @@ Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pe
 
 ## Live project media
 
+### `project_editor_media_leave_offline`
+
+Mark a current media reference as deliberately offline.
+
+Returns `changed` and the current `revision`. The change applies across retained history without adding an undo step.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | Opaque handle from project_windows_list. |
+| `expected_revision` | required | integer, minimum `0` | Revision from the editor state or the candidate receipt. |
+| `operation_id` | required | string, format `uuid` | Fresh UUID for this request. Reuse it to retry an identical request. |
+| `source` | required | string, minimum length `1` | Path returned by the project media list, or an absolute source path. |
+
 ### `project_editor_media_list`
 
 List current project media references, their statuses and uses.
 
-Returns paged `items`, `offset` and `total`. Each row reports the path, status and current uses.
+Returns paged `items`, `offset` and `total`. Each row reports the path, status and uses. Set `include_history` to include retained edits.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -3050,12 +3519,13 @@ Returns paged `items`, `offset` and `total`. Each row reports the path, status a
 | `offset` | optional | integer, minimum `0` | Zero-based page offset. |
 | `limit` | optional | integer, minimum `1`, maximum `256` | Maximum number of media rows to return. |
 | `expected_revision` | optional | integer, minimum `0` | Pin pagination to the revision from the previous page. |
+| `include_history` | optional | boolean | Include media used only by retained undo or redo states. Defaults to false. |
 
 ### `project_editor_media_locate`
 
-Search a folder for relink candidates. Poll analysis_job_status_read for candidate rows and use project_editor_media_relink to apply your choices.
+Search a folder for relink candidates. Set apply_matches to apply unique verified or matched candidates. Poll analysis_job_status_read for the outcome.
 
-Returns an analysis receipt for `analysis_job_status_read`. The completed receipt contains `candidates` and `input_revision`. Pass approved mappings and `locate_job_id` to `project_editor_media_relink` at that revision to check the reviewed file generations.
+Returns an analysis receipt for `analysis_job_status_read`. With `apply_matches`, the completed receipt reports `candidates`, `applied`, `failures`, `changed` and the resulting `revision`. To review candidates first, omit `apply_matches` and pass approved mappings and `locate_job_id` to `project_editor_media_relink` at the receipt's `input_revision`.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -3063,6 +3533,8 @@ Returns an analysis receipt for `analysis_job_status_read`. The completed receip
 | `expected_revision` | required | integer, minimum `0` | Revision from the editor state or the candidate receipt. |
 | `operation_id` | required | string, format `uuid` | Fresh UUID for this request. Reuse it to retry an identical request. |
 | `folder` | required | string, pattern `^/` | Absolute path to the folder to search, including its subdirectories. |
+| `include_history` | optional | boolean | Include media used only by retained undo or redo states. Defaults to false. |
+| `apply_matches` | optional | boolean | Apply unique verified or matched candidates. Defaults to false. |
 
 ### `project_editor_media_relink`
 
@@ -3245,6 +3717,19 @@ Additional schema rules
   ]
 }
 ```
+
+### `project_editor_media_revert`
+
+Restore a previous media location when all current and retained uses trace to its relink.
+
+Returns `changed` and the current `revision`. The change applies across retained history without adding an undo step.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | Opaque handle from project_windows_list. |
+| `expected_revision` | required | integer, minimum `0` | Revision from the editor state or the candidate receipt. |
+| `operation_id` | required | string, format `uuid` | Fresh UUID for this request. Reuse it to retry an identical request. |
+| `source` | required | string, minimum length `1` | Path returned by the project media list, or an absolute source path. |
 
 ## Multicam
 
@@ -3690,14 +4175,14 @@ Reports `revision`, `changed` and `history_retained`. Nudge reports `group_time`
 
 ### `multicam_state_read`
 
-Inspect the live group, program audio and reference camera. Page sources with offsets, index issues and stream IDs, switches with overrides, suggested switch boundaries and range edges, assembly occurrences, or still placements. For switch_coverage, supply group_time and angle_id to check the proposed snapped interval before committing a take. The audio section gives the saved Mix lanes and bindings and the resolved program spans and gaps.
+Inspect the live group, program audio and reference camera. Page sources with offsets, index issues and stream IDs, switches with overrides, persistent transcript voice links, suggested switch boundaries and range edges, assembly occurrences, or still placements. For switch_coverage, supply group_time and angle_id to check the proposed snapped interval before committing a take. The audio section gives the saved Mix lanes and bindings and the resolved program spans and gaps.
 
 Returns the chosen page of sources, switches, suggestions, assembly occurrences or stills, group range, audio policy, `total` and revision. Camera rows identify the displayed angle and recording; separate recordings on an angle can carry explicit group coverage. Sources report availability and indexing state, with duration when known. Assembly rows may identify an occurrence-specific `angle_id`. The `switch_coverage` section reports the proposed group interval, picture and audio status, audio routes and missing group intervals. After an export fails at a range edge, the suggestions section includes `edge` with the one-based `range`, its `boundary` (`from` or `to`), the edge time `at` and the verified `times` it can move to.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project_handle` | required | string |  |
-| `section` | required | `sources` / `switches` / `suggestions` / `assembly` / `stills` / `switch_coverage` / `audio` |  |
+| `section` | required | `sources` / `switches` / `suggestions` / `assembly` / `stills` / `switch_coverage` / `audio` / `voice_angles` |  |
 | `offset` | optional | integer, minimum `0` |  |
 | `limit` | optional | integer, minimum `1`, maximum `200` |  |
 | `expected_revision` | optional | integer, minimum `0` |  |
@@ -3980,6 +4465,86 @@ Additional schema rules
   }
 }
 ```
+
+### `multicam_voice_angle_edit`
+
+Set a persistent link from a transcript attachment and speaker to a camera angle. Clear it to resume automatic matching. Read explicit links in multicam_state_read with section voice_angles.
+
+Returns the updated project revision after setting or clearing the transcript speaker’s camera assignment.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string |  |
+| `expected_revision` | required | integer, minimum `0` |  |
+| `operation_id` | optional | string | Unique operation ID for this edit. Retry the same request with the same ID. |
+| `action` | required | `set` / `clear` |  |
+| `attachment_id` | required | string, minimum length `1` |  |
+| `speaker_id` | required | string, minimum length `1` |  |
+| `angle_id` | optional | string, minimum length `1` | Required for set. |
+
+## Project export settings
+
+### `project_editor_output_read`
+
+Read the project’s effective export canvas, soundtrack, and unchecked-coverage policy.
+
+Returns `output.settings` with canvas, audio and unresolved privacy policy, plus `output.has_stored_canvas`, any still format or soundtrack, and the live revision. Set also reports `changed`.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | Live project handle from project_windows_list. |
+
+### `project_editor_output_set`
+
+Change one or more persistent export settings in a single undoable edit. Save the open project to persist the edit to disk.
+
+Returns `output.settings` with canvas, audio and unresolved privacy policy, plus `output.has_stored_canvas`, any still format or soundtrack, and the live revision. Set also reports `changed`.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | Live project handle from project_windows_list. |
+| `expected_revision` | required | integer, minimum `0` |  |
+| `operation_id` | required | string, minimum length `1` | Unique operation identifier. Repeat the exact request after a lost reply. |
+| `width` | optional | integer, minimum `2`, maximum `8192` | Canvas width in pixels. Use an even value. |
+| `height` | optional | integer, minimum `2`, maximum `8192` | Canvas height in pixels. Use an even value. |
+| `frame_rate` | optional | string, minimum length `1` | Frames per second, for example 25 or 30000/1001. |
+| `background` | optional | integer, minimum `0`, maximum `16777215` | RGB integer in 0xRRGGBB order. |
+| `audio_mode` | optional | `program` / `silence` / `lanes` / `iso` / `follow` | Soundtrack mode. Still timelines use the still soundtrack tools. |
+| `audio_ids` | optional | array of string, minimum length `1`, minimum items `1` | One feed ID for iso, one camera ID for follow, or mix lane IDs for lanes. Omit for program or silence. |
+| `unresolved_privacy` | optional | `stop` / `cover` | Stop export on unchecked coverage or cover the unchecked picture. |
+
+### `project_file_output_read`
+
+Read the project’s effective export canvas, soundtrack, and unchecked-coverage policy. Poll file_job_status_read with the returned job_id.
+
+Returns a file job receipt. The completed result includes `output.settings`, `output.has_stored_canvas` and any still format or soundtrack. Set also reports `changed` and `out_project`.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_path` | required | string, pattern `^/` |  |
+| `operation_id` | required | string, format `uuid` | Fresh UUID for a distinct file job. Reuse it to retry an identical request. |
+| `working_directory` | optional | string, pattern `^/` |  |
+
+### `project_file_output_set`
+
+Change one or more persistent export settings in a single undoable edit. Supply either out_project or in_place. Poll file_job_status_read with the returned job_id.
+
+Returns a file job receipt. The completed result includes `output.settings`, `output.has_stored_canvas` and any still format or soundtrack. Set also reports `changed` and `out_project`.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_path` | required | string, pattern `^/` |  |
+| `operation_id` | required | string, format `uuid` | Fresh UUID for a distinct file job. Reuse it to retry an identical request. |
+| `working_directory` | optional | string, pattern `^/` |  |
+| `width` | optional | integer, minimum `2`, maximum `8192` | Canvas width in pixels. Use an even value. |
+| `height` | optional | integer, minimum `2`, maximum `8192` | Canvas height in pixels. Use an even value. |
+| `frame_rate` | optional | string, minimum length `1` | Frames per second, for example 25 or 30000/1001. |
+| `background` | optional | integer, minimum `0`, maximum `16777215` | RGB integer in 0xRRGGBB order. |
+| `audio_mode` | optional | `program` / `silence` / `lanes` / `iso` / `follow` | Soundtrack mode. Still timelines use the still soundtrack tools. |
+| `audio_ids` | optional | array of string, minimum length `1`, minimum items `1` | One feed ID for iso, one camera ID for follow, or mix lane IDs for lanes. Omit for program or silence. |
+| `unresolved_privacy` | optional | `stop` / `cover` | Stop export on unchecked coverage or cover the unchecked picture. |
+| `out_project` | optional | string, pattern `^/` | Absolute path for a new .cut document. Choose one destination. |
+| `in_place` | optional | boolean | Set true to update the original saved project. |
 
 ## Live exports
 
@@ -4726,7 +5291,7 @@ Returns a file job receipt. The completed result includes analysis identity, sou
 
 Reveal the requested exact time on a horizontal timeline surface.
 
-Returns the window’s actual presentation state, including zoom, available scroll surfaces and editor-specific layout. Geometry is measured in points.
+Returns the window’s actual presentation state, including zoom, available scroll surfaces and editor-specific layout. Geometry is measured in points. `monitor_picture`, `cut_sections_visible` (sequence), `full_height_panel` and `transcript_follow_playback` describe the active settings. Multicam `transcript_suggested_cameras` maps attachment IDs to their remembered speaker and angle IDs.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -4738,7 +5303,7 @@ Returns the window’s actual presentation state, including zoom, available scro
 
 Read a project window’s timeline zoom, native layout, panel state and scroll positions. Returned scroll surface names identify available controls.
 
-Returns the window’s actual presentation state, including zoom, available scroll surfaces and editor-specific layout. Geometry is measured in points.
+Returns the window’s actual presentation state, including zoom, available scroll surfaces and editor-specific layout. Geometry is measured in points. `monitor_picture`, `cut_sections_visible` (sequence), `full_height_panel` and `transcript_follow_playback` describe the active settings. Multicam `transcript_suggested_cameras` maps attachment IDs to their remembered speaker and angle IDs.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -4748,20 +5313,24 @@ Returns the window’s actual presentation state, including zoom, available scro
 
 Change the layout of the requested editor window.
 
-Returns the window’s actual presentation state, including zoom, available scroll surfaces and editor-specific layout. Geometry is measured in points.
+Returns the window’s actual presentation state, including zoom, available scroll surfaces and editor-specific layout. Geometry is measured in points. `monitor_picture`, `cut_sections_visible` (sequence), `full_height_panel` and `transcript_follow_playback` describe the active settings. Multicam `transcript_suggested_cameras` maps attachment IDs to their remembered speaker and angle IDs.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project_handle` | required | string, minimum length `1` |  |
-| `action` | required | `zoom_in` / `zoom_out` / `set_zoom` / `fit` / `restore_zoom` / `set_large_thumbnails` / `set_inspector` / `set_transcript` / `set_tiles` / `set_waveform_span` / `set_pause_controls` / `set_scroll` / `set_track_label_width` / `set_timeline_height` / `set_inspector_width` |  |
+| `action` | required | `zoom_in` / `zoom_out` / `set_zoom` / `fit` / `restore_zoom` / `set_large_thumbnails` / `set_inspector` / `set_transcript` / `set_tiles` / `set_waveform_span` / `set_pause_controls` / `set_scroll` / `set_track_label_width` / `set_timeline_height` / `set_inspector_width` / `set_monitor_picture` / `set_cut_sections` / `set_full_height_panel` / `set_transcript_follow_playback` / `set_transcript_suggested_camera` |  |
 | `zoom` | optional | number, minimum `0`, maximum `13` | Timeline zoom exponent. A value of 0 fits the timeline, and 1 doubles its width. |
-| `enabled` | optional | boolean | Used by set_large_thumbnails; shared across windows. |
+| `enabled` | optional | boolean | Used by set_large_thumbnails, set_full_height_panel and set_transcript_follow_playback. Thumbnail size and panel docking are shared across windows. |
 | `span` | optional | `timeline_zoom` / `whole_clip` / `10_seconds` / `1_second` / `100_milliseconds` / `10_milliseconds` |  |
-| `visible` | optional | boolean | Required for set_pause_controls, set_transcript and set_tiles. Defaults to true for set_inspector. |
+| `visible` | optional | boolean | Required for set_pause_controls, set_transcript, set_tiles and set_cut_sections. Defaults to true for set_inspector. |
 | `section` | optional | `switches` / `sources` / `assembly` / `export` / `transcript` / `tiles` |  |
 | `surface` | optional | `sequence` / `assembly` / `group` / `tracks` |  |
 | `fraction` | optional | number, minimum `0`, maximum `1` | Fraction of available scroll travel. Zero shows the beginning; one shows the far end. |
 | `points` | optional | number, minimum `1`, maximum `10000` | Divider size in screen points. Track labels accept 106 to 360. Native layout constraints apply. |
+| `picture` | optional | `source` / `output` | Source or composed Output in the editor viewer. The separate playback monitor continues to show composed Output. |
+| `attachment` | optional | string, minimum length `1` | Transcript attachment ID for a remembered multicam camera. |
+| `speaker` | optional | string, minimum length `1` | Speaker ID within the transcript attachment. |
+| `camera` | optional | string, minimum length `1` or null | Project angle ID to remember, or null to clear it. |
 
 | Action | Additional required arguments |
 | --- | --- |
@@ -4775,12 +5344,17 @@ Returns the window’s actual presentation state, including zoom, available scro
 | `set_track_label_width` | `points` |
 | `set_timeline_height` | `points` |
 | `set_inspector_width` | `points` |
+| `set_monitor_picture` | `picture` |
+| `set_cut_sections` | `visible` |
+| `set_full_height_panel` | `enabled` |
+| `set_transcript_follow_playback` | `enabled` |
+| `set_transcript_suggested_camera` | `attachment`, `speaker`, `camera` |
 
 ### `workspace_panel_show`
 
 Show the requested app or project panel.
 
-Returns the window’s actual presentation state, including zoom, available scroll surfaces and editor-specific layout. Geometry is measured in points.
+Returns the window’s actual presentation state, including zoom, available scroll surfaces and editor-specific layout. Geometry is measured in points. `monitor_picture`, `cut_sections_visible` (sequence), `full_height_panel` and `transcript_follow_playback` describe the active settings. Multicam `transcript_suggested_cameras` maps attachment IDs to their remembered speaker and angle IDs.
 
 | Action | Additional inputs or prerequisites |
 | --- | --- |
@@ -5189,7 +5763,7 @@ Returns the affected `placement` or `asset`, native action, revision, changed an
 
 ### `still_editor_placement_insert`
 
-Insert the source image at the requested time, extending the timeline.
+Insert the source image at the requested time, extending the timeline. Supply initial_format to start a still-only timeline in a blank sequence window.
 
 Returns the affected `placement` or `asset`, native action, revision, changed and history_retained. Read still_editor_placements_list or the refreshed timeline after structural edits.
 
@@ -5210,6 +5784,13 @@ Returns the affected `placement` or `asset`, native action, revision, changed an
 | `crop.width` | required | string |  |
 | `crop.height` | required | string |  |
 | `background` | optional | string, pattern `^#[0-9A-Fa-f]{6}$` |  |
+| `initial_format` | optional | object | Required for the first still or gap in a blank sequence, with at set to zero. |
+| `initial_format.width` | required | integer, minimum `2`, maximum `8192` |  |
+| `initial_format.height` | required | integer, minimum `2`, maximum `8192` |  |
+| `initial_format.cadence` | required | string | Exact frame interval in seconds, for example 1001/30000. |
+| `initial_format.codec` | required | `h264` / `hevc` / `prores` / `jpeg` |  |
+| `initial_format.container` | required | string, minimum length `1` |  |
+| `initial_format.color` | optional | `sdr` / `pq` / `hlg` | Program color. Defaults to SDR. |
 
 ### `still_editor_placement_remove`
 
@@ -5364,7 +5945,7 @@ Additional schema rules
 
 ### `timeline_gap_insert`
 
-Insert a generated color gap at the requested timeline time.
+Insert a generated color gap at the requested timeline time. Supply initial_format to start a still-only timeline in a blank sequence window.
 
 Returns the affected `placement` or `asset`, native action, revision, changed and history_retained. Read still_editor_placements_list or the refreshed timeline after structural edits.
 
@@ -5378,6 +5959,13 @@ Returns the affected `placement` or `asset`, native action, revision, changed an
 | `duration` | required | string | Positive duration. Exact rational seconds. |
 | `cadence` | optional | string | Positive frame interval, for example 1001/30000. Exact rational seconds. |
 | `background` | optional | string, pattern `^#[0-9A-Fa-f]{6}$` |  |
+| `initial_format` | optional | object | Required for the first still or gap in a blank sequence, with at set to zero. |
+| `initial_format.width` | required | integer, minimum `2`, maximum `8192` |  |
+| `initial_format.height` | required | integer, minimum `2`, maximum `8192` |  |
+| `initial_format.cadence` | required | string | Exact frame interval in seconds, for example 1001/30000. |
+| `initial_format.codec` | required | `h264` / `hevc` / `prores` / `jpeg` |  |
+| `initial_format.container` | required | string, minimum length `1` |  |
+| `initial_format.color` | optional | `sdr` / `pq` / `hlg` | Program color. Defaults to SDR. |
 
 ## Multicam synchronization
 
@@ -5399,15 +5987,17 @@ Returns the observed `revision` and a `report` against the reference recording. 
 
 ### `tiles_editor_accept`
 
-Accept a saved scan or revise the saved count hints for a recording.
+Accept a pending tile review or an explicit scan, or revise count hints for accepted tiles.
 
-With a scan, reports the scan state, recording ID, feed count and analysis path. With count hints alone, returns the edit receipt. Both results include the total `review_issue_count` for the recording in the updated project. A change creates one history action. Use clear_count_hints to remove both stored expectations.
+With the source alone, applies the pending review and its saved choices in one edit and returns the revision and operation count. Pass the pending `review_token` to accept the exact staged choices you reviewed. With an explicit scan, reports the scan state, recording ID, feed count, analysis path and review issue count. Count hints alone update the accepted geometry’s expectations. Use `clear_count_hints` to clear them.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `operation_id` | optional | string, minimum length `1`, maximum length `128` | A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt. |
 | `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
 | `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `review_token` | optional | string, pattern `^[a-f0-9]{64}$` | Optional token from pending read or stage to accept only the reviewed pending choices. |
 | `expected_feeds` | optional | integer, minimum `1` | The expected number of unique feeds. A mismatch requires review. |
 | `max_visible_tiles` | optional | integer, minimum `1` | The expected maximum visible tiles in one frame. A mismatch requires review. |
 | `clear_count_hints` | optional | `true` | Clear both count hints without changing the accepted tiles or feed IDs. |
@@ -5418,40 +6008,6 @@ Additional schema rules
 ```json
 {
   "allOf": [
-    {
-      "not": {
-        "allOf": [
-          {
-            "not": {
-              "required": [
-                "analysis_file"
-              ]
-            }
-          },
-          {
-            "not": {
-              "required": [
-                "expected_feeds"
-              ]
-            }
-          },
-          {
-            "not": {
-              "required": [
-                "max_visible_tiles"
-              ]
-            }
-          },
-          {
-            "not": {
-              "required": [
-                "clear_count_hints"
-              ]
-            }
-          }
-        ]
-      }
-    },
     {
       "not": {
         "required": [
@@ -5465,6 +6021,38 @@ Additional schema rules
         "required": [
           "clear_count_hints",
           "max_visible_tiles"
+        ]
+      }
+    },
+    {
+      "not": {
+        "required": [
+          "review_token",
+          "analysis_file"
+        ]
+      }
+    },
+    {
+      "not": {
+        "required": [
+          "review_token",
+          "expected_feeds"
+        ]
+      }
+    },
+    {
+      "not": {
+        "required": [
+          "review_token",
+          "max_visible_tiles"
+        ]
+      }
+    },
+    {
+      "not": {
+        "required": [
+          "review_token",
+          "clear_count_hints"
         ]
       }
     }
@@ -5533,6 +6121,7 @@ Reports the edit at the resulting project revision and any affected IDs or corre
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `operation_id` | optional | string, minimum length `1`, maximum length `128` | A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt. |
 | `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
 | `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
 | `all` | optional | boolean | Select all feeds on the recording. |
@@ -5588,6 +6177,7 @@ Reports the edit at the resulting project revision and any affected IDs or corre
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `operation_id` | optional | string, minimum length `1`, maximum length `128` | A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt. |
 | `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
 | `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
 | `from` | required | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
@@ -5609,6 +6199,7 @@ Reports the edit at the resulting project revision and any affected IDs or corre
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `operation_id` | optional | string, minimum length `1`, maximum length `128` | A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt. |
 | `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
 | `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
 | `from` | required | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
@@ -5685,6 +6276,7 @@ Returns the new feed_id and updated editor revision. Creating a feed adds one un
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `operation_id` | optional | string, minimum length `1`, maximum length `128` | A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt. |
 | `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
 | `name` | optional | string, minimum length `1` | The display name for the feed. |
 
@@ -5697,6 +6289,7 @@ Reports the edit at the resulting project revision and any affected IDs or corre
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `operation_id` | optional | string, minimum length `1`, maximum length `128` | A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt. |
 | `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
 | `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
 | `from` | optional | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
@@ -5739,6 +6332,7 @@ Reports the edit at the resulting project revision and any affected IDs or corre
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `operation_id` | optional | string, minimum length `1`, maximum length `128` | A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt. |
 | `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
 | `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
 | `feed_id` | required | string, minimum length `1` | The feed ID from feeds list. |
@@ -5753,6 +6347,7 @@ Reports the edit at the resulting project revision and any affected IDs or corre
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `operation_id` | optional | string, minimum length `1`, maximum length `128` | A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt. |
 | `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
 | `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
 | `feed_id` | required | string, minimum length `1` | The feed ID from feeds list. |
@@ -5770,6 +6365,7 @@ Reports the edit at the resulting project revision and any affected IDs or corre
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `operation_id` | optional | string, minimum length `1`, maximum length `128` | A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt. |
 | `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
 | `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
 | `from` | optional | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
@@ -5787,6 +6383,7 @@ Reports the edit at the resulting project revision and any affected IDs or corre
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `operation_id` | optional | string, minimum length `1`, maximum length `128` | A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt. |
 | `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
 | `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
 | `feed_id` | required | string, minimum length `1` | The feed ID from feeds list. |
@@ -5801,6 +6398,7 @@ Reports the edit at the resulting project revision and any affected IDs or corre
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `operation_id` | optional | string, minimum length `1`, maximum length `128` | A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt. |
 | `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
 | `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
 | `from` | optional | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
@@ -5819,6 +6417,7 @@ Reports the edit at the resulting project revision and any affected IDs or corre
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `operation_id` | optional | string, minimum length `1`, maximum length `128` | A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt. |
 | `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
 | `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
 | `feed_id` | required | string, minimum length `1` | The feed ID from feeds list. |
@@ -5834,6 +6433,7 @@ Reports the edit at the resulting project revision and any affected IDs or corre
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `operation_id` | optional | string, minimum length `1`, maximum length `128` | A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt. |
 | `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
 | `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
 | `feed_id` | required | string, minimum length `1` | The feed ID from feeds list. |
@@ -5851,6 +6451,7 @@ Reports the edit at the resulting project revision and any affected IDs or corre
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `operation_id` | optional | string, minimum length `1`, maximum length `128` | A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt. |
 | `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
 | `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
 | `from` | required | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
@@ -5899,6 +6500,7 @@ Reports the edit at the resulting project revision and any affected IDs or corre
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `operation_id` | optional | string, minimum length `1`, maximum length `128` | A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt. |
 | `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
 | `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
 | `from` | optional | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
@@ -5969,6 +6571,7 @@ Reports the edit at the resulting project revision and any affected IDs or corre
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `operation_id` | optional | string, minimum length `1`, maximum length `128` | A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt. |
 | `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
 | `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
 | `from` | optional | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
@@ -5976,6 +6579,59 @@ Reports the edit at the resulting project revision and any affected IDs or corre
 | `tile_id` | required | string, minimum length `1` | The tile ID from inspect. |
 | `feed_id` | optional | string, minimum length `1` | The feed ID from feeds list. |
 | `clear` | optional | boolean | Clear the selected assignment. |
+
+### `tiles_editor_pending_discard`
+
+Discard one pending Tiles review as an undoable edit.
+
+Pass the `review_token` from the current pending review. The result identifies the source and reports one undoable edit.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `operation_id` | optional | string, minimum length `1`, maximum length `128` | A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt. |
+| `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `review_token` | required | string, pattern `^[a-f0-9]{64}$` | The current review token from pending read. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+
+### `tiles_editor_pending_read`
+
+Read the saved pending Tiles review and all staged choices for one recording.
+
+Returns the saved pending scan identity and state, choice feed IDs, complete staged choices and a `review_token`. This reads the pending review even when the source also has accepted geometry.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+
+### `tiles_editor_pending_stage`
+
+Replace the choices staged for one pending Tiles review.
+
+Pass the `review_token` from the current pending review and the complete `choices` object. The result includes the updated `pending_review` and its new token. Use Tiles accept or reconcile to apply the choices.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `operation_id` | optional | string, minimum length `1`, maximum length `128` | A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt. |
+| `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `review_token` | required | string, pattern `^[a-f0-9]{64}$` | The current review token from pending read. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `choices` | required | object | Complete replacement choices from pending read. Omitted fields take their empty defaults. |
+| `choices.analysis_identity` | optional | string | The pending scan identity. Omit to bind to the selected scan. |
+| `choices.names` | optional | object with values of type string | Display names by choice feed ID. |
+| `choices.unchecked` | optional | array of string, minimum length `1` | Choice feed IDs to leave unassigned. |
+| `choices.merged` | optional | object with values of type string, minimum length `1` | Removed choice feed IDs mapped directly to surviving IDs. |
+| `choices.expected_feeds` | optional | string | Expected unique feed count, as text. Use an empty string to clear. |
+| `choices.expected_tiles` | optional | string | Expected peak visible tile count, as text. Use an empty string to clear. |
+| `choices.edited_hints` | optional | boolean | Set true when explicitly changing or clearing count hints. |
+| `choices.grids` | optional | array of object | Source-time grid corrections in application order. |
+| `choices.grids[].range` | required | object |  |
+| `choices.grids[].range.from` | required | string |  |
+| `choices.grids[].range.to` | required | string |  |
+| `choices.grids[].columns` | required | integer, minimum `1`, maximum `64` |  |
+| `choices.grids[].rows` | required | integer, minimum `1`, maximum `64` |  |
 
 ### `tiles_editor_preview`
 
@@ -6026,9 +6682,10 @@ Returns a review token and affected tile, feed and treatment IDs. Apply that tok
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `operation_id` | optional | string, minimum length `1`, maximum length `128` | A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt. |
 | `expected_revision` | optional | integer, minimum `0` | The revision from the latest editor state or tool result. |
 | `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
-| `analysis_file` | required | string, pattern `^/` | A saved Tiles scan JSON file. |
+| `analysis_file` | optional | string, pattern `^/` | A saved Tiles scan JSON file. |
 | `apply` | optional | `true` | Apply the reviewed reconciliation to the project. |
 | `review` | optional | string, minimum length `1` | Review token returned by a reconciliation preview. |
 
@@ -6061,13 +6718,14 @@ Additional schema rules
 
 ### `tiles_editor_scan`
 
-Scan a recording for visible tiles, distinct feeds and layout changes.
+Find visible tiles, feeds and layout changes. Save a pending review in the project or supply an output for a separate report.
 
-Starts a live analysis job. Poll `analysis_job_status_read` with the same project handle and `job_id` for the scan state, recording ID, counts and `analysis_file` or `checkpoint_directory`. A scan with incomplete coverage returns a failed job with its partial result. Scan summary issues report count mismatches. The total `review_issue_count` includes every entry from `tiles_editor_inspect` with `issues: true` on the scan. With acceptance, a revision check precedes the history edit.
+Poll `analysis_job_status_read` with the project handle and `job_id` for the scan state, recording ID, counts and revision. By default the editor saves a pending review as one undoable project edit. Specify `output` to write a standalone `analysis_file` or a resumable `checkpoint_directory`. Saving a pending review or accepting tiles requires `expected_revision`. Incomplete coverage returns a failed job with its partial result. The summary lists count mismatches and `review_issue_count` counts all scan issues.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `operation_id` | optional | string, minimum length `1`, maximum length `128` | A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt. |
 | `expected_revision` | optional | integer, minimum `0` | The revision from the latest editor state or tool result. |
 | `output` | optional | string, pattern `^/` | The destination for the command’s output. |
 | `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
@@ -6088,6 +6746,20 @@ Additional schema rules
 ```json
 {
   "allOf": [
+    {
+      "if": {
+        "not": {
+          "required": [
+            "output"
+          ]
+        }
+      },
+      "then": {
+        "required": [
+          "expected_revision"
+        ]
+      }
+    },
     {
       "if": {
         "required": [
@@ -6118,6 +6790,7 @@ Reports the edit at the resulting project revision and any affected IDs or corre
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `operation_id` | optional | string, minimum length `1`, maximum length `128` | A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt. |
 | `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
 | `proposal` | required | object | The revision-bound proposal from tiles_editor_switches_propose. |
 
@@ -6144,6 +6817,7 @@ Reports the edit at the resulting project revision and any affected IDs or corre
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `operation_id` | optional | string, minimum length `1`, maximum length `128` | A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt. |
 | `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
 | `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
 | `from` | optional | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
@@ -6159,6 +6833,7 @@ Reports the edit at the resulting project revision and any affected IDs or corre
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `operation_id` | optional | string, minimum length `1`, maximum length `128` | A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt. |
 | `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
 | `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
 | `tile_id` | required | string, minimum length `1` | The tile ID from inspect. |
@@ -6167,9 +6842,9 @@ Reports the edit at the resulting project revision and any affected IDs or corre
 
 ### `tiles_file_accept`
 
-Accept a saved scan or revise the saved count hints for a recording.
+Accept a pending tile review or an explicit scan, or revise count hints for accepted tiles.
 
-Returns a file job receipt. Its result reports the saved edit and the total `review_issue_count` for the recording in the updated project.
+Returns a file job receipt. Its result reports the saved edit and the total `review_issue_count` for the recording in the updated project. Pass the pending `review_token` to accept the exact staged choices you reviewed.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -6179,6 +6854,7 @@ Returns a file job receipt. Its result reports the saved edit and the total `rev
 | `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
 | `out_project` | optional | string, pattern `^/` | Write the updated project to this .cut path. |
 | `in_place` | optional | `true` | Update the saved project in place. |
+| `review_token` | optional | string, pattern `^[a-f0-9]{64}$` | Optional token from pending read or stage to accept only the reviewed pending choices. |
 | `expected_feeds` | optional | integer, minimum `1` | The expected number of unique feeds. A mismatch requires review. |
 | `max_visible_tiles` | optional | integer, minimum `1` | The expected maximum visible tiles in one frame. A mismatch requires review. |
 | `clear_count_hints` | optional | `true` | Clear both count hints without changing the accepted tiles or feed IDs. |
@@ -6210,40 +6886,6 @@ Additional schema rules
     },
     {
       "not": {
-        "allOf": [
-          {
-            "not": {
-              "required": [
-                "analysis_file"
-              ]
-            }
-          },
-          {
-            "not": {
-              "required": [
-                "expected_feeds"
-              ]
-            }
-          },
-          {
-            "not": {
-              "required": [
-                "max_visible_tiles"
-              ]
-            }
-          },
-          {
-            "not": {
-              "required": [
-                "clear_count_hints"
-              ]
-            }
-          }
-        ]
-      }
-    },
-    {
-      "not": {
         "required": [
           "clear_count_hints",
           "expected_feeds"
@@ -6255,6 +6897,38 @@ Additional schema rules
         "required": [
           "clear_count_hints",
           "max_visible_tiles"
+        ]
+      }
+    },
+    {
+      "not": {
+        "required": [
+          "review_token",
+          "analysis_file"
+        ]
+      }
+    },
+    {
+      "not": {
+        "required": [
+          "review_token",
+          "expected_feeds"
+        ]
+      }
+    },
+    {
+      "not": {
+        "required": [
+          "review_token",
+          "max_visible_tiles"
+        ]
+      }
+    },
+    {
+      "not": {
+        "required": [
+          "review_token",
+          "clear_count_hints"
         ]
       }
     }
@@ -7346,6 +8020,121 @@ Additional schema rules
 }
 ```
 
+### `tiles_file_pending_discard`
+
+Discard one pending Tiles review as an undoable edit.
+
+Pass the `review_token` from the current pending review. The result identifies the source and reports one undoable edit.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `project_path` | required | string, pattern `^/` | The saved .cut project. |
+| `review_token` | required | string, pattern `^[a-f0-9]{64}$` | The current review token from pending read. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `out_project` | optional | string, pattern `^/` | Write the updated project to this .cut path. |
+| `in_place` | optional | `true` | Update the saved project in place. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "out_project"
+          ]
+        },
+        {
+          "required": [
+            "in_place"
+          ],
+          "properties": {
+            "in_place": {
+              "const": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `tiles_file_pending_read`
+
+Read the saved pending Tiles review and all staged choices for one recording.
+
+Returns the saved pending scan identity and state, choice feed IDs, complete staged choices and a `review_token`. This reads the pending review even when the source also has accepted geometry.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `project_path` | required | string, pattern `^/` | The saved .cut project. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+
+### `tiles_file_pending_stage`
+
+Replace the choices staged for one pending Tiles review.
+
+Pass the `review_token` from the current pending review and the complete `choices` object. The result includes the updated `pending_review` and its new token. Use Tiles accept or reconcile to apply the choices.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `project_path` | required | string, pattern `^/` | The saved .cut project. |
+| `review_token` | required | string, pattern `^[a-f0-9]{64}$` | The current review token from pending read. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `out_project` | optional | string, pattern `^/` | Write the updated project to this .cut path. |
+| `in_place` | optional | `true` | Update the saved project in place. |
+| `choices` | required | object | Complete replacement choices from pending read. Omitted fields take their empty defaults. |
+| `choices.analysis_identity` | optional | string | The pending scan identity. Omit to bind to the selected scan. |
+| `choices.names` | optional | object with values of type string | Display names by choice feed ID. |
+| `choices.unchecked` | optional | array of string, minimum length `1` | Choice feed IDs to leave unassigned. |
+| `choices.merged` | optional | object with values of type string, minimum length `1` | Removed choice feed IDs mapped directly to surviving IDs. |
+| `choices.expected_feeds` | optional | string | Expected unique feed count, as text. Use an empty string to clear. |
+| `choices.expected_tiles` | optional | string | Expected peak visible tile count, as text. Use an empty string to clear. |
+| `choices.edited_hints` | optional | boolean | Set true when explicitly changing or clearing count hints. |
+| `choices.grids` | optional | array of object | Source-time grid corrections in application order. |
+| `choices.grids[].range` | required | object |  |
+| `choices.grids[].range.from` | required | string |  |
+| `choices.grids[].range.to` | required | string |  |
+| `choices.grids[].columns` | required | integer, minimum `1`, maximum `64` |  |
+| `choices.grids[].rows` | required | integer, minimum `1`, maximum `64` |  |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "out_project"
+          ]
+        },
+        {
+          "required": [
+            "in_place"
+          ],
+          "properties": {
+            "in_place": {
+              "const": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
 ### `tiles_file_preview`
 
 Write an annotated source frame for a timestamp or issue. This source review can show untreated pixels.
@@ -7415,7 +8204,7 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 | `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
 | `out_project` | optional | string, pattern `^/` | Write the updated project to this .cut path. |
 | `in_place` | optional | `true` | Update the saved project in place. |
-| `analysis_file` | required | string, pattern `^/` | A saved Tiles scan JSON file. |
+| `analysis_file` | optional | string, pattern `^/` | A saved Tiles scan JSON file. |
 | `apply` | optional | `true` | Apply the reviewed reconciliation to the project. |
 | `review` | optional | string, minimum length `1` | Review token returned by a reconciliation preview. |
 
@@ -7601,9 +8390,9 @@ Additional schema rules
 
 ### `history_editor_compare`
 
-Compare a retained undo or redo state with the current timeline without moving the history cursor. Reports affected occurrences and their ranges.
+Compare a retained undo or redo state with the current timeline without moving the history cursor. Reports affected occurrences and participant changes with source IDs, tile IDs, and source intervals where applicable. The page limit covers occurrence and participant rows together.
 
-Returns a `comparison` with before and after clocks and durations, changed project fields, and occurrence changes with their before and after values. Pass an index and history token from the same history read and the current editor revision. An unavailable index or stale snapshot is an error.
+Returns a `comparison` with before and after clocks and durations, changed project fields, and occurrence changes with their before and after values. Pass an index and history token from the same history read and the current editor revision. An unavailable index or stale snapshot is an error. The same page limit and next_offset cover occurrence changes and participant_changes reporting affected sources, tiles and source-clock intervals or points.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -7857,7 +8646,7 @@ Returns the native history action, whether the edit changed the timeline and the
 
 ### `transcript_editor_edit_plan`
 
-Review a transcript edit and retain its exact boundaries for apply or queue.
+Review a transcript edit and retain its exact boundaries for apply or queue. A top-level attachment_id or result_id scopes its selections. To plan across attachments, address each selection by attachment or occurrence IDs.
 
 Returns the plan ID, resolved boundaries, selections, durations, affected speech and any tier assessment.
 
@@ -8293,7 +9082,7 @@ Returns the resolved selection.
 
 ### `transcript_editor_selection_resolve`
 
-Resolve a word selection on the requested clock.
+Resolve a word selection on the requested clock with optional transcript reader expansion.
 
 Returns the resolved selection.
 
@@ -8320,6 +9109,7 @@ Returns the resolved selection.
 | `expected_transcript_revision` | optional | integer, minimum `0` | Pin the transcript-state revision to an earlier response. |
 | `attachment_id` | optional | string, minimum length `1`, maximum length `512` | Attachment from transcript_editor_attachments_list. Required when several transcripts are attached, unless each selection carries attachment_id or an occurrence ID. |
 | `result_id` | optional | string, minimum length `1`, maximum length `64` | Result identity returned by the attachment or prior transcript page. |
+| `expansion` | optional | `earlier` / `later` / `sentence` / `speaker_turn` / `preceding_question` | Expand phrase endpoints using the transcript reader boundaries in the selected clock. |
 
 ### `transcript_editor_speakers_list`
 
@@ -8585,7 +9375,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.project_path` | required | string, pattern `^/` | Absolute local path. |
 | `request.source_id` | optional | string |  |
 | `request.track_id` | optional | string |  |
-| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
 
 ### `transcript_file_attachment_detach`
@@ -8601,7 +9391,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.in_place` | optional | boolean |  |
 | `request.out_project` | optional | string, pattern `^/` | Absolute local path. |
 | `request.project_path` | required | string, pattern `^/` | Absolute local path. |
-| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
 
 ### `transcript_file_attachment_import`
@@ -8632,7 +9422,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.source_id` | optional | string |  |
 | `request.track_id` | optional | string |  |
 | `request.transcript` | optional | string, pattern `^/` | Absolute local path. |
-| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
 
 ### `transcript_file_attachment_inspect`
@@ -8656,7 +9446,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.project_path` | optional | string, pattern `^/` | Absolute local path. |
 | `request.track_id` | optional | string |  |
 | `request.transcript` | optional | string, pattern `^/` | Absolute local path. |
-| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
 
 ### `transcript_file_edit_apply`
@@ -8705,7 +9495,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.trailing_padding` | when using this variant | object | object variant |
 | `request.trailing_padding.numerator` | required | integer |  |
 | `request.trailing_padding.denominator` | required | integer |  |
-| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
 
 ### `transcript_file_edit_plan`
@@ -8753,7 +9543,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.trailing_padding` | when using this variant | object | object variant |
 | `request.trailing_padding.numerator` | required | integer |  |
 | `request.trailing_padding.denominator` | required | integer |  |
-| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
 
 ### `transcript_file_edits_suggest`
@@ -8780,7 +9570,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.space` | optional | `source` / `group` / `current_cut` |  |
 | `request.speaker_id` | optional | string |  |
 | `request.track_id` | optional | string |  |
-| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
 
 ### `transcript_file_excerpt_queue`
@@ -8829,7 +9619,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.trailing_padding` | when using this variant | object | object variant |
 | `request.trailing_padding.numerator` | required | integer |  |
 | `request.trailing_padding.denominator` | required | integer |  |
-| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
 
 ### `transcript_file_export`
@@ -8855,7 +9645,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.space` | optional | `source` / `group` / `current_cut` |  |
 | `request.speaker_id` | optional | string |  |
 | `request.track_id` | optional | string |  |
-| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
 
 ### `transcript_file_job_cancel`
@@ -8869,7 +9659,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request` | required | object | JSON request for this CLI action. See mpcut help transcript --json. |
 | `request.job_directory` | optional | string, pattern `^/` | Absolute local path. |
 | `request.job_id` | required | string |  |
-| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
 
 ### `transcript_file_job_prepare`
@@ -8894,8 +9684,23 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.progress` | optional | string |  |
 | `request.project_path` | optional | string, pattern `^/` | Absolute local path. |
 | `request.selected_tracks` | optional | array of string |  |
-| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
+
+### `transcript_file_job_reconcile`
+
+Prepare the recognition job linked to a saved attachment using the current project timing. Use transcript_file_job_run and transcript_file_attachment_import to publish the updated result.
+
+Poll the returned file job for the refreshed recognition preparation. Run that durable job and import the reviewed result into the saved project.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `request` | required | object |  |
+| `request.attachment_id` | optional | string |  |
+| `request.job_directory` | optional | string, pattern `^/` | Absolute local path. |
+| `request.progress` | optional | string |  |
+| `request.project_path` | required | string, pattern `^/` | Absolute local path. |
+| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 
 ### `transcript_file_job_retry`
 
@@ -8910,7 +9715,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.job_id` | required | string |  |
 | `request.progress` | optional | string |  |
 | `request.project_path` | optional | string, pattern `^/` | Absolute local path. |
-| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
 
 ### `transcript_file_job_run`
@@ -8926,7 +9731,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.job_id` | required | string |  |
 | `request.download` | optional | boolean | Allow the installed provider to download its selected model. Defaults to false. |
 | `request.progress` | optional | `none` / `stderr` / `jsonl` |  |
-| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
 
 ### `transcript_file_job_status_read`
@@ -8940,8 +9745,23 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request` | required | object | JSON request for this CLI action. See mpcut help transcript --json. |
 | `request.job_directory` | optional | string, pattern `^/` | Absolute local path. |
 | `request.job_id` | required | string |  |
-| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
+
+### `transcript_file_jobs_list`
+
+List recognition jobs belonging to a saved project in the chosen job directory.
+
+Poll the returned file job to discover durable recognition jobs for the saved project.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `request` | required | object |  |
+| `request.job_directory` | optional | string, pattern `^/` | Absolute local path. |
+| `request.offset` | optional | integer, minimum `0` |  |
+| `request.limit` | optional | integer, minimum `1`, maximum `500` |  |
+| `request.project_path` | required | string, pattern `^/` | Absolute local path. |
+| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 
 ### `transcript_file_occurrences_locate`
 
@@ -8968,7 +9788,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.speaker_id` | optional | string |  |
 | `request.track_id` | optional | string |  |
 | `request.word_id` | optional | string |  |
-| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
 
 ### `transcript_file_provider_capabilities_read`
@@ -8980,7 +9800,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `request` | required | object | JSON request for this CLI action. See mpcut help transcript --json. |
-| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
 
 ### `transcript_file_script_align`
@@ -9008,12 +9828,12 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.space` | optional | `source` / `group` / `current_cut` |  |
 | `request.speaker_id` | optional | string |  |
 | `request.track_id` | optional | string |  |
-| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
 
 ### `transcript_file_selection_resolve`
 
-Run transcript words select on saved inputs through the bundled CLI.
+Resolve a saved-project word selection with optional transcript reader expansion through the bundled CLI.
 
 Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page large payloads with `file_job_result_read`.
 
@@ -9037,7 +9857,8 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.trailing_padding` | when using this variant | object | object variant |
 | `request.trailing_padding.numerator` | required | integer |  |
 | `request.trailing_padding.denominator` | required | integer |  |
-| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `request.expansion` | optional | `earlier` / `later` / `sentence` / `speaker_turn` / `preceding_question` | Expand phrase endpoints using the transcript reader boundaries in the selected clock. |
+| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
 
 ### `transcript_file_takes_compare`
@@ -9065,7 +9886,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.space` | optional | `source` / `group` / `current_cut` |  |
 | `request.speaker_id` | optional | string |  |
 | `request.track_id` | optional | string |  |
-| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
 
 ### `transcript_file_tracks_list`
@@ -9081,7 +9902,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.options` | optional | object |  |
 | `request.lane_id` | optional | string, minimum length `1`, maximum length `512` | Filter by multicam audio lane ID. |
 | `request.project_path` | optional | string, pattern `^/` | Absolute local path. |
-| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
 
 ### `transcript_file_words_correct`
@@ -9117,7 +9938,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.trailing_padding` | when using this variant | object | object variant |
 | `request.trailing_padding.numerator` | required | integer |  |
 | `request.trailing_padding.denominator` | required | integer |  |
-| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
 
 ### `transcript_file_words_read`
@@ -9144,7 +9965,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.space` | optional | `source` / `group` / `current_cut` |  |
 | `request.speaker_id` | optional | string |  |
 | `request.track_id` | optional | string |  |
-| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
 
 ### `transcript_file_words_search`
@@ -9171,7 +9992,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.space` | optional | `source` / `group` / `current_cut` |  |
 | `request.speaker_id` | optional | string |  |
 | `request.track_id` | optional | string |  |
-| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
 
 ### `transcript_provider_capabilities_read`

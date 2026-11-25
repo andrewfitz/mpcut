@@ -159,7 +159,6 @@ public enum MediaRefresh {
                 try sidecar.refreshGeneration(evidence: persisted.encoded(), preserving: keep,
                                               expectedEvidence: snapshot?.evidence, force: force,
                                               preservingScenes: persistedComparison.scenes,
-                                              preservingThresholdStreams: persistedComparison.verifiedThresholdStreams,
                                               sections: sections,
                                               cancelled: cancelled)
             } catch let error as CutError where error.code == "cancelled" || error.code == "source_changed" {
@@ -188,7 +187,7 @@ extension SceneReport {
     /// The caller has verified the new generation against the report's picture inputs.
     package func forRefreshedMedia(_ media: MediaInfo) -> SceneReport {
         SceneReport(file: media.url.path, sourceStamp: SceneSourceStamp(media: media), timeBase: timeBase,
-                    origin: origin, duration: duration, scenes: scenes, viewCount: viewCount, views: views,
+                    origin: origin, duration: duration, scenes: scenes, sourceEvidence: sourceEvidence, viewCount: viewCount, views: views,
                     syntheticLeading: syntheticLeading)
     }
 }

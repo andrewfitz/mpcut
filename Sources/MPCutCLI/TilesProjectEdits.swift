@@ -197,12 +197,20 @@ extension TilesCLI {
             throw CLIError("invalid_arguments", "Use --apply with the --review token from the reconciliation report.")
         }
         let cancelled = { !interruption.isActive }
-        let scan = try input.analysis(cancelled: cancelled)
+        let supplied = try input.fields["analysis_file"].map { _ in try input.analysis(cancelled: cancelled) }
+        func sourceForReview(in project: CutProject) throws -> String {
+            if supplied != nil { return try sourceID(in: project, request: input) }
+            return try project.pendingTileSourceID(input.value("source_id", as: String.self))
+        }
         if let token {
             let receipt = try mutateProject(input, document: document, action: "Reconcile Tiles", interruption: interruption) {
-                let source = try sourceID(in: $0, request: input)
-                try $0.applyReviewedParticipantReconciliation(scan, sourceID: source, relativeTo: document,
-                    token: token, cancelled: cancelled)
+                let source = try sourceForReview(in: $0)
+                if let supplied {
+                    try $0.applyReviewedParticipantReconciliation(supplied, sourceID: source, relativeTo: document,
+                                                                 token: token, cancelled: cancelled)
+                } else {
+                    try $0.reconcilePendingTileReview(sourceID: source, relativeTo: document, token: token, cancelled: cancelled)
+                }
             }
             try writeJSON(receipt, pretty: !json, checkCancellation: false)
         } else {
@@ -210,9 +218,15 @@ extension TilesCLI {
                 throw CLIError("invalid_arguments", "Supply an output destination when applying the reviewed reconciliation.")
             }
             let project = try CutProject.load(from: document)
-            let source = try sourceID(in: project, request: input)
+            let source = try sourceForReview(in: project)
+            let pending = try supplied == nil
+                ? project.pendingTileScan(sourceID: source, relativeTo: document, cancelled: cancelled) : nil
+            guard let scan = supplied ?? pending?.1 else {
+                throw CLIError("invalid_arguments", "No replacement scan available.")
+            }
             let review = try project.participantReconciliation(scan, sourceID: source, relativeTo: document, cancelled: cancelled)
-            try writeJSON(TileReconciliationReport(review: review, token: review.reviewToken(for: scan)), pretty: !json)
+            let token = try pending?.0.reconciliationToken(for: review, scan: scan) ?? review.reviewToken(for: scan)
+            try writeJSON(TileReconciliationReport(review: review, token: token), pretty: !json)
         }
     }
 }

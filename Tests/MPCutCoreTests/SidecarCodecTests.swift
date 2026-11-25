@@ -160,7 +160,7 @@ final class SidecarCodecTests: XCTestCase {
         XCTAssertEqual(try plain.decode(cancelled: { false }), own)
     }
 
-    func testProviderLayoutLevelsPackSmallerThanPlainCompression() throws {
+    func testDurableProviderArtifactPacksSmallerThanPlainCompression() throws {
         // Ten minutes at 50 frames a second: speech-like levels at full precision, with
         // stretches of digital silence and of a noise floor too quiet for a plain decimal.
         var state: UInt64 = 0x9E37_79B9_7F4A_7C15
@@ -178,7 +178,7 @@ final class SidecarCodecTests: XCTestCase {
         let duration = levels.count * 320 - 123
         let value = providerLevels(levels.map(providerSpelling), duration: duration)
         let key = "transcript_activity.v1.0." + TranscriptStore.digest(value)
-        let packed = try SidecarPayload.encode(value, key: key, cancelled: { false })
+        let packed = try SidecarPayload.encode(value, key: key, providerActivity: true, cancelled: { false })
         let plain = try SidecarPayload.encode(value, cancelled: { false })
         XCTAssertEqual(packed.bytes.first, 7)
         XCTAssertEqual(plain.bytes.first, 1)

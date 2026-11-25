@@ -92,9 +92,9 @@ final class CutHistoryTests: XCTestCase {
         XCTAssertTrue(disabled.undo.isEmpty && disabled.redo.isEmpty)
     }
 
-    func testLegacyHistoryWithoutOriginRemainsUnknownAfterSaving() throws {
+    func testHistoryWithoutOriginRemainsUnknownAfterSaving() throws {
         let url = file()
-        let json = #"{"format":"mpcut","schema_version":4,"kind":"sequence","clips":[],"history":{"undo":[{"action":"Earlier Edit"}]}}"#
+        let json = #"{"format":"mpcut","schema_version":9,"kind":"sequence","clips":[],"history":{"undo":[{"action":"Earlier Edit"}]}}"#
         try Data(json.utf8).write(to: url)
         let loaded = try CutProject.loadDocument(from: url, limit: 5)
         XCTAssertEqual(loaded.undo.first?.origin, .unknown)
@@ -102,7 +102,7 @@ final class CutHistoryTests: XCTestCase {
         XCTAssertEqual(try CutProject.loadHistory(from: url, limit: 5).undo.first?.origin, .unknown)
     }
 
-    func testTilesOnlyInRetainedHistorySelectTheTilesSchemaAndRoundTrip() throws {
+    func testTilesOnlyInRetainedHistoryRoundTrip() throws {
         let url = file()
         var changed = clip(1)
         changed.tileLayouts = [.init(range: .init(from: .zero, to: .init(numerator: 2)), layout: .original)]
@@ -116,11 +116,11 @@ final class CutHistoryTests: XCTestCase {
         XCTAssertEqual(loaded.redo, redo)
         let json = try ProjectFile.documentJSON(at: url)
         var object = try XCTUnwrap(JSONSerialization.jsonObject(with: json) as? [String: Any])
-        XCTAssertEqual(object["schema_version"] as? Int, CutProject.tilesSchemaVersion)
-        object["schema_version"] = CutProject.schemaVersion
+        XCTAssertEqual(object["schema_version"] as? Int, CutProject.schemaVersion)
+        object["schema_version"] = 8
         try JSONSerialization.data(withJSONObject: object).write(to: url)
         XCTAssertThrowsError(try CutProject.loadDocument(from: url, limit: 1)) {
-            XCTAssertEqual(($0 as? CutError)?.code, "invalid_cut_history")
+            XCTAssertEqual(($0 as? CutError)?.code, "unsupported_cut_version")
         }
     }
 
@@ -175,8 +175,8 @@ final class CutHistoryTests: XCTestCase {
         shortened.participants = model
         let plain = try JSONEncoder().encode(shortened)
         var json = try XCTUnwrap(JSONSerialization.jsonObject(with: plain) as? [String: Any])
-        XCTAssertEqual(json["schema_version"] as? Int, CutProject.tilesSchemaVersion)
-        json["schema_version"] = CutProject.schemaVersion
+        XCTAssertEqual(json["schema_version"] as? Int, CutProject.schemaVersion)
+        json["schema_version"] = 8
         XCTAssertThrowsError(try CutProject.decode(JSONSerialization.data(withJSONObject: json)))
         var convertedModel = model
         convertedModel.sources[0].sourceID = "camera"
@@ -257,22 +257,21 @@ final class CutHistoryTests: XCTestCase {
         XCTAssertNil(object["history"])
     }
 
-    func testLargeUndoCanBePrunedWithoutLosingCurrentProjectOrNearestRedo() throws {
+    func testLargeUndoAndNearestRedoAreBothRetained() throws {
         let url = file()
         let edit = CutProject.sequence([clip(1)])
         let future = CutHistoryState(action: "Remove Clip", project: .sequence([]))
         let large = CutHistoryState(action: "Delete Clips", project: .sequence((0..<50).map(clip)))
-        try edit.save(to: url, undo: [large], redo: [future], byteLimit: 360)
+        try edit.save(to: url, undo: [large], redo: [future])
         let result = try CutProject.loadDocument(from: url, limit: 500)
         XCTAssertEqual(result.project, edit)
-        XCTAssertTrue(result.undo.isEmpty)
+        XCTAssertEqual(result.undo, [large])
         XCTAssertEqual(result.redo, [future])
-        XCTAssertLessThanOrEqual(try Data(contentsOf: url).count, 360)
         let original = try Data(contentsOf: url)
         var recording = clip(0)
         recording.file = url.path
         let unsafe = CutHistoryState(action: "Remove Media", project: .sequence([recording]))
-        XCTAssertThrowsError(try edit.save(to: url, undo: [unsafe, large], redo: [], byteLimit: 360))
+        XCTAssertThrowsError(try edit.save(to: url, undo: [unsafe, large], redo: []))
         XCTAssertEqual(try Data(contentsOf: url), original)
     }
 
@@ -337,19 +336,6 @@ final class CutHistoryTests: XCTestCase {
         try present.save(to: url, undo: [.init(action: action, project: present)], redo: [])
         XCTAssertEqual(try CutProject.loadHistory(from: url, limit: 1).undo.first?.action, action)
         XCTAssertThrowsError(try present.save(to: url, undo: [.init(action: action + "x", project: present)], redo: []))
-    }
-
-    func testCombinedDeltaSizeIsCheckedBeforeDecodingEitherBranch() throws {
-        let url = file()
-        let copies = String(repeating: "[0,1],", count: 500_000) + "[0,1]"
-        let step = #"{"action":"Edit","clips":["# + copies + "]}"
-        let document = #"{"format":"mpcut","schema_version":3,"kind":"sequence","clips":[],"history":{"undo":["#
-            + step + #"],"redo":["# + step + "]}}"
-        try Data(document.utf8).write(to: url)
-        XCTAssertThrowsError(try CutProject.loadDocument(from: url, limit: 0)) {
-            XCTAssertEqual(($0 as? CutError)?.code, "invalid_cut_history")
-            XCTAssertTrue($0.localizedDescription.contains("stored-record limit"))
-        }
     }
 
     func testMalformedHistoryCannotAmplifyOrReplaceMedia() throws {

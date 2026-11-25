@@ -15,7 +15,7 @@ final class TileFeedAttachmentsTests: XCTestCase {
             words: [.init(id: "word", text: "Hello", start: .zero, end: end, speakerID: voice.speakerID,
                           observations: [.init(trackID: "track", start: .zero, end: end, evidence: .recognized)])])
         let attachment = TranscriptAttachment(id: voice.attachmentID,
-            asset: .init(file: "call.json", sha256: String(repeating: "0", count: 64)),
+            asset: .init(sha256: String(repeating: "0", count: 64)),
             bindings: [.init(trackID: "track", sourceID: microphone.source, streamIndex: microphone.stream)])
         return try TranscriptIndex(document: document, attachment: attachment)
     }
@@ -104,7 +104,7 @@ final class TileFeedAttachmentsTests: XCTestCase {
                       observations: [.init(trackID: "track", start: t(5), end: t(15), evidence: .recognized)])
             })
         let attachment = TranscriptAttachment(id: voice.attachmentID,
-            asset: .init(file: "call.json", sha256: String(repeating: "0", count: 64)), bindings: [])
+            asset: .init(sha256: String(repeating: "0", count: 64)), bindings: [])
         let index = try TranscriptIndex(document: document, attachment: attachment)
         let proposals = try TileSwitches.propose(in: group, document: documentURL, indexes: [index], minimumHold: t(1), useSidecar: false)
         XCTAssertEqual(proposals.map(\.at), [t(12)])

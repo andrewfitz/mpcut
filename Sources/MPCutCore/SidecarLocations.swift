@@ -150,7 +150,7 @@ package struct SidecarCatalogEntry: Hashable, Codable, Sendable {
     fileprivate let key: String?
     package var lookupKey: String? { key }
     package var rootURL: URL { root.url }
-    fileprivate var catalogPath: String {
+    var catalogPath: String {
         mode == .media ? root.url.appendingPathComponent(url.lastPathComponent).path : url.path
     }
     package var rootIdentity: String { "\(root.diskMarker ?? root.volume)/\(root.inode)" }
@@ -158,7 +158,7 @@ package struct SidecarCatalogEntry: Hashable, Codable, Sendable {
     package static func adjacent(source: URL) -> Self? {
         guard source.isFileURL, let root = SidecarRoot(source.deletingLastPathComponent()) else { return nil }
         let file = source.standardizedFileURL
-        return Self(source: file, url: file.appendingPathExtension("cutdb"), mode: .media, root: root, key: nil)
+        return Self(source: file, url: file.appendingPathExtension(AnalysisSidecar.fileExtension), mode: .media, root: root, key: nil)
     }
 }
 
@@ -210,7 +210,7 @@ package struct SidecarLocations: Sendable {
         return config
     }
 
-    private static func updateConfiguration(_ update: (inout Configuration) -> Void) throws {
+    private static func updateConfiguration(_ update: (inout Configuration) throws -> Void) throws {
         let directory = home
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                attributes: [.posixPermissions: 0o700])
@@ -221,7 +221,7 @@ package struct SidecarLocations: Sendable {
             if errno != EINTR { throw sidecarError("Cannot lock the sidecar settings directory.") }
         }
         var config = configuration(in: directory)
-        update(&config)
+        try update(&config)
         try JSONEncoder().encode(config).write(to: directory.appendingPathComponent("config.json"), options: .atomic)
     }
 
@@ -232,6 +232,20 @@ package struct SidecarLocations: Sendable {
 
     package static func setMode(_ mode: SidecarStorageMode) throws {
         try updateConfiguration { $0.mode = mode }
+    }
+
+    package static func configureStorage(_ mode: SidecarStorageMode, folder: URL?) throws {
+        if let folder {
+            guard mode == .disk else { throw sidecarError("A shared cache folder requires disk mode.") }
+            try chooseDisk(folder, selecting: true)
+        } else {
+            try updateConfiguration { config in
+                guard mode != .disk || config.disk != nil else {
+                    throw sidecarError("Select a shared cache folder when enabling disk mode.")
+                }
+                config.mode = mode
+            }
+        }
     }
 
     package static func settingsSnapshot() -> (mode: SidecarStorageMode, disk: URL?, available: Bool) {
@@ -316,21 +330,21 @@ package struct SidecarLocations: Sendable {
             root = folder
             key = projectKey
         case .disk:
-            guard let folder = preferences.disk, let diskKey else { throw sidecarError("Choose a cache disk in Settings first.") }
+            guard let folder = preferences.disk, let diskKey else { throw sidecarError("Choose a cache disk in Settings → Storage first.") }
             root = folder
             key = diskKey
         case .media:
             preconditionFailure()
         }
         let directory = try root.directory(for: key, creating: creating)
-        return SidecarCatalogEntry(source: canonical, url: directory.appendingPathComponent(key + ".cutdb"),
+        return SidecarCatalogEntry(source: canonical, url: directory.appendingPathComponent(key + "." + AnalysisSidecar.fileExtension),
                                    mode: mode, root: root, key: key)
     }
 
     package var destination: URL? { preferences.unreadable ? nil : try? entry(preferences.mode).url }
     package func checkWriteConfiguration() throws {
         if preferences.unreadable {
-            throw sidecarError("Cannot read the sidecar storage setting. Select a storage location in Settings to save again.")
+            throw sidecarError("Cannot read the sidecar storage setting. Select a storage location in Settings → Storage to save again.")
         }
     }
 
@@ -383,8 +397,8 @@ package struct SidecarLocations: Sendable {
     package var candidates: [URL] {
         // Ordinary reads probe adjacent paths directly. Capturing the source
         // directory's persistent identity is only needed for catalog maintenance.
-        var urls = [source.appendingPathExtension("cutdb")]
-        let physical = canonical.appendingPathExtension("cutdb")
+        var urls = [source.appendingPathExtension(AnalysisSidecar.fileExtension)]
+        let physical = canonical.appendingPathExtension(AnalysisSidecar.fileExtension)
         if !Self.sameLocation(urls[0], physical) { urls.append(physical) }
         for mode in [SidecarStorageMode.project, .disk] {
             guard let row = try? entry(mode) else { continue }
@@ -399,8 +413,8 @@ package struct SidecarLocations: Sendable {
     }
 
     package func isAdjacent(_ candidate: URL) -> Bool {
-        Self.sameLocation(candidate, source.appendingPathExtension("cutdb")) ||
-            Self.sameLocation(candidate, canonical.appendingPathExtension("cutdb"))
+        Self.sameLocation(candidate, source.appendingPathExtension(AnalysisSidecar.fileExtension)) ||
+            Self.sameLocation(candidate, canonical.appendingPathExtension(AnalysisSidecar.fileExtension))
     }
 
     package func lookupKey(for candidate: URL) -> String? {
@@ -412,7 +426,7 @@ package struct SidecarLocations: Sendable {
             .first { Self.sameLocation($0.url, candidate) && Self.validate($0) }?.key
     }
 
-    /// A successful read may be the first time this process sees a legacy file
+    /// A successful read may be the first time this process sees a cutcache
     /// or a project-local cache written on another Mac. Remember it for this
     /// session's clear dialog and workers, without writing the durable catalog.
     func observeValidated(_ sidecar: URL, device: dev_t, inode: ino_t) {
@@ -442,6 +456,7 @@ package struct SidecarLocations: Sendable {
     /// candidate must have our exact shard layout and a manifest belonging to
     /// the source that produced its filename. Regular reads use direct lookups.
     package static func managedEntries(scanning folders: [URL], sources: [URL] = [],
+                                       restrictedTo scopes: [[String]] = [],
                                        sourceForCache: (URL) -> URL?) -> [SidecarCatalogEntry] {
         let known = knownEntries().filter { $0.mode != .media }
         let durable = SidecarLocationCatalog.persisted(home: home, source: nil)
@@ -462,8 +477,12 @@ package struct SidecarLocations: Sendable {
         }
 
         var result: [SidecarCatalogEntry] = []
-        for (root, modes) in roots where root.available {
+        for (root, modes) in roots {
             let top = root.url.appendingPathComponent("MPCut Cache", isDirectory: true)
+            let components = top.pathComponents
+            guard scopes.isEmpty || scopes.contains(where: {
+                components.starts(with: $0) || $0.starts(with: components)
+            }), root.available else { continue }
             var info = stat()
             guard lstat(top.path, &info) == 0, info.st_mode & S_IFMT == S_IFDIR,
                   let shards = try? FileManager.default.contentsOfDirectory(atPath: top.path) else { continue }
@@ -480,10 +499,11 @@ package struct SidecarLocations: Sendable {
             for shard in shards where shard.utf8.count == 2 && isHex(shard) {
                 guard let directory = try? root.directory(for: shard, creating: false),
                       let files = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { continue }
-                for name in files where name.hasSuffix(".cutdb") {
-                    let key = String(name.dropLast(6))
+                for name in files where name.hasSuffix("." + AnalysisSidecar.fileExtension) {
+                    let key = String(name.dropLast(1 + AnalysisSidecar.fileExtension.count))
                     guard key.utf8.count == 64, key.hasPrefix(shard), isHex(key) else { continue }
                     let url = directory.appendingPathComponent(name)
+                    guard scopes.isEmpty || scopes.contains(where: { url.pathComponents.starts(with: $0) }) else { continue }
                     guard !registered.contains(url.path) else { continue }
                     let verified = sourceForCache(url)
                     guard let file = verified ?? lookup[key], file.isFileURL else { continue }
@@ -516,7 +536,7 @@ package struct SidecarLocations: Sendable {
         if row.mode == .media {
             guard try AnalysisSidecar(source: source).currentStamp(db) != nil else { return }
         } else {
-            guard db.hasChangeTimes, let key = row.lookupKey else { return }
+            guard let key = row.lookupKey else { return }
             let volume = try? source.resourceValues(forKeys: [.volumeURLKey, .volumeUUIDStringKey])
             let recomputed = managedKey(source: source, volume: volume, projectRoot: row.mode == .project ? row.root : nil)
             let verified = try db.statement("SELECT source_path FROM sidecar_location WHERE id = 1 AND lookup_key = ?", [key]) { q in
@@ -534,15 +554,16 @@ package struct SidecarLocations: Sendable {
     package static func validate(_ row: SidecarCatalogEntry) -> Bool {
         guard row.source.isFileURL, row.url.isFileURL else { return false }
         if row.mode == .media {
-            return row.source.appendingPathExtension("cutdb").path == row.url.path &&
+            return row.source.appendingPathExtension(AnalysisSidecar.fileExtension).path == row.url.path &&
                 SidecarRoot(row.source.deletingLastPathComponent()) == row.root
         }
         guard let key = row.key, key.count == 64, isHex(key),
               let directory = try? row.root.directory(for: key, creating: false) else { return false }
-        return row.url.path == directory.appendingPathComponent(key + ".cutdb").path
+        return row.url.path == directory.appendingPathComponent(key + "." + AnalysisSidecar.fileExtension).path
     }
 
-    package static func forgetEntry(_ entry: SidecarCatalogEntry) { SidecarLocationCatalog.forget([entry], home: home) }
+    static func forgetEntries(_ entries: [SidecarCatalogEntry]) { SidecarLocationCatalog.forget(entries, home: home) }
+    package static func forgetEntry(_ entry: SidecarCatalogEntry) { forgetEntries([entry]) }
 
     package static func forget(_ urls: Set<URL>) {
         SidecarLocationCatalog.forget(knownEntries().filter { urls.contains($0.url) && validate($0) }, home: home)

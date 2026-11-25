@@ -34,7 +34,7 @@ class ResolveNativeTests(unittest.TestCase):
                    "-c:v", "prores_ks", "-c:a", "pcm_s16le", media)
             ranges = [("2", "3"), ("0", "2"), ("2", "3")]
             source = folder / "Test.cut"
-            source.write_text(json.dumps(dict(format="mpcut", schema_version=3, kind="sequence", clips=[
+            source.write_text(json.dumps(dict(format="mpcut", schema_version=9, kind="sequence", clips=[
                 {"id": str(i), "file": media.name, "from": a, "to": b} for i, (a, b) in enumerate(ranges)])))
             for ext in ("drp", "drt"):
                 with self.subTest(ext=ext):
@@ -60,7 +60,7 @@ class ResolveNativeTests(unittest.TestCase):
             for rate in (7, 24):
                 media = folder / f"Camera-{rate}.mov"
                 ffmpeg("-f", "lavfi", "-i", f"testsrc2=s=160x90:r={rate}:d=2", "-c:v", "prores_ks", media)
-                source.write_text(json.dumps(dict(format="mpcut", schema_version=3, kind="sequence", clips=[
+                source.write_text(json.dumps(dict(format="mpcut", schema_version=9, kind="sequence", clips=[
                     {"id": "take", "file": media.name, "from": "0", "to": "1"}])))
                 error = self.convert(source, output, succeeds=False)["error"]
                 self.assertEqual(error["code"], "resolve_timebase_changed" if rate == 7 else "conversion_loss")
@@ -79,7 +79,7 @@ class ResolveNativeTests(unittest.TestCase):
                    "-c:a", "pcm_s16le", folder / "microphone.wav")
             source = folder / "Multi.cut"
             end = {"from": "2", "to": "3"}
-            source.write_text(json.dumps(dict(format="mpcut", schema_version=3, kind="multicam",
+            source.write_text(json.dumps(dict(format="mpcut", schema_version=9, kind="multicam",
                 reference_angle_id="wide", group_range={"from": "0", "to": "3"},
                 angles=[dict(id="close", name="Close", file="close-first.mov",
                              group_coverage={"from": "0", "to": "1"},

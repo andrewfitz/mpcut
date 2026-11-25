@@ -20,7 +20,7 @@ final class VideoMonitorTests: XCTestCase {
             let editor = NSWindow(contentRect: .init(x: 0, y: 0, width: 320, height: 240), styleMask: [.titled],
                                   backing: .buffered, defer: false)
             editor.isReleasedWhenClosed = false
-            editor.contentView = NSHostingView(rootView: PreviewView(preview: preview))
+            editor.contentView = NSHostingView(rootView: PreviewView(preview: preview, preferences: nil))
             editor.orderFront(nil)
             defer { editor.close() }
             session.window = editor

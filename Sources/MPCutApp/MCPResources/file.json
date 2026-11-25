@@ -8,7 +8,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -77,7 +77,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -128,7 +128,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -180,7 +180,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -312,7 +312,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -552,7 +552,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -784,7 +784,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -867,7 +867,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -977,7 +977,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -1014,7 +1014,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -1038,7 +1038,7 @@
         "output": {
           "type": "string",
           "pattern": "^/",
-          "description": "Absolute path to a new directory for the JPEGs and manifest."
+          "description": "Absolute path to a new directory for the frame images and manifest."
         },
         "at": {
           "type": "array",
@@ -1103,6 +1103,15 @@
             "group"
           ],
           "description": "Project timebase. Sequence projects use sequence time. Multicam defaults to group time for angle comparisons. Select assembly for the edited program. Project frame exports require at or at_file."
+        },
+        "format": {
+          "type": "string",
+          "enum": [
+            "jpeg",
+            "png",
+            "tiff"
+          ],
+          "description": "Image format. Lossless PNG and TIFF require a supported source. Defaults to JPEG."
         }
       },
       "additionalProperties": false,
@@ -1142,7 +1151,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -1179,7 +1188,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -1246,7 +1255,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -1376,6 +1385,11 @@
             "flac"
           ],
           "description": "Explicit container for a still project export. Match the destination filename extension and selected tracks."
+        },
+        "plan_token": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Token from the approved dry run. Supply project_path and render with the same media, destination and options."
         }
       },
       "additionalProperties": false,
@@ -1397,6 +1411,23 @@
               ]
             }
           ]
+        },
+        {
+          "if": {
+            "required": [
+              "plan_token"
+            ]
+          },
+          "then": {
+            "required": [
+              "project_path"
+            ],
+            "properties": {
+              "dry_run": {
+                "const": false
+              }
+            }
+          }
         }
       ]
     }
@@ -1410,7 +1441,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -1671,7 +1702,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -1928,7 +1959,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -2076,7 +2107,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -2291,7 +2322,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -2342,7 +2373,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -2570,7 +2601,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -2798,7 +2829,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -2826,7 +2857,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -2842,7 +2873,7 @@
   },
   {
     "name": "file_job_status_read",
-    "description": "Get state, native progress and the terminal JSON result. Scene scans, refreshes and Tiles delivery can include the latest available progress event. A Tiles ISO delivery job can finish in needs_review with exit code 3 and a reviewable project. For large results, read result_bytes using file_job_result_read.",
+    "description": "Get state, native progress and the terminal JSON result. Supply the original operation_id as job_id if the acceptance response was lost. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. An outcome_unknown receipt prevents an interrupted operation from running again. Scene scans, refreshes and Tiles delivery can include the latest available progress event. A Tiles ISO delivery job can finish in needs_review with exit code 3 and a reviewable project. For large results, read result_bytes using file_job_result_read.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2887,13 +2918,31 @@
   },
   {
     "name": "file_job_cancel",
-    "description": "Request cancellation. Poll status until completion to see any outputs the job already published.",
+    "description": "Request cancellation through the worker that started the job. Poll status until completion to see any outputs the job already published.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "job_id": {
           "type": "string",
           "description": "The job UUID returned when the request was accepted.",
+          "format": "uuid"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "job_id"
+      ]
+    }
+  },
+  {
+    "name": "file_job_release",
+    "description": "Discard a terminal job's saved result payload while retaining the outcome and operation ID. Repeat safely after collecting all result pages.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "type": "string",
+          "description": "The operation UUID used as the job identifier.",
           "format": "uuid"
         }
       },
@@ -2912,7 +2961,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -3069,7 +3118,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -3116,7 +3165,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -3163,7 +3212,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -3234,7 +3283,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -3369,7 +3418,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -3483,7 +3532,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -3579,7 +3628,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -3700,7 +3749,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -3756,7 +3805,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -3816,7 +3865,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -3846,7 +3895,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -3942,7 +3991,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -4030,7 +4079,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -4083,8 +4132,7 @@
                     "type": "string"
                   },
                   "name": {
-                    "type": "string",
-                    "minLength": 1
+                    "type": "string"
                   },
                   "ranges": {
                     "type": "array",
@@ -4296,6 +4344,26 @@
                     "type": "string",
                     "minLength": 1,
                     "description": "Camera recording ID for an aligned program replacement."
+                  },
+                  "offset": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Exact signed camera offset."
+                  },
+                  "attachment_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Transcript attachment identifier."
+                  },
+                  "speaker_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Speaker identifier within the attachment."
+                  },
+                  "project_revision": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Reviewed multicam revision for a switch operation."
                   }
                 },
                 "required": [
@@ -4400,7 +4468,7 @@
         "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
         },
         "working_directory": {
           "type": "string",
@@ -4453,8 +4521,7 @@
                     "type": "string"
                   },
                   "name": {
-                    "type": "string",
-                    "minLength": 1
+                    "type": "string"
                   },
                   "ranges": {
                     "type": "array",
@@ -4666,6 +4733,26 @@
                     "type": "string",
                     "minLength": 1,
                     "description": "Camera recording ID for an aligned program replacement."
+                  },
+                  "offset": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Exact signed camera offset."
+                  },
+                  "attachment_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Transcript attachment identifier."
+                  },
+                  "speaker_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Speaker identifier within the attachment."
+                  },
+                  "project_revision": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Reviewed multicam revision for a switch operation."
                   }
                 },
                 "required": [
@@ -4693,6 +4780,11 @@
             },
             "project_path": {
               "type": "string"
+            },
+            "project_revision": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Revision from tiles switches propose. Checked against the saved multicam project before any operation."
             }
           },
           "required": [
@@ -4706,6 +4798,169 @@
       "required": [
         "operation_id",
         "request"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "silence_file_pause_protect",
+    "description": "Save protection for pauses identified by a multicam project silence scan, keeping the assembly intact. Returns a job_id. Poll file_job_status_read for the CLI result.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
+        },
+        "project_path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to the saved project."
+        },
+        "out_project": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a new .cut file."
+        },
+        "no_sidecar": {
+          "type": "boolean"
+        },
+        "protect_pauses": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "Pause IDs from the same saved project and detector settings."
+        },
+        "silence_threshold_db": {
+          "type": "number",
+          "minimum": -120,
+          "maximum": 0
+        },
+        "silence_min_pause_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "silence_max_blip_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      },
+      "required": [
+        "operation_id",
+        "project_path",
+        "out_project",
+        "protect_pauses"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "silence_file_room_tone_calibrate",
+    "description": "Set per-track silence thresholds from routed multicam audio inside the supplied room-tone range. Returns a job_id. Poll file_job_status_read for the CLI result.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
+        },
+        "project_path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to the saved project."
+        },
+        "out_project": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a new .cut file."
+        },
+        "no_sidecar": {
+          "type": "boolean"
+        },
+        "clock": {
+          "type": "string",
+          "enum": [
+            "group",
+            "assembly"
+          ]
+        },
+        "from": {
+          "type": "string",
+          "minLength": 1
+        },
+        "to": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "operation_id",
+        "project_path",
+        "out_project",
+        "clock",
+        "from",
+        "to"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "scenes_file_view_rename",
+    "description": "Rename a recurring view in a saved project. Use an empty name to restore the default. Returns a job_id. Poll file_job_status_read for the CLI result.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."
+        },
+        "project_path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to the saved project."
+        },
+        "out_project": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a new .cut file."
+        },
+        "no_sidecar": {
+          "type": "boolean"
+        },
+        "file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute recording path from a full-source project scene scan."
+        },
+        "report_id": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$",
+          "description": "Report ID returned by a full-source project scene scan."
+        },
+        "view": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 1024
+        }
+      },
+      "required": [
+        "operation_id",
+        "project_path",
+        "out_project",
+        "file",
+        "report_id",
+        "view",
+        "name"
       ],
       "additionalProperties": false
     }

@@ -711,12 +711,6 @@ extension ProjectSessions {
                               "Several transcripts are attached. Supply attachment_id, or attachment_id on each selection.")
     }
 
-    private func transcriptSelectionOwner(_ selection: TranscriptWordSelection, controller: LiveTranscriptController) -> String? {
-        selection.attachmentID ?? selection.firstOccurrenceID.flatMap { occurrence in
-            controller.state.attachments.first { occurrence.hasPrefix("\($0.id.count):\($0.id):") }?.id
-        }
-    }
-
     private func mcpManageTranscript(_ a: MCPTranscriptArguments, session: ProjectSession,
                                      checkAccess: () throws -> Void) throws -> [String: Any] {
         let controller = session.transcript
@@ -798,7 +792,7 @@ extension ProjectSessions {
         switch a.action {
         case "select", "mark":
             let selection: TranscriptWordSelection = try a.decode("selection")
-            let selectionOwner = transcriptSelectionOwner(selection, controller: controller)
+            let selectionOwner = try selection.attachmentOwner(in: controller.state.attachments.map(\.id))
             try requireTranscriptAttachment(a, controller: controller, named: [selectionOwner])
             if scoped, let selectionOwner, selectionOwner != attachment?.id {
                 throw MCPCommandError("stale_transcript_plan", "Pin the attachment that owns the named selection.")
@@ -808,16 +802,24 @@ extension ProjectSessions {
             try checkAccess()
             let resolved = try a.action == "mark"
                 ? controller.mark(selection, attachmentID: target.id)
-                : controller.select(selection, attachmentID: target.id)
+                : controller.select(selection, attachmentID: target.id,
+                                        expansion: a.fields["expansion"] == nil ? nil : a.decode("expansion"))
             result["selection"] = try transcriptMCPJSON(resolved)
         case "plan":
             let edit: TranscriptEditRequest = try a.decode("edit")
-            try requireTranscriptAttachment(a, controller: controller,
-                                            named: (edit.selections + [edit.target].compactMap { $0 })
-                                                .map { $0.attachmentID ?? $0.firstOccurrenceID })
+            let attachmentIDs = controller.state.attachments.map(\.id)
+            let selectionOwners = try (edit.selections + [edit.target].compactMap { $0 }).map {
+                try $0.attachmentOwner(in: attachmentIDs)
+            }
+            try requireTranscriptAttachment(a, controller: controller, named: selectionOwners)
+            if scoped, selectionOwners.contains(where: { $0 != nil && $0 != attachment?.id }) {
+                throw MCPCommandError("stale_transcript_plan", "Pin the attachment that owns the named selections.")
+            }
+            let primary = scoped ? attachment?.id : selectionOwners.compactMap { $0 }.first ?? attachment?.id
+            result["result_id"] = try primary.map { try controller.attachment(id: $0).resultID }
             let timelineRevision = controller.timelineRevision
             let transcriptRevision = controller.state.revision
-            let work = try controller.preparePlan(edit, attachmentID: attachment?.id)
+            let work = try controller.preparePlan(edit, attachmentID: primary)
             let plan = try await prepareTranscriptMCP(work)
             try checkAccess()
             _ = try transcriptAttachment(a, controller: controller)
@@ -886,7 +888,8 @@ extension ProjectSessions {
             } else {
                 selections = a.fields["selection"] == nil ? [] : [try a.decode("selection")]
             }
-            let selectionOwners = selections.map { transcriptSelectionOwner($0, controller: controller) }
+            let attachmentIDs = controller.state.attachments.map(\.id)
+            let selectionOwners = try selections.map { try $0.attachmentOwner(in: attachmentIDs) }
             try requireTranscriptAttachment(a, controller: controller, named: selectionOwners.isEmpty ? [nil] : selectionOwners)
             let target = scoped ? attachment?.id : selectionOwners.compactMap { $0 }.first ?? attachment?.id
             guard selectionOwners.allSatisfy({ $0 == nil || $0 == target }) else {
@@ -942,14 +945,23 @@ extension ProjectSessions {
             result["recognition_duration_seconds"] = duration
             return result
         case "start":
-            let options: TranscriptJobOptions = a.fields["options"] == nil ? .init() : try a.decode("options")
+            var options: TranscriptJobOptions = a.fields["options"] == nil ? .init() : try a.decode("options")
             let policy: TranscriptJobPolicy = a.fields["policy"] == nil ? .reuse : try a.decode("policy")
             let operation = try a.id("operation_id")
             // A new job extracts every recording's audio. A helper that is missing or cannot
             // run sessions is reported here, before that work starts.
             if controller.activeJobID != operation, (try? controller.status(operation)) == nil {
-                try await controller.checkHelper()
+                if options.engine == nil {
+                    // An omitted engine is the editor's Settings engine, resolved to a name.
+                    // Reading the engines also checks the helper.
+                    options.engine = try await controller.settingsEngine()
+                } else {
+                    try await controller.checkHelper()
+                }
                 try checkAccess()
+            } else if options.engine == nil {
+                // A repeated start matches the job the first one started with the engine it resolved.
+                options.engine = controller.requestedOptions(for: operation)?.engine
             }
             let id = try controller.start(options: options, operationID: operation, policy: policy,
                                           download: a.fields["download"] as? Bool ?? false)

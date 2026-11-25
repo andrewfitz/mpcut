@@ -1,4 +1,4 @@
-// Run on a macOS desktop with a packaged test bundle:
+// Run on macOS with Backstage and a packaged test bundle:
 // cd mcp && go test -v ./integration -run '^TestLiveBundle$' -count=1 -args -bundle=/absolute/path/MPCut.app
 package integration
 
@@ -92,7 +92,7 @@ func TestLiveBundle(t *testing.T) {
 	}
 	writeProject := func(name string) string {
 		path := filepath.Join(dir, name+".cut")
-		doc := `{"format":"mpcut","schema_version":3,"kind":"sequence","clips":[{"id":"clip","file":"media.mov","from":"0","to":"1001/2500"}]}`
+		doc := `{"format":"mpcut","schema_version":9,"kind":"sequence","clips":[{"id":"clip","file":"media.mov","from":"0","to":"1001/2500"}]}`
 		if err := os.WriteFile(path, []byte(doc), 0600); err != nil {
 			t.Fatal(err)
 		}
@@ -107,33 +107,20 @@ func TestLiveBundle(t *testing.T) {
 	transcriptHelper := filepath.Join(dir, "transcript-provider")
 	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Minute)
 	defer cancel()
-	app := exec.CommandContext(ctx, filepath.Join(contents, "MacOS", "MPCut"),
-		"-automation_local_mcp_enabled", "YES", "-history_max_steps", "50", "-analysis_sidecar_reuse_enabled", "NO",
+	appPID, _ := launchBackstage(t, ctx, filepath.Base(socketDirectory), filepath.Dir(contents), []string{
+		"CFFIXED_USER_HOME=" + dir, isolatedEndpoint, "MPCUT_TRANSCRIBERRR_HELPER=" + transcriptHelper,
+	}, "-automation_local_mcp_enabled", "YES", "-history_max_steps", "50", "-analysis_sidecar_reuse_enabled", "NO",
 		"-timeline_snap_target", "off", "-silence_min_pause_seconds", "0.5", "-silence_padding_per_side_seconds", "0",
 		"-ApplePersistenceIgnoreState", "YES", "-NSQuitAlwaysKeepsWindows", "NO")
-	app.Env = append(os.Environ(), "CFFIXED_USER_HOME="+dir, isolatedEndpoint, "MPCUT_TRANSCRIBERRR_HELPER="+transcriptHelper)
-	app.Stderr = os.Stderr
-	if err := app.Start(); err != nil {
-		t.Fatal(err)
-	}
-	var ownedSocket os.FileInfo
-	defer func() {
-		_ = app.Process.Kill()
-		_ = app.Wait()
-		if fi, err := os.Lstat(socket); err == nil && ownedSocket != nil && os.SameFile(fi, ownedSocket) {
-			_ = os.Remove(socket)
-		}
-	}()
 	eventually(t, "isolated app socket", func() bool {
 		pid, err := socketPeer(socket)
 		if err != nil {
 			return false
 		}
-		if pid != app.Process.Pid {
+		if pid != appPID {
 			t.Fatalf("socket belongs to another app (pid %d); aborting", pid)
 		}
-		ownedSocket, err = os.Lstat(socket)
-		return err == nil
+		return true
 	})
 
 	helper := exec.Command(filepath.Join(contents, "Helpers", "mpcut-mcp"))
@@ -164,7 +151,7 @@ func TestLiveBundle(t *testing.T) {
 
 	requireSocketOwner := func(t *testing.T) {
 		t.Helper()
-		if pid, err := socketPeer(socket); err != nil || pid != app.Process.Pid {
+		if pid, err := socketPeer(socket); err != nil || pid != appPID {
 			t.Fatalf("test app no longer owns socket: pid=%d err=%v", pid, err)
 		}
 	}
@@ -239,7 +226,7 @@ func TestLiveBundle(t *testing.T) {
 		t.Helper()
 		requireSocketOwner(t)
 		probe := exec.CommandContext(ctx, "xcrun", "swift", filepath.Join(filepath.Dir(sourceFile), "testdata", script),
-			strconv.Itoa(app.Process.Pid), argument)
+			strconv.Itoa(appPID), argument)
 		output, err := probe.CombinedOutput()
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 77 {
@@ -335,7 +322,7 @@ func TestLiveBundle(t *testing.T) {
 	t.Run("LiveWaveform", func(t *testing.T) {
 		call := toolCaller(t)
 		audioPath := filepath.Join(dir, "Audio project.cut")
-		doc := `{"format":"mpcut","schema_version":3,"kind":"sequence","clips":[{"id":"mic","file":"Interview Room.wav","from":"0","to":"1"}]}`
+		doc := `{"format":"mpcut","schema_version":9,"kind":"sequence","clips":[{"id":"mic","file":"Interview Room.wav","from":"0","to":"1"}]}`
 		if err := os.WriteFile(audioPath, []byte(doc), 0600); err != nil {
 			t.Fatal(err)
 		}

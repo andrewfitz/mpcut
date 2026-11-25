@@ -223,11 +223,7 @@ extension ParticipantProject {
                 let role: ParticipantAppearance.Role = state == .presentation ? .presentation
                     : region.role == .thumbnail ? .thumbnail
                     : hasThumbnails ? .stage : .tile
-                let rect = region.rect
-                // TileTrail reports f32 edges. Accept small rounding at the right and bottom edges.
-                let width = rect.x + rect.width <= 1.0000001 ? min(rect.width, 1 - rect.x) : rect.width
-                let height = rect.y + rect.height <= 1.0000001 ? min(rect.height, 1 - rect.y) : rect.height
-                let bounds = ParticipantBounds(x: rect.x, y: rect.y, width: width, height: height)
+                let bounds = region.rect.bounds
                 let competingMatch = !observation.competingMatches(for: region).isEmpty
                 let participantID: String?
                 if state == .presentation, promoteScreenShares {
@@ -316,9 +312,10 @@ extension ParticipantProject {
 
 
 extension ParticipantScanResult {
-    /// A pending review companion may move with its recording. Verify the current
+    /// A saved review may move with its recording. Verify the current
     /// recording identity and clock before letting its saved boxes be reviewed again.
-    package func rebindingPendingReview(to recording: URL) throws -> Self {
+    package func rebindingPendingReview(to recording: URL, cancelled: @escaping () -> Bool = { false }) throws -> Self {
+        if cancelled() { throw CancellationError() }
         let url = AnalysisSidecar.canonicalSource(recording)
         let identity = try SourceIdentity(url)
         let sameFile = source.inode == identity.inode && source.stamp == SceneSourceStamp(identity: identity)
@@ -326,14 +323,14 @@ extension ParticipantScanResult {
         if let digest = source.contentSHA256 {
             let cache = AnalysisSidecar.readsEnabled ? AnalysisSidecar(source: url, identity: identity) : nil
             guard validParticipantSourceDigest(digest) else { throw invalid }
-            let currentDigest = try cachedParticipantSourceDigest(identity, in: cache)
-                ?? participantSourceDigest(url, identity: identity)
+            let currentDigest = try cachedParticipantSourceDigest(identity, in: cache, cancelled: cancelled)
+                ?? participantSourceDigest(url, identity: identity, cancelled: cancelled)
             guard currentDigest == digest, identity.isCurrentSnapshot(at: url) else { throw invalid }
         } else if !sameFile {
             throw invalid
         }
         if sameFile, url.path == source.file, identity.isCurrentSnapshot(at: url) { return self }
-        let media = try SceneAnalysis.inspectSceneClock(url, identity: identity, cancelled: { false })
+        let media = try SceneAnalysis.inspectSceneClock(url, identity: identity, cancelled: cancelled)
         guard let video = media.videoStream else { throw invalid }
         var current = try ParticipantScanSource(file: url.path, media: media, video: video)
         guard current.stream == source.stream, current.origin == source.origin, current.timeBase == source.timeBase,
@@ -342,6 +339,6 @@ extension ParticipantScanResult {
         current.producer = source.producer
         current.contentSHA256 = source.contentSHA256
         return .init(state: state, source: current, configuration: configuration, analysis: analysis,
-                     sceneReport: sceneReport, analysisIdentity: analysisIdentity, countHints: countHints)
+                     sceneReport: sceneReport?.forSource(url), analysisIdentity: analysisIdentity, countHints: countHints)
     }
 }

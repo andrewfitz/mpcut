@@ -163,7 +163,7 @@ public enum TileFeedAngles {
             return candidates.first
         }
 
-        let participants = project.participants.mapSourcePaths { recording(for: $0)?.source.id ?? $0 }
+        let participants = project.participants.mapSourceIDs { recording(for: $0)?.source.id ?? $0 }
         func mapBinding(_ original: TranscriptBinding) throws -> TranscriptBinding {
             guard let file = original.file else { return original }
             guard let recording = recording(for: file) else {
@@ -236,11 +236,32 @@ public enum TileFeedAngles {
         for recording in recordings.values {
             try engine.verifyIdentity(recording.media.url, identity: recording.media.identity)
         }
-        let group = MulticamProject(referenceAngle: first.id, range: .init(from: .zero, to: end), angles: angles,
+        var group = MulticamProject(referenceAngle: first.id, range: .init(from: .zero, to: end), angles: angles,
                                     audio: lanes.isEmpty ? (recordedAudio.isEmpty ? .none : .follow) : .mix,
                                     switches: switches, assemblyItems: assembly, stillAssets: project.stillAssets,
                                     stillReplacements: replacements, programColorPolicy: project.programColorPolicy,
                                     transcripts: transcripts, mixLanes: lanes, participants: participants)
+        group.analysisAnnotations = project.analysisAnnotations
+        group.analysisAnnotations.pauseReviews = try project.analysisAnnotations.pauseReviews.map { original in
+            guard let owner = original.occurrenceID else { return original }
+            var row = original
+            guard let clip = clipRanges[owner] else {
+                row.occurrenceID = "still/" + owner
+                return row
+            }
+            row.occurrenceID = "group/" + owner
+            row.from = try original.from.adding(clip.offset)
+            row.to = try original.to?.adding(clip.offset)
+            row.sources = try original.sources.map { input in
+                guard let recording = recording(for: input.file) else { throw invalid("A saved pause refers to an unavailable recording.") }
+                var source = input
+                source.sourceID = recording.source.id
+                source.offset = recording.source.offset
+                source.groupRange = row.span.map(MulticamSilencePlanner.range)
+                return source
+            }
+            return row
+        }
         return (group, recordings.mapValues { $0.source.id })
     }
 

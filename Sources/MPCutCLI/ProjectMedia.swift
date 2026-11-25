@@ -2,7 +2,7 @@ import Foundation
 import MPCutCore
 
 struct ProjectMediaOptions {
-    enum Operation: String { case list, relink, locate, replace }
+    enum Operation: String { case list, relink, locate, replace, leaveOffline = "leave-offline", revert }
 
     let project: String
     let operation: Operation
@@ -23,6 +23,7 @@ struct ProjectMediaOptions {
         case .list: allowed = ["--include-history"]
         case .relink: allowed = destination.union(["--from", "--to", "--map-prefix"])
         case .locate: allowed = destination.union(["--folder", "--apply-matches", "--include-history"])
+        case .leaveOffline, .revert: allowed = destination.union(["--source"])
         case .replace:
             allowed = destination.union(["--source", "--with", "--conform", "--allow-loss", "--loss", "--use-id",
                                          "--clock", "--stream-map", "--reset-crop", "--replacement-offset",
@@ -66,6 +67,10 @@ struct ProjectMediaOptions {
         case .locate:
             guard flags.contains("--folder"), writing == flags.contains("--apply-matches") else {
                 throw CLIError("invalid_arguments", "Supply --folder DIR. Use --apply-matches with --out-project FILE or --in-place.")
+            }
+        case .leaveOffline, .revert:
+            guard writing, flags.contains("--source") else {
+                throw CLIError("invalid_arguments", "Supply --source PATH and choose --out-project FILE or --in-place.")
             }
         case .replace:
             guard flags.contains("--source"), flags.contains("--with") else {
@@ -151,16 +156,29 @@ struct ProjectMediaOptions {
                                                relativeTo: source, folder: folder, includeHistory: flags.contains("--include-history"),
                                                cancelled: { !interruption.isActive })
             if destination != nil {
-                let mappings = rows.compactMap { row -> ProjectMediaMapping? in
-                    guard row.outcome.canRelink, let candidate = row.candidates.first(where: { $0.outcome == row.outcome }) else {
-                        return nil
-                    }
-                    return .init(from: row.path, candidate: candidate)
-                }
+                let mappings = rows.compactMap(\.eligibleMapping)
                 try archive.relink(mappings, destination: destination, search: rows, json: json, interruption: interruption)
             } else {
                 try writeJSON(ProjectMediaReceipt(projectPath: source.path, sources: rows), pretty: !json)
             }
+        case .leaveOffline:
+            guard let destination else { throw CLIError("invalid_arguments", "Choose a project destination.") }
+            var updated = snapshot
+            let path = value("--source")
+            try ProjectMedia.leaveOffline(path, project: project, relativeTo: source, snapshot: &updated)
+            _ = try archive.save(project, undo: undo, redo: redo, snapshot: updated, destination: destination,
+                                 interruption: interruption, beforePublish: {})
+            try writeJSON(ProjectMediaReceipt<String>(projectPath: source.path, outProject: destination.url.path),
+                          pretty: !json, checkCancellation: false)
+        case .revert:
+            guard let destination else { throw CLIError("invalid_arguments", "Choose a project destination.") }
+            let path = value("--source")
+            let result = try ProjectMedia.revert(project: project, undo: undo, redo: redo, snapshot: snapshot,
+                                                relativeTo: source, from: path, cancelled: { !interruption.isActive })
+            _ = try archive.save(result.project, undo: result.undo, redo: result.redo, snapshot: result.snapshot,
+                                 destination: destination, interruption: interruption, beforePublish: result.candidate.checkGeneration)
+            try writeJSON(ProjectMediaReceipt(projectPath: source.path, outProject: destination.url.path, report: result.candidate),
+                          pretty: !json, checkCancellation: false)
         case .replace:
             let candidate = try fileURL(value("--with"), label: "Replacement")
             let preview = try ProjectMediaReplace.preview(
@@ -246,7 +264,7 @@ struct CLIProjectMediaArchive {
             return try state.rebased(from: location, to: destination.url, paths: &paths)
         }
         let project = try updated.rebased(from: location, to: destination.url, paths: &paths)
-        return try project.saveNewCopy(to: destination.url, copyingTranscriptsFrom: location,
+        return try project.saveNewCopy(to: destination.url,
                                        undo: undo.map(rebase), redo: redo.map(rebase),
                                        mediaSnapshot: snapshot.rebased(from: location, to: destination.url),
                                        beforePublish: {

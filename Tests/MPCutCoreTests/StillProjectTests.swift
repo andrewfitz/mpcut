@@ -11,6 +11,24 @@ final class StillProjectTests: XCTestCase {
     private func time(_ seconds: Int64) -> RationalTime { .init(numerator: seconds) }
     private func range(_ from: Int64, _ to: Int64) -> MulticamRange { .init(from: time(from), to: time(to)) }
 
+    func testInsertingStillSplitsAnImplicitGroupsAnnotationOwnership() throws {
+        var project = MulticamProject(referenceAngle: "wide", range: range(0, 30),
+                                      angles: [.init(id: "wide", file: "wide.mov")], audio: .none,
+                                      switches: [.init(at: .zero, angle: "wide")], stillAssets: [asset])
+        project.analysisAnnotations.pauseReviews = [time(5), time(20)].map {
+            .init(occurrenceID: "whole-group", kind: .marker, from: $0, sources: [])
+        }
+        let result = try CutProject.multicam(project).insertingStill(title, at: time(10))
+        guard case .multicam(let updated) = result else { return XCTFail("Expected a multicam project") }
+        let items = try XCTUnwrap(updated.assemblyItems)
+        XCTAssertEqual(items.map(\.group), [range(0, 10), nil, range(10, 30)])
+        let left = try XCTUnwrap(ProjectPauseReview.occurrenceID(items[0]))
+        let right = try XCTUnwrap(ProjectPauseReview.occurrenceID(items[2]))
+        XCTAssertNotEqual(left, right)
+        XCTAssertEqual(updated.analysisAnnotations.pauseReviews.map(\.occurrenceID), [left, right])
+        XCTAssertEqual(updated.analysisAnnotations.pauseReviews.map(\.from), [time(5), time(20)])
+    }
+
     func testSourceRangeSplicePreservesHiddenStillHandlesAtSurvivingTrimEdges() throws {
         let source = CutSequenceClip(id: "interview", file: "interview.mov", from: time(5), to: time(25))
         let overlay = StillReplacement(id: "overlay", assetID: asset.id,
@@ -293,11 +311,16 @@ final class StillProjectTests: XCTestCase {
         XCTAssertEqual(fitted.mapMediaPaths { "/new/" + $0 }.stillSoundtrack?.file, "/new/" + audio.file)
 
         let redo = [CutHistoryState(action: "Fit Image to Soundtrack", project: fitted)]
-        let (bytes, _) = try original.encodedArchive(undo: [], redo: redo, mediaSnapshot: .empty,
-                                                     byteLimit: MulticamProject.maximumFileSize)
+        let (bytes, _) = try original.encodedArchive(undo: [], redo: redo, mediaSnapshot: .empty)
         let archive = try CutProject.decodeDocument(bytes, limit: 10)
         XCTAssertEqual(archive.project, original)
         XCTAssertEqual(archive.redo, redo)
+        let media = try CutProjectMedia.decode(bytes)
+        let location = URL(fileURLWithPath: "/tmp/edit.cut")
+        let destination = CutProject.mediaURL(audio.file, relativeTo: location)
+        XCTAssertThrowsError(try media.validateDestination(destination, relativeTo: location)) {
+            XCTAssertEqual(($0 as? CutError)?.code, "cut_project_source_collision")
+        }
     }
 
     func testRedoOnlyStillUsesCurrentSchemaAndProtectsAssetAcrossHistory() throws {
@@ -314,7 +337,7 @@ final class StillProjectTests: XCTestCase {
         try current.save(to: url, undo: [], redo: history)
         let bytes = try ProjectFile.documentJSON(at: url)
         let root = try XCTUnwrap(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
-        XCTAssertEqual(root["schema_version"] as? Int, 4)
+        XCTAssertEqual(root["schema_version"] as? Int, CutProject.schemaVersion)
         let reopened = try CutProject.decodeDocument(bytes, limit: 10)
         XCTAssertEqual(reopened.project, current)
         XCTAssertEqual(reopened.redo, history)
@@ -327,7 +350,7 @@ final class StillProjectTests: XCTestCase {
         XCTAssertThrowsError(try savedMedia.validateDestination(symlink, relativeTo: url))
         try current.save(to: url, undo: [], redo: [])
         let withoutHistory = try XCTUnwrap(JSONSerialization.jsonObject(with: CutProject.documentJSON(saved: Data(contentsOf: url))) as? [String: Any])
-        XCTAssertEqual(withoutHistory["schema_version"] as? Int, 4)
+        XCTAssertEqual(withoutHistory["schema_version"] as? Int, CutProject.schemaVersion)
     }
 
     func testMixedMediaMulticamHistoryRetainsRepeatedRangeIdentityAndRelink() throws {

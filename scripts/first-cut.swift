@@ -133,7 +133,7 @@ func walkthrough() throws {
     try run(ffmpeg, ["-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=24:duration=6",
                      "-c:v", "prores_videotoolbox", "-pix_fmt", "yuv422p10le", media.path])
     // A named empty project keeps the edit and autosaves separate from the user's windows.
-    try Data(#"{"format":"mpcut","schema_version":4,"kind":"sequence","clips":[]}"#.utf8).write(to: project)
+    try Data(#"{"format":"mpcut","schema_version":9,"kind":"sequence","clips":[]}"#.utf8).write(to: project)
     let config = NSWorkspace.OpenConfiguration()
     config.createsNewApplicationInstance = true
     config.arguments = ["-ApplePersistenceIgnoreState", "YES", "-AppleLanguages", "(en)",

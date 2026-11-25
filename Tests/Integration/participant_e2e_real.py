@@ -100,7 +100,7 @@ accepted participant ID, and comparison with the native development annotations.
     assert {diag["backend"] for diag in scan["analysis"]["diagnostics"]} == {"cpu"}
     assert [rational(obs["timestamp"]) for obs in scan["analysis"]["observations"]] == source_times
     base = evidence / "source.cut"
-    base.write_text(json.dumps({"format": "mpcut", "schema_version": 4, "kind": "sequence",
+    base.write_text(json.dumps({"format": "mpcut", "schema_version": 9, "kind": "sequence",
                                 "clips": [{"id": "gallery", "file": str(source), "from": "0", "to": str(duration)}]}))
     accepted_path = evidence / "accepted.cut"
     invoke("accept", "participants", "project", "accept",

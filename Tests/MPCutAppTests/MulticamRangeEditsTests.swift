@@ -77,6 +77,22 @@ final class MulticamRangeEditsTests: XCTestCase {
         XCTAssertFalse(timelineRulerDescription(at: cut.from.seconds, padding: groupPadding)
             .contains("retained silence padding"))
 
+        XCTAssertNil(original.assemblyItems)
+        XCTAssertTrue(model.setPauseRetainedDuration(0.9, for: try XCTUnwrap(pauses.first)))
+        XCTAssertNotEqual(model.paddingSpans(assembly: false), groupPadding)
+        XCTAssertEqual(model.paddingSpans(assembly: false), model.paddingSpans(assembly: true))
+        let reviewedGroup = try XCTUnwrap(model.project)
+        model.changeOccurrence(0, from: try XCTUnwrap(media.frames.dropFirst().first?.time))
+        let trimmed = try XCTUnwrap(model.project)
+        let trimmedItem = try XCTUnwrap(trimmed.assemblyItems?.first)
+        let trimmedReview = try XCTUnwrap(trimmed.analysisAnnotations.pauseReviews.first)
+        XCTAssertEqual(trimmedReview.occurrenceID, ProjectPauseReview.occurrenceID(trimmedItem))
+        XCTAssertEqual(trimmedReview.retainedSeconds, 0.9)
+        model.undo()
+        XCTAssertEqual(model.project, reviewedGroup)
+        model.undo()
+        XCTAssertEqual(model.project, original)
+
         model.applyMulticamPauses(queueTakes: true, plan: pauses)
         XCTAssertEqual(model.project, original)
         XCTAssertEqual(model.queuedRanges.map(\.range), [
@@ -144,6 +160,15 @@ final class MulticamRangeEditsTests: XCTestCase {
         let first = try XCTUnwrap(initial.first?.range)
         let middle = try first.from.adding(first.to.subtracting(first.from).multiplied(by: .init(numerator: 1, denominator: 2)))
         XCTAssertTrue(model.editMulticamTakeBoundary(at: middle, add: true))
+        let annotated = try XCTUnwrap(model.project)
+        let document = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".cut")
+        defer { try? FileManager.default.removeItem(at: document) }
+        try CutProject.multicam(annotated).save(to: document)
+        let persisted = try CutProject.load(from: document).analysisAnnotations.pauseReviews
+        XCTAssertEqual(persisted.map(\.kind), [.retain, .marker])
+        XCTAssertEqual(persisted.first?.occurrenceID, persisted.last?.occurrenceID)
+        XCTAssertEqual(persisted.first?.span, pauses.first?.id.span)
+        XCTAssertEqual(persisted.first?.retainedSeconds, 0.9)
         let corrected = model.multicamTakeCandidates(plan: updated)
         XCTAssertEqual(corrected.count, initial.count + 1)
         let divider = try XCTUnwrap(corrected.first(where: \.hasManualStart)?.range.from)
@@ -535,6 +560,124 @@ final class MulticamRangeEditsTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
         model.chooseProgramExport()
         XCTAssertEqual(model.exportProgram, .assembly)
+    }
+
+    @MainActor
+    func testFirstMarkedRangeCarriesWholeGroupReviewIntoExplicitAssembly() throws {
+        let (project, media) = try fixture()
+        let model = MulticamEditorModel()
+        defer { model.reset() }
+        model.confirmSetup(drafts: [.init(source: project.angles[0], media: media)], opening: "wide", audio: .none)
+        let frames = media.frames.map(\.time)
+        let marker = ProjectPauseReview(occurrenceID: "whole-group", kind: .marker, from: frames[4], sources: [])
+        XCTAssertTrue(model.edit { $0.analysisAnnotations.pauseReviews = [marker] })
+        let selected = MulticamRange(from: frames[3], to: frames[8])
+        model.addAssemblyRange(selected)
+        XCTAssertEqual(model.ranges, [selected])
+        let owner = try XCTUnwrap(model.assemblyItems.first.flatMap(ProjectPauseReview.occurrenceID))
+        XCTAssertEqual(model.project?.analysisAnnotations.pauseReviews,
+                       [.init(occurrenceID: owner, kind: .marker, from: frames[4], sources: [])])
+        model.addAssemblyRange(selected)
+        XCTAssertEqual(model.ranges, [selected, selected])
+        XCTAssertNil(model.assemblyItems[1].occurrenceID)
+        XCTAssertEqual(model.project?.analysisAnnotations.pauseReviews.count, 1)
+    }
+
+    @MainActor
+    func testDeletingGroupRangePreservesThePlayheadInsideAnUnaffectedCard() throws {
+        let (project, media) = try fixture()
+        let model = MulticamEditorModel()
+        defer { model.reset() }
+        model.confirmSetup(drafts: [.init(source: project.angles[0], media: media)], opening: "wide", audio: .none)
+        model.setAnalysisSnap(.off)
+        let frames = media.frames.map(\.time)
+        let clip = MulticamRange(from: .zero, to: frames[8])
+        let gap = StillAsset(gapID: "gap")
+        let card = StillInsert(id: "card", assetID: gap.id, duration: .init(numerator: 1),
+                               cadence: .init(numerator: 1, denominator: 30))
+        XCTAssertTrue(model.edit {
+            $0.stillAssets = [gap]
+            $0.assemblyItems = [.group(clip), .still(card)]
+        })
+        model.setAssemblyPreview(true)
+        let localTime = RationalTime(numerator: 1, denominator: 2)
+        model.seekAssembly(at: try clip.to.adding(localTime), scrubbing: false)
+        model.selectAssemblyRange(.zero, frames[3])
+        model.deleteSelectedRange()
+        XCTAssertEqual(model.assemblyStill(at: 1), card)
+        XCTAssertEqual(model.selectedOccurrence, 1)
+        XCTAssertEqual(model.preview.time, try clip.to.subtracting(frames[3]).adding(localTime))
+    }
+
+    @MainActor
+    func testSplittingCardSelectionRebasesItsSavedTakeMarker() throws {
+        let (project, media) = try fixture()
+        let model = MulticamEditorModel()
+        defer { model.reset() }
+        model.confirmSetup(drafts: [.init(source: project.angles[0], media: media)], opening: "wide", audio: .none)
+        let gap = StillAsset(gapID: "gap")
+        let card = StillInsert(id: "card", assetID: gap.id, duration: .init(numerator: 1),
+                               cadence: .init(numerator: 1, denominator: 4))
+        let half = RationalTime(numerator: 1, denominator: 2)
+        let quarter = RationalTime(numerator: 1, denominator: 4)
+        XCTAssertTrue(model.edit {
+            $0.stillAssets = [gap]
+            $0.assemblyItems = [.group(project.range), .still(card)]
+            $0.analysisAnnotations.pauseReviews = [.init(occurrenceID: "still/card", kind: .marker, from: half, sources: [])]
+        })
+        let start = try project.range.to.subtracting(project.range.from)
+        model.selectAssemblyRange(try start.adding(quarter), try start.adding(half).adding(quarter))
+        model.splitSelectedRange()
+        let items = try XCTUnwrap(model.project?.assemblyItems)
+        XCTAssertEqual(items.count, 4)
+        let marker = try XCTUnwrap(model.project?.analysisAnnotations.pauseReviews.first)
+        XCTAssertEqual(marker.occurrenceID, ProjectPauseReview.occurrenceID(items[2]))
+        XCTAssertEqual(marker.from, quarter)
+    }
+
+    @MainActor
+    func testAssemblyRangeSnapsToTheOccurrencePictureClock() throws {
+        let (project, media) = try fixture()
+        let model = MulticamEditorModel()
+        defer { model.reset() }
+        let offset = RationalTime(numerator: 1, denominator: 120)
+        let close = MulticamSource(id: "close", file: media.url.path, offset: offset)
+        model.confirmSetup(drafts: [.init(source: project.angles[0], media: media), .init(source: close, media: media)],
+                           opening: "wide", audio: .none)
+        model.setAnalysisSnap(.off)
+        let frames = media.frames.map(\.time)
+        let occurrence = MulticamRange(from: frames[1], to: frames[9])
+        XCTAssertTrue(model.edit { $0.assemblyItems = [.group(occurrence, angle: "close")] })
+        let from = try frames[3].adding(offset)
+        let to = try frames[6].adding(offset)
+        model.selectAssemblyRange(try from.subtracting(occurrence.from), try to.subtracting(occurrence.from))
+        XCTAssertEqual(model.selectedExportRanges, [.init(from: from, to: to)])
+    }
+
+    @MainActor
+    func testAssemblySelectionExportsTimedShotsFromTheSelectedRepeat() throws {
+        let (project, media) = try fixture()
+        let model = MulticamEditorModel()
+        defer { model.reset() }
+        model.confirmSetup(drafts: [.init(source: project.angles[0], media: media)], opening: "wide", audio: .none)
+        let clip = MulticamRange(from: .zero, to: media.frames[6].time)
+        let end = try clip.to.adding(clip.to)
+        let shotStart = try clip.to.adding(media.frames[2].time)
+        XCTAssertTrue(model.edit {
+            $0.assembly = [clip, clip]
+            $0.participants.render = .init(shots: [
+                .init(layout: .original),
+                .init(range: .init(from: .zero, to: media.frames[1].time), occurrence: 0, layout: .original),
+                .init(range: .init(from: shotStart, to: end), occurrence: 1, layout: .original)
+            ])
+        })
+        model.selectAssemblyRange(clip.to, end)
+        let document = try XCTUnwrap(model.stillExportDocument(wholeGroup: false, selection: model.selectedExportRanges))
+        guard case .multicam(let snapshot) = document else { return XCTFail("Expected a multicam selection") }
+        XCTAssertEqual(snapshot.participants.render?.shots, [
+            .init(layout: .original),
+            .init(range: .init(from: media.frames[2].time, to: clip.to), occurrence: 0, layout: .original)
+        ])
     }
 
     private func fixture() throws -> (MulticamProject, MediaInfo) {

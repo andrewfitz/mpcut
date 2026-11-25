@@ -16,7 +16,7 @@ enum ApplicationEntry {
               fcntl(readyFD, F_SETNOSIGPIPE, 1) == 0 else { exit(2) }
         let directory = args[2]
         let socket = MCPSocket(directory: directory)
-        let jobs = MCPFileJobs()
+        let jobs = MCPFileJobs(receipts: .standalone)
         do {
             try socket.start { data in
                 do {

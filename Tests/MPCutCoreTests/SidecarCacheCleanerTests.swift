@@ -18,74 +18,53 @@ final class SidecarCacheCleanerTests: XCTestCase {
         try XCTUnwrap(SidecarCacheCleaner.preview(sources: [store.source]).first { $0.url.lastPathComponent == store.url.lastPathComponent })
     }
 
-    func testSelectiveClearKeepsTranscriptActivityNamedScenesOverridesAndUnknownSections() throws {
+    func testScopedPreviewOmitsOtherFoldersAndIssuesTokensOnlyForCurrentEligibleCopies() throws {
+        try fixture { root, store in
+            let outside = root.appendingPathComponent("recordings", isDirectory: true)
+            try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: false)
+            let source = outside.appendingPathComponent("B.mov")
+            try Data([4, 5, 6]).write(to: source)
+            let adjacent = try AnalysisSidecar(source: source)
+            try store.save(["waveform_peaks.v1.0": Data([1])])
+            try adjacent.save(["waveform_peaks.v1.0": Data([2])])
+
+            func preview(protected: Set<URL> = []) -> [SidecarCacheEntry] {
+                SidecarCacheCleaner.preview(scanning: [outside], protected: protected, scannedOnly: true)
+            }
+            let initial = preview()
+            let token = try XCTUnwrap(initial.first?.clearToken)
+            XCTAssertEqual(initial.map(\.url.lastPathComponent), [adjacent.url.lastPathComponent])
+            XCTAssertEqual(preview().first?.clearToken, token)
+
+            let blocked = try XCTUnwrap(preview(protected: [adjacent.url]).first)
+            XCTAssertNil(blocked.clearToken)
+            XCTAssertNotNil(blocked.issue)
+            try adjacent.save(["new_section": Data(repeating: 3, count: 4_096)])
+            XCTAssertNotEqual(try XCTUnwrap(preview().first?.clearToken), token)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: store.url.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: adjacent.url.path))
+        }
+    }
+
+    func testClearRemovesWholeCacheAndRejectsWritesFromPreviousEpoch() throws {
         try fixture { _, store in
-            let retained = [AnalysisSidecar.viewNameSectionKey: Data(#"{"1":"Speaker"}"#.utf8),
-                            AnalysisSidecar.sceneSectionKey: Data("scene boundaries".utf8),
-                            AnalysisSidecar.sceneClockKey: Data("clock".utf8),
-                            AnalysisSidecar.silenceThresholdOverridesKey: Data(#"{"1":-35}"#.utf8),
-                            "transcript_recognition.v2.0.key": Data("recognition".utf8),
-                            "transcript_activity.v1.0.key": Data("levels".utf8),
-                            "waveform_peaks.v9.0": Data("future".utf8)]
-            let disposable = ["waveform_peaks.v1.0": Data(repeating: 6, count: 25000),
-                              "timeline_filmstrip.v1.0.4020.4040": Data([5]),
-                              // Pause lists are rebuildable in the property-list and the packed layout alike.
-                              "silence_pauses.v1.0.auto.3fe0000000000000": Data([8]),
-                              "silence_pauses.v2.0.auto.3fe0000000000000": Data([9]),
-                              "media_index_audio.v1": Data([7])]
-            try store.save(retained.merging(disposable) { old, _ in old })
+            let key = "waveform_peaks.v1.0"
+            try store.save([key: Data(repeating: 6, count: 25000)])
             let inspected = try entry(store)
-            XCTAssertNil(inspected.issue)
-            XCTAssertGreaterThan(inspected.rebuildableBytes, 0)
-            XCTAssertTrue(inspected.retained.contains("Transcript results and activity"))
-            XCTAssertTrue(inspected.retained.contains("Scene names and their reports"))
+            let usage = try XCTUnwrap(inspected.usage)
+            XCTAssertGreaterThan(try XCTUnwrap(usage.sectionBytes[key]), 0)
+            XCTAssertEqual(usage.databaseBytes, usage.sectionBytes.values.reduce(0, +) + usage.sqliteOverheadBytes)
+            XCTAssertGreaterThan(inspected.bytes, 0)
             let stale = SidecarClearEpoch.capture(sidecar: store.url)
             let result = SidecarCacheCleaner.clear([inspected])
             XCTAssertEqual(result.cleared, [inspected.url], String(describing: result.skipped))
             XCTAssertThrowsError(try stale.check())
-            XCTAssertThrowsError(try store.save(["waveform_peaks.v1.0": Data([1])]))
-            let after = try AnalysisSidecar(source: store.source)
-            for (key, value) in retained { XCTAssertEqual(after.read(key), value) }
-            for key in disposable.keys { XCTAssertNil(after.read(key)) }
-            XCTAssertEqual(try entry(after).rebuildableBytes, 0)
-            try after.save(["waveform_peaks.v1.0": Data([2])])
-            XCTAssertEqual(after.read("waveform_peaks.v1.0"), Data([2]))
-            XCTAssertTrue(FileManager.default.fileExists(atPath: store.url.path))
-        }
-    }
-
-    func testPaidRecognitionAndNamedSceneAreReusableAfterClearingAndReopening() throws {
-        try fixture { root, _ in
-            let fixtures = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
-                .appendingPathComponent("MPCutAppTests/Fixtures")
-            let source = root.appendingPathComponent("scenes.mov")
-            try FileManager.default.copyItem(at: fixtures.appendingPathComponent("Pause-Quiet.mov"), to: source)
-            let media = try CutEngine().inspectMulticamSource(source)
-            let store = AnalysisSidecar(media: media)
-            let full = try XCTUnwrap(SceneAnalysis.run(source, session: SceneScanSession()).report)
-            try store.save(AnalysisSidecar.viewNameSections([1: "Interview"], for: full))
-            let stream = try XCTUnwrap(media.audio.first?.stream.index)
-            let evidence = try XCTUnwrap(TranscriptJobPlan.streamEvidence(media: media, streamIndex: stream))
-            let key = String(repeating: "a", count: 64)
-            let recognition = TranscriptRecognitionCache(sidecar: store, key: key, evidence: evidence, stream: stream)
-            let levels = try transcriptActivityDocument(levels: [0.3], duration: 320, evidence: evidence)
-            let result = Data("""
-            {"version":1,"sample_rate":16000,"recognition_key":"\(key)","stream_evidence":"\(evidence)","duration_samples":320,"words":[],"activity":[]}
-            """.utf8)
-            try recognition.saveSidecar(.init(result: result, activity: levels), media: media, cancelled: { false })
-            try store.save(["waveform_peaks.v1.0": Data(repeating: 8, count: 42)])
-            let preview = try entry(store)
-            let cleared = SidecarCacheCleaner.clear([preview])
-            XCTAssertEqual(cleared.cleared, [preview.url], String(describing: cleared.skipped))
-            let reopened = try AnalysisSidecar(source: source)
-            XCTAssertNil(reopened.read("waveform_peaks.v1.0"))
-            XCTAssertEqual(reopened.sceneReport()?.views.first?.name, "Interview")
-            let warm = try SceneAnalysis.run(source, session: SceneScanSession())
-            XCTAssertEqual(warm.state, .upToDate)
-            let cached = TranscriptRecognitionCache(sidecar: reopened, key: key, evidence: evidence, stream: stream)
-            let restored = try XCTUnwrap(cached.readSidecar(cancelled: { false }))
-            XCTAssertEqual(restored.result, result)
-            XCTAssertEqual(restored.activity, levels)
+            XCTAssertThrowsError(try store.save([key: Data([1])]))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: store.url.path))
+            let reopened = try AnalysisSidecar(source: store.source)
+            XCTAssertNil(reopened.read(key))
+            try reopened.save([key: Data([2])])
+            XCTAssertEqual(reopened.read(key), Data([2]))
         }
     }
 
@@ -94,11 +73,11 @@ final class SidecarCacheCleanerTests: XCTestCase {
             try store.save(["waveform_peaks.v1.0": Data([1])])
             let oldPreview = try entry(store)
             try store.save(["custom": Data(repeating: 1, count: 4096)])
-            XCTAssertFalse(SidecarCacheCleaner.clear([oldPreview], wholeSidecars: true).skipped.isEmpty)
+            XCTAssertFalse(SidecarCacheCleaner.clear([oldPreview]).skipped.isEmpty)
             XCTAssertNotNil(store.read("custom"))
             let fresh = try entry(store)
-            XCTAssertFalse(SidecarCacheCleaner.clear([fresh], wholeSidecars: true, protected: [store.url]).skipped.isEmpty)
-            let result = SidecarCacheCleaner.clear([fresh], wholeSidecars: true)
+            XCTAssertFalse(SidecarCacheCleaner.clear([fresh], protected: [store.url]).skipped.isEmpty)
+            let result = SidecarCacheCleaner.clear([fresh])
             XCTAssertEqual(result.reclaimedBytes, fresh.bytes, String(describing: result.skipped))
             XCTAssertFalse(FileManager.default.fileExists(atPath: store.url.path))
             XCTAssertTrue(FileManager.default.fileExists(atPath: store.source.path))
@@ -106,12 +85,12 @@ final class SidecarCacheCleanerTests: XCTestCase {
         }
     }
 
-    func testBusyReadersAndLiveLeasesAreSkippedAndReleasedCheckpointsSurvive() throws {
+    func testBusyReadersAndLiveLeasesAreSkippedAndReleasedCheckpointsCanBeCleared() throws {
         try fixture { _, store in
             let claim = try XCTUnwrap(store.claimSceneAttempt(scope: "full", operationID: nil, restart: false, owner: "test"))
             let live = try entry(store)
             XCTAssertNotNil(live.issue)
-            XCTAssertFalse(SidecarCacheCleaner.clear([live], wholeSidecars: true).skipped.isEmpty)
+            XCTAssertFalse(SidecarCacheCleaner.clear([live]).skipped.isEmpty)
             try store.commitSceneAttempt(claim, checkpoint: Data([2]), markerBatch: Data([3]),
                                          coveredThrough: 1, complete: false, release: true)
             try store.save(["waveform_peaks.v1.0": Data([9])])
@@ -121,15 +100,14 @@ final class SidecarCacheCleanerTests: XCTestCase {
                 let reader = try SidecarDatabase(store.url, writing: false)
                 try reader.execute("BEGIN")
                 _ = try reader.integer("SELECT count(*) FROM sections")
-                let result = SidecarCacheCleaner.clear([paused], wholeSidecars: true)
+                let result = SidecarCacheCleaner.clear([paused])
                 XCTAssertTrue(result.cleared.isEmpty)
                 XCTAssertNotNil(result.skipped[paused.url])
                 try reader.execute("ROLLBACK")
             }
             XCTAssertFalse(SidecarCacheCleaner.clear([paused]).cleared.isEmpty)
             let reopened = try AnalysisSidecar(source: store.source)
-            XCTAssertEqual(reopened.sceneAttempt(claim)?.checkpoint, Data([2]))
-            XCTAssertEqual(reopened.sceneAttempt(claim)?.markerBatches, [Data([3])])
+            XCTAssertNil(reopened.sceneAttempt(claim))
         }
     }
 
@@ -139,27 +117,12 @@ final class SidecarCacheCleanerTests: XCTestCase {
             try store.commitSceneAttempt(claim, checkpoint: Data([2]), markerBatch: Data([3]),
                                          coveredThrough: 1, complete: true)
             let preview = try entry(store)
-            XCTAssertGreaterThan(preview.rebuildableBytes, 0)
+            XCTAssertGreaterThan(try XCTUnwrap(preview.usage?.markerBytes), 0)
             let result = SidecarCacheCleaner.clear([preview])
             XCTAssertEqual(result.cleared, [preview.url], String(describing: result.skipped))
             let reopened = try AnalysisSidecar(source: store.source)
             XCTAssertNil(reopened.sceneAttempt(scope: "full", completed: true))
-            let db = try SidecarDatabase(store.url, writing: false)
-            XCTAssertEqual(try db.integer("SELECT count(*) FROM scene_markers"), 0)
-            XCTAssertEqual(try db.integer("SELECT count(*) FROM scene_reports"), 0)
-        }
-    }
-
-    func testUnexpectedDeleteTriggerCannotErasePreservedMetadata() throws {
-        try fixture { _, store in
-            try store.save([AnalysisSidecar.viewNameSectionKey: Data([1]), "waveform_peaks.v1.0": Data([2])])
-            let db = try SidecarDatabase(store.url, writing: true)
-            try db.execute("CREATE TRIGGER external_cleanup AFTER DELETE ON sections BEGIN DELETE FROM sections; END")
-            let preview = try entry(store)
-            let result = SidecarCacheCleaner.clear([preview])
-            XCTAssertNotNil(result.skipped[preview.url])
-            XCTAssertEqual(store.read(AnalysisSidecar.viewNameSectionKey), Data([1]))
-            XCTAssertEqual(store.read("waveform_peaks.v1.0"), Data([2]))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: store.url.path))
         }
     }
 
@@ -182,27 +145,73 @@ final class SidecarCacheCleanerTests: XCTestCase {
             input.fileHandleForWriting.write(Data("BEGIN; SELECT count(*) FROM sections;\n".utf8))
             let reply = output.fileHandleForReading.availableData
             XCTAssertFalse(reply.isEmpty)
-            let busy = SidecarCacheCleaner.clear([preview], wholeSidecars: true)
+            let busy = SidecarCacheCleaner.clear([preview])
             XCTAssertTrue(busy.cleared.isEmpty)
             XCTAssertNotNil(busy.skipped[preview.url])
             XCTAssertTrue(FileManager.default.fileExists(atPath: store.url.path))
         }
     }
 
-    func testExplicitFolderScanFindsLegacyAdjacentFilesButSkipsForeignDatabasesAndSymlinks() throws {
+    func testExplicitFolderScanFindsNewFilesAndSkipsLegacyForeignAndSymlinks() throws {
         try fixture { root, store in
             try store.save(["waveform_peaks.v1.0": Data([1])])
             SidecarLocations.forget([store.url])
+            let legacy = store.source.appendingPathExtension("cutdb")
+            try FileManager.default.copyItem(at: store.url, to: legacy)
             let unrelated = root.appendingPathComponent("foreign.mov")
             try Data([1]).write(to: unrelated)
-            try Data("user file".utf8).write(to: unrelated.appendingPathExtension("cutdb"))
+            try Data("user file".utf8).write(to: unrelated.appendingPathExtension("cutcache"))
             let alias = root.appendingPathComponent("link.mov")
             try Data([2]).write(to: alias)
-            try FileManager.default.createSymbolicLink(at: alias.appendingPathExtension("cutdb"), withDestinationURL: store.url)
+            try FileManager.default.createSymbolicLink(at: alias.appendingPathExtension("cutcache"), withDestinationURL: store.url)
             let entries = SidecarCacheCleaner.preview(scanning: [root])
             XCTAssertEqual(entries.count, 1)
             XCTAssertEqual(entries.first?.source.lastPathComponent, "A.mov")
             XCTAssertTrue(SidecarLocations.knownEntries().contains { $0.source.lastPathComponent == "A.mov" })
+        }
+    }
+
+    func testAdjacentAndManagedCachesWithSameFilenameAppearAndClearSeparately() throws {
+        try fixture { root, original in
+            let project = root.appendingPathComponent("edit.cut")
+            try SidecarLocations.setMode(.project)
+            let managed = try SidecarLocations.$projectURL.withValue(project) {
+                let store = try AnalysisSidecar(source: original.source)
+                try store.save(["custom": Data([1])])
+                return store.url
+            }
+            try SidecarLocations.setMode(.media)
+            let otherMedia = root.appendingPathComponent(managed.deletingPathExtension().lastPathComponent)
+            try Data([4, 5, 6]).write(to: otherMedia)
+            let adjacent = try AnalysisSidecar(source: otherMedia)
+            try adjacent.save(["custom": Data([2])])
+            XCTAssertEqual(managed.lastPathComponent, adjacent.url.lastPathComponent)
+
+            let preview = SidecarCacheCleaner.preview(sources: [otherMedia, original.source], projects: [project])
+            XCTAssertEqual(Set(preview.map(\.url.path)), Set([managed.path, adjacent.url.path]))
+            XCTAssertEqual(Set(preview.map(\.id)).count, 2)
+            let result = SidecarCacheCleaner.clear(preview)
+            XCTAssertTrue(result.skippedEntries.isEmpty, String(describing: result.skipped))
+            XCTAssertEqual(Set(result.cleared.map(\.path)), Set([managed.path, adjacent.url.path]))
+        }
+    }
+
+    func testCaseVariantsCountPhysicalCachesAndForgetAllRemovedPaths() throws {
+        try fixture { root, original in
+            let alternate = root.appendingPathComponent("a.mov")
+            let sameFile = FileManager.default.fileExists(atPath: alternate.path)
+            if !sameFile { try Data([4, 5, 6]).write(to: alternate) }
+            let other = try AnalysisSidecar(source: alternate)
+            try original.save(["custom": Data([1])])
+            try other.save(["custom": Data([2])])
+            let preview = SidecarCacheCleaner.preview(sources: [original.source, alternate])
+            XCTAssertEqual(preview.count, sameFile ? 1 : 2)
+            XCTAssertTrue(preview.allSatisfy { $0.issue == nil })
+            let result = SidecarCacheCleaner.clear(preview)
+            XCTAssertTrue(result.skippedEntries.isEmpty, String(describing: result.skipped))
+            XCTAssertEqual(result.cleared.count, sameFile ? 1 : 2)
+            XCTAssertEqual(Set(result.clearedSources.map(\.path)), Set([original.source.path, alternate.path]))
+            XCTAssertTrue(SidecarLocations.knownEntries().isEmpty)
         }
     }
 
@@ -243,14 +252,14 @@ final class SidecarCacheCleanerTests: XCTestCase {
     func testMisnamedAdjacentCacheForDifferentRecordingCannotBeRegisteredOrCleared() throws {
         try fixture { root, original in
             try original.save(["waveform_peaks.v1.0": Data([7])])
-            for version in [4, 5] {
+            for version in [AnalysisSidecar.schemaVersion + 1, AnalysisSidecar.schemaVersion] {
                 let source = root.appendingPathComponent("wrong-\(version).mov")
                 try Data([1, 2, 3]).write(to: source)
-                let foreign = source.appendingPathExtension("cutdb")
+                let foreign = source.appendingPathExtension("cutcache")
                 try FileManager.default.copyItem(at: original.url, to: foreign)
-                if version == 4 {
+                if version != AnalysisSidecar.schemaVersion {
                     let db = try SidecarDatabase(foreign, writing: true)
-                    try db.execute("PRAGMA user_version=4")
+                    try db.execute("PRAGMA user_version=\(version)")
                 }
                 let before = try Data(contentsOf: foreign)
                 let scanned = SidecarCacheCleaner.preview(scanning: [root])
@@ -258,12 +267,10 @@ final class SidecarCacheCleanerTests: XCTestCase {
                 XCTAssertFalse(SidecarLocations.knownEntries().contains { $0.url == foreign })
                 let opened = try XCTUnwrap(SidecarCacheCleaner.preview(sources: [source]).first { $0.url == foreign })
                 XCTAssertNotNil(opened.issue)
-                for whole in [false, true] {
-                    let cleared = SidecarCacheCleaner.clear([opened], wholeSidecars: whole)
-                    XCTAssertTrue(cleared.cleared.isEmpty)
-                    XCTAssertNotNil(cleared.skipped[foreign])
-                    XCTAssertEqual(try Data(contentsOf: foreign), before)
-                }
+                let cleared = SidecarCacheCleaner.clear([opened])
+                XCTAssertTrue(cleared.cleared.isEmpty)
+                XCTAssertNotNil(cleared.skipped[foreign])
+                XCTAssertEqual(try Data(contentsOf: foreign), before)
             }
         }
     }
@@ -275,11 +282,9 @@ final class SidecarCacheCleanerTests: XCTestCase {
             let saved = try Data(contentsOf: store.url)
             try FileManager.default.moveItem(at: store.source, to: root.appendingPathComponent("original.mov"))
             try Data([1, 2, 3]).write(to: store.source)
-            for whole in [false, true] {
-                let cleared = SidecarCacheCleaner.clear([preview], wholeSidecars: whole)
-                XCTAssertNotNil(cleared.skipped[store.url])
-                XCTAssertEqual(try Data(contentsOf: store.url), saved)
-            }
+            let cleared = SidecarCacheCleaner.clear([preview])
+            XCTAssertNotNil(cleared.skipped[store.url])
+            XCTAssertEqual(try Data(contentsOf: store.url), saved)
         }
     }
 
@@ -299,7 +304,7 @@ final class SidecarCacheCleanerTests: XCTestCase {
             XCTAssertEqual(found.source.lastPathComponent, original.source.lastPathComponent)
             XCTAssertEqual(found.location, .disk)
             XCTAssertNil(found.issue)
-            XCTAssertFalse(SidecarCacheCleaner.clear([found], wholeSidecars: true).cleared.isEmpty)
+            XCTAssertFalse(SidecarCacheCleaner.clear([found]).cleared.isEmpty)
         }
     }
 
@@ -318,7 +323,7 @@ final class SidecarCacheCleanerTests: XCTestCase {
             let after = SidecarCacheCleaner.preview()
             let missing = try XCTUnwrap(after.first { $0.url == inspected.url })
             XCTAssertNotNil(missing.issue)
-            XCTAssertFalse(SidecarCacheCleaner.clear([inspected], wholeSidecars: true).skipped.isEmpty)
+            XCTAssertFalse(SidecarCacheCleaner.clear([inspected]).skipped.isEmpty)
             XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: disk.path), [])
             try FileManager.default.removeItem(at: disk)
             try FileManager.default.moveItem(at: offline, to: disk)

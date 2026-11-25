@@ -607,7 +607,14 @@ private func jsonEncoder(pretty: Bool) -> JSONEncoder {
 }
 
 func writeJSON<T: Encodable>(_ result: T, pretty: Bool = false, checkCancellation: Bool = true) throws {
-    var data = try jsonEncoder(pretty: pretty).encode(result)
+    let encoder = jsonEncoder(pretty: pretty)
+    var data: Data
+    if let review = ProjectRenderReview.preflight {
+        try review.validate()
+        data = try encoder.encode(ReviewedRenderResponse(result: result, review: review))
+    } else {
+        data = try encoder.encode(result)
+    }
     data.append(0x0A)
     try interruption.beginResponse(checkCancellation: checkCancellation)
     try writeOutput(data)
@@ -659,7 +666,6 @@ private func reportFailure<T: Encodable>(_ error: T, message: String, json: Bool
     }
 }
 
-private let inputLimit = 64 * 1024 * 1024
 
 /// A saved project and the location that its relative media paths resolve from.
 private struct LoadedProject<Project> {
@@ -775,9 +781,6 @@ func readStandardInput(_ interruption: Interruption) throws -> Data {
         if count < 0 && errno == EINTR { continue }
         guard count > 0 else {
             throw CLIError("stdin_read_failed", "Unable to read standard input.")
-        }
-        guard data.count + count <= inputLimit else {
-            throw CLIError("invalid_json", "Standard input exceeds the 64 MB request limit.")
         }
         data.append(contentsOf: buffer.prefix(count))
     }
@@ -1071,6 +1074,9 @@ private func runSceneScan(_ options: SceneScanOptions, json: Bool, useSidecar: B
                 }
                 return (media, request.scope, max(0, duration))
             }
+            let annotations = loaded.project.analysisAnnotations.mappingPaths {
+                CutProject.mediaURL($0, relativeTo: loaded.location).path
+            }
             let total = sources.reduce(0) { $0 + $1.2 }
             var finished: Double = 0
             var results: [SceneSourceResult] = []
@@ -1078,12 +1084,19 @@ private func runSceneScan(_ options: SceneScanOptions, json: Bool, useSidecar: B
                 if cancelled() { break }
                 let (media, sourceScope, duration) = source
                 let last = index == sources.count - 1
-                let outcome = try SceneAnalysis.run(media, scope: sourceScope, policy: options.policy,
-                                                    useSidecar: useSidecar, cancelled: cancelled, progress: { progress in
+                func reportProgress(_ progress: SceneScanProgress) {
                     let fraction = total > 0 ? min(last ? 1 : 0.999, (finished + duration * progress.fraction) / total) : nil
                     reportMediaProgress(MediaProgressEvent(file: media.url.path, progress: progress, fraction: fraction),
                                         output: options.progress)
-                })
+                }
+                let outcome: SceneScanOutcome
+                if options.policy == .reuse, let reviewed = annotations.scene(for: media) {
+                    outcome = try SceneAnalysis.reviewed(reviewed, media: media, scope: sourceScope)
+                    reportProgress(outcome.progress)
+                } else {
+                    outcome = try SceneAnalysis.run(media, scope: sourceScope, policy: options.policy,
+                                                    useSidecar: useSidecar, cancelled: cancelled, progress: reportProgress)
+                }
                 results.append(SceneSourceResult(file: media.url.path, outcome: outcome))
                 if outcome.state == .paused { break }
                 finished += duration
@@ -1159,7 +1172,6 @@ private func runSilence(_ options: SilenceOptions, arguments: Arguments, request
             throw ParticipantProjectExport.unsupported("Pause removal export")
         }
         if case .multicam(let multicam) = loaded.project {
-            guard options.protectedPauses.isEmpty else { throw CLIError("invalid_arguments", "--protect-pause addresses sequence clips.") }
             let input = LoadedProject(project: multicam, media: loaded.media, location: loaded.location, file: loaded.file)
             try runProjectSilence(options, loaded: input, json: json, interruption: interruption)
         } else {
@@ -1339,16 +1351,119 @@ private func runSilence(_ options: SilenceOptions, arguments: Arguments, request
 }
 
 private func saveShortened<T>(_ updated: CutProject, loaded: LoadedProject<T>, destination: URL,
-                              interruption: Interruption) throws {
+                              interruption: Interruption, action: String = "Shorten Pauses",
+                              validateSources: () throws -> Void = {}) throws {
     guard let file = loaded.file, destination.pathExtension.lowercased() == "cut" else {
         throw CLIError("invalid_arguments", "Choose a saved input project and a new .cut destination.")
     }
     let archive = try CutProject.loadEditorDocument(from: file, limit: CutProject.maximumHistorySteps)
     guard archive.media.diskRevision == loaded.media.diskRevision else { throw CutError(code: "source_changed", message: "The project changed during analysis.") }
     try archive.media.validateDestination(destination, relativeTo: file)
-    try saveEditedProject(updated, source: file, destination: destination, action: "Shorten Pauses", original: archive.project,
+    try saveEditedProject(updated, source: file, destination: destination, action: action, original: archive.project,
                           undo: archive.undo, redo: archive.redo, mediaSnapshot: archive.media.mediaSnapshot,
-                          interruption: interruption)
+                          interruption: interruption) {
+        try validateSources()
+        guard try CutProjectMedia.load(from: file).diskRevision == loaded.media.diskRevision else {
+            throw CutError(code: "source_changed", message: "The project changed during analysis.")
+        }
+    }
+}
+
+private func runProjectAnalysisEdit(_ options: ProjectAnalysisEdit, json: Bool, useSidecar: Bool,
+                                    interruption: Interruption) throws {
+    guard let project = options.project, !isStandardInput(project) else {
+        throw CLIError("invalid_arguments", "Choose a saved input project.")
+    }
+    let loaded = try loadDocument(project, interruption: interruption)
+    let cancelled: @Sendable () -> Bool = { !interruption.isActive }
+    try AnalysisSidecar.$excludedSources.withValue(loaded.excludedSidecarSources) {
+        switch options {
+        case .protect(let settings):
+            guard case .multicam(var project) = loaded.project, let path = settings.outProject else {
+                throw CLIError("expected_multicam", "Choose a saved multicam project.")
+            }
+            let destination = try fileURL(path, label: "Output project")
+            var report = try ProjectSilenceReport(project, at: loaded.location, options: settings,
+                                                   container: ExportRules.multicamContainers[0], cancelled: cancelled)
+            project.analysisAnnotations = report.reviewedAnnotations
+            try saveShortened(.multicam(project), loaded: loaded, destination: destination,
+                              interruption: interruption, action: "Protect Pause") {
+                try report.checkSources(cancelled: cancelled)
+            }
+            report.outProject = destination.path
+            try writeJSON(report, pretty: !json, checkCancellation: false)
+        case .roomTone(_, let path, let clock, let span):
+            guard case .multicam(var project) = loaded.project else {
+                throw CLIError("expected_multicam", "Choose a saved multicam project.")
+            }
+            let destination = try fileURL(path, label: "Output project")
+            let result = try RoomToneCalibration(project, at: loaded.location, clock: clock, span: span, cancelled: cancelled)
+            project.analysisAnnotations = result.annotations
+            try saveShortened(.multicam(project), loaded: loaded, destination: destination,
+                              interruption: interruption, action: "Set Room Tone") {
+                guard result.media.values.allSatisfy({ $0.identity.isCurrentSnapshot(at: $0.url) }) else {
+                    throw CutError(code: "source_changed", message: "A recording changed while measuring room tone.")
+                }
+            }
+            struct Receipt: Encodable {
+                let ok = true
+                let outProject: String
+                let clock: String
+                let range: AudioSpan
+                let thresholds: [ProjectSilenceReport.Threshold]
+            }
+            try writeJSON(Receipt(outProject: destination.path, clock: clock, range: span, thresholds: result.thresholds),
+                          pretty: !json, checkCancellation: false)
+        case .sceneName(_, let path, let source, let reportID, let view, let name):
+            let destination = try fileURL(path, label: "Output project")
+            let url = try fileURL(source, label: "Recording")
+            let requests = try projectSceneRequests(loaded, scope: .allSources)
+            guard let request = requests.first(where: { $0.file == url }) else {
+                throw CLIError("invalid_target", "Choose a recording path reported by the saved project scene scan.")
+            }
+            let engine = CutEngine(cancelled: cancelled, useSidecar: useSidecar)
+            let media = try engine.inspectForPreview(request.file)
+            var annotations = loaded.project.analysisAnnotations.mappingPaths {
+                CutProject.mediaURL($0, relativeTo: loaded.location).path
+            }
+            var report: SceneReport
+            if let saved = annotations.scene(for: media) {
+                report = saved
+            } else {
+                guard name != nil else { throw CLIError("invalid_target", "This recording has no saved view name to reset.") }
+                report = try SceneAnalysis.scan(media, useSidecar: useSidecar, cancelled: cancelled)
+            }
+            guard report.coversFullSource, report.reviewID() == reportID else {
+                throw CLIError("stale_scene_report", "Refresh the full-source project scene scan and use its report ID.")
+            }
+            guard report.views.contains(where: { $0.view == view }) else {
+                throw CLIError("invalid_target", "The recording has no analyzed view with ID \(view).")
+            }
+            report.setViewName(name, for: view)
+            guard annotations.setScene(report, for: media) else {
+                throw CutError(code: "analysis_unavailable", message: "Could not verify the recording and its scene report.")
+            }
+            var updated = loaded.project
+            updated.analysisAnnotations = annotations.mappingPaths { CutProject.relativeMediaPath($0, to: loaded.location) }
+            try saveShortened(updated, loaded: loaded, destination: destination,
+                              interruption: interruption, action: "Rename Scene View") {
+                guard media.identity.isCurrentSnapshot(at: media.url) else {
+                    throw CutError(code: "source_changed", message: "The recording changed while reviewing its scenes.")
+                }
+            }
+            struct Receipt: Encodable {
+                let ok = true
+                let outProject: String
+                let report: SceneReport
+                let reportID: String
+                private enum CodingKeys: String, CodingKey {
+                    case ok, outProject, report
+                    case reportID = "report_id"
+                }
+            }
+            try writeJSON(Receipt(outProject: destination.path, report: report, reportID: reportID), pretty: !json, checkCancellation: false)
+        }
+    }
 }
 
 private func runProjectSilence(_ options: SilenceOptions, loaded: LoadedProject<MulticamProject>, json: Bool,
@@ -1367,6 +1482,7 @@ private func runProjectSilence(_ options: SilenceOptions, loaded: LoadedProject<
             guard !report.retainedAssembly.isEmpty else { throw CutError(code: "empty_edit", message: "The pauses cover the assembly.") }
             var updated = project
             updated.assemblyItems = report.retainedAssembly
+            updated.analysisAnnotations = report.retainedAnnotations
             let destination = try fileURL(path, label: "Output project")
             try report.checkSources(cancelled: cancelled)
             try saveShortened(.multicam(updated), loaded: loaded, destination: destination, interruption: interruption)
@@ -1636,7 +1752,7 @@ private func runStill(_ options: StillOptions, json: Bool, interruption: Interru
                                        mediaSnapshot: snapshot,
                                        expected: media.diskRevision, beforePublish: beforePublish)
         } else {
-            report.timeline = try saved.saveNewCopy(to: destination, copyingTranscriptsFrom: location,
+            report.timeline = try saved.saveNewCopy(to: destination,
                                                     undo: savedUndo, redo: savedRedo, mediaSnapshot: snapshot,
                                                     check: beforePublish)
         }
@@ -1978,8 +2094,18 @@ private func rangeListDuration(_ media: MediaInfo, options: ExportOptions) throw
     return media.duration
 }
 
-private func renderLoadedProject(_ loaded: LoadedProject<CutProject>, output: URL, flags: ExportOptions, dryRun: Bool,
+private func renderLoadedProject(_ snapshot: LoadedProject<CutProject>, output: URL, flags: ExportOptions, dryRun: Bool,
                                  arguments: Arguments, interruption: Interruption) async throws {
+    var loaded = snapshot
+    if let spacing = flags.spaceClips {
+        guard !loaded.project.requiresPictureProcessing else { throw ParticipantProjectExport.unsupported("Clip spacing export") }
+        try checkSpacing(flags)
+        let updated = try AnalysisSidecar.$excludedSources.withValue(loaded.excludedSidecarSources) {
+            try spacedProject(loaded.project, using: spacing, relativeTo: loaded.location,
+                              engine: CutEngine(cancelled: { !interruption.isActive }, useSidecar: arguments.useSidecar))
+        }
+        loaded = LoadedProject(project: updated, media: loaded.media, location: loaded.location, file: loaded.file)
+    }
     let placements = try loaded.project.exportPlacementScope()
     if !loaded.project.requiresPictureProcessing, placements != .none || loaded.project.stillFormat != nil {
         try runStillExport(loaded, output: output, dryRun: dryRun, options: flags, json: arguments.json,
@@ -1991,6 +2117,7 @@ private func renderLoadedProject(_ loaded: LoadedProject<CutProject>, output: UR
     }
     var options = flags
     options.spaceClips = nil
+    options.planToken = nil
     switch loaded.project {
     case .multicam(let multicam):
         let document = LoadedProject(project: multicam, media: loaded.media, location: loaded.location, file: loaded.file)
@@ -2081,7 +2208,9 @@ private func run(_ arguments: Arguments, interruption: Interruption) async throw
     case .multicamSync(let options): path = options.project
     case .refresh(let options): path = options.project
     case .projectMedia(let options): path = options.project
+    case .projectOutput(let options): path = options.project
     case .still(let options): path = options.project
+    case .projectAnalysisEdit(let options): path = options.project
     case .silence(let options): path = options.project
     case .frames(let options):
         if case .project(let file, _, _) = options.source { path = file } else { path = nil }
@@ -2089,7 +2218,13 @@ private func run(_ arguments: Arguments, interruption: Interruption) async throw
         if case .project(let project, _) = options.input { path = project } else { path = nil }
     default: path = nil
     }
-    let project = try path.flatMap { isStandardInput($0) ? nil : try fileURL($0, label: "Project") }
+    let project: URL?
+    if case .exportProject(_, _, _, let options) = arguments.command, options.planToken != nil {
+        // Bound renders translate a path that no longer resolves into a stale plan.
+        project = path.flatMap { isStandardInput($0) ? nil : try? fileURL($0, label: "Project") }
+    } else {
+        project = try path.flatMap { isStandardInput($0) ? nil : try fileURL($0, label: "Project") }
+    }
     try await SidecarLocations.$projectURL.withValue(project ?? SidecarLocations.projectURL) {
         try await runCommand(arguments, interruption: interruption)
     }
@@ -2097,6 +2232,10 @@ private func run(_ arguments: Arguments, interruption: Interruption) async throw
 
 private func runCommand(_ arguments: Arguments, interruption: Interruption) async throws {
     switch arguments.command {
+    case let .sidecarCache(options):
+        let result = try options.run(interruption: interruption)
+        try writeJSON(result, pretty: !arguments.json,
+                      checkCancellation: options.operation == .preview || options.operation == .settings)
     case let .multicamSync(options):
         let loaded = try loadProject(options.project, interruption: interruption)
         if let incoming = options.replacement, let referenceID = options.referenceSourceID {
@@ -2170,7 +2309,7 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
         try writeJSON(result, pretty: !arguments.json, checkCancellation: options.statusOnly)
     case .version:
         if arguments.json {
-            try writeJSON(["version": Arguments.version])
+            try writeJSON(CLIVersion())
         } else {
             try interruption.beginResponse()
             try writeOutput(Arguments.version)
@@ -2202,12 +2341,16 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
         try options.run(json: arguments.json, useSidecar: arguments.useSidecar, interruption: interruption)
     case let .transcript(options):
         try options.run(json: arguments.json, useSidecar: arguments.useSidecar, interruption: interruption)
+    case let .projectAnalysisEdit(options):
+        try runProjectAnalysisEdit(options, json: arguments.json, useSidecar: arguments.useSidecar, interruption: interruption)
     case let .silence(options):
         try await runSilence(options, arguments: arguments, requestFile: arguments.requestFile, json: arguments.json, interruption: interruption)
     case let .scenes(options):
         try runSceneScan(options, json: arguments.json, useSidecar: arguments.useSidecar, interruption: interruption)
     case let .sceneExport(file, options):
         try runSceneExport(file: file, requestFile: arguments.requestFile, options: options, json: arguments.json, interruption: interruption)
+    case let .projectOutput(options):
+        try options.run(json: arguments.json, interruption: interruption)
     case let .projectMedia(options):
         try options.run(json: arguments.json, interruption: interruption)
     case let .refresh(options):
@@ -2248,7 +2391,7 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
         try writeJSON(multicamSwitchCoverage(data: data, useSidecar: arguments.useSidecar, interruption: interruption),
                       pretty: !arguments.json)
     case let .timelineReview(options):
-        try options.run(pretty: !arguments.json)
+        try options.run(pretty: !arguments.json, interruption: interruption)
     case let .authorProject(creating):
         let data = try arguments.requestFile.map { try ClipEditCSV.readListData(fileURL($0, label: "Request"), kind: "JSON",
                                                                                 cancelled: { !interruption.isActive }) } ?? readStandardInput(interruption)
@@ -2260,6 +2403,12 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
             let media = try CutEngine(cancelled: { !interruption.isActive }).inspect(
                 fileURL(file, label: "Input"), keyframes: true)
             guard media.hasVideo else { throw CutError(code: "no_video", message: "JPEG export requires a video stream.") }
+            if options.mcpImage, case let .times(times) = selection, let time = times.first {
+                let (jpeg, frame) = try JPEGExport.reviewFrame(media, at: time, exclusiveEnd: false,
+                                                              cancelled: { !interruption.isActive })
+                try writeJSON(FileReviewImage(source: media.url, time: time, frame: frame, jpeg: jpeg))
+                return
+            }
             let result = try JPEGExport.write(media, to: output, selection: selection, sample: sample,
                                               preset: options.preset, format: options.format,
                                               limit: limit, cancelled: { !interruption.isActive })
@@ -2268,7 +2417,13 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
             let identity = isStandardInput(file) ? nil : (try? SourceIdentity(fileURL(file, label: "Project")))
             let loaded = try loadDocument(file, interruption: interruption)
             try AnalysisSidecar.$excludedSources.withValue(loaded.excludedSidecarSources) {
-                if !loaded.project.requiresPictureProcessing, case .multicam(let multicam) = loaded.project, clock == nil || clock == .group {
+                if options.mcpImage, let time = times.first {
+                    let result = try fileProgramReviewImage(loaded.project, media: loaded.media, projectPath: loaded.path,
+                                                            location: loaded.location, time: time, clock: clock, output: output,
+                                                            documentIdentity: identity, useSidecar: arguments.useSidecar,
+                                                            cancelled: { !interruption.isActive })
+                    try writeJSON(result)
+                } else if !loaded.project.requiresPictureProcessing, case .multicam(let multicam) = loaded.project, clock == nil || clock == .group {
                     let result = try JPEGExport.writeMulticam(multicam, document: loaded.file, at: times, to: output,
                                                               preset: options.preset, format: options.format,
                                                               useSidecar: arguments.useSidecar,
@@ -2287,9 +2442,9 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
             }
         }
     case .printDocument(let source):
-        let saved = try isStandardInput(source) ? readStandardInput(interruption)
-            : Data(contentsOf: fileURL(source, label: "Project"))
-        let document = try CutProject.readableDocument(saved: saved)
+        let document = try isStandardInput(source)
+            ? CutProject.readableDocument(saved: readStandardInput(interruption))
+            : CutProject.readableDocument(at: fileURL(source, label: "Project"))
         try interruption.beginResponse(checkCancellation: false)
         try writeOutput(document)
     case let .mergeProject(base, ours, theirs):
@@ -2311,9 +2466,13 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
         let output = Pipe()
         merge.standardOutput = output
         try merge.run()
-        let merged = output.fileHandleForReading.readDataToEndOfFile()
+        let mergedLines = output.fileHandleForReading.readDataToEndOfFile()
         merge.waitUntilExit()
         try interruption.beginResponse(checkCancellation: false)
+        guard merge.terminationReason == .exit, (0...127).contains(merge.terminationStatus) else {
+            throw CLIError("merge_failed", "git merge-file could not merge \(ours).")
+        }
+        let merged = try sides.restoringAssets(in: mergedLines)
         switch merge.terminationStatus {
         case 0:
             let saved: Data
@@ -2540,19 +2699,54 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
             exit(exitStatus(failure.issue.code, operation: true))
         }
     case let .exportProject(project, path, dryRun, flags):
-        var loaded = try loadDocument(project, interruption: interruption)
-        let output = try fileURL(path, label: "Output")
-        try checkProjectOutput(output, media: loaded.media, location: loaded.location)
-        if let spacing = flags.spaceClips {
-            guard !loaded.project.requiresPictureProcessing else { throw ParticipantProjectExport.unsupported("Clip spacing export") }
-            try checkSpacing(flags)
-            let updated = try AnalysisSidecar.$excludedSources.withValue(loaded.excludedSidecarSources) {
-                try spacedProject(loaded.project, using: spacing, relativeTo: loaded.location,
-                                  engine: CutEngine(cancelled: { !interruption.isActive }, useSidecar: arguments.useSidecar))
-            }
-            loaded = LoadedProject(project: updated, media: loaded.media, location: loaded.location, file: loaded.file)
+        if flags.planToken != nil, dryRun || isStandardInput(project) {
+            throw CLIError("invalid_arguments", "Use a render plan token when rendering a saved project without --dry-run.")
         }
-        try await renderLoadedProject(loaded, output: output, flags: flags, dryRun: dryRun, arguments: arguments, interruption: interruption)
+        let loaded: LoadedProject<CutProject>
+        let output: URL
+        do {
+            loaded = try loadDocument(project, interruption: interruption)
+            output = try fileURL(path, label: "Output")
+        } catch {
+            try interruption.check()
+            if flags.planToken != nil { throw ProjectRenderReview.stale }
+            throw error
+        }
+        let review: ProjectRenderReview?
+        if (dryRun || flags.planToken != nil), let projectFile = loaded.file {
+            review = try ProjectRenderReview(project: projectFile, projectArgument: project, media: loaded.media,
+                                             output: output, outputArgument: path, options: flags, useSidecar: arguments.useSidecar)
+        } else {
+            review = nil
+        }
+        if let expected = flags.planToken {
+            guard let review, review.token == expected else { throw ProjectRenderReview.stale }
+            try review.validate()
+        }
+        try checkProjectOutput(output, media: loaded.media, location: loaded.location)
+        let validatePublication: (@Sendable (URL) throws -> Void)?
+        if !dryRun, let review {
+            validatePublication = {
+                try review.validatePublication(at: $0)
+                try interruption.check()
+            }
+        } else {
+            validatePublication = nil
+        }
+        do {
+            try await ProjectRenderReview.$preflight.withValue(dryRun ? review : nil) {
+                try await MediaExportPublication.$validate.withValue(validatePublication) {
+                    try await renderLoadedProject(loaded, output: output, flags: flags, dryRun: dryRun,
+                                                  arguments: arguments, interruption: interruption)
+                }
+            }
+        } catch {
+            try interruption.check()
+            if let issue = error as? CutError, issue.code == "source_changed" {
+                try review?.validate()
+            }
+            throw error
+        }
     case let .export(supplied, dryRun, flags, requestedOrder, resolveOpen):
         let input = try supplied ?? readInput(interruption, path: arguments.requestFile)
         var options = try flags.merging(input.options)
@@ -2570,6 +2764,9 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
                           interruption: interruption)
             return
         }
+        guard options.planToken == nil else {
+            throw CLIError("invalid_arguments", "A render plan token requires export project render.")
+        }
         guard options.stillTiming == nil, options.container == nil else {
             throw CLIError("invalid_arguments", "Specify still timing and container with a saved still project.")
         }
@@ -2579,7 +2776,7 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
         if resolveOpen != nil {
             guard options.mode == nil, options.snap == nil, options.tracks == nil, options.video == nil,
                   options.audio == nil, options.audioOutput == nil, options.quality == nil,
-                  options.audioStream == nil, options.spaceClips == nil else {
+                  options.audioStream == nil, options.spaceClips == nil, options.requireCameraCopy == nil else {
                 throw CLIError("invalid_arguments", "Resolve timeline export accepts edits and soundtrack replacements. Omit render settings.")
             }
             guard !input.clips.contains(where: { $0.project != nil }) else {
@@ -2912,7 +3109,9 @@ do {
     try await AnalysisSidecar.$readsEnabled.withValue(arguments.useSidecar) {
         let origin: HistoryOrigin = ProcessInfo.processInfo.environment["MPCUT_HISTORY_ORIGIN"] == "agent" ? .agent : .user
         try await HistoryOrigin.$current.withValue(origin) {
-            try await run(arguments, interruption: interruption)
+            try await CutProject.$documentReadCancelled.withValue({ !interruption.isActive }) {
+                try await run(arguments, interruption: interruption)
+            }
         }
     }
 } catch let error as CutError {

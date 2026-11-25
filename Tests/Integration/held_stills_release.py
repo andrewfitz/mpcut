@@ -416,7 +416,7 @@ class HeldStillsRelease(unittest.TestCase):
                "-color_primaries", "bt709", "-colorspace", "bt709", "-c:a", "copy", source)
         sequence = self.root / "multitrack.cut"
         sequence.write_text(json.dumps({
-            "format": "mpcut", "schema_version": 3, "kind": "sequence",
+            "format": "mpcut", "schema_version": 9, "kind": "sequence",
             "clips": [{"id": "multitrack", "file": str(source), "from": "1", "to": "3"}],
         }))
         project = self.root / "multitrack-covered.cut"
@@ -445,7 +445,7 @@ class HeldStillsRelease(unittest.TestCase):
                "-colorspace", "bt709", camera)
         source = camera.with_suffix(".cut")
         source.write_text(json.dumps({
-            "format": "mpcut", "schema_version": 3, "kind": "sequence",
+            "format": "mpcut", "schema_version": 9, "kind": "sequence",
             "clips": [{"id": "camera", "file": str(camera), "from": "0", "to": "71/24"}],
         }))
         project = self.root / "off-tick-held.cut"
@@ -485,7 +485,7 @@ class HeldStillsRelease(unittest.TestCase):
                "-colorspace", "bt709", "-c:a", "copy", camera)
         source = self.root / "camera.cut"
         source.write_text(json.dumps({
-            "format": "mpcut", "schema_version": 3, "kind": "sequence",
+            "format": "mpcut", "schema_version": 9, "kind": "sequence",
             "clips": [{"id": "first", "file": str(camera), "from": "0", "to": "2"},
                       {"id": "second", "file": str(camera), "from": "1", "to": "3"}],
         }))
@@ -527,7 +527,7 @@ class HeldStillsRelease(unittest.TestCase):
         ffmpeg("-i", camera, "-map", "0:v", "-map", "0:a", "-c:v", "copy", "-c:a", "aac", compressed)
         compressed_source = self.root / "camera-aac.cut"
         compressed_source.write_text(json.dumps({
-            "format": "mpcut", "schema_version": 3, "kind": "sequence",
+            "format": "mpcut", "schema_version": 9, "kind": "sequence",
             "clips": [{"id": "camera-aac", "file": str(compressed), "from": "0", "to": "4"}],
         }))
         compressed_edit = self.root / "camera-aac-covered.cut"
@@ -654,7 +654,7 @@ class HeldStillsRelease(unittest.TestCase):
                        "-colorspace", matrix, "-movflags", "+write_colr", camera)
                 source = camera.with_suffix(".cut")
                 source.write_text(json.dumps({
-                    "format": "mpcut", "schema_version": 3, "kind": "sequence",
+                    "format": "mpcut", "schema_version": 9, "kind": "sequence",
                     "clips": [{"id": "camera", "file": str(camera), "from": "0", "to": "4"}],
                 }))
                 project = self.root / f"mixed-held-{codec}.cut"

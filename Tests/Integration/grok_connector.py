@@ -34,7 +34,7 @@ def check_edit(root, key, headers):
     clip = root / "media.mov"
     shutil.copyfile(Path(__file__).resolve().parents[1] / "MPCutAppTests/Fixtures/ProRes-2997.mov", clip)
     path = root / "Sample.cut"
-    path.write_text(json.dumps({"format": "mpcut", "schema_version": 3, "kind": "sequence",
+    path.write_text(json.dumps({"format": "mpcut", "schema_version": 9, "kind": "sequence",
                                 "clips": [{"id": "demo", "file": clip.name, "from": "0", "to": "1001/2500"}]}))
     handle = call("project_open", project_path=str(path), operation_id=str(uuid.uuid4()))["structuredContent"]["project_handle"]
     for _ in range(100):
@@ -42,6 +42,8 @@ def check_edit(root, key, headers):
         if state["total"] == 1 and not state["busy"]:
             break
         time.sleep(0.1)
+    else:
+        raise TimeoutError(f"editor project did not become ready: {state}")
     frame = call("review_editor_frame_read", project_handle=handle, time="1001/30000", space="sequence")
     assert any(c["type"] == "image" and base64.b64decode(c["data"]).startswith(b"\xff\xd8") for c in frame["content"])
     exact = call("project_editor_state_read", project_handle=handle, offset=9007199254740993)
@@ -71,17 +73,23 @@ def check(package, app, live):
     with tempfile.TemporaryDirectory(prefix="MPCut Grok QA ") as temp, ExitStack() as cleanup:
         root = Path(temp).resolve()
         subprocess.run(["unzip", "-q", package, "-d", root], check=True)
-        (root / "helper-path.txt").write_text(str(contents / "Helpers/mpcut-mcp") + "\n")
-        guide = (root / "MPCut Editing.md").read_text()
-        assert all(f"`{name}`" in guide for name in expected)
+        launcher_path = root / "Start MPCut Connector.command"
+        helper_path = root / "helper-path.txt"
         keys = root / "keys"
         env = os.environ | {"MPCUT_GROK_KEY_DIR": str(keys)}
+        helper_path.write_text("")
+        unconfigured = subprocess.run([launcher_path], env=env, capture_output=True, text=True, timeout=5)
+        assert unconfigured.returncode != 0 and "helper-path.txt" in unconfigured.stderr, unconfigured.stderr
+        assert not keys.exists(), "launcher generated a key before reading the helper path"
+        # A manually edited helper path may omit the final newline.
+        helper_path.write_text(str(contents / "Helpers/mpcut-mcp"))
+        guide = (root / "MPCut Editing.md").read_text()
+        assert all(f"`{name}`" in guide for name in expected)
         keys.mkdir(mode=0o700)
         key_file = keys / "bearer-token.txt"
         key_file.write_text("a" * 64 + "\n")
         key_file.chmod(0o644)
-        unsafe = subprocess.run([root / "Start MPCut Connector.command"], env=env,
-                                capture_output=True, text=True, timeout=5)
+        unsafe = subprocess.run([launcher_path], env=env, capture_output=True, text=True, timeout=5)
         assert unsafe.returncode != 0 and "private regular file" in unsafe.stderr, unsafe.stderr
         key_file.unlink()
         if live:
@@ -93,21 +101,28 @@ def check(package, app, live):
             cleanup.callback(subprocess.run, ["/usr/bin/defaults", "delete", domain], stderr=subprocess.DEVNULL)
             for name in ["control.sock", "listener.lock"]:
                 cleanup.callback((socket_dir / name).unlink, missing_ok=True)
-            env.update(MPCUT_TEST_SOCKET_DIRECTORY=socket_dir.name, CFFIXED_USER_HOME=str(root))
+            env.update(BACKSTAGE_SESSION=socket_dir.name, MPCUT_TEST_SOCKET_DIRECTORY=socket_dir.name)
             (root / "Library/Preferences").mkdir(parents=True)
-            editor = subprocess.Popen([contents / "MacOS/MPCut", "-automation_local_mcp_enabled", "YES", "-history_max_steps", "20",
-                                       "-timeline_snap_target", "off", "-analysis_sidecar_reuse_enabled", "NO",
-                                       "-ApplePersistenceIgnoreState", "YES", "-NSQuitAlwaysKeepsWindows", "NO"], env=env)
-            cleanup.callback(editor.wait, timeout=5)
-            cleanup.callback(editor.kill)
+            launch = subprocess.run(
+                ["backstage", "launch", str(app), "--timeout", "45",
+                 "--env", f"CFFIXED_USER_HOME={root}", "--env", f"MPCUT_TEST_SOCKET_DIRECTORY={socket_dir.name}",
+                 "--env", "MPCUT_MUTED=1", "--", "-automation_local_mcp_enabled", "YES",
+                 "-history_max_steps", "20", "-timeline_snap_target", "off",
+                 "-analysis_sidecar_reuse_enabled", "NO", "-ApplePersistenceIgnoreState", "YES",
+                 "-NSQuitAlwaysKeepsWindows", "NO"],
+                env=env, capture_output=True, text=True, timeout=60)
+            if launch.returncode:
+                raise RuntimeError(f"Backstage launch failed: {launch.stdout} {launch.stderr}")
+            pid = json.loads(launch.stdout)["pid"]
+            cleanup.callback(subprocess.run, ["backstage", "quit", "--pid", str(pid), "--force"],
+                             env=env, check=True, timeout=20)
             for _ in range(150):
                 if (socket_dir / "control.sock").is_socket():
                     break
                 time.sleep(0.1)
             else:
                 raise TimeoutError("isolated test editor socket")
-        launcher = subprocess.Popen([root / "Start MPCut Connector.command"],
-                                    env=env)
+        launcher = subprocess.Popen([launcher_path], env=env)
         try:
             params = {"protocolVersion": "2025-06-18", "capabilities": {},
                       "clientInfo": {"name": "grok-parity", "version": "1"}}

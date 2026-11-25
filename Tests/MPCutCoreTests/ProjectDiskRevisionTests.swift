@@ -15,12 +15,36 @@ final class ProjectDiskRevisionTests: XCTestCase {
         try external.save(to: externalURL)
         let data = try Data(contentsOf: externalURL)
 
-        XCTAssertThrowsError(try CutProject.sequence([]).saveRevision(to: url, undo: [], redo: [], mediaSnapshot: .empty, expected: revision) {
+        let edit = CutProject.sequence([.init(id: "mine", file: "mine.mov", from: .zero, to: .init(numerator: 1))])
+        XCTAssertThrowsError(try edit.saveRevision(to: url, undo: [], redo: [], mediaSnapshot: .empty, expected: revision) {
+            let staged = try FileManager.default.contentsOfDirectory(atPath: directory.path).filter { $0.hasPrefix(".mpcut-") }
+            XCTAssertEqual(staged.count, 1)
+            if let name = staged.first {
+                XCTAssertEqual(try CutProject.load(from: directory.appendingPathComponent(name)), edit)
+            }
             try data.write(to: url, options: .atomic)
         }) {
             XCTAssertEqual(($0 as? CutError)?.code, "project_save_conflict")
         }
         XCTAssertEqual(try CutProject.load(from: url), external)
+        XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: directory.path)),
+                       Set(["Project.cut", "External.cut"]))
+    }
+
+    func testReplacementPreservesDestinationPermissions() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let files = FileManager.default
+        try files.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? files.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("Project.cut")
+        try CutProject.sequence([]).save(to: url)
+        try files.setAttributes([.posixPermissions: 0o640], ofItemAtPath: url.path)
+        let revision = try XCTUnwrap(CutProjectMedia.load(from: url).diskRevision)
+        let edit = CutProject.sequence([.init(id: "mine", file: "mine.mov", from: .zero, to: .init(numerator: 1))])
+
+        _ = try edit.saveRevision(to: url, undo: [], redo: [], mediaSnapshot: .empty, expected: revision)
+        XCTAssertEqual(try files.attributesOfItem(atPath: url.path)[.posixPermissions] as? Int, 0o640)
+        XCTAssertEqual(try CutProject.load(from: url), edit)
     }
 
     func testUnversionedSaveWaitsForRevisionPublication() throws {

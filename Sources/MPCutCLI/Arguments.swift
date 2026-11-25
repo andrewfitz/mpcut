@@ -68,7 +68,7 @@ struct InputEdit: Decodable {
     var options = ExportOptions()
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
-        case output, clips, file, project = "project_path", order, mode, video, quality, audio, audioOutput = "audio_output", snap, tracks, audioStream = "audio_stream", replaceAudio = "replace_audio", replaceTrack = "replace_track", replacementStream = "replacement_stream", requireCameraCopy = "require_camera_copy", spaceClips = "space_clips", stillTiming = "still_timing", container
+        case output, clips, file, project = "project_path", order, mode, video, quality, audio, audioOutput = "audio_output", snap, tracks, audioStream = "audio_stream", replaceAudio = "replace_audio", replaceTrack = "replace_track", replacementStream = "replacement_stream", requireCameraCopy = "require_camera_copy", spaceClips = "space_clips", stillTiming = "still_timing", container, planToken = "plan_token"
     }
 
     init(output: String, clips: [InputClip]) {
@@ -88,6 +88,7 @@ struct InputEdit: Decodable {
             }
             clips = []
         }
+        options.planToken = try fields.decodeIfPresent(String.self, forKey: .planToken)
         options.container = try fields.decodeIfPresent(String.self, forKey: .container)
         if let value = try fields.decodeIfPresent(String.self, forKey: .stillTiming) {
             try options.set("still-timing", to: value, code: "invalid_json")
@@ -127,12 +128,12 @@ struct InputEdit: Decodable {
     }
 }
 
-enum ClipSpacing: Equatable {
+enum ClipSpacing: Equatable, Encodable {
     case source
     case duration(RationalTime)
 }
 
-struct ExportOptions {
+struct ExportOptions: Encodable {
     var mode: ExportMode?
     var video: ReencodeCodec?
     var quality: ReencodeQuality?
@@ -150,6 +151,7 @@ struct ExportOptions {
     var spaceClips: ClipSpacing?
     var stillTiming: StillPictureTiming?
     var container: String?
+    var planToken: String?
 
     var organization: ExportOrganization { .init(subfolder: subfolder ?? "", baseName: baseName ?? "") }
 
@@ -225,7 +227,8 @@ struct ExportOptions {
             requireCameraCopy: resolve("require-camera-copy", requireCameraCopy, request.requireCameraCopy, jsonKey: "require_camera_copy"),
             spaceClips: resolve("space-clips", spaceClips, request.spaceClips, jsonKey: "space_clips"),
             stillTiming: resolve("still-timing", stillTiming, request.stillTiming, jsonKey: "still_timing"),
-            container: resolve("container", container, request.container)
+            container: resolve("container", container, request.container),
+            planToken: resolve("plan-token", planToken, request.planToken, jsonKey: "plan_token")
         )
     }
 }
@@ -254,6 +257,7 @@ private struct AnyRequestKey: CodingKey {
 
 enum CLICommand {
     case sidecar(SidecarOptions)
+    case sidecarCache(SidecarCacheOptions)
     case manual
     case help(CommandHelp?)
     case version
@@ -267,11 +271,13 @@ enum CLICommand {
     case participants(ParticipantCLI)
     case tiles(TilesCLI)
     case stillCreate(StillCreateOptions)
+    case projectAnalysisEdit(ProjectAnalysisEdit)
     case silence(SilenceOptions)
     case scenes(SceneScanOptions)
     case sceneExport(file: String?, options: SceneExportOptions)
     case refresh(RefreshOptions)
     case projectMedia(ProjectMediaOptions)
+    case projectOutput(ProjectOutputOptions)
     case inspect(file: String, keyframes: Bool, allFrames: Bool, audioPackets: Bool, packetStream: Int?, from: RationalTime?, to: RationalTime?, tracks: ExportTracks, audioStream: Int?)
     case convert(input: String, output: String, allowLoss: Bool, flattenMulticam: Bool)
     case printDocument(String)
@@ -364,11 +370,20 @@ struct Arguments {
         if !sidecar, case let .sidecar(settings) = parsed.command, settings.statusOnly {
             throw CLIError("invalid_arguments", "Inspecting a sidecar requires sidecar access.")
         }
+        if !sidecar, case let .sidecarCache(cache) = parsed.command, cache.operation == .preview || cache.operation == .clear {
+            throw CLIError("invalid_arguments", "Previewing or clearing caches requires sidecar access.")
+        }
         return Arguments(command: parsed.command, json: json, useSidecar: sidecar,
                          requestFile: requestFile, operation: operation)
     }
 
     private static func parseCommand(_ path: String, options: [String], json: Bool) throws -> Arguments {
+        if let operation = CommandPath.sidecarCache[path] {
+            return Arguments(command: .sidecarCache(try SidecarCacheOptions(operation, arguments: options)), json: json)
+        }
+        if path.hasPrefix("project output "), let operation = ProjectOutputOptions.Operation(rawValue: String(path.dropFirst("project output ".count))) {
+            return Arguments(command: .projectOutput(try ProjectOutputOptions(operation, arguments: options)), json: json)
+        }
         if path.hasPrefix("project media "), let operation = ProjectMediaOptions.Operation(rawValue: String(path.dropFirst("project media ".count))) {
             return Arguments(command: .projectMedia(try ProjectMediaOptions(operation, arguments: options)), json: json)
         }
@@ -387,7 +402,7 @@ struct Arguments {
                                                               replace: path == "still picture replace")), json: json)
         }
         switch path {
-        case "timeline range map", "history compare":
+        case "timeline range map", "history compare", "history restore-copy":
             return Arguments(command: .timelineReview(try TimelineReviewOptions(path: path, arguments: options)), json: json)
         case "multicam sync suggest":
             return Arguments(command: .multicamSync(try MulticamSyncOptions(options)), json: json)
@@ -400,10 +415,11 @@ struct Arguments {
         case "project convert":
             return Arguments(command: try convert(options), json: json)
         case "project document print":
-            guard options.count == 1, !json else {
+            let operands = options.filter { $0 != "--json" }
+            guard operands.count == 1, !operands[0].hasPrefix("--") else {
                 throw CLIError("invalid_arguments", "Use project document print FILE, or - to read the project from standard input.")
             }
-            return Arguments(command: .printDocument(options[0]), json: false)
+            return Arguments(command: .printDocument(operands[0]), json: json)
         case "project merge":
             guard options.count == 3, !json, !options.contains(where: { $0.hasPrefix("--") }) else {
                 throw CLIError("invalid_arguments", "Use project merge BASE OURS THEIRS. The merged project replaces OURS.")
@@ -445,6 +461,8 @@ struct Arguments {
             return Arguments(command: .sidecar(try SidecarOptions(options, statusOnly: path == "analysis sidecar inspect")), json: json)
         case "still project create":
             return Arguments(command: .stillCreate(try StillCreateOptions(options.filter { $0 != "--json" })), json: json)
+        case "silence pause protect", "silence room-tone calibrate", "scenes view rename":
+            return Arguments(command: .projectAnalysisEdit(try ProjectAnalysisEdit(path: path, arguments: options)), json: json)
         case "silence scan", "silence plan", "silence export", "silence shorten":
             var settings = try SilenceOptions(options)
             guard (path == "silence shorten") == (settings.outProject != nil),
@@ -495,7 +513,7 @@ struct Arguments {
             }
             return Arguments(command: .bulk(dryRun: dryRun, options: flags, list: nil), json: true)
         case "export project render", "export clips join", "export soundtrack replace":
-            let command = try export(options, json: json)
+            let command = try export(options, json: json, forProject: path == "export project render")
             if case .exportProject = command, path != "export project render" {
                 throw CLIError("invalid_arguments", "Use export project render with --project.")
             }
@@ -801,7 +819,8 @@ struct Arguments {
         return .inspect(file: file, keyframes: keyframes, allFrames: allFrames, audioPackets: audioPackets, packetStream: packetStream, from: from, to: to, tracks: settings.tracks ?? .all, audioStream: settings.audioStream)
     }
 
-    private static func export(_ options: [String], json: Bool, forResolve: Bool = false, forBulk: Bool = false, openResolve: Bool = false) throws -> CLICommand {
+    private static func export(_ options: [String], json: Bool, forResolve: Bool = false, forBulk: Bool = false, openResolve: Bool = false,
+                               forProject: Bool = false) throws -> CLICommand {
         var arguments = options.makeIterator()
         var output: String?
         var project: String?
@@ -837,6 +856,11 @@ struct Arguments {
                     throw CLIError("invalid_arguments", "--space-clips may be specified only once.")
                 }
                 try exportOptions.set("space-clips", to: value(for: argument))
+            case "--plan-token" where forProject:
+                guard suppliedSettings.insert(argument).inserted else {
+                    throw CLIError("invalid_arguments", "--plan-token may be specified only once.")
+                }
+                exportOptions.planToken = try value(for: argument)
             case "--still-timing", "--container":
                 guard !forResolve, !forBulk, suppliedSettings.insert(argument).inserted else {
                     throw CLIError("invalid_arguments", "Use \(argument) once when rendering a still project.")

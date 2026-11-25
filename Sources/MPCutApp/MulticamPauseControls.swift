@@ -40,6 +40,9 @@ struct MulticamPauseControls: View {
                 .help("Measure marked room tone")
             Divider().padding(.vertical, 2)
             SectionHeading("Pauses")
+            if model.multicamPauseReviewMismatch {
+                IssueLabel("The recording, audio routing or detected pause boundaries have changed. Review the saved ranges before shortening.")
+            }
             if let progress = model.analysis.silenceProgress {
                 ProgressView(value: progress) {
                     Text("Scanning program audio… \(progressPercent(progress))").font(.callout).monospacedDigit()
@@ -231,16 +234,15 @@ private struct MulticamCutReview: View {
     var body: some View {
         let isPause = review.id != nil
         EditorSheet(title: isPause ? "Preview Cut" : "Preview Join",
-                    message: isPause ? "Listen to the cut with the shorter pause." : "Review up to one second on each side of the join.") {
-            MulticamPreviewView(preview: preview).frame(width: 480, height: 270).background(.black)
+                    message: isPause ? "Listen to the cut with the shorter pause." : review.joinMessage) {
+            MulticamPreviewView(preview: preview, preferences: model.preferences).frame(width: 480, height: 270).background(.black)
                 .modifier(InsetPanel())
             if let message = preview.issue { IssueLabel(message) }
         } actions: {
             CutPreviewPlayButton(isPlaying: preview.isPlaying, toggle: preview.togglePlayback)
             if let id = review.id {
                 Button("Keep This Pause") {
-                    model.pauseEdits.protected.insert(id.span)
-                    dismiss()
+                    if model.setPauseProtection(true, id: id) { dismiss() }
                 }
                 .help("Keep pause at full length")
             } else {

@@ -1,6 +1,7 @@
 """Run against a packaged or development mpcut-mcp helper, without an editor."""
 
 import argparse
+from fractions import Fraction
 import json
 import math
 import os
@@ -146,16 +147,67 @@ def exercise(client, folder):
     assert [suggestion["source_id"] for suggestion in sync["suggestions"]] == ["two"]
     coverage = job("multicam_file_switch_coverage_read", project_path=multi, angle_id="two", group_time="0")
     assert coverage["angle_id"] == "two" and coverage["picture"]["status"] == "covered"
+    quiet_movie = str(folder / "quiet.mov")
+    shutil.copyfile(ROOT / "Tests/MPCutAppTests/Fixtures/Pause-Quiet.mov", quiet_movie)
+    quiet_project = str(folder / "quiet.cut")
+    job("project_file_create", request=dict(kind="multicam", angles=[dict(id="quiet", file=quiet_movie, audio_stream_index=1)],
+                                          group_end="4", out_project=quiet_project, operations=[]))
+    quiet_settings = dict(silence_threshold_db=-45, silence_min_pause_seconds=.4, no_sidecar=True)
+    detected = job("silence_file_scan", project_path=quiet_project, **quiet_settings)
+    protected = str(folder / "quiet-protected.cut")
+    def timecode(value):
+        return Fraction(value["numerator"], value["denominator"])
+    cut = detected["removals"][0]["group"]
+    pause = next(item for item in detected["pauses"] if timecode(item["group"]["from"]) <= timecode(cut["from"])
+                 and timecode(item["group"]["to"]) >= timecode(cut["to"]))
+    job("silence_file_pause_protect", project_path=quiet_project, out_project=protected,
+        protect_pauses=[pause["id"]], **quiet_settings)
+    rescanned = job("silence_file_scan", project_path=protected, **quiet_settings)
+    assert len(rescanned["removals"]) < len(detected["removals"]), rescanned
+    calibrated = str(folder / "quiet-calibrated.cut")
+    room = job("silence_file_room_tone_calibrate", project_path=protected, out_project=calibrated,
+               clock="assembly", **{"from": "1", "to": "3/2"}, no_sidecar=True)
+    measured = job("silence_file_scan", project_path=calibrated, no_sidecar=True)
+    assert room["thresholds"] == measured["thresholds"], measured
+    named = str(folder / "quiet-named.cut")
+    scene_sequence = str(folder / "quiet-scene-sequence.cut")
+    job("project_file_create", request=dict(kind="sequence", out_project=scene_sequence, operations=[
+        {"action": "append", "id": "scene-clip", "file": quiet_movie, "from": "1/2", "to": "3/2"}]))
+    scoped_scene = job("scenes_file_scan", project_path=scene_sequence, clip_id="scene-clip",
+                       no_sidecar=True)["sources"][0]["outcome"]
+    job("scenes_file_view_rename", error="stale_scene_report", project_path=scene_sequence, out_project=named,
+        file=quiet_movie, report_id=scoped_scene["report_id"], view=1, name="Wrong", no_sidecar=True)
+    assert not Path(named).exists()
+    source_scene = job("scenes_file_scan", project_path=calibrated, no_sidecar=True)["sources"][0]["outcome"]
+    scene = job("scenes_file_view_rename", project_path=calibrated, out_project=named,
+                file=quiet_movie, report_id=source_scene["report_id"], view=1, name="--json", no_sidecar=True)
+    assert scene["report"]["views"][0]["name"] == "--json", scene
+    reset = job("scenes_file_view_rename", project_path=named, out_project=str(folder / "quiet-reset.cut"),
+                file=quiet_movie, report_id=scene["report_id"], view=1, name="", no_sidecar=True)
+    assert "name" not in reset["report"]["views"][0], reset
     directory = str(folder / "jobs")
     prepared = job("transcript_file_job_prepare", request=dict(project_path=seq, job_directory=directory,
                                                                 engine="lifecycle-fixture", model="fixture"))
     recognition = dict(job_id=prepared["id"], job_directory=directory)
     completed = job("transcript_file_job_run", request=recognition)
     assert completed["state"] == "completed", completed
+    listed = job("transcript_file_jobs_list", request=dict(project_path=seq, job_directory=directory))
+    assert listed["total"] == 1 and listed["items"][0]["id"] == prepared["id"], listed
     attached = str(folder / "with-transcript.cut")
     job("transcript_file_attachment_import", request=dict(recognition, project_path=seq, out_project=attached))
     attachment = job("transcript_file_attachment_inspect", request=dict(project_path=attached))
     assert [(item["status"], item["words"]) for item in attachment["attachments"]] == [("available", 1)], attachment
+    resolved = job("transcript_file_words_read", request=dict(project_path=attached, space="source"))
+    token = resolved["items"][0]
+    selection = dict(space="source", first_word_id=token["word_id"], first_occurrence_id=token["id"])
+    expanded = job("transcript_file_selection_resolve", request=dict(project_path=attached, selection=selection,
+                                                                       expansion="sentence"))
+    assert expanded["first"]["id"] == token["id"] and expanded["last"]["id"] == token["id"], expanded
+    reconciled = job("transcript_file_job_reconcile", request=dict(project_path=attached, job_directory=directory))
+    assert reconciled["id"] == prepared["id"], reconciled
+    assert job("transcript_file_job_run", request=recognition)["state"] == "completed"
+    published = job("transcript_file_attachment_import", request=dict(recognition, project_path=attached, in_place=True))
+    assert published["attachment"]["id"] == attachment["attachments"][0]["attachment"]["id"], published
     assert Path(seq).read_bytes() == original
 
 
@@ -195,6 +247,7 @@ if __name__ == "__main__":
         shutil.copyfile(ROOT / "Tests/MPCutAppTests/Fixtures/TranscriptLifecycleProvider.py", provider)
         provider.chmod(0o755)
         (folder / "release-1").write_text("completed")
+        (folder / "release-2").write_text("completed")
         client = Client(args.helper.resolve(), "--files-only", env=dict(os.environ, MPCUT_TRANSCRIBERRR_HELPER=str(provider)))
         try:
             signal.alarm(120)

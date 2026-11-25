@@ -109,7 +109,7 @@ final class SidecarCopiesTests: XCTestCase {
                 try FileManager.default.createDirectory(at: disk, withIntermediateDirectories: false)
                 return Data([9])
             }]))
-            XCTAssertFalse(FileManager.default.fileExists(atPath: source.appendingPathExtension("cutdb").path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: source.appendingPathExtension("cutcache").path))
             XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: disk.path), [])
             XCTAssertFalse(FileManager.default.fileExists(atPath: store.url.path))
         }
@@ -134,6 +134,29 @@ final class SidecarCopiesTests: XCTestCase {
             XCTAssertEqual(try load(newer), Array(repeating: Data([1]), count: 3))
             try old.save(["fresh.thumb": Data([7])])
             XCTAssertEqual(try load(old.pinned(to: old.url)), Array(repeating: Data([1]), count: 3))
+        }
+    }
+
+    func testUpdateRecoversFromAnOlderReplicaWhenLocalPayloadIsCorrupt() throws {
+        try withCopies { source, _, _ in
+            try SidecarLocations.setMode(.media)
+            let adjacent = try AnalysisSidecar(source: source)
+            let key = "custom.section"
+            try adjacent.save([key: Data([1])])
+
+            try SidecarLocations.setMode(.project)
+            let project = try AnalysisSidecar(source: source)
+            try project.save([key: Data([2])])
+            do {
+                let db = try SidecarDatabase(project.url, writing: true)
+                try db.update("UPDATE sidecar_changes SET changed = changed + 60 WHERE name = ?", [key])
+                try db.update("UPDATE sections SET digest = zeroblob(32) WHERE name = ?", [key])
+            }
+
+            try project.save([:], updating: [key: { previous in
+                try XCTUnwrap(previous) + Data([3])
+            }])
+            XCTAssertEqual(project.pinned(to: project.url).read(key), Data([1, 3]))
         }
     }
 
@@ -263,48 +286,10 @@ final class SidecarCopiesTests: XCTestCase {
         }
     }
 
-    func testIndependentMetadataEditsAndExplicitClearsSurviveCopyReconciliation() throws {
+    func testNewAnalysisWinsOverTouchedCopyAndIdenticalSaves() throws {
         try withCopies { source, _, _ in
-            let old = try AnalysisSidecar(source: source), key = AnalysisSidecar.viewNameSectionKey
-            try old.save([key: Data(#"{"1":"A","2":"B","3":"C"}"#.utf8)])
-            try SidecarLocations.setMode(.project)
-            let project = try AnalysisSidecar(source: source)
-            try project.save(["warm": Data([1])])
-            try old.pinned(to: old.url).save([key: Data(#"{"1":"Ann","3":"C"}"#.utf8)])
-            try project.pinned(to: project.url).save([key: Data(#"{"1":"A","2":"B","3":"Chris"}"#.utf8)])
-            let expected = ["1": "Ann", "3": "Chris"]
-            func values(_ store: AnalysisSidecar) throws -> [String: String] {
-                try JSONDecoder().decode([String: String].self, from: XCTUnwrap(store.read(key)))
-            }
-            XCTAssertEqual(try values(project), expected)
-            try project.save(["another": Data([2])])
-            XCTAssertEqual(try values(project.pinned(to: project.url)), expected)
-        }
-    }
-
-    func testDatabaseFreshnessPrefersTheNewestInheritedTimeUntilAnEditIsRecorded() throws {
-        try withCopies { source, _, _ in
-            let store = try AnalysisSidecar(source: source)
-            try store.save(["old": Data([1]), "new": Data([2])])
-            let db = try SidecarDatabase(store.url, writing: true)
-            try store.validate(db)
-            try db.execute("UPDATE sidecar_changes SET changed = CASE WHEN name = 'old' THEN -100 ELSE -300 END")
-            let inherited = try store.changeTime(nil, in: db, at: store.url)
-            XCTAssertFalse(inherited.recorded)
-            XCTAssertEqual(inherited.time, 300)
-            try db.execute("UPDATE sidecar_changes SET changed = 50 WHERE name = 'old'")
-            let edited = try store.changeTime(nil, in: db, at: store.url)
-            XCTAssertTrue(edited.recorded)
-            XCTAssertEqual(edited.time, 50)
-        }
-    }
-
-    func testClearInNewLocationWinsOverTouchedLegacyFileAndIdenticalSaves() throws {
-        try withCopies { source, _, _ in
-            let old = try AnalysisSidecar(source: source), k = AnalysisSidecar.viewNameSectionKey
+            let old = try AnalysisSidecar(source: source), k = "waveform_peaks.v1.0"
             try old.save([k: Data(#"{"1":"Guest"}"#.utf8)])
-            let oldDB = try SidecarDatabase(old.url, writing: true)
-            try oldDB.execute("PRAGMA user_version = 4")
             try SidecarLocations.setMode(.disk)
             let next = try AnalysisSidecar(source: source)
             try next.save([k: Data("{}".utf8)])

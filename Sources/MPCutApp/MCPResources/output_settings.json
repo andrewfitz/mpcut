@@ -1,0 +1,230 @@
+[
+  {
+    "name": "project_editor_output_read",
+    "description": "Read the project’s effective export canvas, soundtrack, and unchecked-coverage policy.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Live project handle from project_windows_list."
+        }
+      },
+      "required": [
+        "project_handle"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "project_editor_output_set",
+    "description": "Change one or more persistent export settings in a single undoable edit. Save the open project to persist the edit to disk.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Live project handle from project_windows_list."
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operation_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Unique operation identifier. Repeat the exact request after a lost reply."
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 8192,
+          "description": "Canvas width in pixels. Use an even value."
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 8192,
+          "description": "Canvas height in pixels. Use an even value."
+        },
+        "frame_rate": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Frames per second, for example 25 or 30000/1001."
+        },
+        "background": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 16777215,
+          "description": "RGB integer in 0xRRGGBB order."
+        },
+        "audio_mode": {
+          "type": "string",
+          "enum": [
+            "program",
+            "silence",
+            "lanes",
+            "iso",
+            "follow"
+          ],
+          "description": "Soundtrack mode. Still timelines use the still soundtrack tools."
+        },
+        "audio_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1,
+          "description": "One feed ID for iso, one camera ID for follow, or mix lane IDs for lanes. Omit for program or silence."
+        },
+        "unresolved_privacy": {
+          "type": "string",
+          "enum": [
+            "stop",
+            "cover"
+          ],
+          "description": "Stop export on unchecked coverage or cover the unchecked picture."
+        }
+      },
+      "required": [
+        "project_handle",
+        "expected_revision",
+        "operation_id"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "project_file_output_read",
+    "description": "Read the project’s effective export canvas, soundtrack, and unchecked-coverage policy. Poll file_job_status_read with the returned job_id.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_path": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Fresh UUID for a distinct file job. Reuse it to retry an identical request."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/"
+        }
+      },
+      "required": [
+        "project_path",
+        "operation_id"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "project_file_output_set",
+    "description": "Change one or more persistent export settings in a single undoable edit. Supply either out_project or in_place. Poll file_job_status_read with the returned job_id.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_path": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Fresh UUID for a distinct file job. Reuse it to retry an identical request."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 8192,
+          "description": "Canvas width in pixels. Use an even value."
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 8192,
+          "description": "Canvas height in pixels. Use an even value."
+        },
+        "frame_rate": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Frames per second, for example 25 or 30000/1001."
+        },
+        "background": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 16777215,
+          "description": "RGB integer in 0xRRGGBB order."
+        },
+        "audio_mode": {
+          "type": "string",
+          "enum": [
+            "program",
+            "silence",
+            "lanes",
+            "iso",
+            "follow"
+          ],
+          "description": "Soundtrack mode. Still timelines use the still soundtrack tools."
+        },
+        "audio_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1,
+          "description": "One feed ID for iso, one camera ID for follow, or mix lane IDs for lanes. Omit for program or silence."
+        },
+        "unresolved_privacy": {
+          "type": "string",
+          "enum": [
+            "stop",
+            "cover"
+          ],
+          "description": "Stop export on unchecked coverage or cover the unchecked picture."
+        },
+        "out_project": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path for a new .cut document. Choose one destination."
+        },
+        "in_place": {
+          "type": "boolean",
+          "description": "Set true to update the original saved project."
+        }
+      },
+      "required": [
+        "project_path",
+        "operation_id"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "openWorldHint": false
+    }
+  }
+]

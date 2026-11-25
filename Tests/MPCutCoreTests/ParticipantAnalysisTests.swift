@@ -168,7 +168,10 @@ final class ParticipantAnalysisTests: XCTestCase {
                 XCTAssertEqual(($0 as? CutError)?.code, "participant_resume_mismatch")
             }
         }
-        let resumed = try ParticipantAnalysis.scan(file, options: saved.configuration.options(useSidecar: false), resuming: saved)
+        let copied = file.deletingLastPathComponent().appendingPathComponent("Copied.mov")
+        try FileManager.default.copyItem(at: file, to: copied)
+        let rebound = try saved.rebindingPendingReview(to: copied)
+        let resumed = try ParticipantAnalysis.scan(copied, options: saved.configuration.options(useSidecar: false), resuming: rebound)
         XCTAssertEqual(resumed.state, .completed)
         XCTAssertEqual(resumed.analysisIdentity, paused.analysisIdentity)
         let tracks = try XCTUnwrap(resumed.analysis?.tracks)

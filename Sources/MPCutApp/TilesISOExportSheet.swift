@@ -7,6 +7,8 @@ struct TilesISOExportSheet: View {
     let session: ProjectSession
     var recordingID: String? = nil
     var recordingName: String? = nil
+    /// The recording's file, for the Source folder starting rule.
+    var recordingURL: URL? = nil
     var openProject: (URL) -> Void = { _ in }
 
     @Environment(\.dismiss) private var dismiss
@@ -287,6 +289,7 @@ struct TilesISOExportSheet: View {
             panel.canChooseFiles = false
             panel.canChooseDirectories = true
             panel.title = "Choose an Existing ISO Delivery"
+            if let directory = startDirectory { panel.directoryURL = directory }
             ProjectPanels.present(panel, in: session.window, fromSheet: true) { accepted in
                 if accepted, let url = panel.url { export(to: url) }
             }
@@ -294,10 +297,28 @@ struct TilesISOExportSheet: View {
             let panel = NSSavePanel()
             panel.title = "Create ISO Delivery Folder"
             panel.nameFieldStringValue = URL(fileURLWithPath: recordingName).deletingPathExtension().lastPathComponent + " ISOs"
+            if let directory = startDirectory { panel.directoryURL = directory }
             ProjectPanels.present(panel, in: session.window, fromSheet: true) { accepted in
-                if accepted, let url = panel.url { export(to: url) }
+                guard accepted, let url = panel.url else { return }
+                if session.editor.preferences.exportStartFolder != .automatic {
+                    session.transcriptPaneMemory.exportFolder = url.deletingLastPathComponent()
+                }
+                export(to: url)
             }
         }
+    }
+
+    /// Settings → Export → Start export panels in. Automatic leaves the panel where AppKit opens it, as it always did.
+    private var startDirectory: URL? {
+        let preferences = session.editor.preferences
+        guard preferences.exportStartFolder != .automatic else { return nil }
+        let projectURL = session.isMulticam ? session.multicam.projectURL : session.editor.projectURL
+        return ExportStartFolder.resolve(
+            mode: preferences.exportStartFolder,
+            chosenFolder: preferences.exportStartFolderPath.isEmpty ? nil : URL(fileURLWithPath: preferences.exportStartFolderPath),
+            projectFile: projectURL.flatMap { ProjectDraft.isManaged($0) ? nil : $0 }, sourceRecording: recordingURL,
+            sessionFolder: session.transcriptPaneMemory.exportFolder, automatic: nil
+        ).directory
     }
 
     private func export(to directory: URL) {
@@ -310,11 +331,15 @@ struct TilesISOExportSheet: View {
             if session.isMulticam { try session.multicam.validateHistoryDestination(directory, includesContents: true) }
             else { try session.editor.validateHistoryDestination(directory, includesContents: true) }
             let project = session.transcript.project
+            let preferences = session.editor.preferences
             failure = nil
             progress = 0
             run(priority: .userInitiated) { token in
-                try TilesISODelivery.render(plan, project: project, document: document, to: directory,
-                                            cancelled: { token.isCancelled }) { amount in
+                // Keep the Mac awake for the whole delivery; a failure or cancel ends it as a finish does.
+                let awake = SleepPrevention(reason: "Exporting ISO movies")
+                defer { awake.end() }
+                return try TilesISODelivery.render(plan, project: project, document: document, to: directory,
+                                                   cancelled: { token.isCancelled }) { amount in
                     Task { @MainActor in
                         if self.token === token { progress = amount }
                     }
@@ -323,6 +348,10 @@ struct TilesISOExportSheet: View {
             } receive: { outcome in
                 destination = directory
                 manifest = outcome
+                ExportCompletion.shared.exportFinished(directory, title: "ISO export finished",
+                                                       reveal: preferences.revealsFinishedExport,
+                                                       notify: preferences.notifiesFinishedExport,
+                                                       playSound: preferences.playsFinishedExportSound)
             }
         } catch { failure = error.localizedDescription }
     }

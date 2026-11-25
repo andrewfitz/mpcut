@@ -198,6 +198,47 @@ final class AudioEditorTests: XCTestCase {
     }
 
     @MainActor
+    func testPauseReviewReopensUnderNewClipUUIDsAndUndoesWithoutCaches() async throws {
+        let source = try recording()
+        let saved = source.deletingPathExtension().appendingPathExtension("cut")
+        let model = EditorModel()
+        let reopened = EditorModel()
+        defer {
+            model.endSession()
+            reopened.endSession()
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: saved)
+        }
+        model.useAnalysisSidecars = false
+        reopened.useAnalysisSidecars = false
+        model.minimumPause = 0.5
+        reopened.minimumPause = 0.5
+        model.importFiles([source])
+        try await wait { model.canEdit }
+        model.scanForSilence()
+        try await wait { model.pauseAnalysisReady }
+        let pause = try XCTUnwrap(model.pausePlan.first)
+        XCTAssertTrue(model.setPauseRetainedDuration(0.375, for: pause.key))
+        XCTAssertTrue(model.addTakeBoundary(at: 0.5))
+        model.seek(1.5)
+        model.protectCurrentPause()
+        try model.writeProject(to: saved)
+        let project = try CutProject.load(from: saved)
+        XCTAssertEqual(project.analysisAnnotations.pauseReviews.count, 3)
+        try reopened.openProject(try XCTUnwrap(project.sequenceClips), at: saved)
+        try await wait { reopened.canEdit }
+        reopened.scanForSilence()
+        try await wait { reopened.pauseAnalysisReady }
+        XCTAssertEqual(reopened.pausePlan.first?.key.span, pause.key.span)
+        XCTAssertEqual(reopened.pausePlan.first?.isProtected, true)
+        XCTAssertEqual(reopened.pausePlan.first?.requestedRetainedSeconds, 0.375)
+        XCTAssertTrue(reopened.takeCandidates.contains { $0.hasManualStart && $0.range.from == .init(numerator: 1, denominator: 2) })
+        reopened.undo()
+        try await wait { reopened.pauseAnalysisReady && reopened.pausePlan.first?.isProtected == false }
+        XCTAssertEqual(reopened.pausePlan.first?.requestedRetainedSeconds, 0.375)
+    }
+
+    @MainActor
     func testUndoRestoresCompletedPausesAfterDeletingLastOccurrence() async throws {
         let url = try recording()
         defer { try? FileManager.default.removeItem(at: url) }

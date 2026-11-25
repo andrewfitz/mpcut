@@ -1356,6 +1356,10 @@ MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only,
     int status = AVERROR(ENOMEM);
     if (!file)
         goto fail;
+    if (cancelled && cancelled(context)) {
+        status = AVERROR_EXIT;
+        goto fail;
+    }
     file->interrupt_callback = (AVIOInterruptCB){.callback = cancelled, .opaque = context};
     status = avformat_open_input(&file, path, NULL, NULL);
     if (status < 0)
@@ -1438,6 +1442,10 @@ MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only,
         goto fail;
     }
     if (preview_only) {
+        if (cancelled && cancelled(context)) {
+            status = AVERROR_EXIT;
+            goto fail;
+        }
         // Use declared timing for an early preview. The full scan determines
         // the edit duration and verified boundaries independently.
         const AVStream *video = file->streams[primary];
@@ -1549,6 +1557,10 @@ MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only,
         result->source_start_safe = 1;
     }
     capture_source_stamp(file, result, primary);
+    if (cancelled && cancelled(context)) {
+        status = AVERROR_EXIT;
+        goto fail;
+    }
     av_packet_free(&packet);
     mp_probe_evidence_free(evidence);
     avformat_close_input(&file);

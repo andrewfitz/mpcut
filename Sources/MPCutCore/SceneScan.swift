@@ -45,6 +45,19 @@ public struct SceneScanOutcome: Encodable, Sendable {
     public let state: State
     public let report: SceneReport?
     public let progress: SceneScanProgress
+
+    private enum CodingKeys: String, CodingKey {
+        case state, report, progress
+        case reportID = "report_id"
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var fields = encoder.container(keyedBy: CodingKeys.self)
+        try fields.encode(state, forKey: .state)
+        try fields.encodeIfPresent(report, forKey: .report)
+        try fields.encode(progress, forKey: .progress)
+        try fields.encodeIfPresent(report?.reviewID(scope: progress.requested), forKey: .reportID)
+    }
 }
 
 private struct SceneScanKey: Hashable, Sendable {
@@ -70,7 +83,6 @@ private struct SceneCheckpoint: Codable {
     let layouts: Data
     let decoded: RationalTime?
     let confirmed: RationalTime?
-    var names: [Int: String]? = nil
     var leading: SceneStart? = nil
 }
 
@@ -112,24 +124,9 @@ public final class SceneScanSession: @unchecked Sendable {
     fileprivate var completed: [SceneScanKey: SceneScanRecord] = [:]
     fileprivate var partial: [SceneScanKey: SceneScanRecord] = [:]
     fileprivate var operations: [SceneScanKey: [String: SceneScanRecord]] = [:]
-    fileprivate var editedNames: [SceneScanKey: [Int: String?]] = [:]
     private var recent: [SceneScanKey] = []
 
     public init() {}
-
-    package func setViewName(_ name: String?, view: Int, for media: MediaInfo) {
-        guard let request = try? SceneRequest(media, scope: .fullSource) else { return }
-        lock.lock()
-        defer { lock.unlock() }
-        discardCleared(request.key)
-        touch(request.key)
-        editedNames[request.key, default: [:]].updateValue(name, forKey: view)
-        if var record = completed[request.key], let outcome = record.outcome, var report = outcome.report {
-            report.setViewName(name, for: view)
-            record.outcome = SceneScanOutcome(state: outcome.state, report: report, progress: outcome.progress)
-            completed[request.key] = record
-        }
-    }
 
     fileprivate func touch(_ key: SceneScanKey) {
         recent.removeAll { $0 == key }
@@ -139,7 +136,6 @@ public final class SceneScanSession: @unchecked Sendable {
             completed.removeValue(forKey: expired)
             partial.removeValue(forKey: expired)
             operations.removeValue(forKey: expired)
-            editedNames.removeValue(forKey: expired)
         }
     }
 
@@ -152,7 +148,6 @@ public final class SceneScanSession: @unchecked Sendable {
         guard !cleared.isEmpty else { return }
         if let epoch = completed[key]?.cacheEpoch, cleared.contains(epoch) {
             completed.removeValue(forKey: key)
-            editedNames.removeValue(forKey: key)
         }
         if let epoch = partial[key]?.cacheEpoch, cleared.contains(epoch) { partial.removeValue(forKey: key) }
         operations[key] = operations[key]?.filter { $0.value.cacheEpoch.map(cleared.contains) != true }
@@ -172,27 +167,29 @@ private struct SceneRequest: Sendable {
     let endPTS: Int64
     let key: SceneScanKey
 
-    // The unqualified scenes_boundaries.v1 and scenes_view_names.v1 sections use the ordinary
+    // The unqualified scenes_boundaries.v1 section uses the ordinary
     // file clock. Shifted clocks persist through their scoped attempts.
     var usesCanonicalReport: Bool { scope == .fullSource && media.multicamClockOffset == .zero }
 
-    init(_ media: MediaInfo, scope: SceneScanScope) throws {
+    init(_ media: MediaInfo, scope: SceneScanScope, reviewedClock: SceneReport? = nil) throws {
         self.media = media
         self.scope = scope
         guard let video = media.videoStream, video.timeBase.numerator > 0 else {
             throw CutError(code: "no_video", message: "Scene detection requires a video track.")
         }
+        let duration = reviewedClock?.duration ?? media.duration
+        let origin = reviewedClock?.origin ?? media.origin
         switch scope {
-        case .fullSource: (start, end) = (.zero, media.duration)
+        case .fullSource: (start, end) = (.zero, duration)
         case let .range(start, end): (self.start, self.end) = (start, end)
         }
-        guard start >= .zero, end > start, end <= media.duration else {
+        guard start >= .zero, end > start, end <= duration else {
             throw CutError(code: "invalid_scene_range", message: "The scene interval must be within the video source.")
         }
 
         let inverse = RationalTime(numerator: video.timeBase.denominator, denominator: video.timeBase.numerator)
         func firstTick(at time: RationalTime) throws -> Int64 {
-            let ticks = try time.adding(media.origin).multiplied(by: inverse)
+            let ticks = try time.adding(origin).multiplied(by: inverse)
             let whole = ticks.numerator / ticks.denominator
             return whole + (ticks.numerator % ticks.denominator > 0 ? 1 : 0)
         }
@@ -222,7 +219,7 @@ private struct SceneRequest: Sendable {
                                  fraction: complete ? 1 : min(0.999, max(0, ratio)), persistenceError: error)
     }
 
-    func report(_ markers: [SceneStart], names: [Int: String] = [:]) -> SceneReport {
+    func report(_ markers: [SceneStart]) -> SceneReport {
         var members: [Int: [Int]] = [:]
         let scenes = markers.enumerated().map { index, marker in
             let number = index + 1
@@ -233,7 +230,7 @@ private struct SceneRequest: Sendable {
                                  view: marker.view, viewLabel: SceneView.label(for: marker.view))
         }
         let views = members.keys.sorted().map { view in
-            SceneView(view: view, label: SceneView.label(for: view), sceneNumbers: members[view] ?? [], name: names[view])
+            SceneView(view: view, label: SceneView.label(for: view), sceneNumbers: members[view] ?? [], name: nil)
         }
         return SceneReport(file: media.url.standardizedFileURL.path, sourceStamp: SceneSourceStamp(media: media),
                            timeBase: media.video.timeBase, origin: media.origin, duration: media.duration,
@@ -259,7 +256,7 @@ private struct SceneRequest: Sendable {
         let syntheticLeading = first < limit && (report.scenes[first].start < start || (first == 0 && report.syntheticLeading))
         return SceneReport(file: media.url.standardizedFileURL.path, sourceStamp: report.sourceStamp, timeBase: report.timeBase,
                            origin: report.origin, duration: report.duration, scenes: scenes,
-                           viewCount: views.count, views: views,
+                           sourceEvidence: report.sourceEvidence, viewCount: views.count, views: views,
                            syntheticLeading: syntheticLeading)
     }
 
@@ -359,6 +356,12 @@ extension SceneAnalysis {
         try run(media, scope: scope, policy: policy, useSidecar: useSidecar, session: session,
                 allowAutomaticSave: allowAutomaticSave, cancelled: cancelled,
                 progress: progress, onScene: onScene, onReset: onReset, verifiedClock: nil)
+    }
+
+    package static func reviewed(_ report: SceneReport, media: MediaInfo,
+                                 scope: SceneScanScope) throws -> SceneScanOutcome {
+        try checkSnapshot(media)
+        return try SceneRequest(media, scope: scope, reviewedClock: report).cached(report, durable: true)
     }
 
     private static func run(_ media: MediaInfo, scope: SceneScanScope,
@@ -488,7 +491,7 @@ extension SceneAnalysis {
         session.lock.unlock()
         if let local { return local }
         guard let snapshot = cache?.sceneAttempt(scope: request.key.scope, completed: false),
-              let stored = decode(snapshot, operationID: nil), let checkpoint = stored.checkpoint else { return nil }
+              let stored = decode(snapshot), let checkpoint = stored.checkpoint else { return nil }
         return SceneScanOutcome(state: .paused, report: nil,
                                 progress: request.progress(decoded: checkpoint.decoded, confirmed: checkpoint.confirmed,
                                                            durable: checkpoint.decoded))
@@ -612,21 +615,18 @@ extension SceneAnalysis {
         if current != nil || session.partial[request.key] != nil { session.touch(request.key) }
         let fullRecord = fullRequest.flatMap { session.completed[$0.key] }
         let full = fullRecord?.outcome
-        let hasLocalNames = fullRequest.map { !(session.editedNames[$0.key] ?? [:]).isEmpty } ?? false
         session.lock.unlock()
-        // Keep an intentional session-only restart or rename ahead of an older
-        // disk report. A plain in-memory scan can still acquire saved names.
+        // Keep a session-only restart ahead of an older disk report.
         if let current, let report = current.report, current.progress.durable != request.end,
-           cache == nil || currentRecord?.operationID != nil || hasLocalNames {
+           cache == nil || currentRecord?.operationID != nil {
             return SceneScanOutcome(state: .upToDate, report: report.forSource(request.media.url), progress: current.progress)
         }
 
         func storedReport(_ owner: SceneRequest) -> SceneScanOutcome? {
             guard let cache, let snapshot = cache.sceneAttempt(scope: owner.key.scope, completed: true),
-                  let stored = decode(snapshot, operationID: nil) else { return nil }
-            var report = owner.report(stored.reportMarkers, names: stored.checkpoint?.names ?? [:])
+                  let stored = decode(snapshot) else { return nil }
+            let report = owner.report(stored.reportMarkers)
             if owner.usesCanonicalReport {
-                report = cache.restoringViewNames(to: report, cancelled: { false })
                 if allowRepair, let sections = try? AnalysisSidecar.sceneSections(for: report) {
                     try? cache.repairCanonicalSceneReport(scope: owner.key.scope, expectedCheckpoint: snapshot.checkpoint,
                                                          sections: sections)
@@ -639,23 +639,17 @@ extension SceneAnalysis {
             if let current, let report = current.report { return request.cached(report, durable: current.progress.durable != nil) }
         }
         if let full, let report = full.report, full.progress.durable != request.media.duration,
-           cache == nil || fullRecord?.operationID != nil || hasLocalNames {
+           cache == nil || fullRecord?.operationID != nil {
             return request.cached(report, durable: false)
         }
         if let report = cache?.sceneReport(for: request.media) { return request.cached(report, durable: true) }
         if let full, let report = full.report {
-            let restored = fullRequest?.usesCanonicalReport == true
-                ? cache?.restoringViewNames(to: report, cancelled: { false }) ?? report : report
-            if allowRepair, restored.views.map(\.name) != report.views.map(\.name) {
-                // Rebuild the canonical report before a subsequent metadata edit.
-                return nil
-            }
-            return request.cached(restored, durable: full.progress.durable != nil)
+            return request.cached(report, durable: full.progress.durable != nil)
         }
         return fullRequest.flatMap(storedReport)
     }
 
-    private static func decode(_ snapshot: SceneAttemptSnapshot, operationID: String?) -> SceneScanRecord? {
+    private static func decode(_ snapshot: SceneAttemptSnapshot) -> SceneScanRecord? {
         let decoder = JSONDecoder()
         guard let checkpoint = try? decoder.decode(SceneCheckpoint.self, from: snapshot.checkpoint) else { return nil }
         var markers: [SceneStart] = []
@@ -668,7 +662,7 @@ extension SceneAnalysis {
               (checkpoint.leading.map { [$0] } ?? []).allSatisfy({ $0.view > 0 && $0.view <= checkpoint.layouts.count / count }),
               markers.allSatisfy({ $0.view > 0 && $0.view <= checkpoint.layouts.count / count }),
               zip(markers, markers.dropFirst()).allSatisfy({ $0.time < $1.time }) else { return nil }
-        return SceneScanRecord(operationID: operationID, checkpoint: checkpoint, markers: markers,
+        return SceneScanRecord(operationID: snapshot.operationID, checkpoint: checkpoint, markers: markers,
                                durableCheckpointDigest: SHA256.hash(data: snapshot.checkpoint))
     }
 }
@@ -763,7 +757,7 @@ extension SceneAnalysis {
 
         session.lock.lock()
         session.discardCleared(request.key)
-        let operation: String?
+        var operation: String?
         let local: SceneScanRecord?
         if case let .restart(operationID) = policy {
             operation = operationID
@@ -805,7 +799,7 @@ extension SceneAnalysis {
                         if let snapshot = cache.sceneAttempt(scope: request.key.scope, completed: false,
                                                              afterCoverage: followed?.coverage,
                                                              followedAttempt: followed?.id, followedFence: followed?.fence),
-                           let record = decode(snapshot, operationID: operation) {
+                           let record = decode(snapshot) {
                             let reset = followed.map { $0.id != snapshot.attemptID || $0.coverage > snapshot.coveredThrough } == true
                                 || !record.markers.starts(with: observedMarkers)
                             followed = (snapshot.attemptID, snapshot.fence, snapshot.coveredThrough)
@@ -820,7 +814,7 @@ extension SceneAnalysis {
                 } while claim == nil
                 if let claim {
                     cacheEpoch = cache.pinned(to: claim.database).clearEpoch
-                    stored = cache.sceneAttempt(claim).flatMap { decode($0, operationID: operation) }
+                    stored = cache.sceneAttempt(claim).flatMap { decode($0) }
                     if claim.superseded {
                         throw CutError(code: "operation_superseded", message: "This restart was superseded by a newer scene scan.")
                     }
@@ -828,7 +822,7 @@ extension SceneAnalysis {
                         guard let stored else {
                             throw CutError(code: "invalid_sidecar_analysis", message: "The completed scene checkpoint cannot be read.")
                         }
-                        let ownReport = request.report(stored.reportMarkers, names: stored.checkpoint?.names ?? [:])
+                        let ownReport = request.report(stored.reportMarkers)
                         let report = operation == nil && request.scope == .fullSource
                             ? (cache.sceneReport(for: request.media) ?? ownReport) : ownReport
                         let outcome = request.cached(report, durable: true)
@@ -854,10 +848,11 @@ extension SceneAnalysis {
         // separate from the work that continues in memory.
         if claim == nil, stored == nil, operation == nil,
            let snapshot = cache?.sceneAttempt(scope: request.key.scope, completed: false),
-           let record = decode(snapshot, operationID: nil) {
+           let record = decode(snapshot) {
             stored = record
             durable = record.checkpoint?.decoded
         }
+        if operation == nil { operation = stored?.operationID }
 
         if policy == .resume, stored == nil, local == nil,
            let cached = cachedResult(request, cache: cache, session: session, policy: .reuse) {
@@ -908,9 +903,6 @@ extension SceneAnalysis {
                 var sections: [String: Data] = [:]
                 if let report, request.usesCanonicalReport {
                     sections = try AnalysisSidecar.sceneSections(for: report)
-                    if !(checkpoint.names ?? [:]).isEmpty || cache.read(AnalysisSidecar.viewNameSectionKey) != nil {
-                        sections.merge(try AnalysisSidecar.viewNameSections(checkpoint.names ?? [:], for: report)) { _, new in new }
-                    }
                 }
                 if let clockToSave { sections[AnalysisSidecar.sceneClockKey] = clockToSave }
                 let coverage = report == nil ? checkpoint.decoded : request.end
@@ -977,41 +969,7 @@ extension SceneAnalysis {
         guard paused || (status == 0 && !record.reportMarkers.isEmpty) else {
             throw CutError(code: "scene_analysis_failed", message: "Could not analyze this video. " + message)
         }
-        var report: SceneReport?
-        if !paused {
-            session.lock.lock()
-            let previousComplete = session.completed[request.key]
-            let editedNames = session.editedNames[request.key] ?? [:]
-            session.lock.unlock()
-            var names: [Int: String] = [:]
-            let previousStored = cache?.sceneAttempt(scope: request.key.scope, completed: true).flatMap { decode($0, operationID: nil) }
-            let canonical = request.usesCanonicalReport ? cache?.sceneReport(for: request.media) : nil
-            let oldReport = canonical ?? previousComplete?.outcome?.report
-            var oldNames = oldReport.map { report in
-                Dictionary(uniqueKeysWithValues: report.views.compactMap { view in view.name.map { (view.view, $0) } })
-            } ?? previousStored?.checkpoint?.names ?? [:]
-            for (view, name) in editedNames { oldNames[view] = name }
-            if let oldLayouts = previousStored?.checkpoint?.layouts ?? previousComplete?.checkpoint?.layouts,
-               let newLayouts = record.checkpoint?.layouts {
-                let stride = Int(MP_SCENE_FEATURE_SIZE)
-                for (view, name) in oldNames {
-                    guard view > 0, view <= min(oldLayouts.count, newLayouts.count) / stride else { continue }
-                    let start = (view - 1) * stride
-                    let end = start + stride
-                    guard oldLayouts[start..<end].elementsEqual(newLayouts[start..<end]) else { continue }
-                    names[view] = name
-                }
-            }
-            var completed = request.report(record.reportMarkers, names: names)
-            if request.usesCanonicalReport, let cache, operation == nil, canonical == nil {
-                completed = cache.restoringViewNames(to: completed, cancelled: { false })
-                names = Dictionary(uniqueKeysWithValues: completed.views.compactMap { view in
-                    view.name.map { (view.view, $0) }
-                })
-            }
-            record.checkpoint?.names = names
-            report = completed
-        }
+        let report = paused ? nil : request.report(record.reportMarkers)
         save(record, report: report, release: paused)
         if let invalidated { throw invalidated }
         try checkSnapshot(request.media)
@@ -1028,7 +986,6 @@ extension SceneAnalysis {
         else {
             session.completed[request.key] = record
             session.partial.removeValue(forKey: request.key)
-            session.editedNames.removeValue(forKey: request.key)
         }
         if let operation {
             var operations = session.operations[request.key] ?? [:]
@@ -1070,7 +1027,7 @@ extension SceneAnalysis {
                 }
                 defer { try? cache.releaseSceneAttempt(claim) }
                 let encoder = JSONEncoder()
-                let existing = cache.sceneAttempt(claim).flatMap { decode($0, operationID: record.operationID) }
+                let existing = cache.sceneAttempt(claim).flatMap { decode($0) }
                 let markers = existing?.markers ?? []
                 let isPrefix = record.markers.starts(with: markers)
                 let matchesCheckpoint = existing == nil || existing?.durableCheckpointDigest == record.durableCheckpointDigest

@@ -42,13 +42,12 @@ func press(_ control: AXUIElement, _ label: String) throws {
 
 guard AXIsProcessTrusted() else { exit(77) }
 let arguments = Array(CommandLine.arguments.dropFirst())
-guard arguments.count == 2, let pid = pid_t(arguments[0]), let app = NSRunningApplication(processIdentifier: pid) else {
+guard arguments.count == 2, let pid = pid_t(arguments[0]), NSRunningApplication(processIdentifier: pid) != nil else {
     fputs("Usage: rebind_transcript.swift PID OFFSET\n", stderr)
     exit(2)
 }
 let root = AXUIElementCreateApplication(pid)
 do {
-    app.activate(options: [])
     let window: AXUIElement = try waitFor("focused MPCut project") { read(root, "AXFocusedWindow") }
     if find("transcript.import", under: window) == nil && find("Import Transcript…", under: window) == nil {
         try press(try waitFor("Transcript toolbar button") { find("Transcript", under: window, role: "AXButton") }, "Transcript")

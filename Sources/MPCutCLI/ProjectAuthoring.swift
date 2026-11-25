@@ -77,7 +77,7 @@ func saveEditedProject(_ candidate: CutProject, source: URL, destination: URL, a
         next = []
     }
     do {
-        try project.saveNewCopy(to: destination, copyingTranscriptsFrom: source,
+        try project.saveNewCopy(to: destination,
                                 undo: old.map(copyState), redo: next.map(copyState),
                                 mediaSnapshot: mediaSnapshot.rebased(from: source, to: destination),
                                 beforePublish: validateSources, check: interruption.check)
@@ -103,6 +103,8 @@ func authorProject(data: Data, creating: Bool, interruption: Interruption) throw
     try requireNewProject(destination)
     let location: URL
     var original: CutProject?
+    var reviewedRevision: String?
+    var reviewedDiskRevision: ProjectDiskRevision?
     var undo: [CutHistoryState] = [], redo: [CutHistoryState] = []
     var project: CutProject
     var mediaSnapshot = ProjectMediaSnapshot.empty
@@ -158,9 +160,19 @@ func authorProject(data: Data, creating: Bool, interruption: Interruption) throw
         default: throw CLIError("invalid_arguments", "Choose sequence or multicam.")
         }
     } else {
-        try fields.check("project_path", "out_project", "operations")
+        try fields.check("project_path", "out_project", "operations", "project_revision")
         location = try fileURL(fields.string("project_path"), label: "Project")
         let loaded = try CutProject.loadEditorDocument(from: location, limit: CutProject.maximumHistorySteps)
+        if object["project_revision"] != nil {
+            guard case .multicam(let saved) = loaded.project else {
+                throw CLIError("invalid_arguments", "A switch proposal revision requires a saved multicam project.")
+            }
+            reviewedRevision = try fields.string("project_revision")
+            try TileSwitches.verifyRevision(reviewedRevision, in: saved)
+        }
+        if reviewedRevision != nil || operations.contains(where: { $0["project_revision"] != nil }) {
+            reviewedDiskRevision = loaded.media.diskRevision
+        }
         try loaded.media.validateDestination(destination, relativeTo: location)
         original = loaded.project
         project = loaded.project
@@ -175,7 +187,8 @@ func authorProject(data: Data, creating: Bool, interruption: Interruption) throw
         let edit = EditFields(values: operations[index])
         let action = try edit.string("action")
         if case .multicam(var multicam) = project {
-            try editMulticam(&multicam, action: action, edit: edit, inspect: inspectMulticam, location: location)
+            try editMulticam(&multicam, action: action, edit: edit, inspect: inspectMulticam, location: location,
+                             reviewedRevision: reviewedRevision)
             project = .multicam(multicam)
         } else if action == "append" {
             // Validate consecutive appends in one timeline pass.
@@ -209,6 +222,11 @@ func authorProject(data: Data, creating: Bool, interruption: Interruption) throw
             guard snapshot.isCurrentSnapshot(at: url) else {
                 throw CutError(code: "source_changed", message: "The source changed during project authoring: " + url.path)
             }
+        }
+        if let reviewedDiskRevision {
+            try interruption.check()
+            do { try reviewedDiskRevision.checkCurrent(at: location) }
+            catch { throw TileSwitches.stale() }
         }
     }
     return .init(projectPath: destination.path, operationCount: operations.count)
@@ -280,7 +298,7 @@ private func editSequence(_ project: CutProject, action: String, edit: EditField
 }
 
 private func editMulticam(_ project: inout MulticamProject, action: String, edit: EditFields,
-                          inspect: (URL) throws -> MediaInfo, location: URL) throws {
+                          inspect: (URL) throws -> MediaInfo, location: URL, reviewedRevision: String?) throws {
     func requireAudioStream(_ selection: MulticamAudioSelection) throws {
         guard let source = project.sources.first(where: { $0.id == selection.source }),
               try inspect(CutProject.checkedMediaURL(source.file, relativeTo: location))
@@ -290,6 +308,72 @@ private func editMulticam(_ project: inout MulticamProject, action: String, edit
     }
 
     switch action {
+    case "camera_offset_set", "camera_rename", "camera_microphone_set":
+        let id = try edit.string("source_id")
+        guard let source = project.sources.first(where: { $0.id == id }) else {
+            throw CLIError("invalid_target", "Choose an existing source.")
+        }
+        switch action {
+        case "camera_offset_set":
+            try edit.check("action", "source_id", "offset")
+            guard source.feedAngle == nil else {
+                throw CLIError("invalid_target", "Set the offset on the feed angle's physical recording.")
+            }
+            let offset = try edit.time("offset")
+            try project.updateSource(id) { $0.offset = offset }
+        case "camera_rename":
+            try edit.check("action", "source_id", "name")
+            guard let name = edit.values["name"] as? String else {
+                throw CLIError("invalid_arguments", "Supply a name string. Use an empty string to restore a physical source's default name.")
+            }
+            try project.renameSource(id, to: name)
+        default:
+            try edit.check("action", "source_id", "audio_stream_index")
+            guard source.feedAngle == nil, project.pictureSources.contains(where: { $0.id == id }) else {
+                throw CLIError("invalid_target", "Choose a physical camera recording.")
+            }
+            let stream = try edit.values["audio_stream_index"].map { _ in try edit.stream("audio_stream_index") }
+            if let stream { try requireAudioStream(.init(source: id, stream: stream)) }
+            try project.updateSource(id) { $0.audioStream = stream }
+        }
+        project.syncFeedAngleRecordings()
+        return try project.validate()
+    case "camera_move":
+        try edit.check("action", "angle_id", "to_index")
+        let id = try edit.string("angle_id")
+        guard let index = project.angles.firstIndex(where: { $0.id == id }) else {
+            throw CLIError("invalid_target", "Choose an existing camera angle.")
+        }
+        let destination = try edit.index("to_index", count: project.angles.count)
+        let camera = project.angles.remove(at: index)
+        project.angles.insert(camera, at: destination)
+        return try project.validate()
+    case "group_end_set":
+        try edit.check("action", "to")
+        project.range.to = try edit.time("to")
+        return try project.validate()
+    case "switch_audio_set", "switch_audio_clear":
+        if action == "switch_audio_set" { try edit.check("action", "at", "source_id", "audio_stream_index") }
+        else { try edit.check("action", "at") }
+        let at = try edit.time("at")
+        guard let index = project.switches.firstIndex(where: { $0.at == at }) else {
+            throw CLIError("invalid_target", "Choose an existing switch at that group time.")
+        }
+        if action == "switch_audio_set" {
+            let selection = try MulticamAudioSelection(source: edit.string("source_id"), stream: edit.stream("audio_stream_index"))
+            try requireAudioStream(selection)
+            project.switches[index].audio = selection
+        } else {
+            project.switches[index].audio = nil
+        }
+        return try project.validate()
+    case "voice_angle_set", "voice_angle_clear":
+        if action == "voice_angle_set" { try edit.check("action", "attachment_id", "speaker_id", "angle_id") }
+        else { try edit.check("action", "attachment_id", "speaker_id") }
+        let voice = try ParticipantSpeakerBinding(attachmentID: edit.string("attachment_id"), speakerID: edit.string("speaker_id"))
+        let angle = action == "voice_angle_set" ? try edit.string("angle_id") : nil
+        try project.setSpeakerAngle(angle, for: voice, documentURL: location)
+        return try project.validate()
     case "audio_set":
         let mode = try edit.string("mode")
         if mode == "replace" {
@@ -408,14 +492,19 @@ private func editMulticam(_ project: inout MulticamProject, action: String, edit
     }
     if action == "switch_set" || action == "switch_remove" {
         let at = try edit.time("at")
+        if action == "switch_set" { try edit.check("action", "at", "angle_id", "project_revision") }
+        else { try edit.check("action", "at", "project_revision") }
+        if edit.values["project_revision"] != nil {
+            let revision = try edit.string("project_revision")
+            if let reviewedRevision {
+                guard reviewedRevision == revision else { throw TileSwitches.stale() }
+            } else {
+                try TileSwitches.verifyRevision(revision, in: project)
+            }
+        }
         if action == "switch_set" {
-            try edit.check("action", "at", "angle_id", "project_revision")
-            let angle = try edit.string("angle_id")
-            let revision = edit.values["project_revision"] == nil ? nil : try edit.string("project_revision")
-            try TileSwitches.verifyRevision(revision, in: project)
-            project = try project.settingSwitch(at: at, angle: angle)
+            project = try project.settingSwitch(at: at, angle: edit.string("angle_id"))
         } else {
-            try edit.check("action", "at")
             guard let index = project.switches.firstIndex(where: { $0.at == at }), index > 0 else {
                 throw CLIError("invalid_target", "Choose an existing switch after the opening switch.")
             }
@@ -430,11 +519,21 @@ private func editMulticam(_ project: inout MulticamProject, action: String, edit
         if action == "append" { try edit.check("action", "from", "to") }
         else { try edit.check("action", "index", "from", "to") }
         let range = try MulticamRange(from: edit.time("from"), to: edit.time("to"))
-        if action == "append" { items.append(.group(range)) }
-        else {
+        if action == "append" {
+            if project.assemblyItems == nil {
+                project.replaceAssembly(items, carryingPauseReviewsFrom: [0])
+                items = project.assemblyItems ?? items
+            }
+            items.append(.group(range))
+        } else {
             let index = try edit.index("index", count: items.count)
-            guard items[index].group != nil else { throw CLIError("invalid_target", "Choose a group occurrence.") }
-            items[index] = .group(range, angle: items[index].angleOverride)
+            guard let current = items[index].group else { throw CLIError("invalid_target", "Choose a group occurrence.") }
+            guard current != range else { return }
+            if project.assemblyItems == nil {
+                project.replaceAssembly(items, carryingPauseReviewsFrom: [0])
+                items = project.assemblyItems ?? items
+            }
+            items[index] = items[index].trimmingGroup(to: range)
         }
     case "remove":
         try edit.check("action", "index")
@@ -456,11 +555,15 @@ private func editMulticam(_ project: inout MulticamProject, action: String, edit
         guard let range = items[index].group, range.from < at, at < range.to else {
             throw CLIError("invalid_range", "Split inside the selected group occurrence.")
         }
-        let angle = items[index].angleOverride
+        let item = items[index]
+        var origin = Array(items.indices)
+        origin.insert(index, at: index + 1)
         items.replaceSubrange(index...index, with: [
-            .group(.init(from: range.from, to: at), angle: angle),
-            .group(.init(from: at, to: range.to), angle: angle)
+            item.groupPiece(.init(from: range.from, to: at), to: at),
+            item.groupPiece(.init(from: at, to: range.to), from: at, keepingID: false)
         ])
+        project.replaceAssembly(items, carryingPauseReviewsFrom: origin)
+        return try project.validate()
     case "angle_set", "angle_clear":
         if action == "angle_set" { try edit.check("action", "index", "angle_id") }
         else { try edit.check("action", "index") }
@@ -468,7 +571,11 @@ private func editMulticam(_ project: inout MulticamProject, action: String, edit
         guard let range = items[index].group else { throw CLIError("invalid_target", "Choose a group occurrence.") }
         let angle = action == "angle_set" ? try edit.string("angle_id") : nil
         guard angle != items[index].angleOverride else { return }
-        items[index] = .group(range, angle: angle)
+        items[index] = .group(range, angle: angle, id: items[index].occurrenceID, layouts: items[index].tileLayouts)
+        if project.assemblyItems == nil {
+            project.replaceAssembly(items, carryingPauseReviewsFrom: [0])
+            return try project.validate()
+        }
     default: throw CLIError("invalid_arguments", "Unknown multicam action " + action)
     }
     guard !items.isEmpty else { throw CLIError("empty_edit", "Retain at least one assembly item.") }

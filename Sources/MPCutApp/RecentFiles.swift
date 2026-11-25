@@ -4,13 +4,23 @@ import SwiftUI
 @MainActor
 final class RecentFiles: ObservableObject {
     private static let key = "recent_file_paths"
-    private static let limit = 10
     private let defaults: UserDefaults?
+    /// Settings → General → Recent items.
+    private(set) var limit: Int
     @Published private(set) var urls: [URL]
 
-    init(defaults: UserDefaults?) {
+    init(defaults: UserDefaults?, limit: Int = 10) {
         self.defaults = defaults
-        urls = (defaults?.stringArray(forKey: Self.key) ?? []).prefix(Self.limit).map { URL(fileURLWithPath: $0) }
+        self.limit = max(1, limit)
+        urls = (defaults?.stringArray(forKey: Self.key) ?? []).prefix(max(1, limit)).map { URL(fileURLWithPath: $0) }
+    }
+
+    /// A lower limit trims the list. `persisting` false trims only what the menu shows.
+    func applyLimit(_ newLimit: Int, persisting: Bool) {
+        limit = max(1, newLimit)
+        guard urls.count > limit else { return }
+        let trimmed = Array(urls.prefix(limit))
+        if persisting { update(trimmed) } else { urls = trimmed }
     }
 
     func record(_ files: [URL]) {
@@ -19,7 +29,7 @@ final class RecentFiles: ObservableObject {
         for file in files + urls where file.isFileURL {
             let url = file.standardizedFileURL
             if seen.insert(url).inserted { recent.append(url) }
-            if recent.count == Self.limit { break }
+            if recent.count == limit { break }
         }
         update(recent)
     }

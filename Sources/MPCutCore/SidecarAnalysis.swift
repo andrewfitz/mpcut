@@ -204,7 +204,7 @@ private struct CachedScenes: Codable, Equatable {
         markers = report.scenes.map { Marker(pts: $0.startPTS, view: $0.view) }
     }
 
-    func report(source: URL, identity: SourceIdentity, names: [Int: String], cancelled: () -> Bool) throws -> SceneReport? {
+    func report(source: URL, identity: SourceIdentity, cancelled: () -> Bool) throws -> SceneReport? {
         guard timeBase > .zero, duration > .zero, !markers.isEmpty else { return nil }
         var groups: [[Int]] = []
         var labels: [String] = []
@@ -231,9 +231,8 @@ private struct CachedScenes: Codable, Equatable {
         }
         let views = groups.indices.map { index in
             let id = index + 1
-            let name = names[id]?.trimmingCharacters(in: .whitespacesAndNewlines)
             return SceneView(view: id, label: labels[index], sceneNumbers: groups[index],
-                             name: name?.isEmpty == false ? name : nil)
+                             name: nil)
         }
         return SceneReport(file: source.path, sourceStamp: SceneSourceStamp(identity: identity),
                            timeBase: timeBase, origin: origin, duration: duration, scenes: scenes,
@@ -275,7 +274,6 @@ private func valid(_ result: SilenceAnalysisResult, duration: RationalTime, canc
 extension AnalysisSidecar {
     // Revise these together when detection can change marker timing or view IDs.
     public static let sceneSectionKey = "scenes_boundaries.v1"
-    public static let viewNameSectionKey = "scenes_view_names.v1"
 
     public static func savedSilenceSettings(forKey key: String) -> (stream: Int, thresholdDB: Double?, minimum: Double)? {
         let parts = key.split(separator: ".", omittingEmptySubsequences: false)
@@ -313,35 +311,6 @@ extension AnalysisSidecar {
         return [sceneSectionKey: try JSONEncoder().encode(CachedScenes(report))]
     }
 
-    /// Names use source-local view IDs. Saving an empty map also clears
-    /// earlier names when the user has restored all defaults.
-    public static func viewNameSections(_ names: [Int: String], for report: SceneReport) throws -> [String: Data] {
-        [viewNameSectionKey: try viewNameData(names, for: report)]
-    }
-
-    public static func viewNameData(_ names: [Int: String], for report: SceneReport) throws -> Data {
-        guard names.keys.allSatisfy({ $0 > 0 && $0 <= report.viewCount }) else {
-            throw CutError(code: "invalid_sidecar_analysis", message: "The view names refer to a different scene report.")
-        }
-        let cleaned = names.mapValues { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                           .filter { !$0.value.isEmpty }
-        return try JSONEncoder().encode(cleaned)
-    }
-
-    private func viewNames(read: (String) -> Data?) -> [Int: String]? {
-        guard let data = read(Self.viewNameSectionKey) else { return nil }
-        return try? JSONDecoder().decode([Int: String].self, from: data)
-    }
-
-    func restoringViewNames(to report: SceneReport, cancelled: () -> Bool) -> SceneReport {
-        guard report.sourceStamp == SceneSourceStamp(identity: identity) else { return report }
-        guard let bytes = read(Self.viewNameSectionKey, cancelled: cancelled),
-              let names = try? JSONDecoder().decode([Int: String].self, from: bytes) else { return report }
-        var result = report
-        result.restoreViewNames(names)
-        return result
-    }
-
     /// A scene-only lookup reads the marker section and constructs the same report
     /// as a decode, without loading the source index, audio, or unrelated tracks.
     public func sceneReport(cancelled: () -> Bool = { Task.isCancelled }) -> SceneReport? {
@@ -354,9 +323,6 @@ extension AnalysisSidecar {
         for copy in copies {
             guard !cancelled() else { return nil }
             if let report = try? decodeSceneReport(read: { key in
-                if copies.count > 1, key == Self.viewNameSectionKey {
-                    return try? resolvedFields(key, copies: copies, matching: copy, cancelled: cancelled)
-                }
                 return try? verifiedSection(key, in: copy.db, stamp: copy.stamp, maxBytes: nil, cancelled: cancelled)
             }, cancelled: cancelled), !cancelled(), identity.isCurrentSnapshot(at: source) {
                 if let media, matchingSceneReport(report, media: media) == nil { continue }
@@ -372,15 +338,14 @@ extension AnalysisSidecar {
               let rebuilt = try? decoder.decode(CachedScenes.self, from: replacement),
               cached.timeBase == rebuilt.timeBase, cached.duration == rebuilt.duration,
               cached.origin == rebuilt.origin else { return false }
-        return (try? cached.report(source: source, identity: identity, names: [:], cancelled: cancelled)) != nil
+        return (try? cached.report(source: source, identity: identity, cancelled: cancelled)) != nil
     }
 
     private func decodeSceneReport(read: (String) -> Data?, cancelled: () -> Bool) throws -> SceneReport? {
         guard let data = read(Self.sceneSectionKey),
               let cached = try? JSONDecoder().decode(CachedScenes.self, from: data)
         else { return nil }
-        let names = viewNames(read: read)
-        return try cached.report(source: source, identity: identity, names: names ?? [:], cancelled: cancelled)
+        return try cached.report(source: source, identity: identity, cancelled: cancelled)
     }
 
     public func sceneReport(for media: MediaInfo, cancelled: () -> Bool = { Task.isCancelled }) -> SceneReport? {
@@ -392,27 +357,6 @@ extension AnalysisSidecar {
         guard let report, report.timeBase == media.video.timeBase, report.duration == media.duration,
               report.origin == media.origin else { return nil }
         return report
-    }
-
-    package func editorMetadata(for media: MediaInfo, cancelled: () -> Bool) -> (SceneReport?, [Int: Double])? {
-        guard identity.matchesSnapshot(media.identity) else { return nil }
-        if locations.candidates.filter({ FileManager.default.fileExists(atPath: $0.path) }).count > 1 {
-            guard Self.readsEnabled, !cancelled() else { return nil }
-            let report = media.hasVideo ? sceneReport(for: media, cancelled: cancelled) : nil
-            let thresholds = read(Self.silenceThresholdOverridesKey, cancelled: cancelled).flatMap {
-                try? JSONDecoder().decode([Int: Double].self, from: $0)
-            } ?? [:]
-            return !cancelled() && identity.isCurrentSnapshot(at: source) ? (report, thresholds) : nil
-        }
-        return try? withReadSnapshot(cancelled: cancelled) { read in
-            let report = media.hasVideo
-                ? matchingSceneReport(try? decodeSceneReport(read: read, cancelled: cancelled), media: media)
-                : nil
-            let thresholds = read(AnalysisSidecar.silenceThresholdOverridesKey).flatMap {
-                try? JSONDecoder().decode([Int: Double].self, from: $0)
-            } ?? [:]
-            return (report, thresholds)
-        }
     }
 
     /// A checksum verifies the bytes. Decode and validate each candidate's
@@ -476,12 +420,12 @@ extension AnalysisSidecar {
         }
         if key == Self.sceneSectionKey {
             guard let next = try? JSONDecoder().decode(CachedScenes.self, from: bytes),
-                  (try? next.report(source: source, identity: identity, names: [:], cancelled: cancelled)) != nil else { return false }
+                  (try? next.report(source: source, identity: identity, cancelled: cancelled)) != nil else { return false }
             if let evidence = evidence() {
                 return matchesVideo(evidence, duration: next.duration, origin: next.origin, timeBase: next.timeBase)
             }
             guard let previous, let old = try? JSONDecoder().decode(CachedScenes.self, from: previous),
-                  (try? old.report(source: source, identity: identity, names: [:], cancelled: cancelled)) != nil else { return true }
+                  (try? old.report(source: source, identity: identity, cancelled: cancelled)) != nil else { return true }
             return old.duration == next.duration && old.origin == next.origin && old.timeBase == next.timeBase
         }
         let decoder = PropertyListDecoder()

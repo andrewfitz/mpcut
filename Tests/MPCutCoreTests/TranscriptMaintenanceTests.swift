@@ -8,6 +8,7 @@ final class TranscriptMaintenanceTests: XCTestCase {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent("MPCut-maintenance-\(UUID())", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
         addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+        isolateRecognitionResults(in: folder)
         return folder
     }
 
@@ -156,171 +157,7 @@ final class TranscriptMaintenanceTests: XCTestCase {
         XCTAssertFalse(original.identity.matchesSnapshot(sidecar.identity))
         let key = TranscriptActivityKey(stream: 0)
         XCTAssertThrowsError(try sidecar.saveTranscriptActivity(Data(), key: key, media: original))
-        let recognition = TranscriptRecognitionCache(sidecar: sidecar, key: String(repeating: "a", count: 64),
-                                                     evidence: "old evidence", stream: 0)
-        let artifacts = TranscriptRecognitionCache.Artifacts(result: Data(), activity: nil)
-        XCTAssertThrowsError(try recognition.saveSidecar(artifacts, media: original, cancelled: { false }))
         XCTAssertNil(sidecar.readTranscriptActivity(key))
-        XCTAssertNil(sidecar.read(recognition.section))
-    }
-
-    func testNewerRecognitionWithWrongStreamEvidenceFallsBackToCompatibleCopy() throws {
-        let folder = try directory()
-        let source = try wave(in: folder)
-        let key = String(repeating: "a", count: 64)
-
-        let document = folder.appendingPathComponent("edit.cut")
-        func bytes(_ stamp: String) -> Data {
-            Data("""
-            {"version":1,"sample_rate":16000,"recognition_key":"\(key)","stream_evidence":"\(stamp)","duration_samples":320,"words":[],"activity":[{"start_sample":0,"end_sample":320,"level":0.5}]}
-            """.utf8)
-        }
-        try SidecarLocations.$storageDirectory.withValue(folder.appendingPathComponent("prefs")) {
-            try SidecarLocations.$projectURL.withValue(document) {
-                let media = try CutEngine().inspectMulticamSource(source)
-                let evidence = try XCTUnwrap(TranscriptJobPlan.streamEvidence(media: media, streamIndex: 0))
-                let adjacent = AnalysisSidecar(media: media)
-                let good = TranscriptRecognitionCache(sidecar: adjacent, key: key, evidence: evidence, stream: 0)
-                let original = TranscriptRecognitionCache.Artifacts(result: bytes(evidence), activity: nil)
-                try good.saveSidecar(original, media: media, cancelled: { false })
-                try SidecarLocations.setMode(.project)
-                let project = try AnalysisSidecar(source: source)
-                let reader = TranscriptRecognitionCache(sidecar: project, key: key, evidence: evidence, stream: 0)
-                try project.save([reader.section: Data([10]) + bytes("other-stream")])
-                XCTAssertEqual(reader.readSidecar(cancelled: { false })?.result, original.result)
-            }
-        }
-    }
-
-    func testUnrelatedSaveKeepsPaidRecognitionAcrossCopiesAndRepairsBadSeed() throws {
-        for defect in ["wrong stream", "missing activity", "inconsistent activity"] {
-            let folder = try directory()
-            let source = try wave(in: folder)
-            let disk = folder.appendingPathComponent("disk", isDirectory: true)
-            try FileManager.default.createDirectory(at: disk, withIntermediateDirectories: true)
-            try SidecarLocations.$storageDirectory.withValue(folder.appendingPathComponent("prefs")) {
-                try SidecarLocations.$projectURL.withValue(folder.appendingPathComponent("edit.cut")) {
-                    let media = try CutEngine().inspectMulticamSource(source)
-                    let key = String(repeating: "a", count: 64)
-                    let evidence = try XCTUnwrap(TranscriptJobPlan.streamEvidence(media: media, streamIndex: 0))
-                    func cache(_ sidecar: AnalysisSidecar) -> TranscriptRecognitionCache {
-                        TranscriptRecognitionCache(sidecar: sidecar, key: key, evidence: evidence, stream: 0)
-                    }
-                    func result(_ proof: String) -> Data {
-                        Data("""
-                        {"version":1,"sample_rate":16000,"recognition_key":"\(key)","stream_evidence":"\(proof)","duration_samples":320,"words":[],"activity":[]}
-                        """.utf8)
-                    }
-                    let paid = result(evidence)
-                    let levels = try transcriptActivityDocument(levels: [0.25], duration: 320, evidence: evidence)
-                    let digest = TranscriptStore.digest(levels)
-                    let address = "transcript_activity.v1.0." + digest
-                    let artifacts = TranscriptRecognitionCache.Artifacts(result: paid, activity: levels)
-                    let adjacent = AnalysisSidecar(media: media)
-                    try cache(adjacent).saveSidecar(artifacts, media: media, cancelled: { false })
-                    try SidecarLocations.setMode(.project)
-                    let project = try AnalysisSidecar(source: source)
-                    let record = cache(project).section
-                    var bad = [address: Data("bad levels".utf8)]
-                    switch defect {
-                    case "wrong stream":
-                        bad[record] = Data((digest + "\n").utf8) + result("other")
-                    case "missing activity":
-                        bad[record] = Data((String(repeating: "e", count: 64) + "\n").utf8) + paid
-                    default:
-                        let mismatched = try transcriptActivityDocument(levels: [0.6], duration: 320, evidence: "other")
-                        let mismatchedDigest = TranscriptStore.digest(mismatched)
-                        bad["transcript_activity.v1.0." + mismatchedDigest] = mismatched
-                        bad[record] = Data((mismatchedDigest + "\n").utf8) + paid
-                    }
-                    try project.save(bad)
-                    XCTAssertNil(cache(project.pinned(to: project.url)).readSidecar(cancelled: { false }), defect)
-                    // The latest physical DB is the defective project copy.
-                    try SidecarLocations.chooseDisk(disk, selecting: true)
-                    let third = try AnalysisSidecar(source: source)
-                    try third.save(["unrelated": Data([1])])
-                    for copy in [third, adjacent] {
-                        try copy.save(["unrelated": Data([2])])
-                        let pinned = cache(copy.pinned(to: copy.url))
-                        XCTAssertEqual(pinned.readSidecar(cancelled: { false })?.result, paid, defect)
-                        XCTAssertEqual(pinned.readSidecar(cancelled: { false })?.activity, levels, defect)
-                    }
-                    let damaged = cache(project.pinned(to: project.url))
-                    try damaged.saveSidecar(artifacts, media: media, cancelled: { false })
-                    XCTAssertEqual(damaged.readSidecar(cancelled: { false })?.activity, levels, defect)
-                    let another = TranscriptRecognitionCache.Artifacts(result: paid + Data([10]), activity: levels)
-                    try damaged.saveSidecar(another, media: media, cancelled: { false })
-                    XCTAssertEqual(damaged.readSidecar(cancelled: { false })?.result, paid, defect)
-                }
-            }
-        }
-    }
-
-    func testRecognitionSettingsShareExactLevelsAndReadLegacyArtifacts() throws {
-        let folder = try directory()
-        let source = try wave(in: folder)
-        let media = try CutEngine().inspectMulticamSource(source)
-        let sidecar = AnalysisSidecar(media: media)
-        let evidence = try XCTUnwrap(TranscriptJobPlan.streamEvidence(media: media, streamIndex: 0))
-        let count = 18_000
-        let duration = Int64(count * 320)
-        let levels = try transcriptActivityDocument(levels: (0..<count).map { Float(($0 * 37) % 1009) / 1009 },
-                                                    duration: duration, evidence: evidence)
-        let activityKey = TranscriptActivityKey(stream: 0)
-        try sidecar.saveTranscriptActivity(levels, key: activityKey, media: media)
-        let caches = ["a", "b"].map {
-            TranscriptRecognitionCache(sidecar: sidecar, key: String(repeating: $0, count: 64), evidence: evidence, stream: 0)
-        }
-        let artifacts = caches.map { cache in
-            let result = Data("""
-            {"version":1,"sample_rate":16000,"recognition_key":"\(cache.key)","stream_evidence":"\(evidence)","duration_samples":\(duration),"words":[],"activity":[]}
-            """.utf8)
-            return TranscriptRecognitionCache.Artifacts(result: result, activity: levels)
-        }
-        for (cache, artifact) in zip(caches, artifacts) {
-            try cache.saveSidecar(artifact, media: media, cancelled: { false })
-            XCTAssertEqual(cache.readSidecar(cancelled: { false })?.result, artifact.result)
-        }
-        // The same physical URL is pinned across writes. Stat each database
-        // separately so URL's cached resource values cannot mask a replacement.
-        func currentSize() throws -> Int {
-            let attributes = try FileManager.default.attributesOfItem(atPath: sidecar.url.path)
-            return try XCTUnwrap(attributes[.size] as? NSNumber).intValue
-        }
-        let newSize = try currentSize()
-        let keys = Set(sidecar.keys().filter { $0.hasPrefix("transcript_") })
-        XCTAssertEqual(MediaRefreshEvidence.Comparison(audio: [0]).preservedSectionKeys(keys), keys)
-        XCTAssertTrue(MediaRefreshEvidence.Comparison(audio: [1]).preservedSectionKeys(keys).isEmpty)
-        let content = "transcript_activity.v1.0." + TranscriptStore.digest(levels)
-        XCTAssertNil(sidecar.read(content))
-        XCTAssertEqual(sidecar.keys().filter { $0.hasPrefix("transcript_activity.") }.count, 1)
-        let originalKeys = sidecar.keys()
-        let competing = TranscriptRecognitionCache.Artifacts(result: artifacts[0].result, activity: levels + Data([10]))
-        try caches[0].saveSidecar(competing, media: media, cancelled: { false })
-        XCTAssertEqual(sidecar.keys(), originalKeys)
-        XCTAssertEqual(caches[0].readSidecar(cancelled: { false })?.activity, levels)
-        try sidecar.saveTranscriptActivity(Data("updated levels".utf8), key: activityKey, media: media, replacing: true)
-        XCTAssertEqual(sidecar.read(content), levels)
-        XCTAssertEqual(sidecar.keys().filter { $0.hasPrefix("transcript_activity.") }.count, 2)
-        for cache in caches {
-            XCTAssertEqual(cache.readSidecar(cancelled: { false })?.activity, levels)
-            XCTAssertNil(cache.readSidecar(cancelled: { true }))
-        }
-        try sidecar.save([content: Data("corrupt".utf8)])
-        XCTAssertNil(caches[0].readSidecar(cancelled: { false }))
-        try sidecar.saveTranscriptActivity(levels, key: activityKey, media: media, replacing: true)
-        XCTAssertEqual(caches[0].readSidecar(cancelled: { false })?.activity, levels)
-
-        try FileManager.default.removeItem(at: sidecar.url)
-        try sidecar.saveTranscriptActivity(levels, key: activityKey, media: media)
-        for (cache, artifact) in zip(caches, artifacts) {
-            let legacy = "transcript_recognition.v1.0." + cache.key
-            try sidecar.saveTranscript(JSONEncoder().encode(artifact), name: legacy, media: media, cancelled: { false })
-            XCTAssertEqual(cache.readSidecar(cancelled: { false })?.activity, levels)
-        }
-        let oldSize = try currentSize()
-        print("Two recognition settings, six-minute activity: legacy=\(oldSize) shared=\(newSize) bytes")
-        XCTAssertLessThan(newSize, oldSize)
     }
 
     func testProviderCheckFailsBeforeAnyAudioIsStaged() throws {
@@ -410,8 +247,23 @@ final class TranscriptMaintenanceTests: XCTestCase {
         // A folder whose record and lock are gone, last written long ago.
         let strayFolder = store.directory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: strayFolder, withIntermediateDirectories: false)
-        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -50 * 86_400)],
-                                              ofItemAtPath: strayFolder.path)
+        let scratchSession = strayFolder.appendingPathComponent("session-1", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratchSession, withIntermediateDirectories: false)
+        let staging = scratchSession.appendingPathComponent("track.wav")
+        let manifest = scratchSession.appendingPathComponent("manifest.json")
+        try Data().write(to: staging)
+        try Data("{}".utf8).write(to: manifest)
+        for url in [staging, manifest, scratchSession, strayFolder] {
+            try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -50 * 86_400)],
+                                                  ofItemAtPath: url.path)
+        }
+        let lostRecordFolder = store.directory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let providerFolder = lostRecordFolder.appendingPathComponent("session-1", isDirectory: true)
+        try FileManager.default.createDirectory(at: providerFolder, withIntermediateDirectories: true)
+        let handoff = providerFolder.appendingPathComponent("session.json")
+        let recognized = try TranscriptCodec.decode(Data("1\n00:00:00,000 --> 00:00:01,000\nRecovered words\n".utf8), format: .srt)
+        let providerOutput = try TranscriptCodec.encodeStored(recognized)
+        try providerOutput.write(to: handoff)
         let unrelated = store.directory.appendingPathComponent("notes.txt")
         try Data("keep".utf8).write(to: unrelated)
 
@@ -426,6 +278,7 @@ final class TranscriptMaintenanceTests: XCTestCase {
         let later = Date().addingTimeInterval(40 * 86_400)
         let removed = Set(try store.prune(olderThan: 30 * 86_400, now: later))
         XCTAssertEqual(removed, Set([attached, failed, abandoned, crashed, orphaned].map(\.id)))
+        XCTAssertEqual(try TranscriptCodec.decode(Data(contentsOf: handoff), format: .json), recognized)
         for record in [attached, failed, abandoned, crashed, orphaned] {
             XCTAssertEqual(exists(record), [false, false, false], record.documentID)
         }
@@ -442,198 +295,7 @@ final class TranscriptMaintenanceTests: XCTestCase {
         XCTAssertEqual(exists(owned), [false, false, false])
     }
 
-    /// Prepares a job for `document` and gives it a result: every track recognized, and a
-    /// session output on disk from before the record was last written. A job MPCut ran also
-    /// holds a result for each track. A provider run on its own may leave only the output.
-    private func finishedJob(in store: TranscriptJobStore, source: URL, document: URL, fingerprint: String,
-                             trackResults: Bool = true,
-                             _ change: (inout TranscriptJobRecord) -> Void = { _ in }) throws -> TranscriptJobRecord {
-        let prepared = try AnalysisSidecar.$readsEnabled.withValue(false) {
-            try store.prepare(media: source, documentID: document.path)
-        }
-        try Data("session result".utf8).write(to: prepared.sessions[0].output)
-        for track in prepared.sessions[0].tracks where trackResults {
-            let result: [String: Any] = [
-                "version": 1, "sample_rate": 16_000, "stream_evidence": track.evidence, "duration_samples": 16_000,
-                "activity": [[String: Any]](), "recognition_key": String(repeating: "a", count: 64),
-                "words": [[String: Any]](),
-            ]
-            try JSONSerialization.data(withJSONObject: result).write(to: XCTUnwrap(track.result))
-        }
-        return try store.update(prepared.id) {
-            $0.state = .completed
-            $0.attached = true
-            $0.sessions[0].fingerprint = fingerprint
-            for index in $0.sessions[0].tracks.indices { $0.sessions[0].tracks[index].state = .recognized }
-            change(&$0)
-        }
-    }
-
-    private func saveProject(to document: URL, source: URL, owner: UUID?,
-                             attachments: [TranscriptAttachment], multicam: Bool = false) throws {
-        let second = RationalTime(numerator: 1)
-        var project = multicam
-            ? CutProject.multicam(MulticamProject(referenceAngle: "camera", range: .init(from: .zero, to: second),
-                                                  angles: [.init(id: "camera", file: source.lastPathComponent)],
-                                                  audio: .follow, switches: [.init(at: .zero, angle: "camera")]))
-            : CutProject.sequence([.init(id: "clip", file: source.lastPathComponent, from: .zero, to: second)])
-        project.transcripts = .init(attachments: attachments, revision: 1, documentID: owner)
-        try project.save(to: document)
-    }
-
-    func testPruneReadsWhatAMulticamDocumentHasAttached() throws {
-        let folder = try directory()
-        let store = TranscriptJobStore(directory: folder.appendingPathComponent("jobs"))
-        let source = try wave(in: folder)
-        let document = folder.appendingPathComponent("group.cut")
-        let owner = UUID()
-        let current = try finishedJob(in: store, source: source, document: document, fingerprint: "current") {
-            $0.documentIdentity = owner
-        }
-        let replaced = try finishedJob(in: store, source: source, document: document, fingerprint: "replaced") {
-            $0.documentIdentity = owner
-        }
-        let asset = try TranscriptStore.put(TranscriptCodec.encodeStored(TranscriptDocument(clock: .presentation)),
-                                            relativeTo: document)
-        try saveProject(to: document, source: source, owner: owner, attachments: [
-            .init(id: "current", asset: asset, bindings: [], fingerprint: "current"),
-        ], multicam: true)
-        guard case .multicam = try CutProject.load(from: document) else {
-            return XCTFail("Expected the saved document to read as a multicam project.")
-        }
-        let later = Date().addingTimeInterval(40 * 86_400)
-        XCTAssertEqual(try store.prune(olderThan: 30 * 86_400, now: later), [replaced.id])
-        XCTAssertEqual(try store.status(current.id).state, .completed)
-    }
-
-    func testPruneRemovesAttachedOutputsAndJobsTheDocumentHasReplaced() throws {
-        let folder = try directory()
-        let store = TranscriptJobStore(directory: folder.appendingPathComponent("jobs"))
-        let source = try wave(in: folder)
-        let document = folder.appendingPathComponent("edit.cut")
-        let owner = UUID()
-        func job(_ fingerprint: String, _ change: (inout TranscriptJobRecord) -> Void = { _ in }) throws -> TranscriptJobRecord {
-            try finishedJob(in: store, source: source, document: document, fingerprint: fingerprint) {
-                $0.documentIdentity = owner
-                change(&$0)
-            }
-        }
-        func exists(_ record: TranscriptJobRecord) -> Bool {
-            [store.recordURL(record.id), record.workingDirectory].allSatisfy { FileManager.default.fileExists(atPath: $0.path) }
-        }
-        func hasOutput(_ record: TranscriptJobRecord) -> Bool {
-            FileManager.default.fileExists(atPath: record.sessions[0].output.path)
-        }
-        let current = try job("current")
-        let replaced = try job("replaced")
-        let replacedPartial = try job("replaced-partial") { $0.state = .partial }
-        // A result that was never attached exists nowhere else.
-        let waiting = try job("waiting") { $0.attached = false }
-        // Retried since the document was saved: its sessions have new fingerprints, and the
-        // saved transcript still names this job.
-        let named = try job("after-retry")
-        let otherOwner = try job("other-owner") { $0.documentIdentity = UUID() }
-        let owned = try job("owned") { $0.ownerToken = UUID(); $0.ownerPID = getpid() }
-        let locked = try job("locked")
-        // Its provider wrote this output after the job was acknowledged.
-        let late = try job("current")
-        try Data("later session result".utf8).write(to: late.sessions[0].output)
-        // A session still to be recognized keeps the place its provider writes.
-        let unfinished = try job("current") { $0.state = .partial; $0.sessions[0].tracks[0].state = .staged }
-        // Its provider ran on its own and left no track result: the output is the only copy.
-        let standalone = try finishedJob(in: store, source: source, document: document, fingerprint: "current",
-                                         trackResults: false) { $0.documentIdentity = owner }
-
-        func asset(_ transcript: TranscriptDocument) throws -> TranscriptAsset {
-            try TranscriptStore.put(TranscriptCodec.encodeStored(transcript), relativeTo: document)
-        }
-        func transcript(_ track: String, job: UUID? = nil) -> TranscriptDocument {
-            TranscriptDocument(clock: .presentation, tracks: [.init(id: track, name: "Mic")], jobID: job?.uuidString)
-        }
-        try saveProject(to: document, source: source, owner: owner, attachments: [
-            .init(id: "current", asset: asset(transcript("current")), bindings: [], fingerprint: "current"),
-            .init(id: "imported", asset: asset(transcript("imported")), bindings: []),
-            .init(id: "named", asset: asset(transcript("named", job: named.id)), bindings: [], fingerprint: "before-retry"),
-        ])
-        let all = [current, replaced, replacedPartial, waiting, named, otherOwner, owned, locked, late, unfinished,
-                   standalone]
-        let held = open(store.directory.appendingPathComponent(locked.id.uuidString + ".lock").path, O_RDWR)
-        XCTAssertGreaterThanOrEqual(held, 0)
-        XCTAssertEqual(flock(held, LOCK_EX | LOCK_NB), 0)
-        defer { close(held) }
-        XCTAssertTrue(all.allSatisfy(hasOutput))
-
-        // Nothing is old enough to remove. An attached job gives up, at any age, the outputs
-        // its track results repeat.
-        XCTAssertEqual(try store.prune(olderThan: 30 * 86_400), [])
-        XCTAssertTrue(all.allSatisfy(exists))
-        for record in [current, replaced, replacedPartial, named, otherOwner] {
-            XCTAssertFalse(hasOutput(record), record.sessions[0].fingerprint)
-        }
-        for record in [waiting, owned, locked, late, unfinished, standalone] {
-            XCTAssertTrue(hasOutput(record), record.sessions[0].fingerprint)
-        }
-
-        let later = Date().addingTimeInterval(40 * 86_400)
-        XCTAssertEqual(Set(try store.prune(olderThan: 30 * 86_400, now: later)), [replaced.id, replacedPartial.id])
-        for record in [replaced, replacedPartial] {
-            XCTAssertFalse(exists(record), record.sessions[0].fingerprint)
-            XCTAssertFalse(FileManager.default.fileExists(
-                atPath: store.directory.appendingPathComponent(record.id.uuidString + ".lock").path))
-        }
-        for record in [current, waiting, named, otherOwner, owned, locked, late, unfinished, standalone] {
-            XCTAssertTrue(exists(record), record.sessions[0].fingerprint)
-        }
-        // However old, the only copy of a recognition stays while its job does.
-        XCTAssertTrue(hasOutput(standalone))
-        // A kept job reads as before without its output.
-        for record in [current, named] {
-            XCTAssertEqual(try store.status(record.id).state, .completed)
-            XCTAssertEqual(try store.status(record.id), try store.status(record.id))
-        }
-
-        // The document moves on from the remaining results.
-        try saveProject(to: document, source: source, owner: owner, attachments: [
-            .init(id: "imported", asset: asset(transcript("imported")), bindings: []),
-        ])
-        let removed = Set(try store.prune(olderThan: 30 * 86_400, now: later))
-        XCTAssertEqual(removed, [current.id, named.id, late.id, unfinished.id, standalone.id])
-        for record in [waiting, otherOwner, owned, locked] {
-            XCTAssertTrue(exists(record), record.sessions[0].fingerprint)
-        }
-    }
-
-    func testPruneKeepsAttachedJobsWhenTheDocumentCannotAnswer() throws {
-        let folder = try directory()
-        let store = TranscriptJobStore(directory: folder.appendingPathComponent("jobs"))
-        let source = try wave(in: folder)
-        let later = Date().addingTimeInterval(40 * 86_400)
-
-        // A transcript without a fingerprint, whose stored result cannot be read, may be this job's.
-        let unreadable = folder.appendingPathComponent("unreadable.cut")
-        let opaque = try TranscriptStore.put(Data("not a transcript".utf8), relativeTo: unreadable)
-        try saveProject(to: unreadable, source: source, owner: nil,
-                        attachments: [.init(id: "opaque", asset: opaque, bindings: [])])
-        let doubtful = try finishedJob(in: store, source: source, document: unreadable, fingerprint: "replaced")
-
-        // A file at the document's path that is not a project.
-        let damaged = folder.appendingPathComponent("damaged.cut")
-        try Data("{".utf8).write(to: damaged)
-        let unknown = try finishedJob(in: store, source: source, document: damaged, fingerprint: "replaced")
-
-        // A project whose transcripts were all removed answers that none came from this job.
-        let emptied = folder.appendingPathComponent("emptied.cut")
-        try saveProject(to: emptied, source: source, owner: nil, attachments: [])
-        let detached = try finishedJob(in: store, source: source, document: emptied, fingerprint: "replaced")
-
-        XCTAssertEqual(try store.prune(olderThan: 30 * 86_400, now: later), [detached.id])
-        for record in [doubtful, unknown] {
-            XCTAssertTrue(FileManager.default.fileExists(atPath: store.recordURL(record.id).path), record.documentID)
-            XCTAssertEqual(try store.status(record.id).state, .completed)
-        }
-    }
-
-    func testPruneRemovesIdleSharedResultsAndKeepsClaimedOnes() throws {
+    func testPruneKeepsPublishedRecognitionForStandaloneReaders() throws {
         let folder = try directory()
         let idle = String(repeating: "1", count: 64)
         let claimed = String(repeating: "2", count: 64)
@@ -649,8 +311,8 @@ final class TranscriptMaintenanceTests: XCTestCase {
         XCTAssertEqual(TranscriptJobStore.pruneSharedRecognition(in: folder, olderThan: 90 * 86_400), 0)
         XCTAssertEqual(try names(), everything)
         let later = Date().addingTimeInterval(100 * 86_400)
-        XCTAssertEqual(TranscriptJobStore.pruneSharedRecognition(in: folder, olderThan: 90 * 86_400, now: later), 2)
-        XCTAssertEqual(try names(), [claimed, claimed + ".json", "notes.txt", "short.json"])
+        XCTAssertEqual(TranscriptJobStore.pruneSharedRecognition(in: folder, olderThan: 90 * 86_400, now: later), 0)
+        XCTAssertEqual(try names(), everything)
 
         // A claim taken after its file was pruned locks the file that now carries the name.
         let next = TranscriptRecognitionClaims()

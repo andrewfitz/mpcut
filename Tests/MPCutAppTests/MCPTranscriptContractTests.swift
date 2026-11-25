@@ -51,7 +51,7 @@ final class MCPTranscriptContractTests: XCTestCase {
                            end: .init(numerator: Int64(number + 1), denominator: 4))
         }
         let digest = String(repeating: "a", count: 64)
-        let asset = TranscriptAsset(file: "Transcripts/\(digest).json", sha256: digest)
+        let asset = TranscriptAsset(sha256: digest)
         let attachment = TranscriptAttachment(id: attachmentID ?? text, asset: asset, bindings: [])
         return try TranscriptIndex(document: TranscriptDocument(clock: .presentation, words: words),
                                    attachment: attachment, spaces: [.source])

@@ -136,8 +136,15 @@ extension ProjectSession {
         return editor.canEdit && !editor.isAudioOnly && !editor.mcpHasActiveTrim
     }
 
+    var mcpCanStartStillTimeline: Bool {
+        !isMulticam && editor.isEmpty && editor.stillProject.stillFormat == nil
+            && editor.canInsertStill && !editor.mcpHasActiveTrim && !hasLifecycleModal
+    }
+
     func mcpCommitStill(_ candidate: CutProject, action: String) throws {
-        guard mcpCanEditStills else { throw MCPCommandError("editor_busy", "An editable picture timeline is required.") }
+        guard mcpCanEditStills || (mcpCanStartStillTimeline && candidate.stillFormat != nil) else {
+            throw MCPCommandError("editor_busy", "An editable picture timeline is required.")
+        }
         if isMulticam {
             guard case .multicam = candidate,
                   multicam.performStillEdit(action, { _ in candidate }) else {
@@ -190,8 +197,13 @@ extension ProjectSessions {
             return try project.mcpStillList(location: session.mcpStillLocation, offset: arguments["offset"] as? Int ?? 0,
                                            limit: arguments["limit"] as? Int ?? 50)
         }
-        guard session.mcpCanEditStills else { throw MCPCommandError("editor_busy", "An editable picture timeline is required.") }
+        let isInsert = tool == "timeline_gap_insert" || tool == "still_editor_placement_insert"
+        let startsTimeline = isInsert && session.mcpCanStartStillTimeline
+        guard session.mcpCanEditStills || startsTimeline else {
+            throw MCPCommandError("editor_busy", "An editable picture timeline is required.")
+        }
         let input = MCPStillInput(fields: arguments)
+        let initialFormat = try input.initialFormat(required: startsTimeline)
         let revision = session.mcpRevision
         var candidate = project
         var result: [String: Any] = [:]
@@ -267,8 +279,19 @@ extension ProjectSessions {
             let assetID = asset.id
             let placementID = ProjectIdentifier.make()
             let framing = try input.framing(existing: .fit)
-            candidate = try candidate.addingStillAsset(asset)
-            if operation == "insert" {
+            if let (format, color) = initialFormat {
+                guard try input.requiredTime("at") == .zero else {
+                    throw input.invalid("Start the still-only timeline at zero.")
+                }
+                if let interval = try input.time("cadence"), interval != format.cadence {
+                    throw input.invalid("Use the initial format cadence for the first still.")
+                }
+                candidate = try .makeStillTimeline(format: format, asset: asset, placementID: placementID,
+                                                  duration: input.requiredTime("duration"), framing: framing,
+                                                  colorPolicy: color.policy)
+                action = asset.isGap ? "Insert Color Gap" : "Insert Still"
+            } else if operation == "insert" {
+                candidate = try candidate.addingStillAsset(asset)
                 let at = try session.mcpStillBoundary(input.requiredTime("at"), space: space)
                 let cadence = try input.time("cadence") ?? session.mcpDefaultStillCadence(at: at)
                 guard let cadence else { throw input.invalid("Supply cadence as an exact frame interval for this timeline.") }
@@ -277,6 +300,7 @@ extension ProjectSessions {
                 candidate = try candidate.insertingStill(insert, at: at)
                 action = asset.isGap ? "Insert Color Gap" : "Insert Still"
             } else {
+                candidate = try candidate.addingStillAsset(asset)
                 candidate = try session.mcpReplacePicture(in: candidate, id: placementID, asset: assetID, framing: framing,
                                                           from: input.requiredTime("from"), to: input.requiredTime("to"))
                 action = "Replace Picture"
@@ -380,6 +404,23 @@ private struct MCPStillInput {
     }
 
     func requiredTime(_ key: String) throws -> RationalTime { try RationalTime(parsing: string(key)) }
+
+    func initialFormat(required: Bool) throws -> (StillTimelineFormat, StillTimelineFormat.Color)? {
+        guard let raw = fields["initial_format"] else {
+            if required { throw invalid("Supply initial_format to start a still-only timeline.") }
+            return nil
+        }
+        guard required else { throw invalid("Supply initial_format only for the first still or gap in a blank sequence.") }
+        guard var object = raw as? [String: Any] else { throw invalid("Supply a still timeline format object.") }
+        let color = object.removeValue(forKey: "color") as? String ?? "sdr"
+        guard let interpretation = StillTimelineFormat.Color(rawValue: color) else {
+            throw invalid("Choose sdr, pq or hlg for the initial format color.")
+        }
+        let data = try JSONSerialization.data(withJSONObject: object)
+        let format = try JSONDecoder().decode(StillTimelineFormat.self, from: data)
+        try format.validate(color: interpretation.policy)
+        return (format, interpretation)
+    }
 
     func framing(existing: StillImageFraming) throws -> StillImageFraming {
         var value = existing

@@ -364,7 +364,7 @@ final class MixedTimelineAppTests: XCTestCase {
         let window = NSWindow(contentRect: .init(x: 0, y: 0, width: 320, height: 240), styleMask: [.titled],
                               backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
-        window.contentView = NSHostingView(rootView: PreviewView(preview: preview))
+        window.contentView = NSHostingView(rootView: PreviewView(preview: preview, preferences: nil))
         window.orderFront(nil)
         defer { window.close() }
         session.window = window

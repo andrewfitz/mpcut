@@ -139,6 +139,7 @@ final class ReverseAudioPlayer {
     private var scheduled: Int64 = 0
     private var manualStart: Int64 = 0
     private var tailPlayed = false
+    private var tailDrainDeadline: ContinuousClock.Instant?
     private var speed = 1
     private var origin: Int64 = 0
     private var cursor: Int64 = 0
@@ -182,14 +183,35 @@ final class ReverseAudioPlayer {
             stop()
             return
         }
-        guard cursor > 0 else { return }
+        if cursor == 0 {
+            checkTailDrain()
+        } else {
+            holdAfterUnderrun()
+            fill()
+        }
+    }
+
+    private func checkTailDrain() {
+        guard !tailPlayed, engine?.isInManualRenderingMode == false,
+              scheduled > 0, rendered >= scheduled - 1 else { return }
+        if let deadline = tailDrainDeadline {
+            tailPlayed = .now >= deadline
+        } else {
+            // Some output routes lose the final playback callback. Once the node's
+            // sample clock reaches the tail, allow the downstream pipeline to drain.
+            let latency = node.outputPresentationLatency
+            let grace = latency.isFinite ? max(0.1, latency) : 0.1
+            tailDrainDeadline = .now + .seconds(grace)
+        }
+    }
+
+    private func holdAfterUnderrun() {
         if node.isPlaying && rendered >= scheduled {
             // A slow read exhausted the queue. Hold the picture at the last rendered
             // sample and prime the node again when the next block becomes available.
             node.stop()
             playedBeforeRestart = scheduled
         }
-        fill()
     }
 
     func start(_ timeline: ReverseAudioTimeline, at position: Double, speed: Int) {
@@ -208,6 +230,7 @@ final class ReverseAudioPlayer {
         timeline = nil
         scheduled = 0
         tailPlayed = false
+        tailDrainDeadline = nil
         playedBeforeRestart = 0
         if let engine {
             node.stop()
@@ -233,11 +256,14 @@ final class ReverseAudioPlayer {
         }
     }
 
-    private var needsBlock: Bool {
-        cursor > 0 && scheduled - rendered < 4 * Self.blockFrames
-    }
+    var bufferedFrames: Int64 { max(0, scheduled - rendered) }
+
+    private var needsBlock: Bool { cursor > 0 && bufferedFrames < 4 * Self.blockFrames }
 
     private func enqueue(_ samples: [Float], generation token: Int) {
+        // A decode can finish after the node drains and before the next display tick.
+        // Reset its clock before adding frames so the silent interval isn't counted.
+        holdAfterUnderrun()
         if engine == nil { connect(AVAudioEngine()) }
         guard let engine, let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count / 2)),
               let channels = buffer.floatChannelData else { stop(); return }

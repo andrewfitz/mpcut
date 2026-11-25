@@ -7,9 +7,11 @@ struct ExportResultFile {
     private let encode: (Int64?, [EncodedEdgeResult]?) throws -> Data
 
     @MainActor
-    static func checkbox() -> NSButton {
+    /// - Parameter isOn: the starting state, Settings → Export → Save Export Result JSON.
+    static func checkbox(isOn: Bool = false) -> NSButton {
         let control = NSButton(checkboxWithTitle: "Save Export Result JSON", target: nil, action: nil)
         control.toolTip = "Save the resolved render plan and editorial cut map next to the exported media"
+        control.state = isOn ? .on : .off
         return control
     }
 

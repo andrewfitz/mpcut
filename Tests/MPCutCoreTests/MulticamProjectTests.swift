@@ -122,7 +122,7 @@ final class MulticamProjectTests: XCTestCase {
         var edit = project
         let data = try JSONEncoder().encode(edit)
         var document = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-        document["schema_version"] = 5
+        document["schema_version"] = MulticamProject.schemaVersion + 1
         let future = try JSONSerialization.data(withJSONObject: document)
         XCTAssertThrowsError(try JSONDecoder().decode(MulticamProject.self, from: future)) {
             XCTAssertEqual(($0 as? CutError)?.code, "unsupported_multicam_version")
@@ -209,7 +209,7 @@ final class MulticamProjectTests: XCTestCase {
         }
     }
 
-    func testOversizedProjectFileIsRejectedBeforeReading() throws {
+    func testLargeNonProjectFilesAndMissingFilesAreRejected() throws {
         let manager = FileManager.default
         let folder = manager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try manager.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -218,7 +218,7 @@ final class MulticamProjectTests: XCTestCase {
         let recording = folder.appendingPathComponent("recording.mov")
         XCTAssertTrue(manager.createFile(atPath: recording.path, contents: nil))
         let handle = try FileHandle(forWritingTo: recording)
-        try handle.truncate(atOffset: UInt64(MulticamProject.maximumFileSize) + 1)
+        try handle.truncate(atOffset: (64 << 20) + 1)
         try handle.close()
         let link = folder.appendingPathComponent("link.cut")
         try manager.createSymbolicLink(at: link, withDestinationURL: recording)
@@ -226,7 +226,7 @@ final class MulticamProjectTests: XCTestCase {
             XCTAssertThrowsError(try MulticamProject.load(from: url)) {
                 let issue = $0 as? CutError
                 XCTAssertEqual(issue?.code, "invalid_multicam_project")
-                XCTAssertTrue(issue?.message.contains("64 MB") == true, issue?.message ?? "")
+                XCTAssertTrue(issue?.message.contains("UTF-8 JSON") == true, issue?.message ?? "")
             }
         }
         XCTAssertThrowsError(try MulticamProject.load(from: folder.appendingPathComponent("absent.cut"))) {
@@ -265,28 +265,24 @@ final class MulticamProjectTests: XCTestCase {
                                                    .init(numerator: 25, denominator: 2)])
     }
 
-    func testSaveCompactsAtSizeLimitAndPreservesPreviousFileOnOverflow() throws {
+    func testProjectsAcrossFormerSizeBoundaryCanBeReadSavedAndRevised() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let url = directory.appendingPathComponent("edit.cut")
-        var edit = project
-        edit.angles[0].name = ""
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        let overhead = try encoder.encode(edit).count
-        edit.angles[0].name = String(repeating: "x", count: MulticamProject.maximumFileSize - overhead)
-        // The limit is on the document. The file holds it compressed.
-        try edit.save(to: url)
-        let saved = try Data(contentsOf: url)
-        XCTAssertEqual(try CutProject.documentJSON(saved: saved).count, MulticamProject.maximumFileSize)
-        XCTAssertEqual(try MulticamProject.load(from: url), edit)
-
-        edit.angles[0].name!.append("x")
-        XCTAssertThrowsError(try edit.save(to: url)) {
-            XCTAssertEqual(($0 as? CutError)?.code, "invalid_multicam_project")
+        let edit = CutProject.multicam(project)
+        let plain = try JSONEncoder().encode(edit)
+        for size in [(64 << 20) - 1, 64 << 20, (64 << 20) + 1] {
+            var padded = plain
+            padded.append(Data(repeating: 0x20, count: size - plain.count))
+            try padded.write(to: url)
+            let opened = try CutProject.loadEditorDocument(from: url, limit: 1)
+            XCTAssertEqual(opened.project, edit)
+            XCTAssertEqual(try CutProject.decode(padded), edit)
+            _ = try edit.saveRevision(to: url, undo: [], redo: [], mediaSnapshot: .empty,
+                                      expected: opened.media.diskRevision)
+            XCTAssertEqual(try CutProject.load(from: url), edit)
         }
-        XCTAssertEqual(try Data(contentsOf: url), saved)
     }
 
     func testSavingOverSourceOrLinkLeavesMediaIntact() throws {

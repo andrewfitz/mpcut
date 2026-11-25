@@ -581,14 +581,10 @@ final class SidecarPackingTests: XCTestCase {
         }
     }
 
-    func testEveryPayloadTagDecodesToItsSection() throws {
+    func testCutcachePayloadTagsDecodeToTheirSections() throws {
         var random = Random(state: 17)
         let levels = (0..<2000).map { Float(($0 * 37) % 1009) / 1009 }
         let own = try transcriptActivityDocument(levels: levels, duration: 2000 * 320, evidence: "stream")
-        var provider = #"{"version":1,"sample_rate":16000,"stream_evidence":"e","duration_samples":640000,"activity":["#
-        for index in 0..<2000 {
-            provider += (index > 0 ? "," : "") + #"{"start_sample":\#(index * 320),"end_sample":\#(index * 320 + 320),"level":0.\#(index + 1)}"#
-        }
         var packets = PackedWriter()
         for index in 0..<2000 {
             packets.bytes.append(1)
@@ -602,7 +598,6 @@ final class SidecarPackingTests: XCTestCase {
             ("custom", Data(repeating: 42, count: 5000), [1]),
             ("transcript_activity.v1.0.own", own, [2, 3]),
             ("media_index_audio.v1", Data(packets.bytes), [4, 5]),
-            ("transcript_activity.v1.0.provider", Data((provider + "]}").utf8), [6, 7]),
             ("media_index_frames.v1", frames, [8, 9]),
             ("waveform_peaks.v1.0", peaks, [11]),
             ("waveform_envelope.v1.0", peaks, [11]),

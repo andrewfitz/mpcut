@@ -89,7 +89,7 @@ public struct ParticipantAppearance: Codable, Hashable, Sendable, Identifiable {
 
 public enum ParticipantCoverageState: String, Codable, Sendable { case unknown, inferred, verified }
 
-public struct ParticipantCoverage: Codable, Equatable, Sendable {
+public struct ParticipantCoverage: Codable, Hashable, Sendable {
     public var range: MulticamRange
     public var state: ParticipantCoverageState
 
@@ -296,7 +296,7 @@ public struct ParticipantPerson: Codable, Equatable, Sendable, Identifiable {
     }
 }
 
-public struct ParticipantAppearanceOverride: Codable, Equatable, Sendable {
+public struct ParticipantAppearanceOverride: Codable, Hashable, Sendable {
     public var participantID: String
     public var sourceID: String
     public var appearanceID: String
@@ -333,6 +333,19 @@ public struct ParticipantProject: Codable, Equatable, Sendable {
     public var appearanceOverrides: [ParticipantAppearanceOverride]
     public var render: ParticipantRenderPlan?
     public var tileOutput: TileOutputSettings?
+    private var savedPendingReviews: [PendingTileReview]?
+    package var pendingReviews: [PendingTileReview] {
+        get { savedPendingReviews ?? [] }
+        set { savedPendingReviews = newValue.isEmpty ? nil : newValue }
+    }
+
+    package mutating func setPendingReview(_ review: PendingTileReview) {
+        if let index = pendingReviews.firstIndex(where: { $0.sourceID == review.sourceID }) {
+            pendingReviews[index] = review
+        } else {
+            pendingReviews.append(review)
+        }
+    }
 
     public init(people: [ParticipantPerson] = [], sources: [ParticipantSourceGeometry] = [],
                 appearanceOverrides: [ParticipantAppearanceOverride] = [], render: ParticipantRenderPlan? = nil,
@@ -346,11 +359,12 @@ public struct ParticipantProject: Codable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case people, sources, render
+        case savedPendingReviews = "pending_reviews"
         case tileOutput = "tile_output"
         case appearanceOverrides = "appearance_overrides"
     }
 
-    public var isEmpty: Bool { people.isEmpty && sources.isEmpty && appearanceOverrides.isEmpty && render == nil && tileOutput == nil }
+    public var isEmpty: Bool { people.isEmpty && sources.isEmpty && appearanceOverrides.isEmpty && render == nil && tileOutput == nil && pendingReviews.isEmpty }
 
     public func appearances(sourceID: String, at time: RationalTime) -> [ParticipantAppearance] {
         sources.first { $0.sourceID == sourceID }?.appearances.filter { $0.range.contains(time) } ?? []
@@ -398,6 +412,7 @@ public struct ParticipantProject: Codable, Equatable, Sendable {
                   appearanceOverrides: try values.decodeIfPresent([ParticipantAppearanceOverride].self, forKey: .appearanceOverrides) ?? [],
                   render: try values.decodeIfPresent(ParticipantRenderPlan.self, forKey: .render),
                   tileOutput: try values.decodeIfPresent(TileOutputSettings.self, forKey: .tileOutput))
+        pendingReviews = try values.decodeIfPresent([PendingTileReview].self, forKey: .savedPendingReviews) ?? []
     }
 }
 

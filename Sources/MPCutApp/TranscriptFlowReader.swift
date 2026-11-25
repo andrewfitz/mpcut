@@ -47,6 +47,8 @@ final class TranscriptFlowLayout: @unchecked Sendable {
     }
     let source: TranscriptFlowSource
     let width: CGFloat
+    /// The body text size in points. Settings → Transcripts → Reader text size; 14 is the factory size.
+    let textSize: CGFloat
     fileprivate static let headingKey = NSAttributedString.Key("MPCutTranscriptHeading")
     fileprivate static let laneSlotKey = NSAttributedString.Key("MPCutTranscriptLaneSlot")
     let paragraphs: [NSAttributedString]
@@ -54,11 +56,17 @@ final class TranscriptFlowLayout: @unchecked Sendable {
     let ranges: [NSRange]
     let lines: [Line]
 
-    init(source: TranscriptFlowSource, width: CGFloat) throws {
+    static let factoryTextSize: CGFloat = 14
+    /// Row height and baseline scale with the text. At the factory size they are 23 and 6 points.
+    static func rowHeight(textSize: CGFloat) -> CGFloat { (23 * textSize / factoryTextSize).rounded() }
+    static func baseline(textSize: CGFloat) -> CGFloat { (6 * textSize / factoryTextSize).rounded() }
+
+    init(source: TranscriptFlowSource, width: CGFloat, textSize: CGFloat = TranscriptFlowLayout.factoryTextSize) throws {
         self.source = source
         self.width = width
+        self.textSize = textSize
         let foreground = NSAttributedString.Key(kCTForegroundColorFromContextAttributeName as String)
-        let body: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 14), foreground: true]
+        let body: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: textSize), foreground: true]
         let heading: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11, weight: .semibold), Self.headingKey: true]
         var paragraphs: [NSAttributedString] = [], starts: [Int] = [], lines: [Line] = [], ranges: [NSRange] = []
         var text = "", headerLength = 0, base = 0, length = 0
@@ -180,6 +188,7 @@ struct TranscriptFlowReader: NSViewRepresentable {
     let choose: (TranscriptOccurrence, Bool, Bool) -> Void
     let inspect: () -> Void
     let describe: (TranscriptOccurrence) -> String
+    var textSize = TranscriptFlowLayout.factoryTextSize
 
     func sizeThatFits(_ proposal: ProposedViewSize, nsView: TranscriptFlowScrollView, context: Context) -> CGSize? {
         proposal.replacingUnspecifiedDimensions(by: CGSize(width: 380, height: 360))
@@ -196,7 +205,7 @@ struct TranscriptFlowReader: NSViewRepresentable {
         view.choose = choose
         view.inspect = inspect
         view.describe = describe
-        view.update(source: source, active: active, selection: selection, scroll: scroll)
+        view.update(source: source, active: active, selection: selection, scroll: scroll, textSize: textSize)
     }
 
     static func dismantleNSView(_ view: TranscriptFlowScrollView, coordinator: ()) {
@@ -212,6 +221,7 @@ final class TranscriptFlowScrollView: NSScrollView, NSTableViewDataSource, NSTab
     private(set) var selection: TranscriptFlowSelection?
     private let table = NSTableView()
     private var source: TranscriptFlowSource?
+    private var textSize = TranscriptFlowLayout.factoryTextSize
     private var requestedWidth: CGFloat = 0
     private var worker: Task<Void, Never>?
     private var request: TranscriptFlowScroll?
@@ -259,9 +269,14 @@ final class TranscriptFlowScrollView: NSScrollView, NSTableViewDataSource, NSTab
 
     func cancel() { worker?.cancel() }
 
-    func update(source: TranscriptFlowSource, active: [Int], selection: TranscriptFlowSelection?, scroll: TranscriptFlowScroll?) {
-        let changed = self.source !== source
+    func update(source: TranscriptFlowSource, active: [Int], selection: TranscriptFlowSelection?, scroll: TranscriptFlowScroll?,
+                textSize: CGFloat = TranscriptFlowLayout.factoryTextSize) {
+        let changed = self.source !== source || self.textSize != textSize
         self.source = source
+        if self.textSize != textSize {
+            self.textSize = textSize
+            table.rowHeight = TranscriptFlowLayout.rowHeight(textSize: textSize)
+        }
         self.request = scroll
         let oldActive = self.active
         let selectionChanged = self.selection != selection
@@ -296,10 +311,13 @@ final class TranscriptFlowScrollView: NSScrollView, NSTableViewDataSource, NSTab
         guard width != requestedWidth else { return }
         requestedWidth = width
         worker?.cancel()
+        let textSize = textSize
         worker = Task { [weak self] in
-            let task = Task.detached(priority: .userInitiated) { try TranscriptFlowLayout(source: source, width: width) }
+            let task = Task.detached(priority: .userInitiated) {
+                try TranscriptFlowLayout(source: source, width: width, textSize: textSize)
+            }
             let result = await withTaskCancellationHandler { await task.result } onCancel: { task.cancel() }
-            guard !Task.isCancelled, let self, self.source === source, requestedWidth == width,
+            guard !Task.isCancelled, let self, self.source === source, requestedWidth == width, self.textSize == textSize,
                   case let .success(layout) = result else { return }
             let anchor = layoutResult?.source === source ? topWord : nil
             layoutResult = layout
@@ -475,7 +493,7 @@ private final class TranscriptFlowLine: NSView, NSViewToolTipOwner {
         ctx.saveGState()
         ctx.textMatrix = .identity
         ctx.setFillColor(NSColor.labelColor.cgColor)
-        ctx.textPosition = .init(x: inset, y: 6)
+        ctx.textPosition = .init(x: inset, y: TranscriptFlowLayout.baseline(textSize: layoutResult.textSize))
         CTLineDraw(line, ctx)
         ctx.restoreGState()
     }

@@ -3,6 +3,42 @@ import Foundation
 import XCTest
 
 final class ProjectMediaReplaceBindingsTests: XCTestCase {
+    func testTrimmingImplicitMulticamAssemblyRebindsRetainedPauseReview() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("MPCutAppTests/Fixtures/SmartTrim-GOP.mp4")
+        let old = folder.appendingPathComponent("original.mp4")
+        let candidate = folder.appendingPathComponent("replacement.mp4")
+        try FileManager.default.copyItem(at: fixture, to: old)
+        try FileManager.default.copyItem(at: fixture, to: candidate)
+        let media = try CutEngine(useSidecar: false).inspect(old)
+        let offset = RationalTime(numerator: 1, denominator: 2)
+        let range = MulticamRange(from: .zero, to: .init(numerator: 1))
+        let source = MulticamSource(id: "camera", file: old.lastPathComponent)
+        let evidence = try XCTUnwrap(ProjectPauseReview.Source(media: media, sourceID: source.id))
+        var project = CutProject.multicam(.init(referenceAngle: source.id, range: range, angles: [source], audio: .none,
+                                               switches: [.init(at: .zero, angle: source.id)]))
+        project.analysisAnnotations.pauseReviews = [
+            .init(occurrenceID: "whole-group", kind: .marker, from: .init(numerator: 3, denominator: 4),
+                  sources: [evidence])
+        ]
+
+        let preview = try ProjectMediaReplace.preview(project, relativeTo: folder.appendingPathComponent("edit.cut"),
+                                                      source: old.path, candidate: candidate,
+                                                      options: .init(useID: source.id, replacementOffset: offset))
+        guard case .multicam(let result) = try preview.applying(to: project) else { return XCTFail("Expected multicam.") }
+        let retained = try XCTUnwrap(result.assemblyItems?.first)
+        XCTAssertEqual(retained.group, .init(from: offset, to: range.to))
+        let occurrenceID = try XCTUnwrap(retained.occurrenceID)
+        let review = try XCTUnwrap(result.analysisAnnotations.pauseReviews.first)
+        XCTAssertEqual(review.occurrenceID, "group/" + occurrenceID)
+        XCTAssertEqual(review.from, RationalTime(numerator: 3, denominator: 4))
+        XCTAssertEqual(review.sources.first?.file, candidate.lastPathComponent)
+        XCTAssertEqual(review.sources.first?.evidence, evidence.evidence)
+    }
+
     func testExistingDestinationGeometryRequiresPrivacyReviewAfterReplacement() throws {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -169,8 +205,7 @@ final class ProjectMediaReplaceBindingsTests: XCTestCase {
     }
 
     func testSavedReplaceHistoryPreservesLaterChangesToOtherBindingsInSameAttachment() throws {
-        let digest = String(repeating: "0", count: 64)
-        let asset = TranscriptAsset(file: "edit.transcripts/\(digest).json", sha256: digest, unavailable: .missing)
+        let asset = try TranscriptStore.put(TranscriptDocument(clock: .presentation))
         let old = TranscriptBinding(trackID: "replaced", file: "old.wav", streamIndex: 0)
         let new = TranscriptBinding(trackID: "replaced", file: "new.wav", streamIndex: 0)
         let other = TranscriptBinding(trackID: "edited-later", file: "unrelated.wav", streamIndex: 0)
@@ -186,8 +221,7 @@ final class ProjectMediaReplaceBindingsTests: XCTestCase {
         let current = project(new, editedOther)
         let change = TranscriptBindingChange.changes(from: replacement.transcripts, to: original.transcripts)
         let history = CutHistoryState(action: "Replace Source File", project: original, bindingChanges: change)
-        let (data, _) = try current.encodedArchive(undo: [history], redo: [], mediaSnapshot: .empty,
-                                                    byteLimit: MulticamProject.maximumFileSize)
+        let (data, _) = try current.encodedArchive(undo: [history], redo: [], mediaSnapshot: .empty)
         let reopened = try CutProject.decodeEditorDocument(data, limit: 1)
         let previous = try XCTUnwrap(reopened.undo.last)
         XCTAssertEqual(previous.bindingChanges, change)
@@ -198,11 +232,9 @@ final class ProjectMediaReplaceBindingsTests: XCTestCase {
 
 
         let unchanged = CutHistoryState(action: "Rename Clip", project: replacement)
-        let (initial, _) = try replacement.encodedArchive(undo: [unchanged], redo: [], mediaSnapshot: .empty,
-                                                             byteLimit: MulticamProject.maximumFileSize)
+        let (initial, _) = try replacement.encodedArchive(undo: [unchanged], redo: [], mediaSnapshot: .empty)
         let retained = try CutProject.decodeEditorDocument(initial, limit: 1).undo
-        let (resaved, _) = try current.encodedArchive(undo: retained, redo: [], mediaSnapshot: .empty,
-                                                        byteLimit: MulticamProject.maximumFileSize)
+        let (resaved, _) = try current.encodedArchive(undo: retained, redo: [], mediaSnapshot: .empty)
         let renamed = try CutProject.decodeEditorDocument(resaved, limit: 1).undo.last
         XCTAssertEqual(renamed?.bindingChanges, [])
         XCTAssertEqual(renamed?.project.transcripts.attachments.first?.bindings, [new, editedOther])

@@ -74,6 +74,7 @@ private func scenePage(_ report: SceneReport, source: String, args: AnalysisObje
     }
     result["source_id"] = source
     result["clock"] = "source"
+    result["report_id"] = report.reviewID(scope: interval.map { .range(start: $0.0, end: $0.1) } ?? .fullSource)
     if let staleReason {
         result["stale"] = true
         result["stale_reason"] = staleReason
@@ -216,7 +217,7 @@ extension ProjectSessions {
             if mc {
                 guard multi.canApplyPauses else { throw unavailable("Complete the program silence scan first.") }
                 return try page(multi.multicamPausePlan, args) { pause in
-                    ["id": mcpPauseID(pause, revision: session.mcpRevision), "occurrence": pause.id.occurrence, "clock": "group",
+                    ["id": mcpPauseID(pause, revision: session.mcpPauseListingRevision), "occurrence": pause.id.occurrence, "clock": "group",
                      "range": span(pause.visible), "removal": pause.removal.map { span($0) as Any } ?? NSNull(),
                      "protected": pause.isProtected, "retained_seconds": pause.retainedSeconds,
                      "requested_retained_seconds": pause.requestedRetainedSeconds.map { $0 as Any } ?? NSNull()]
@@ -224,7 +225,7 @@ extension ProjectSessions {
             }
             guard editor.pauseAnalysisReady else { throw unavailable("Complete the sequence silence scan first.") }
             return try page(editor.pausePlan, args) { pause in
-                ["id": mcpPauseID(pause, revision: session.mcpRevision), "clock": "sequence",
+                ["id": mcpPauseID(pause, revision: session.mcpPauseListingRevision), "clock": "sequence",
                  "occurrence": pause.key.source.occurrence.uuidString, "range": span(pause.sequence),
                  "removal": pause.removal.map { span($0) as Any } ?? NSNull(), "protected": pause.isProtected,
                  "retained_seconds": pause.retainedSeconds,
@@ -473,14 +474,21 @@ extension ProjectSessions {
                 throw unavailable("Mark a range with measured audio on the selected tracks.")
             }
         case "scenes_view_rename":
-            guard let name = args["name"] as? String, name.utf8.count <= 1024 else {
-                throw badInput("Choose an analyzed source and supply a view name up to 1024 bytes.")
+            guard let name = args["name"] as? String, name.utf8.count <= 1024,
+                  let reportID = args["report_id"] as? String else {
+                throw badInput("Supply a full-source scene report ID and a view name up to 1024 bytes.")
             }
             let report = try sceneReport()
+            guard report.coversFullSource, report.reviewID() == reportID else {
+                throw MCPCommandError("stale_scene_report", "Read the full-source scene boundaries and use their report ID.")
+            }
             let view = try integer(args["view"], field: "view", range: 1...Int.max)
             guard let index = report.scenes.firstIndex(where: { $0.view == view }) else { throw unavailable("This view is unavailable.") }
-            if mc, let source { multi.analysis.rename(.init(source: source, report: report, index: index), to: name) }
-            else if let uuid { editor.setViewName(name, source: uuid, view: view) }
+            let applied: Bool
+            if mc, let source { applied = multi.analysis.rename(.init(source: source, report: report, index: index), to: name) }
+            else if let uuid { applied = editor.setViewName(name, source: uuid, view: view) }
+            else { applied = false }
+            guard applied else { throw unavailable("Could not save the scene view name for this recording.") }
         case "silence_editor_pause_review":
             return try reviewPause(args, session: session)
         case "timeline_editor_join_preview":
@@ -601,6 +609,12 @@ private func mcpPauseID(_ pause: MulticamPauseEdit, revision: Int) -> String {
 private func reviewPause(_ args: AnalysisObject, session: ProjectSession) throws -> AnalysisObject {
     guard let action = args["action"] as? String else { throw badInput("Specify a review action.") }
     let editor = session.editor, multi = session.multicam, mc = session.isMulticam
+    let before = session.mcpRevision, listing = session.mcpPauseListingRevision
+    defer {
+        if session.mcpRevision != before {
+            session.mcpPauseReviewRevision = (session.mcpHandle, session.mcpRevision, listing)
+        }
+    }
     if action == "done" {
         if mc { multi.pauseEdits.review = nil } else { editor.cutPreview = nil }
     } else if ["next_cut", "keep_and_advance"].contains(action) {
@@ -611,23 +625,24 @@ private func reviewPause(_ args: AnalysisObject, session: ProjectSession) throws
             throw badInput("Supply a pause ID from silence_editor_pauses_list and a review action.")
         }
         if mc {
-            guard let pause = multi.multicamPausePlan.first(where: { mcpPauseID($0, revision: session.mcpRevision) == id }) else {
+            guard let pause = multi.multicamPausePlan.first(where: { mcpPauseID($0, revision: session.mcpPauseListingRevision) == id }) else {
                 throw unavailable("Refresh silence_editor_pauses_list.")
             }
             if action == "set_retained" || action == "reset_retained" {
                 let seconds = action == "set_retained" ? try number(args["retained_seconds"], field: "retained_seconds") : nil
-                guard multi.pauseEdits.review == nil, multi.setPauseRetainedDuration(seconds, for: pause),
-                      let updated = multi.multicamPausePlan.first(where: { $0.id == pause.id }) else {
+                guard multi.pauseEdits.review == nil, multi.setPauseRetainedDuration(seconds, for: pause) else {
                     throw badInput("Close the preview and supply a nonnegative retained duration for the detected pause.")
                 }
-                return ["review_open": false, "retained_seconds": updated.retainedSeconds,
-                        "requested_retained_seconds": updated.requestedRetainedSeconds.map { $0 as Any } ?? NSNull()]
+                return pauseRetainedReceipt(multi.multicamPausePlan.first(where: { $0.id == pause.id })
+                    .map { ($0.retainedSeconds, $0.requestedRetainedSeconds) })
             }
             if let review = multi.pauseEdits.review {
                 guard action == "protect", review.id == pause.id else {
                     throw unavailable("Close the current cut preview first.")
                 }
-                multi.setPauseProtection(true, for: pause)
+                guard multi.setPauseProtection(true, for: pause) else {
+                    throw unavailable("The pause could not be protected. Finish the current operation and verify its source audio.")
+                }
                 multi.pauseEdits.review = nil
                 return ["review_open": false]
             }
@@ -635,30 +650,40 @@ private func reviewPause(_ args: AnalysisObject, session: ProjectSession) throws
                 multi.reviewMulticamPause(pause)
                 guard multi.pauseEdits.review != nil else { throw unavailable("This join cannot be previewed.") }
             } else if action == "seek" { multi.seekMulticamPause(pause) }
-            else { multi.setPauseProtection(action == "protect", for: pause) }
+            else if !multi.setPauseProtection(action == "protect", for: pause) {
+                throw unavailable("The pause protection could not be changed. Verify its source audio and refresh the pause list.")
+            }
         } else {
             guard editor.cutPreview == nil, editor.pauseAnalysisReady,
-                  let pause = editor.pausePlan.first(where: { mcpPauseID($0, revision: session.mcpRevision) == id }) else {
+                  let pause = editor.pausePlan.first(where: { mcpPauseID($0, revision: session.mcpPauseListingRevision) == id }) else {
                 throw unavailable("Close the cut preview and refresh silence_editor_pauses_list.")
             }
             if action == "set_retained" || action == "reset_retained" {
                 let seconds = action == "set_retained" ? try number(args["retained_seconds"], field: "retained_seconds") : nil
-                guard editor.setPauseRetainedDuration(seconds, for: pause.key),
-                      let updated = editor.pausePlan.first(where: { $0.key == pause.key }) else {
+                guard editor.setPauseRetainedDuration(seconds, for: pause.key) else {
                     throw badInput("Supply a nonnegative retained duration for the detected pause.")
                 }
-                return ["review_open": false, "retained_seconds": updated.retainedSeconds,
-                        "requested_retained_seconds": updated.requestedRetainedSeconds.map { $0 as Any } ?? NSNull()]
+                return pauseRetainedReceipt(editor.pausePlan.first(where: { $0.key == pause.key })
+                    .map { ($0.retainedSeconds, $0.requestedRetainedSeconds) })
             }
             editor.seek(pause.sequence.from.seconds)
-            guard editor.currentPause.map({ mcpPauseID($0, revision: session.mcpRevision) }) == id else {
+            guard editor.currentPause.map({ mcpPauseID($0, revision: session.mcpPauseListingRevision) }) == id else {
                 throw unavailable("Refresh the pause selection.")
             }
             if action == "preview" {
                 editor.previewCurrentCut()
                 guard editor.cutPreview != nil else { throw unavailable("This join cannot be previewed.") }
-            } else if action != "seek" && pause.isProtected != (action == "protect") { editor.protectCurrentPause() }
+            } else if action != "seek", pause.isProtected != (action == "protect"), !editor.protectCurrentPause() {
+                throw unavailable("The pause protection could not be changed. Verify its source audio and refresh the pause list.")
+            }
         }
     }
     return ["review_open": mc ? multi.pauseEdits.review != nil : editor.cutPreview != nil]
+}
+
+private func pauseRetainedReceipt(_ durations: (retained: Double, requested: Double?)?) -> AnalysisObject {
+    // Removing the review can merge or remove the old pause.
+    guard let durations else { return ["review_open": false] }
+    return ["review_open": false, "retained_seconds": durations.retained,
+            "requested_retained_seconds": durations.requested.map { $0 as Any } ?? NSNull()]
 }

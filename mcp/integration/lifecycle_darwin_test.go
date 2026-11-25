@@ -12,6 +12,17 @@ func checkClosedProjectHistory(t *testing.T, call func(string, object, string) o
 	if before["dirty"] != false {
 		t.Fatalf("saved project is dirty: %v", before)
 	}
+	readArgs := object{"project_handle": project}
+	if shown := call("history_panel_show", readArgs, ""); shown["history_visible"] != true {
+		t.Fatalf("history sheet did not open: %v", shown)
+	}
+	saveArgs := object{"project_handle": project, "expected_revision": before["revision"], "operation_id": "save-after-history"}
+	call("project_save", saveArgs, "busy")
+	if hidden := call("history_panel_close", readArgs, ""); hidden["history_visible"] != false {
+		t.Fatalf("history sheet did not close: %v", hidden)
+	}
+	saveArgs["operation_id"] = "save-after-history-closed"
+	call("project_save", saveArgs, "")
 	args := object{"project_handle": project, "expected_revision": before["revision"], "operation_id": "close-saved"}
 	cancel := maps.Clone(args)
 	cancel["operation_id"] = "cancel-close-saved"

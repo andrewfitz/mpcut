@@ -4,11 +4,23 @@ import MPCutCore
 extension ProjectSessions {
     /// The bridge has already resolved the handle against the open document registry.
     /// Commands that prepare work asynchronously call checkAccess again before committing.
+    /// Every agent command is agent-originated for its whole duration: history labels it, and a preference
+    /// it writes is refused at the write path when Let agents change settings is off.
     func handleMCPCommand(tool: String, arguments: [String: Any], session: ProjectSession?,
                           checkAccess: @escaping @MainActor () throws -> Void) async throws -> [String: Any] {
-        try await HistoryOrigin.$current.withValue(.agent) {
-            try await dispatchMCPCommand(tool: tool, arguments: arguments, session: session, checkAccess: checkAccess)
+        let request = AgentSettingsRequest()
+        let result: [String: Any]
+        do {
+            result = try await AgentOrigin.$request.withValue(request) {
+                try await HistoryOrigin.$current.withValue(.agent) {
+                    try await dispatchMCPCommand(tool: tool, arguments: arguments, session: session, checkAccess: checkAccess)
+                }
+            }
+        } catch {
+            throw request.failure ?? error
         }
+        if let refused = request.failure { throw refused }
+        return result
     }
 
     private func dispatchMCPCommand(tool: String, arguments: [String: Any], session: ProjectSession?,
@@ -33,6 +45,9 @@ extension ProjectSessions {
             return result
         }
         if let result = try await mcpTranscript(tool: tool, arguments: arguments, session: session, checkAccess: checkAccess) {
+            return result
+        }
+        if let result = try session.mcpProjectOutput(tool: tool, arguments: arguments, checkAccess: checkAccess) {
             return result
         }
         if let result = try await mcpProjectMedia(tool: tool, arguments: arguments, session: session, checkAccess: checkAccess) {

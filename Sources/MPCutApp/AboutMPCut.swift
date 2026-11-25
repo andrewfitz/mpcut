@@ -18,6 +18,10 @@ struct AboutCommands: Commands {
                 .help("Open agent guide")
             Button("Release Notes") { NSWorkspace.shared.open(MPCutDocument.releaseNotes.url) }
                 .help("Open release notes")
+            Divider()
+            // MPCut makes no network request itself; the browser shows the latest release.
+            Button("Check for Updates…") { ReleasesPage.open() }
+                .help("Open the MPCut releases page in your browser")
         }
     }
 }

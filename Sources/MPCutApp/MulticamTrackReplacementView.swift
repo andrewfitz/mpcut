@@ -397,7 +397,7 @@ struct MulticamTrackReplacementView: View {
 
     private func showAudition(_ clip: PreviewRange, stream: Int) {
         audition.show(clip, streamIndex: stream, parent: model.window?.attachedSheet ?? model.window,
-                      autoplay: true, clockOffset: .zero)
+                      autoplay: true, clockOffset: .zero, preferences: model.preferences)
     }
 
     private func analyze() async {

@@ -1,16 +1,22 @@
+import AppKit
 import Foundation
-import MPCutCore
+@testable import MPCutCore
 import XCTest
 @testable import MPCutApp
 
 @MainActor
 final class MCPTilesTests: XCTestCase {
-    func testCountHintAcceptSchemasRequireAnEdit() throws {
+    func testAcceptSchemasSupportPendingReviewsAndCountEdits() throws {
         let schemas = try MCPSchemas.loaded.get()
         let editor: [String: Any] = ["project_handle": "window", "expected_revision": 1]
         let file: [String: Any] = ["operation_id": UUID().uuidString, "project_path": "/tmp/example.cut", "in_place": true]
         for (tool, base) in [("tiles_editor_accept", editor), ("tiles_file_accept", file)] {
-            XCTAssertThrowsError(try schemas.validate(tool: tool, arguments: base))
+            let token = String(repeating: "a", count: 64)
+            XCTAssertNoThrow(try schemas.validate(tool: tool, arguments: base))
+            XCTAssertNoThrow(try schemas.validate(tool: tool, arguments: base.merging(
+                ["review_token": token]) { _, new in new }))
+            XCTAssertThrowsError(try schemas.validate(tool: tool, arguments: base.merging(
+                ["review_token": token, "expected_feeds": 2]) { _, new in new }))
             XCTAssertNoThrow(try schemas.validate(tool: tool, arguments: base.merging(
                 ["expected_feeds": 2, "max_visible_tiles": 3]) { _, new in new }))
             XCTAssertNoThrow(try schemas.validate(tool: tool, arguments: base.merging(
@@ -25,6 +31,74 @@ final class MCPTilesTests: XCTestCase {
     func testLiveTilesReadAndEditShareRevisionAndUndo() async throws {
         try await withSequence { sessions, session in
             try await checkReadAndEdit(in: sessions, session)
+        }
+    }
+
+    func testLivePendingChoicesReplayAndDiscardAreUndoable() async throws {
+        _ = NSApplication.shared
+        try await withSequence { sessions, session in
+            let clip = try XCTUnwrap(session.editor.sequenceClips.first)
+            let media = URL(fileURLWithPath: clip.file)
+            let scan = ParticipantScanResult(state: .paused,
+                source: .init(file: clip.file, stamp: try SceneSourceStamp(identity: SourceIdentity(media)),
+                              inode: nil, stream: 0, origin: .zero, timeBase: .init(numerator: 1, denominator: 30),
+                              duration: clip.to, transform: .init(rotation: .r0, pixelAspectNum: 1, pixelAspectDen: 1)),
+                configuration: .init(.init()), analysis: nil, sceneReport: nil, analysisIdentity: "pending")
+            var participants = session.participantProject
+            participants.setPendingReview(try .init(scan: scan, sourceID: clip.file, file: clip.file))
+            try session.commitParticipants(participants, action: "Find Tiles")
+
+            let window = NSWindow(contentRect: .init(x: 0, y: 0, width: 400, height: 300),
+                                  styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            sessions.register(session, window: window)
+            defer { sessions.windowClosed(session); window.close() }
+            let directory = "/tmp/mpcut-test-" + UUID().uuidString
+            let bridge = MCPLocalControl(sessions: sessions, socket: MCPSocket(directory: directory))
+            sessions.preferences.localMCPEnabled = true
+            bridge.observeSetting()
+            defer { bridge.stop(); try? FileManager.default.removeItem(atPath: directory) }
+
+            let cursor = session.editor.historyCursor
+            let target: [String: Any] = ["project_handle": session.mcpHandle]
+            let read = try await bridge.perform(tool: "tiles_editor_pending_read", arguments: target)
+            let token = try XCTUnwrap(read["review_token"] as? String)
+            let stage = target.merging([
+                "expected_revision": session.mcpRevision, "operation_id": "pending-stage",
+                "review_token": token, "choices": ["expected_feeds": "2", "edited_hints": true],
+            ]) { _, new in new }
+            let staged = try await bridge.perform(tool: "tiles_editor_pending_stage", arguments: stage)
+            let replay = try await bridge.perform(tool: "tiles_editor_pending_stage", arguments: stage)
+            let pending = try XCTUnwrap(staged["pending_review"] as? [String: Any])
+            XCTAssertEqual(staged["operation_count"] as? Int, 1)
+            XCTAssertEqual(replay["revision"] as? Int, staged["revision"] as? Int)
+            XCTAssertEqual(session.editor.historyCursor, cursor + 1)
+            XCTAssertEqual(session.participantProject.pendingReviews.first?.choices.expectedFeeds, "2")
+            do {
+                let changed = stage.merging(["choices": ["expected_feeds": "3"]]) { _, new in new }
+                _ = try await bridge.perform(tool: "tiles_editor_pending_stage", arguments: changed)
+                XCTFail("A changed request cannot reuse the stage operation ID.")
+            } catch let error as MCPFailure {
+                XCTAssertEqual(error.code, "operation_conflict")
+            }
+            do {
+                let staleAcceptance = target.merging(["expected_revision": session.mcpRevision, "review_token": token]) { _, new in new }
+                _ = try await bridge.perform(tool: "tiles_editor_accept", arguments: staleAcceptance)
+                XCTFail("A current editor revision cannot approve choices from an older pending review.")
+            } catch let error as CutError {
+                XCTAssertEqual(error.code, "stale_tile_review")
+            }
+            let discard = target.merging([
+                "expected_revision": session.mcpRevision, "operation_id": "pending-discard",
+                "review_token": try XCTUnwrap(pending["review_token"] as? String),
+            ]) { _, new in new }
+            let discarded = try await bridge.perform(tool: "tiles_editor_pending_discard", arguments: discard)
+            XCTAssertEqual(discarded["operation_count"] as? Int, 1)
+            XCTAssertTrue(session.participantProject.pendingReviews.isEmpty)
+            session.editor.undo()
+            XCTAssertEqual(session.participantProject.pendingReviews.first?.choices.expectedFeeds, "2")
+            session.editor.undo()
+            XCTAssertEqual(session.participantProject, participants)
         }
     }
 
@@ -55,8 +129,11 @@ final class MCPTilesTests: XCTestCase {
     func testScanResumeAndSwitchScopeMatchDiscovery() throws {
         let schemas = try MCPSchemas.loaded.get()
         let target: [String: Any] = ["project_handle": "window"]
+        XCTAssertThrowsError(try schemas.validate(tool: "tiles_editor_scan", arguments: target))
         XCTAssertNoThrow(try schemas.validate(tool: "tiles_editor_scan", arguments: target.merging(
-            ["resume": true]) { _, new in new }))
+            ["output": "/tmp/scan.json"]) { _, new in new }))
+        XCTAssertNoThrow(try schemas.validate(tool: "tiles_editor_scan", arguments: target.merging(
+            ["resume": true, "expected_revision": 1]) { _, new in new }))
         XCTAssertThrowsError(try schemas.validate(tool: "tiles_editor_switches_propose", arguments: target.merging(
             ["source_id": "unused"]) { _, new in new }))
     }

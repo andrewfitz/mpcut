@@ -87,7 +87,7 @@ def scan(cli, recording, output, sampling, layout, size, expected=None):
 
 def accept(cli, recording, output, duration):
     base = output.with_name(f"{output.stem}-sequence.cut")
-    base.write_text(json.dumps({"format": "mpcut", "schema_version": 4, "kind": "sequence",
+    base.write_text(json.dumps({"format": "mpcut", "schema_version": 9, "kind": "sequence",
                                 "clips": [{"id": "gallery", "file": str(recording),
                                            "from": "0", "to": str(duration)}]}))
     reviewed = output.with_suffix(".cut")

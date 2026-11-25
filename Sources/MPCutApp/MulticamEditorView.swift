@@ -28,7 +28,7 @@ struct MulticamEditorView: View {
                 editor(project)
             } else {
                 EditorWorkspace(viewer: emptyViewer, transport: EmptyView(), timeline: EmptyView(), status: status,
-                                showsTimeline: false, showsStatus: showsStatus)
+                                preferences: model.preferences, showsTimeline: false, showsStatus: showsStatus)
             }
         }
         .safeAreaInset(edge: .top, spacing: 0) {
@@ -40,7 +40,7 @@ struct MulticamEditorView: View {
             }
         }
         .sheet(item: $model.projectMediaRequest, onDismiss: openReplacementTranscription) { request in
-            ProjectMediaSheet(jobs: model.projectMediaJobs, request: request, archive: { model.projectMediaArchive },
+            ProjectMediaSheet(jobs: model.projectMediaJobs, preferences: model.preferences, request: request, archive: { model.projectMediaArchive },
                               revision: { .init(generation: model.mcpGeneration, edit: model.mcpRevision) }, isMulticam: true,
                               status: model.mediaStatus(for:),
                               relinkBatch: { try await model.relinkProjectMedia($0) },
@@ -163,7 +163,7 @@ struct MulticamEditorView: View {
 
     private func editor(_ project: MulticamProject) -> some View {
         EditorWorkspace(
-            viewer: MulticamProgramViewer(preview: model.preview)
+            viewer: MulticamProgramViewer(preview: model.preview, preferences: model.preferences)
                 .overlay {
                     let editing = presentation.inspectorVisible && presentation.inspector == .participants
                     if let transcriptSession, editing || !project.participants.isEmpty || CutProject.multicam(project).requiresPictureProcessing {
@@ -179,7 +179,7 @@ struct MulticamEditorView: View {
                 presentation.inspectorVisible = true
             }
             .disabled(model.isBusy),
-            status: status, showsTimeline: true, showsStatus: showsStatus, allowsTimelineResize: true,
+            status: status, preferences: model.preferences, showsTimeline: true, showsStatus: showsStatus, allowsTimelineResize: true,
             showsSidebar: presentation.inspectorVisible
         ) {
             inspectorPanel(project)
@@ -213,13 +213,13 @@ struct MulticamEditorView: View {
                         .controlSize(.small)
                         .fixedSize(horizontal: true, vertical: false)
                     Spacer(minLength: 0)
-                    PanelDockToggle()
+                    PanelDockToggle(preferences: model.preferences)
                 }
                 HStack {
                     Text("Inspector").font(.headline)
                     Spacer()
                     inspectorPicker.pickerStyle(.menu).fixedSize()
-                    PanelDockToggle()
+                    PanelDockToggle(preferences: model.preferences)
                 }
             }
             .padding(.horizontal, 12)
@@ -759,6 +759,10 @@ struct MulticamEditorView: View {
                     Text(model.status).lineLimit(1).help(model.status)
                 }
                 Spacer(minLength: 8)
+                if model.lastExportedURL != nil {
+                    BarButton("Show in Finder", symbol: "folder", action: model.showExportInFinder)
+                        .help("Reveal exported file")
+                }
             }
         }
     }
@@ -903,12 +907,13 @@ private struct MulticamMediaSlate: View {
 
 private struct MulticamProgramViewer: View {
     let preview: MulticamPreview
+    let preferences: EditorPreferences
     @State private var issue: String?
     @State private var audioWarning: String?
 
     var body: some View {
         EditorPreview(accessibilityTitle: "Multicam program preview", issue: issue, audioWarning: audioWarning) {
-            MulticamPreviewView(preview: preview)
+            MulticamPreviewView(preview: preview, preferences: preferences)
         }
         // The preview surface receives frames directly. SwiftUI only displays the warnings.
         .onReceive(preview.$issue.combineLatest(preview.$pictureIssue).map { $0 ?? $1 }.removeDuplicates()) {
@@ -951,6 +956,9 @@ private struct MulticamTimelineHost: View {
                          zoom: $model.timelineZoom, largeThumbnails: Binding(
                             get: { model.preferences.largeThumbnails },
                             set: { model.preferences.largeThumbnails = $0 }
+                         ), trackLabelWidth: Binding(
+                            get: { model.preferences.trackLabelWidth },
+                            set: { model.preferences.trackLabelWidth = $0 }
                          ), showsSourceRuler: model.preferences.sourceTimeTicks, timeEntryRequest: model.timeEntryRequest, analysis: model.analysis,
                          snapTarget: Binding(get: { model.analysis.snapTarget }, set: model.setAnalysisSnap),
                          jump: { model.preview.pause(); model.seekGroup($0) },
@@ -1026,10 +1034,11 @@ private struct MulticamTimelineHost: View {
         let document = model.projectURL ?? model.draft.url ?? LiveProjectMediaArchive.untitledURL
         let useSidecar = model.useAnalysisSidecars
         let sidecarWork = model.sidecarWork
+        let minimumHold = TilesDialogueDefaults.switchLaneHold(model.preferences)
         proposalRefresh?.cancel()
         proposalRefresh = Task {
             let work = sidecarWork.detached(priority: .userInitiated) {
-                try TileSwitches.propose(in: updated, document: document, indexes: indexes,
+                try TileSwitches.propose(in: updated, document: document, indexes: indexes, minimumHold: minimumHold,
                                          useSidecar: useSidecar, cancelled: { Task.isCancelled })
             }
             let refreshed = try? await withTaskCancellationHandler { try await work.value } onCancel: { work.cancel() }
@@ -1396,6 +1405,8 @@ private struct MulticamExportControls: View {
         // the mode that failed, so the control reopens on it rather than on the preference.
         let preferred = model.unavailableExportMode ?? model.preferences.defaultExportMode
         var initial = MulticamExportChoices(entry: .multicamSheet, preferred: preferred)
+        // A fresh control starts from the Settings export defaults. Changing one here is kept by this control only.
+        initial.seed(from: model.preferences)
         let selection = model.exportProgram == .selection ? model.selectedExportRanges : nil
         let document = model.stillExportDocument(wholeGroup: model.exportProgram == .group, selection: selection)
         initial.usePictureProject(.multicam(project))
@@ -1604,11 +1615,15 @@ private struct MulticamExportControls: View {
         let panel = NSSavePanel()
         panel.title = "Export Multicam"
         panel.allowedContentTypes = [UTType(filenameExtension: chosen.container) ?? .data]
-        panel.nameFieldStringValue = "Multicam.\(chosen.container)"
+        panel.nameFieldStringValue = model.suggestedExportName(container: chosen.container)
+        // No rule of its own: Automatic leaves the folder to AppKit, as before.
+        panel.directoryURL = model.exportStartFolder(automatic: nil)
         let saveResult = ExportResultFile.checkbox()
+        saveResult.state = model.preferences.savesExportResult ? .on : .off
         panel.accessoryView = multicamDeliveryAccessory(summary, additionalControl: saveResult)
         ProjectPanels.present(panel, in: model.window) { [weak model] accepted in
             guard accepted, let output = panel.url, let model, model.project == request.project else { return }
+            model.noteExportFolder(output.deletingLastPathComponent())
             model.export(output: output, mode: chosen.effectiveMode, tracks: chosen.tracks, dryRun: false,
                          wholeGroup: request.wholeGroup, settings: chosen.settings, selection: request.selection,
                          requireCameraCopy: chosen.placements != .none && chosen.requireCameraCopy,

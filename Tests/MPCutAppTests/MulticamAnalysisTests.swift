@@ -256,14 +256,16 @@ final class MulticamAnalysisTests: XCTestCase {
         let waveform = try AudioAnalysis.scan(source, stream: track, useSidecar: false)
         let pauses = try AudioAnalysis.silence(source, stream: track, waveform: waveform, useSidecar: false)
         let sidecar = AnalysisSidecar(media: source)
-        var sections = try AnalysisSidecar.sections(media: source, scenes: report, waveforms: [track: waveform],
+        let sections = try AnalysisSidecar.sections(media: source, scenes: report, waveforms: [track: waveform],
                                                    silence: [pauses])
-        sections.merge(try AnalysisSidecar.viewNameSections([1: "Room"], for: report)) { _, name in name }
         try sidecar.save(sections)
 
-        let project = MulticamProject(referenceAngle: "camera", range: .init(from: .zero, to: source.duration),
+        var project = MulticamProject(referenceAngle: "camera", range: .init(from: .zero, to: source.duration),
                                       angles: [.init(id: "camera", file: url.path, audioStream: track)],
                                       audio: .follow, switches: [.init(at: .zero, angle: "camera")])
+        var reviewed = report
+        reviewed.setViewName("Room", for: 1)
+        XCTAssertTrue(project.analysisAnnotations.setScene(reviewed, for: source))
         let media = ["camera": source]
         let analysis = MulticamAnalysisStore()
         defer { analysis.reset() }

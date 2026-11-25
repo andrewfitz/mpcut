@@ -201,7 +201,7 @@ class StillTimelineAcceptance(unittest.TestCase):
 
     def project(self, row, kind, *, sources=None, assembly=None, repeated=False, length=LENGTH, label=None):
         wide, close = self.sources[row.name] if sources is None else sources
-        document = {"format": "mpcut", "schema_version": 3, "kind": kind}
+        document = {"format": "mpcut", "schema_version": 9, "kind": kind}
         if kind == "sequence":
             document["clips"] = [{"id": "a", "file": str(wide), "from": "0", "to": str(length)}]
             if repeated:

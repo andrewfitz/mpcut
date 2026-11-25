@@ -548,7 +548,7 @@ class MixedTimelineTests(unittest.TestCase):
                  {"id": "two", "file": str(self.prores), "from": "1/2", "to": "3/2"},
                  {"id": "three", "file": str(self.portrait), "from": "0", "to": "1"}]
         project = self.root / "mixed.cut"
-        project.write_text(json.dumps({"format": "mpcut", "schema_version": 3, "kind": "sequence", "clips": clips}))
+        project.write_text(json.dumps({"format": "mpcut", "schema_version": 9, "kind": "sequence", "clips": clips}))
         output = self.root / "mixed-fcp.fcpxml"
         self.assertEqual(self.cli("project", "convert", project, "--to", "fcp", "--output", output, "--json")["warnings"], [])
         import xml.etree.ElementTree as tree
@@ -572,7 +572,7 @@ class MixedTimelineTests(unittest.TestCase):
         # That is refused and names the cut. With the loss allowed the cut is rounded to a frame and warned about.
         clips[1].update({"from": "1/24", "to": "13/24"})
         clips[2].update({"from": "1/30", "to": "1"})
-        project.write_text(json.dumps({"format": "mpcut", "schema_version": 3, "kind": "sequence", "clips": clips}))
+        project.write_text(json.dumps({"format": "mpcut", "schema_version": 9, "kind": "sequence", "clips": clips}))
         rounded = self.root / "rounded.fcpxml"
         refused = self.cli("project", "convert", project, "--to", "fcp", "--output", rounded, "--json", ok=False)["error"]
         self.assertEqual(refused["code"], "conversion_loss")

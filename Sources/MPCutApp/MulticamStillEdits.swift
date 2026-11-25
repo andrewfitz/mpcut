@@ -152,7 +152,8 @@ extension MulticamEditorModel {
         guard canSpaceClips else { return }
         preview.pause()
         let revision = mcpRevision
-        StillPanels.spaceClips(cadence: multicamStillCadence(atAssembly: .zero), in: window) { [weak self] timing, cadence, background in
+        StillPanels.spaceClips(cadence: multicamStillCadence(atAssembly: .zero), seconds: preferences.gapDuration,
+                               color: preferences.gapColor, in: window) { [weak self] timing, cadence, background in
             guard let self, self.mcpRevision == revision, self.canSpaceClips else { return }
             self.performStillEditByHand("Space Clips") { document in
                 try timing.applying(to: document, cadence: cadence, background: background,
@@ -167,7 +168,8 @@ extension MulticamEditorModel {
         guard let requested = stillInsertionPlayhead() else { return }
         let position = snappedAssemblyStillPosition(requested)
         let revision = mcpRevision
-        StillPanels.gap(cadence: multicamStillCadence(atAssembly: position), in: window) { [weak self] duration, cadence, framing in
+        StillPanels.gap(cadence: multicamStillCadence(atAssembly: position), seconds: preferences.gapDuration,
+                        color: preferences.gapColor, in: window) { [weak self] duration, cadence, framing in
             guard let self, self.mcpRevision == revision, !self.isBusy else { return }
             let id = ProjectIdentifier.make()
             if self.performStillEditByHand("Insert Color Gap", { document in
@@ -215,8 +217,8 @@ extension MulticamEditorModel {
         preview.pause()
         guard let requested = explicitTime ?? stillInsertionPlayhead() else { return }
         let position = snappedAssemblyStillPosition(requested)
-        let cadence = multicamStillCadence(atAssembly: position) ?? .init(numerator: 1, denominator: 30)
-        let duration = max(cadence, stillFrameBoundary(.init(numerator: 2), cadence: cadence, nearest: true) ?? cadence)
+        // The Settings duration, rounded to a whole frame at the cadence there (30 fps when it has none).
+        let (duration, cadence) = defaultStillTiming(cadence: multicamStillCadence(atAssembly: position))
         let revision = mcpRevision
         let title = urls.count == 1 ? "Insert Still" : "Insert \(urls.count) Stills"
         StillPanels.duration(title: "\(title) at Assembly Time \(position)", duration: duration,

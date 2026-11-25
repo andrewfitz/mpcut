@@ -1,10 +1,11 @@
 import Foundation
 import MPCutCore
 
-func sourceID(in project: CutProject, request: ParticipantRequest, scannedOnly: Bool = true) throws -> String {
+func sourceID(in project: CutProject, request: ParticipantRequest, scannedOnly: Bool = true, includingPending: Bool = false) throws -> String {
     let ids: Set<String>
     if scannedOnly {
-        ids = Set(project.participants.sources.map(\.sourceID))
+        let sources = Set(project.participants.sources.map(\.sourceID))
+        ids = includingPending ? sources.union(project.participants.pendingReviews.map(\.sourceID)) : sources
     } else if case let .multicam(multicam) = project {
         ids = Set(multicam.pictureSources.filter { $0.feedAngle == nil }.map(\.id))
     } else {
@@ -20,6 +21,34 @@ func sourceID(in project: CutProject, request: ParticipantRequest, scannedOnly: 
 }
 
 extension TilesCLI {
+    func runPendingReview(json: Bool, interruption: Interruption) throws {
+        let request = try request(interruption)
+        let document = try request.url("project_path")
+        let requested = try request.value("source_id", as: String.self)
+        if operation == .readPending {
+            let project = try CutProject.load(from: document)
+            try writeJSON(project.pendingTileReview(requested).report(), pretty: !json)
+            return
+        }
+
+        let token = try request.required("review_token", as: String.self)
+        let choices = operation == .stagePending ? try request.required("choices", as: TilesPendingReviewChoices.self).value : nil
+        let action = choices == nil ? "Discard Pending Tile Review" : "Stage Tile Review Choices"
+        var sourceID = ""
+        var pendingReview: TilesPendingReviewReport?
+        let receipt = try mutateProject(request, document: document, action: action, interruption: interruption) { project in
+            sourceID = try project.pendingTileSourceID(requested)
+            if let choices {
+                pendingReview = try project.stagePendingTileChoices(sourceID: sourceID, token: token, choices: choices).report()
+            } else {
+                try project.discardPendingTileReview(sourceID: sourceID, token: token)
+            }
+        }
+        try writeJSON(TilesPendingReviewEdit(sourceID: sourceID, operationCount: receipt.operationCount,
+                                             pendingReview: pendingReview, projectPath: receipt.projectPath),
+                      pretty: !json, checkCancellation: false)
+    }
+
     func runReview(json: Bool, useSidecar: Bool, interruption: Interruption) throws {
         let request = try request(interruption)
         let cancelled: @Sendable () -> Bool = { !interruption.isActive }
@@ -45,8 +74,9 @@ extension TilesCLI {
                 let requested = try request.value("source_id", as: String.self)
                 let scanned = operation != .inspect
                     || project.participants.sources.contains { requested == nil || requested == $0.sourceID }
-                let source = try sourceID(in: project, request: request, scannedOnly: scanned)
-                review = TilesReview(project: project, sourceID: source, document: document,
+                    || project.participants.pendingReviews.contains { requested == nil || requested == $0.sourceID }
+                let source = try sourceID(in: project, request: request, scannedOnly: scanned, includingPending: true)
+                review = try TilesReview(reviewing: project, sourceID: source, document: document,
                                      useSidecar: useSidecar, cancelled: cancelled)
             }
             if let clock = try request.value("clock", as: String.self), clock != "source" {
@@ -108,7 +138,13 @@ extension TilesCLI {
         var conflicts: [String] = []
         var resultFeedID: String?
         var reviewIssueCount: Int?
-        let acceptingScan = operation == .accept && request.fields["analysis_file"] != nil
+        let acceptsPending = operation == .accept && ["analysis_file", "expected_feeds", "max_visible_tiles", "clear_count_hints"]
+            .allSatisfy { request.fields[$0] == nil }
+        let pendingToken = try request.value("review_token", as: String.self)
+        guard pendingToken == nil || acceptsPending else {
+            throw CLIError("invalid_arguments", "Use --review-token when accepting a pending review without a scan file or count overrides.")
+        }
+        let acceptingScan = operation == .accept && (request.fields["analysis_file"] != nil || acceptsPending)
         let action: String
         switch operation {
         case .addFeed: action = "Add Feed"
@@ -120,7 +156,8 @@ extension TilesCLI {
                 resultFeedID = try project.participants.addFeed(name: request.value("name", as: String.self))
                 return
             }
-            let source = try sourceID(in: project, request: request, scannedOnly: !acceptingScan)
+            let source = try acceptsPending ? project.pendingTileSourceID(request.value("source_id", as: String.self))
+                : sourceID(in: project, request: request, scannedOnly: !acceptingScan)
             if operation == .accept {
                 let overrides = try request.tileCountHints()
                 let clearHints = try request.value("clear_count_hints", as: Bool.self) ?? false
@@ -130,7 +167,9 @@ extension TilesCLI {
                 guard !(clearHints && overrides != nil) else {
                     throw CLIError("invalid_arguments", "Choose count hints or --clear-count-hints.")
                 }
-                if acceptingScan {
+                if acceptsPending {
+                    try project.acceptPendingTileReview(sourceID: source, relativeTo: document, token: pendingToken, cancelled: cancelled)
+                } else if acceptingScan {
                     let scan = try request.analysis(cancelled: cancelled)
                     try project.acceptParticipantAnalysis(scan, sourceID: source, relativeTo: document, cancelled: cancelled)
                 }

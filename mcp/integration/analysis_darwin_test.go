@@ -61,6 +61,14 @@ func checkSilenceToQueue(t *testing.T, call func(string, object, string) object,
 		return call("analysis_editor_state_read", object{"project_handle": project}, "")["silence_ready"] == true
 	})
 	detected := pauses()
+	if len(detected) != 2 || detected[0].(object)["requested_retained_seconds"] != 0.4 ||
+		!reflect.DeepEqual(detected[0].(object)["range"], separated[0].(object)["range"]) {
+		t.Fatalf("expected redetection to preserve the exact reviewed pause: %v", detected)
+	}
+	mutate("silence_editor_pause_review", "two-takes-reset-before-merge", object{
+		"action": "reset_retained", "pause": detected[0].(object)["id"],
+	})
+	detected = pauses()
 	if len(detected) != 1 {
 		t.Fatalf("expected one pause containing the 300 ms blip: %v", detected)
 	}

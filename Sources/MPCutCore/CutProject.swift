@@ -95,9 +95,28 @@ struct SequenceClipOrderValidation {
 
 public enum CutProject: Equatable, Codable, Sendable {
     public static let format = "mpcut"
-    public static let schemaVersion = 6
-    public static let tilesSchemaVersion = 8
-    package static let readableSchemaVersions: Set<Int> = [3, 4, schemaVersion, tilesSchemaVersion]
+    public static let schemaVersion = 9
+    @TaskLocal package static var documentReadCancelled: @Sendable () -> Bool = { Task.isCancelled }
+
+    static func checkDocumentRead() throws {
+        if documentReadCancelled() { throw CutError(code: "cancelled", message: "Project read cancelled.") }
+    }
+
+    /// Old analysis databases can contain saved work. Report the format without opening SQLite.
+    /// The signature distinguishes an old database from playable media using the same suffix.
+    package static func rejectLegacyCache(_ url: URL) throws {
+        guard url.isFileURL, url.pathExtension.lowercased() == "cutdb" else { return }
+        let fd = open(url.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { return }
+        defer { close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { return }
+        let signature = Array("SQLite format 3\0".utf8)
+        var header = [UInt8](repeating: 0, count: signature.count)
+        if read(fd, &header, signature.count) == signature.count, header == signature {
+            throw CutError(code: "unsupported_cutcache_version", message: "This .cutdb uses an unsupported MPCut cache format.")
+        }
+    }
 
     case sequence([CutSequenceClip])
     case multicam(MulticamProject)
@@ -108,11 +127,13 @@ public enum CutProject: Equatable, Codable, Sendable {
         case schemaVersion = "schema_version"
         case kind, clips, history
         case mediaSnapshot = "media_snapshot"
+        case embeddedAssets = "embedded_assets"
         case stillAssets = "still_assets"
         case stillReplacements = "still_replacements"
         case programColorPolicy = "program_color_policy"
         case stillFormat = "still_format"
         case stillSoundtrack = "still_soundtrack"
+        case analysisAnnotations = "analysis_annotations"
         case transcripts, participants
         case sourceSelects = "source_selects"
     }
@@ -133,7 +154,7 @@ public enum CutProject: Equatable, Codable, Sendable {
                 }
             case .stillSequence(var project):
                 project.transcripts = newValue
-                self = newValue.isEmpty && !project.hasStillContent && project.sourceSelects.isEmpty && project.stillAudioReference == nil && project.participants.isEmpty
+                self = newValue.isEmpty && project.analysisAnnotations.isEmpty && !project.hasStillContent && project.sourceSelects.isEmpty && project.stillAudioReference == nil && project.participants.isEmpty
                     ? .sequence(project.items.compactMap(\.source)) : .stillSequence(project)
             case .multicam(var project):
                 project.transcripts = newValue
@@ -157,7 +178,7 @@ public enum CutProject: Equatable, Codable, Sendable {
                 self = .stillSequence(.init(items: clips.map(StillSequenceItem.source), participants: newValue))
             case .stillSequence(var project):
                 project.participants = newValue
-                self = newValue.isEmpty && !project.hasStillContent && project.transcripts.isEmpty
+                self = newValue.isEmpty && project.analysisAnnotations.isEmpty && !project.hasStillContent && project.transcripts.isEmpty
                     && project.sourceSelects.isEmpty && project.stillAudioReference == nil
                     ? .sequence(project.items.compactMap(\.source)) : .stillSequence(project)
             case .multicam(var project):
@@ -169,12 +190,16 @@ public enum CutProject: Equatable, Codable, Sendable {
     }
 
     public init(from decoder: Decoder) throws {
+        self = try ProjectEmbeddedAssets.decoding(from: decoder) { try Self(contentsOf: decoder) }
+    }
+
+    private init(contentsOf decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         guard try values.decode(String.self, forKey: .format) == Self.format else {
             throw CutError(code: "invalid_cut_project", message: "Expected an MPCut project document")
         }
         guard let version = try values.decodeIfPresent(Int.self, forKey: .schemaVersion),
-              Self.readableSchemaVersions.contains(version) else {
+              version == Self.schemaVersion else {
             throw CutError(code: "unsupported_cut_version", message: "Unsupported MPCut project schema version")
         }
         switch try values.decode(String.self, forKey: .kind) {
@@ -196,18 +221,14 @@ public enum CutProject: Equatable, Codable, Sendable {
                 stillSoundtrack: values.decodeIfPresent(CutSequenceClip.self, forKey: .stillSoundtrack)
             )
             self = project.hasStillContent || !project.sourceSelects.isEmpty ? .stillSequence(project) : .sequence(project.items.compactMap(\.source))
-            if version < Self.schemaVersion, requiresExtendedStillSchema {
-                throw stillError("These still sequence settings require project schema version \(Self.schemaVersion)")
+            if values.contains(.analysisAnnotations) {
+                analysisAnnotations = try values.decode(ProjectAnalysisAnnotations.self, forKey: .analysisAnnotations)
             }
             if values.contains(.transcripts) {
                 transcripts = try values.decode(ProjectTranscripts.self, forKey: .transcripts)
             }
             if values.contains(.participants) {
-                guard version >= 4 else { throw invalidParticipantProject("Participant metadata requires project schema version 4.") }
                 participants = try values.decode(ParticipantProject.self, forKey: .participants)
-            }
-            guard version == Self.tilesSchemaVersion || !usesTilesFormat else {
-                throw CutError(code: "invalid_cut_project", message: "Tiles fields require project schema version \(Self.tilesSchemaVersion).")
             }
             try validate()
         case "multicam": self = .multicam(try MulticamProject(from: decoder))
@@ -215,29 +236,26 @@ public enum CutProject: Equatable, Codable, Sendable {
         }
     }
 
-    var requiresExtendedStillSchema: Bool {
-        stillSoundtrack != nil || stillFormat?.requiresExtendedStillSchema == true || stillInserts.contains(where: \.usesExactDuration)
-    }
-
     public func encode(to encoder: Encoder) throws {
-        try encode(to: encoder, requiresExtendedStillSchema: requiresExtendedStillSchema)
+        try ProjectEmbeddedAssets.encoding(to: encoder) { try encodeFields(to: encoder) }
     }
 
-    func encode(to encoder: Encoder, requiresExtendedStillSchema: Bool, requiresTilesSchema: Bool = false) throws {
+    private func encodeFields(to encoder: Encoder) throws {
         try validate()
         guard stillAudioReference == nil else {
             throw CutError(code: "transient_selection", message: "A still selection with inherited audio is an export snapshot.")
         }
         if case .multicam(let project) = self {
-            try project.encode(to: encoder, requiresTilesSchema: requiresTilesSchema)
+            try project.encode(to: encoder)
             return
         }
         var values = encoder.container(keyedBy: CodingKeys.self)
         try values.encode(Self.format, forKey: .format)
-        try values.encode(usesTilesFormat || requiresTilesSchema ? Self.tilesSchemaVersion : requiresExtendedStillSchema ? Self.schemaVersion : 4, forKey: .schemaVersion)
+        try values.encode(Self.schemaVersion, forKey: .schemaVersion)
         try values.encode("sequence", forKey: .kind)
         if !transcripts.isEmpty { try values.encode(transcripts, forKey: .transcripts) }
         if !participants.isEmpty { try values.encode(participants, forKey: .participants) }
+        if !analysisAnnotations.isEmpty { try values.encode(analysisAnnotations, forKey: .analysisAnnotations) }
         let project = stillSequenceValue!
         try values.encode(project.items, forKey: .clips)
         if !project.sourceSelects.isEmpty { try values.encode(project.sourceSelects, forKey: .sourceSelects) }
@@ -252,6 +270,7 @@ public enum CutProject: Equatable, Codable, Sendable {
         switch self {
         case .multicam(let project): try project.validate()
         case .stillSequence(let project):
+            try project.analysisAnnotations.validate()
             try project.transcripts.validate()
             try project.participants.validate()
             guard project.participants.protectedMediaPaths.allSatisfy({ ProjectFile.validMediaPath($0.1) }) else {
@@ -327,24 +346,17 @@ public enum CutProject: Equatable, Codable, Sendable {
             }
         case .multicam(let project):
             return project.sources.map { ($0.id, $0.file) } + project.stillAssets.map { ($0.id, $0.file) }
-                + project.transcripts.protectedPaths
+                + project.analysisAnnotations.protectedPaths + project.transcripts.protectedPaths + project.participants.pendingMediaPaths
         case .stillSequence(let project):
             let references = [project.stillAudioReference, project.stillSoundtrack].compactMap { $0 }
             return Self.sequence(project.items.compactMap(\.source) + references).mediaPaths + project.stillAssets.map { ($0.id, $0.file) }
-                + project.transcripts.protectedPaths + project.sourceSelects.map { ($0.id, $0.range.file) }
+                + project.analysisAnnotations.protectedPaths + project.transcripts.protectedPaths + project.sourceSelects.map { ($0.id, $0.range.file) }
                 + project.participants.protectedMediaPaths
         }
     }
 
     public func validateDestination(_ output: URL, relativeTo projectURL: URL, includesContents: Bool = false) throws {
         try validateDestination(output, sourceDirectory: ProjectFile.directory(of: projectURL), includesContents: includesContents)
-        let assets = transcripts.attachments.compactMap { attachment in
-            TranscriptStore.assetLocation(attachment.asset, relativeTo: projectURL).map { (attachment.id, $0.path) }
-        }
-        if !assets.isEmpty {
-            try ProjectFile.validateDestination(output, sourceDirectory: ProjectFile.directory(of: projectURL), sources: assets,
-                                                prefix: "cut", includesContents: includesContents)
-        }
     }
 
     package func validateDestination(_ output: URL, sourceDirectory: URL, includesContents: Bool = false) throws {
@@ -426,14 +438,19 @@ public enum CutProject: Equatable, Codable, Sendable {
             project.stillSoundtrack = project.stillSoundtrack.map(rebaseClip)
             project.sourceSelects = project.sourceSelects.map { $0.mapPath(rebase) }
             project.participants = project.participants.mapSourcePaths(rebase)
+            project.analysisAnnotations = project.analysisAnnotations.mappingPaths(rebase)
             project.transcripts = project.transcripts.mapSourcePaths(rebase)
             return .stillSequence(project)
         case .multicam(var project):
             project.angles = project.angles.map { $0.mappingFiles(rebase) }
             project.audioSources = project.audioSources.map { $0.mappingFiles(rebase) }
+            for index in project.participants.pendingReviews.indices {
+                project.participants.pendingReviews[index].file = rebase(project.participants.pendingReviews[index].file)
+            }
             for index in project.stillAssets.indices where !project.stillAssets[index].isGap {
                 project.stillAssets[index].file = rebase(project.stillAssets[index].file)
             }
+            project.analysisAnnotations = project.analysisAnnotations.mappingPaths(rebase)
             project.transcripts = project.transcripts.mapSourcePaths(rebase)
             return .multicam(project)
         }
@@ -560,6 +577,7 @@ enum ProjectFile {
     }
 
     static func readBytes(from url: URL, multicam: Bool = false) throws -> Data {
+        try CutProject.rejectLegacyCache(url)
         let prefix = multicam ? "multicam" : "cut"
         var data = Data()
         do {
@@ -571,13 +589,11 @@ enum ProjectFile {
             guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG else {
                 throw CutError(code: "\(prefix)_project_read_failed", message: "Expected a regular project file at \(url.path)")
             }
-            let limit = MulticamProject.maximumFileSize
-            guard info.st_size <= limit else {
-                throw CutError(code: "invalid_\(prefix)_project", message: "Project exceeds the 64 MB limit")
-            }
-            while data.count <= limit {
-                let count = min(1 << 20, limit + 1 - data.count)
-                guard let block = try reader.read(upToCount: count), !block.isEmpty else { break }
+            while let block = try reader.read(upToCount: 1 << 20), !block.isEmpty {
+                try CutProject.checkDocumentRead()
+                guard !block.contains(0) else {
+                    throw CutError(code: "invalid_\(prefix)_project", message: "Project must contain a UTF-8 JSON object")
+                }
                 data.append(block)
             }
         } catch let error as CutError { throw error }
@@ -588,34 +604,49 @@ enum ProjectFile {
     }
 
     static func decode<T: Decodable>(_ type: T.Type, data: Data, multicam: Bool = false) throws -> T {
+        try decodeWithDocument(type, data: data, multicam: multicam).value
+    }
+
+    static func decodeWithDocument<T: Decodable>(_ type: T.Type, data: Data, multicam: Bool = false) throws
+        -> (value: T, plain: Data) {
         let code = multicam ? "invalid_multicam_project" : "invalid_cut_project"
-        guard data.count <= MulticamProject.maximumFileSize else {
-            throw CutError(code: code, message: "Project exceeds the 64 MB limit")
-        }
         let text = data
         guard !text.contains(0), String(data: text, encoding: .utf8) != nil else {
             throw CutError(code: code, message: "Project must contain a UTF-8 JSON object")
         }
         // A project saved with a table of what it repeats is read as the document it stands for.
         // A history saved with another edit, as after a change made in the text or a merge, is left out.
-        let data = ProjectHistoryStamp.verified(try ProjectKeyedLayout.expanded(text, code: code) ?? text)
+        let data = try documentJSON(text, multicam: multicam)
         do {
             let project = try JSONDecoder().decode(type, from: data)
             if let issue = jsonInputIssue(data, integerNumbersOnly: true, allowsFraction: allowsProjectFraction) {
                 throw CutError(code: code, message: "Project \(issue)")
             }
-            return project
+            return (project, data)
         } catch let error as DecodingError {
             throw CutError(code: code, message: "Invalid project JSON: \(error)")
         }
     }
 
-    private static func allowsProjectFraction(_ locations: [JSONInputLocation]) -> Bool {
+    static func allowsProjectFraction(_ locations: [JSONInputLocation]) -> Bool {
         let keys = locations.compactMap { location -> String? in
             guard case .key(let key) = location else { return nil }
             return key
         }
+        if let index = keys.firstIndex(of: "analysis_annotations"),
+           keys.first == "analysis_annotations" || keys.first == "history" {
+            let field = Array(keys[(index + 1)...])
+            if field == ["silence", "threshold_db"] || field == ["multicam_threshold_db"] || field == ["pause_reviews", "retained_seconds"] || field == ["scenes", "scenes", "start_seconds"] { return true }
+        }
         if keys.first == "media_snapshot" { return true }
+        if keys.first == "embedded_assets" {
+            let field = keys.dropFirst(3)
+            switch keys.dropFirst().first {
+            case "transcripts": return TranscriptStoredForm.allowsFraction(at: field)
+            case "tile_scans": return EmbeddedTileScan.allowsFraction(at: field)
+            default: return false
+            }
+        }
         // A history delta can wrap changed clips and occurrences in splice records.
         // The same fractional anchors are valid in live and retained layout slots.
         let end = keys.count
@@ -651,18 +682,13 @@ enum ProjectFile {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         if !compact { encoder.outputFormatting.insert(.prettyPrinted) }
-        var data = try encoder.encode(project)
-        if !compact, data.count >= MulticamProject.maximumFileSize {
-            encoder.outputFormatting.remove(.prettyPrinted)
-            data = try encoder.encode(project)
-        }
-        return data
+        return try encoder.encode(project)
     }
 
     static func write(_ bytes: Data, to url: URL, sources: [(String, String)], prefix: String,
-                      replacingExisting: Bool = true, byteLimit: Int = MulticamProject.maximumFileSize) throws {
+                      replacingExisting: Bool = true) throws {
         _ = try writeRevision(bytes, to: url, sources: sources, prefix: prefix,
-                              replacingExisting: replacingExisting, expected: nil, byteLimit: byteLimit)
+                              replacingExisting: replacingExisting, expected: nil)
     }
 
     /// The caller holds the draft lease and publishes this private stage.
@@ -674,63 +700,33 @@ enum ProjectFile {
 
     static func writeRevision(_ bytes: Data, to url: URL, sources: [(String, String)], prefix: String,
                               replacingExisting: Bool, expected: ProjectDiskRevision?,
-                              transcriptAssets: [TranscriptAsset]? = nil, hasTranscriptMetadata: Bool = false,
-                              byteLimit: Int = MulticamProject.maximumFileSize,
                               beforePublish: () throws -> Void = {}) throws -> ProjectDiskRevision {
-        let data = try diskBytes(bytes, prefix: prefix, byteLimit: byteLimit)
+        let data = try diskBytes(bytes, prefix: prefix)
         return try coordinatedWrite(to: url, prefix: prefix, expected: expected) { destination, verifyDestination in
             let target = replacingExisting ? destination : url
             try validateDestination(target, sourceDirectory: directory(of: target), sources: sources, prefix: prefix)
-            func publish() throws {
-                try publishProject(data, to: target, prefix: prefix, replacingExisting: replacingExisting) {
-                    try beforePublish()
-                    try verifyDestination()
-                }
-            }
-            if let transcriptAssets {
-                try TranscriptStore.publish(relativeTo: target, keeping: transcriptAssets,
-                                            hasTranscriptMetadata: hasTranscriptMetadata, publish)
-            } else {
-                try publish()
+            try publishProject(data, to: target, prefix: prefix, replacingExisting: replacingExisting) {
+                try beforePublish()
+                try verifyDestination()
             }
             return data
         }
     }
 
-    static func diskBytes(_ bytes: Data, prefix: String, byteLimit: Int = MulticamProject.maximumFileSize) throws -> Data {
-        // The limit is on the document itself, whatever form it is written in.
-        let limit = min(byteLimit, MulticamProject.maximumFileSize)
-        guard bytes.count <= limit else {
-            if limit < MulticamProject.maximumFileSize {
-                throw CutError(code: "invalid_\(prefix)_project", message: "Project exceeds its \(limit)-byte limit")
-            }
-            throw CutError(code: "invalid_\(prefix)_project", message: "Project exceeds the 64 MB limit")
+    static func diskBytes(_ bytes: Data, prefix: String) throws -> Data {
+        guard let original = ProjectSavedLayout.parse(bytes), case .object = original else {
+            throw CutError(code: "invalid_\(prefix)_project", message: "Project must contain a UTF-8 JSON object")
         }
-        // A project is written as text with one field to a line, so that version control can
-        // compare and merge it, and with what it repeats listed once under keys taken from
-        // the content. Nothing in it refers to another part by position.
-        var fitting = bytes
-        if let original = ProjectSavedLayout.parse(bytes), case .object = original {
-            let plain = ProjectHistoryStamp.stamped(original)
-            let keyed = ProjectKeyedLayout.compactedDocument(plain)
-            let text = ProjectSavedLayout.readable(keyed ?? plain, capacity: bytes.count)
-            if text.count <= limit { return text }
-            let compactBytes = ProjectSavedLayout.text(keyed ?? plain, capacity: bytes.count)
-            if compactBytes.count <= limit { fitting = compactBytes }
-        }
-        // Near the limit the project is written without the line breaks, and past that in
-        // whatever form it was given.
-        guard fitting.count < limit else { return fitting }
-        var data = fitting
-        data.append(0x0A)
-        return data
+        let plain = ProjectHistoryStamp.stamped(original)
+        let saved = ProjectKeyedLayout.compactedDocument(plain) ?? plain
+        return ProjectSavedLayout.readable(saved, capacity: bytes.count)
     }
 
     static func publishProject(_ data: Data, to url: URL, prefix: String, replacingExisting: Bool,
                                beforePublish: () throws -> Void = {}) throws {
+        let stage = url.deletingLastPathComponent().appendingPathComponent(".mpcut-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: stage) }
         if !replacingExisting {
-            let stage = url.deletingLastPathComponent().appendingPathComponent(".mpcut-" + UUID().uuidString)
-            defer { try? FileManager.default.removeItem(at: stage) }
             try data.write(to: stage, options: .withoutOverwriting)
             try beforePublish()
             let error = publishExclusively(from: stage, to: url)
@@ -740,14 +736,44 @@ enum ProjectFile {
             }
             return
         }
-        var info = stat()
-        if lstat(url.path, &info) == 0, info.st_mode & S_IFMT != S_IFREG {
-            throw CutError(code: "\(prefix)_project_write_failed", message: "Choose a regular project file at \(url.path)")
+
+        do {
+            var info = stat()
+            if lstat(url.path, &info) == 0 {
+                guard info.st_mode & S_IFMT == S_IFREG else {
+                    throw CutError(code: "\(prefix)_project_write_failed", message: "Choose a regular project file at \(url.path)")
+                }
+                let mode = info.st_mode & 0o7777
+                // A staged replacement starts with at most the destination's owner permissions.
+                let descriptor = open(stage.path, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, mode & 0o600)
+                guard descriptor >= 0 else { throw systemError() }
+                let writer = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+                defer { try? writer.close() }
+                try writer.write(contentsOf: data)
+                // Keep the destination mode, as Foundation's atomic write did.
+                guard fchmod(descriptor, mode) == 0 else { throw systemError() }
+                try writer.close()
+            } else {
+                guard errno == ENOENT else { throw systemError() }
+                try data.write(to: stage, options: .withoutOverwriting)
+            }
+        } catch let error as CutError {
+            throw error
+        } catch {
+            throw writeError(error)
         }
+
+        // Complete disk staging before checking the revision. Only the rename
+        // remains after the check, minimizing the window for external writers.
         try beforePublish()
-        do { try data.write(to: url, options: .atomic) }
-        catch {
-            throw CutError(code: "\(prefix)_project_write_failed", message: "Could not save \(url.path): \(error.localizedDescription)")
+        guard rename(stage.path, url.path) == 0 else { throw writeError(systemError()) }
+
+        func systemError() -> POSIXError {
+            POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+
+        func writeError(_ error: Error) -> CutError {
+            CutError(code: "\(prefix)_project_write_failed", message: "Could not save \(url.path): \(error.localizedDescription)")
         }
     }
 

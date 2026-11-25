@@ -47,7 +47,12 @@
             "set_scroll",
             "set_track_label_width",
             "set_timeline_height",
-            "set_inspector_width"
+            "set_inspector_width",
+            "set_monitor_picture",
+            "set_cut_sections",
+            "set_full_height_panel",
+            "set_transcript_follow_playback",
+            "set_transcript_suggested_camera"
           ]
         },
         "zoom": {
@@ -58,7 +63,7 @@
         },
         "enabled": {
           "type": "boolean",
-          "description": "Used by set_large_thumbnails; shared across windows."
+          "description": "Used by set_large_thumbnails, set_full_height_panel and set_transcript_follow_playback. Thumbnail size and panel docking are shared across windows."
         },
         "span": {
           "type": "string",
@@ -73,7 +78,7 @@
         },
         "visible": {
           "type": "boolean",
-          "description": "Required for set_pause_controls, set_transcript and set_tiles. Defaults to true for set_inspector."
+          "description": "Required for set_pause_controls, set_transcript, set_tiles and set_cut_sections. Defaults to true for set_inspector."
         },
         "section": {
           "type": "string",
@@ -106,6 +111,36 @@
           "minimum": 1,
           "maximum": 10000,
           "description": "Divider size in screen points. Track labels accept 106 to 360. Native layout constraints apply."
+        },
+        "picture": {
+          "type": "string",
+          "enum": [
+            "source",
+            "output"
+          ],
+          "description": "Source or composed Output in the editor viewer. The separate playback monitor continues to show composed Output."
+        },
+        "attachment": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Transcript attachment ID for a remembered multicam camera."
+        },
+        "speaker": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Speaker ID within the transcript attachment."
+        },
+        "camera": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Project angle ID to remember, or null to clear it."
         }
       },
       "required": [
@@ -254,6 +289,78 @@
               "points"
             ]
           }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "set_monitor_picture"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "picture"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "set_cut_sections"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "visible"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "set_full_height_panel"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "enabled"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "set_transcript_follow_playback"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "enabled"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "set_transcript_suggested_camera"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "attachment",
+              "speaker",
+              "camera"
+            ]
+          }
         }
       ]
     }
@@ -285,6 +392,20 @@
             "agent_guide",
             "release_notes"
           ]
+        },
+        "page": {
+          "type": "string",
+          "enum": [
+            "general",
+            "editing",
+            "playback",
+            "media",
+            "transcripts",
+            "export",
+            "storage",
+            "automation"
+          ],
+          "description": "For show_settings, the Settings page to open. Omit it to reopen the last page."
         }
       },
       "required": [

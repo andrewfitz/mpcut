@@ -25,6 +25,10 @@
           "type": "integer",
           "minimum": 0,
           "description": "Pin pagination to the revision from the previous page."
+        },
+        "include_history": {
+          "type": "boolean",
+          "description": "Include media used only by retained undo or redo states. Defaults to false."
         }
       },
       "required": [
@@ -39,7 +43,7 @@
   },
   {
     "name": "project_editor_media_locate",
-    "description": "Search a folder for relink candidates. Poll analysis_job_status_read for candidate rows and use project_editor_media_relink to apply your choices.",
+    "description": "Search a folder for relink candidates. Set apply_matches to apply unique verified or matched candidates. Poll analysis_job_status_read for the outcome.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -62,6 +66,14 @@
           "type": "string",
           "description": "Absolute path to the folder to search, including its subdirectories.",
           "pattern": "^/"
+        },
+        "include_history": {
+          "type": "boolean",
+          "description": "Include media used only by retained undo or redo states. Defaults to false."
+        },
+        "apply_matches": {
+          "type": "boolean",
+          "description": "Apply unique verified or matched candidates. Defaults to false."
         }
       },
       "required": [
@@ -73,7 +85,7 @@
       "additionalProperties": false
     },
     "annotations": {
-      "readOnlyHint": true,
+      "readOnlyHint": false,
       "openWorldHint": false
     }
   },
@@ -415,6 +427,86 @@
           }
         }
       ]
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "project_editor_media_leave_offline",
+    "description": "Mark a current media reference as deliberately offline.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string",
+          "description": "Opaque handle from project_windows_list.",
+          "minLength": 1
+        },
+        "expected_revision": {
+          "type": "integer",
+          "description": "Revision from the editor state or the candidate receipt.",
+          "minimum": 0
+        },
+        "operation_id": {
+          "type": "string",
+          "description": "Fresh UUID for this request. Reuse it to retry an identical request.",
+          "format": "uuid"
+        },
+        "source": {
+          "type": "string",
+          "description": "Path returned by the project media list, or an absolute source path.",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "project_handle",
+        "expected_revision",
+        "operation_id",
+        "source"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "project_editor_media_revert",
+    "description": "Restore a previous media location when all current and retained uses trace to its relink.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string",
+          "description": "Opaque handle from project_windows_list.",
+          "minLength": 1
+        },
+        "expected_revision": {
+          "type": "integer",
+          "description": "Revision from the editor state or the candidate receipt.",
+          "minimum": 0
+        },
+        "operation_id": {
+          "type": "string",
+          "description": "Fresh UUID for this request. Reuse it to retry an identical request.",
+          "format": "uuid"
+        },
+        "source": {
+          "type": "string",
+          "description": "Path returned by the project media list, or an absolute source path.",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "project_handle",
+        "expected_revision",
+        "operation_id",
+        "source"
+      ],
+      "additionalProperties": false
     },
     "annotations": {
       "readOnlyHint": false,

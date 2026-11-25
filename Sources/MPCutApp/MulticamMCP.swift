@@ -37,7 +37,7 @@ extension MulticamEditorModel {
         let args = MulticamArguments(values: arguments)
         guard ["timeline_item_split", "multicam_camera_take", "timeline_playhead_seek", "playback_transport_play", "playback_transport_pause", "history_read", "history_undo", "history_redo",
                "history_state_restore", "multicam_switch_edit", "multicam_source_edit", "multicam_assembly_edit",
-               "multicam_program_audio_set", "multicam_group_end_set", "multicam_selection_set", "multicam_preview_control", "multicam_state_read", "multicam_sync_suggest"].contains(tool)
+               "multicam_program_audio_set", "multicam_group_end_set", "multicam_voice_angle_edit", "multicam_selection_set", "multicam_preview_control", "multicam_state_read", "multicam_sync_suggest"].contains(tool)
         else { return nil }
         try validateCommit()
         guard let original = project else { throw args.invalid("Open a multicam project.") }
@@ -214,6 +214,32 @@ extension MulticamEditorModel {
                 else if policy == .mix, project.mixLanes.isEmpty { project.mixLanes = project.defaultMixLanes }
                 project.audio = policy
             }) else { throw nativeEditError }
+        case "multicam_voice_angle_edit":
+            let voice = try ParticipantSpeakerBinding(attachmentID: args.string("attachment_id"), speakerID: args.string("speaker_id"))
+            let angle: String?
+            switch try args.string("action") {
+            case "set": angle = try args.string("angle_id")
+            case "clear":
+                guard args.values["angle_id"] == nil else { throw args.invalid("Omit angle_id when clearing a voice link.") }
+                angle = nil
+            default: throw args.invalid("Choose set or clear.")
+            }
+            let generation = mcpGeneration
+            let documentURL = projectURL
+            let links = try await Task.detached(priority: .userInitiated) {
+                var updated = original
+                try updated.setSpeakerAngle(angle, for: voice, documentURL: documentURL)
+                return updated.speakerAngles
+            }.value
+            try validateCommit()
+            guard generation == mcpGeneration, revisionBeforeCommand == mcpRevision,
+                  original.transcripts == project?.transcripts else {
+                throw MCPCommandError("stale_revision", "The multicam project changed while reading the transcript voice.")
+            }
+            guard !isBusy, window?.attachedSheet == nil, setup.isEmpty, notice == nil else {
+                throw MCPCommandError("editor_busy", "Finish the current multicam operation or dialog.")
+            }
+            guard edit("Link Transcript Voice", { $0.speakerAngles = links }) else { throw nativeEditError }
         case "multicam_group_end_set":
             let end: RationalTime
             switch try args.string("action") {
@@ -383,6 +409,10 @@ extension MulticamEditorModel {
                 item["issue"] = sourceIssues[source.id] ?? sourceIndexIssues[source.id]
                 return item
             }
+        case "voice_angles":
+            state["total"] = project.speakerAngles.count
+            state["voice_angles"] = try JSONSerialization.jsonObject(
+                with: JSONEncoder().encode(Array(project.speakerAngles[page(project.speakerAngles.count)])))
         case "switches":
             state["total"] = project.switches.count
             state["switches"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(Array(project.switches[page(project.switches.count)])))
@@ -402,7 +432,7 @@ extension MulticamEditorModel {
                 state["edge"] = ["range_number": suggestion.edge.range, "boundary": suggestion.edge.boundary,
                                  "group_time": suggestion.edge.at.description, "times": suggestion.times.map(\.description)]
             }
-        default: throw args.invalid("Choose sources, switches, switch coverage, suggestions, assembly, stills or audio.")
+        default: throw args.invalid("Choose sources, switches, switch coverage, suggestions, assembly, stills, audio or voice angles.")
         }
         if let policy = project.programColorPolicy {
             state["program_color_policy"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(policy))
@@ -638,6 +668,8 @@ extension MulticamEditorModel {
         case "start": seekPlaybackBoundary(end: false)
         case "end": seekPlaybackBoundary(end: true)
         case "snap":
+            // Snap to is an app-wide setting. The editor's own snap control does not come through here.
+            try preferences.checkAgentWrite()
             guard let snap = try TimelineSnapTarget(rawValue: args.string("target")) else { throw args.invalid("Unknown snap target.") }
             setAnalysisSnap(snap)
         default: throw args.invalid("Unknown preview action.")

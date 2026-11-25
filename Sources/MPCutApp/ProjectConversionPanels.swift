@@ -67,6 +67,15 @@ extension ProjectSessions {
         let name = session.isMulticam ? session.multicam.projectName : session.editor.projectURL?.deletingPathExtension().lastPathComponent
         panel.nameFieldStringValue = (name ?? "Untitled") + "." + format.rawValue
         panel.allowedContentTypes = [format.contentType]
+        // Project interchange has no folder rule of its own, so only Settings' starting folder applies.
+        if session.isMulticam {
+            if preferences.exportStartFolder != .automatic {
+                panel.directoryURL = ExportStartFolder.resolve(preferences, projectFile: session.multicam.projectURL, sourceRecording: nil,
+                                                               sessionFolder: nil, automatic: nil).directory
+            }
+        } else if let start = session.editor.exportPanelDirectory(source: session.editor.firstSourceURL, hasAutomaticRule: false) {
+            panel.directoryURL = start
+        }
         let loss = Self.lossOption(in: panel)
         let flatten: PremiereFlattenOption?
         if format == .premiere && session.isMulticam {
@@ -102,6 +111,7 @@ extension ProjectSessions {
             }
             let exclusions = session.isMulticam ? session.multicam.sidecarExclusions : session.editor.sidecarExclusions
             let checkingVolumes = session.isMulticam ? session.multicam.interchangeCheckingVolumes : session.editor.interchangeCheckingVolumes
+            if !session.isMulticam { session.editor.noteExportFolder(output.deletingLastPathComponent(), hasAutomaticRule: false) }
             let allowLoss = loss.state == .on
             let flattenMulticam = allowLoss && flatten?.state == .on
             // Unsaved desktop projects already retain absolute paths for all working media.
@@ -139,14 +149,20 @@ extension ProjectSessions {
         conversionOwner = session?.mcpHandle
         projectConversion = token
         let sidecarWork = session?.sidecarWork ?? ProjectSidecarWork(project: nil)
+        let awake = imported ? nil : SleepPrevention(reason: "Exporting from MPCut")
         Task {
-            defer { finishProjectConversion() }
+            defer {
+                awake?.end()
+                finishProjectConversion()
+            }
             do {
                 let warnings = try await sidecarWork.detached(priority: .userInitiated) { try operation(token) }.value
                 guard conversionDidFinish == nil else { return }
                 let target = session.flatMap { sessions[$0.id] === $0 ? $0 : nil }
                 if imported { openFiles([output], in: target) }
-                if !warnings.isEmpty || !imported {
+                if !imported { ExportCompletion.runActions(for: output, preferences: preferences) }
+                // Warnings always show. Settings → General can turn off the message for a clean project export.
+                if !warnings.isEmpty || (!imported && preferences.showsProjectExportMessage) {
                     let alert = NSAlert()
                     alert.messageText = (imported ? "Imported " : "Exported ") + output.lastPathComponent
                     alert.informativeText = warnings.joined(separator: "\n")

@@ -287,7 +287,7 @@ struct ParticipantCLI {
             try updated.validate()
             if inPlace, project != updated {
                 let history = loaded.undo + [.init(action: action, project: project)]
-                try updated.saveCopy(to: destination, copyingTranscriptsFrom: document,
+                try updated.saveCopy(to: destination,
                                      undo: history, redo: [], mediaSnapshot: loaded.media.mediaSnapshot, replacingExisting: true,
                                      expected: loaded.media.diskRevision, check: interruption.check)
             } else if !inPlace {
@@ -475,7 +475,7 @@ struct ParticipantRequest {
     }
 
     func readJSONFile<T: Decodable>(_ key: String, as type: T.Type, label: String,
-                                     maximumBytes: Int = MulticamProject.maximumFileSize,
+                                     maximumBytes: Int? = nil,
                                      cancelled: () -> Bool) throws -> T {
         let bytes = try ClipEditCSV.readListData(url(key), kind: label, maximumBytes: maximumBytes, cancelled: cancelled)
         let decoded: T

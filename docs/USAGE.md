@@ -36,7 +36,7 @@ Search **Source** for an off-air take, **Group** to compare synchronized microph
 
 ![Transcript search in MPCut with speaker names, timecodes and highlighted matches](images/transcript-search.png)
 
-Select the words you want to keep or remove. Review the proposed media boundaries before applying an edit, or choose **Queue Excerpt…** to keep the passage as a separate export. For captions timed to the edited movie, export the transcript from **Current Cut**. Keep the project and its sibling `.cut.transcripts` directory together when moving your work.
+Select the words you want to keep or remove. Review the proposed media boundaries before applying an edit, or choose **Queue Excerpt…** to keep the passage as a separate export. For captions timed to the edited movie, export the transcript from **Current Cut**. Copy the project and its linked media when moving your work.
 
 [Compare takes, assemble quotes and export captions](TRANSCRIPTS.md#review-an-edit-or-build-a-quote) · [Run Transcriberrr and MPCut as separate commands](TRANSCRIPTS.md#stage-recognition-and-import-the-result)
 
@@ -67,7 +67,7 @@ from,to
 5,8
 ```
 
-A CSV file can contain up to 64 MiB. An edit can expand CSV rows and repeats into up to 100,000 pieces. The range header is optional. `start,end` also works. Every start is inclusive and every end is exclusive. Both CSV layouts accept seconds, clock times such as `01:02.5`, and exact fractions such as `1001/30000`. Zero means the beginning of the clip as trimmed. Export uses the normal boundary rules for the chosen mode.
+An edit can expand CSV rows and repeats into up to 100,000 pieces. The range header is optional. `start,end` also works. Every start is inclusive and every end is exclusive. Both CSV layouts accept seconds, clock times such as `01:02.5`, and exact fractions such as `1001/30000`. Zero means the beginning of the clip as trimmed. Export uses the normal boundary rules for the chosen mode.
 
 In the CLI, attach `--ranges selects.csv` to its `--clip`. Use `--from` and `--to` on that clip to set the scope first. Add `--dry-run --json` to inspect the resolved edit.
 
@@ -119,7 +119,7 @@ In Finder, select supported media and choose **Open With → MPCut**. When you o
 
 Windows opening the same recording can share one background index scan. MPCut also keeps a bounded in-memory cache of completed indexes for the current app session, including when automatic sidecars are off. It checks the file identity before reusing an index.
 
-**⌘W** closes the active window. MPCut asks about unsaved timeline edits when you close their window. **⌘S** saves the project. **File → Save Analysis Sidecars** writes completed analysis to each recording’s `.cutdb` cache.
+**⌘W** closes the active window. MPCut asks about unsaved timeline edits when you close their window. **⌘S** saves the project. **File → Save Analysis Sidecars** writes completed analysis to each recording’s `.cutcache`.
 
 MPCut writes an untitled `.cut` draft when you add clips. Each window keeps its own draft in the macOS Autosave Information directory. **⌘S** writes the project and its retained history to the location you choose, then removes the draft. If the app stops unexpectedly, choose **File → Recover Untitled Project…** and select the last edit time. Saving the recovered project lets you give it a name. If macOS closes a window without completing its save prompt, you can also recover unsaved edits to a named project here. The saved original stays at its last explicit save.
 
@@ -283,7 +283,7 @@ To create a project from an agent, retrieve `project_template` with `mpcut help 
 cat > interview.cut <<'JSON'
 {
   "format": "mpcut",
-  "schema_version": 4,
+  "schema_version": 9,
   "kind": "multicam",
   "reference_angle_id": "wide",
   "group_range": {"from": "0", "to": "12"},
@@ -359,7 +359,9 @@ In the sequence and multicam editors, **Ignore sounds up to** sets the longest s
 - **Shorten the recording.** Set **Minimum pause** and **Padding per side**. The summary shows how many pauses can be shortened and how much time you will save. Two marks limit the operation to that range. Choose **Shorten Pauses**, then **⌘E** to export the joined timeline. One **⌘Z** undoes the batch.
 - **Export takes separately.** Set a longer minimum pause and choose **Queue Takes**. Open **Export Queue** to save the retained sections as separate files. In multicam, an assembly-time selection queues any cards in the selection in output order.
 
-In the pause controls, open **Take Candidates** to add a missed boundary at a sequence or assembly time, or remove a manual split. MPCut aligns the new boundary to the media. **Queue Takes** follows the revised candidates. To keep a specific duration of one detected pause, select it and enable **Set retained duration for this pause**. Enter the total seconds to retain across both sides. Boundary alignment can keep more silence, and protecting the pause keeps the whole interval. Multicam splits and retained durations follow their occurrence when it moves. Other structural assembly edits clear these adjustments. During the editor session, a duration override applies when the scan finds the same pause span in that occurrence. A split or merged detection uses global padding unless you set its own override.
+In the pause controls, open **Take Candidates** to add a missed boundary at a sequence or assembly time, or remove a manual split. MPCut aligns the new boundary to the media. **Queue Takes** follows the revised candidates. To keep a specific duration of one detected pause, select it and enable **Set retained duration for this pause**. Enter the total seconds to retain across both sides. Boundary alignment can keep more silence, and protecting the pause keeps the whole interval.
+
+Saving the project keeps manual take boundaries, protected spans and retained durations. Reopening or rescanning the same recording preserves the exact source interval you reviewed, even if the detector now splits it differently. In multicam, decisions belong to the occurrence you edited. Moving that occurrence carries its decisions with it. Trimming or splitting it carries applicable decisions into the retained pieces.
 
 For a copy-only edit, choose **Snap To → Keyframes** before shortening and choose **Lossless Copy** at export. MPCut looks for usable boundaries inside each removable interval. Kept footage has to resume on a keyframe, so widely spaced keyframes can leave a longer pause, and a gap with no usable pair stays intact. On H.264 and HEVC in MOV, MP4 and MKV the footage before a pause can usually end between keyframes. Smart Trim can cut between keyframes on supported footage. The export sheet verifies the complete set of linked audio and video joins.
 
@@ -457,7 +459,7 @@ Smart Trim supports progressive 4:2:0 SDR footage with even dimensions and a ver
 
 ## Use the CLI from an agent
 
-See the [command-line guide](CLI.md) for commands that work with media files and saved projects.
+For a saved project, use the CLI directly or start the bundled MCP helper with `--files-only`. The files-only connection works with the editor closed. If you lose a reply, reconnect and look up the original operation UUID with `file_job_status_read`. If the receipt says `outcome_unknown`, inspect the saved file and output before submitting another operation. [Command-line guide](CLI.md) · [File jobs and recovery](HEADLESS.md)
 
 For agent control of open and unsaved GUI projects, enable **Settings → General → Automation → Enable local MCP control** and connect the bundled stdio helper. [MCP setup, editing recipes and recovery](MCP-AGENT-GUIDE.md)
 
@@ -465,12 +467,15 @@ Start with the installed executable. In a shell, set `mpcut=/Applications/MPCut.
 
 | Task | Command | Data or files returned |
 | --- | --- | --- |
-| Discover this build | `help --json`, `help COMMAND --json`, `--version --json` | Command map and shared conventions, one command reference, or installed version |
+| Discover this build | `help --json`, `help COMMAND --json`, `--version --json` | Command map, one command reference, or the release number, executable build ID, supported project schemas and detector capabilities |
 | Identify streams and cut points | `media inspect` | Media metadata, copy eligibility/containers, optional frame, keyframe, or audio packet list |
 | Render or check a multicam project | `export project render --project PROJECT --output FILE` | Program file and resolved plan. Add `--dry-run` for the plan alone |
 | Build or inspect a multicam project | `help multicam --json`, `project inspect --project` | Editable schema template, selected streams, and source coverage |
 | Inspect sound | `waveform envelope read`, `silence scan`, `silence scan --project PROJECT` | Signed envelope or detected pauses, removal and retained ranges. Silence can also export the joined result |
-| Review picture | `scenes scan`, `scenes export`, `review frames export` | Scene/view report or grouped exports, or JPEGs and a timestamped manifest |
+| Review picture | `scenes scan`, `scenes export`, `review frames export` | Scene/view report, grouped exports, or frames and a timestamped manifest. Choose JPEG, PNG or TIFF for supported inputs. |
+| Check a privacy edit | `history compare --project PROJECT --history-index N` | `participant_changes` identifies the source, tile and affected source time. Fetch an inline frame over MCP with `review_file_frame_read`, then `review_file_frame_result_read` after the job succeeds. |
+| Resume a Tiles review | `tiles pending read`, `tiles pending stage`, `tiles accept` | Saved choices and a review token for the selected source. [Pending Tiles workflow](CLI.md#review-pending-tiles) |
+| Set the saved delivery format | `project output read`, `project output set` | Canvas, frame rate, soundtrack routing and privacy policy. [Project export options](CLI.md#set-project-export-options) |
 | Save or inspect reusable analysis | `analysis sidecar build`, `analysis sidecar inspect` | Analysis database at the selected destination, plus its status and inventory |
 | Convert an editable project | `project convert INPUT --output NEW_PROJECT` | A project in the format selected by its extension. [Supported editors and requirements](../README.md#convert-projects) |
 | Send a timeline to Resolve | `project resolve export --project PROJECT --output FILE.fcpxml` | An editable timeline. Use `project resolve import` to import it into the current Resolve project. [Resolve setup and import](../README.md#export-a-project-to-davinci-resolve) |
@@ -495,7 +500,7 @@ For the full installed guide in a pipe, use `mpcut help manual` or read the `man
 
 **Input and output contract.** Pass paths as separate argv entries. Relative paths in argv and JSON resolve from the process working directory. Use the inspection report’s top-level `file` for edit requests. It contains the absolute filesystem path, including any spaces. Read one UTF-8 JSON object from stdout with `--json` and drain stderr for progress. On stdin, send one complete UTF-8 JSON object, then close the pipe. Emit each JSON field once. Export and bulk reject unknown edit fields and conflicting flag/field values. Time bounds in edit JSON are strings or integer numerator/denominator objects. Stream indices are absolute and zero-based. Clip order, scene numbers, and failed range numbers start at one.
 
-**Errors and retries.** Exit 0 means success; exit 1 is an operation failure, exit 2 is a CLI/request error, and exit 130 indicates cancellation. With `--json`, inspect `error.code` and `error.message` and any `error.segment`, `boundary`, `track`, and `nearest` values. `segment` is the one-based clip number in the request, whatever the playback order. For a saved multicam project it is the one-based assembly range, and a project without an assembly has the single range 1. In a multicam error, `nearest` replaces the switch at `multicam.switch_group_time`, or the `from` or `to` edge of the range named by `multicam.edge`. For an unsafe boundary, inspect the nearest choices or preflight a permitted snapping/Smart Trim policy. For an incompatible container, inspect the selected tracks and try an eligible extension. Use a new destination for `output_exists` and regenerate saved analysis after `source_changed`. A failed bulk or scene batch can return `outputs` for completed files and a one-based `failed_range`. Account for those files before retrying.
+**Errors and retries.** Exit 0 means success; exit 1 is an operation failure, exit 2 is a CLI/request error, exit 3 means a Tiles ISO delivery needs review, and exit 130 indicates cancellation. With `--json`, inspect `error.code` and `error.message` and any `error.segment`, `boundary`, `track`, and `nearest` values. `segment` is the one-based clip number in the request, whatever the playback order. For a saved multicam project it is the one-based assembly range, and a project without an assembly has the single range 1. In a multicam error, `nearest` replaces the switch at `multicam.switch_group_time`, or the `from` or `to` edge of the range named by `multicam.edge`. For an unsafe boundary, inspect the nearest choices or preflight a permitted snapping/Smart Trim policy. For an incompatible container, inspect the selected tracks and try an eligible extension. Use a new destination for `output_exists` and regenerate saved analysis after `source_changed`. A failed bulk or scene batch can return `outputs` for completed files and a one-based `failed_range`. Account for those files before retrying.
 
 ## Automate an export
 
@@ -547,6 +552,23 @@ To preflight a complete hardware conversion, choose the codec, quality and audio
 JSON requests accept `mode`, `video`, `quality`, `audio` and `snap` at the top level. Set `snap` to `exact` (default) or `nearest`. For export decisions, use the dry-run report for the whole request, since compatible audio boundaries and joins also matter. Video choices are `h264`, `hevc` and `prores`. Choose `smaller`, `balanced` or `high` for H.264/HEVC, and `422-lt`, `422` or `422-hq` for ProRes. Audio choices are `auto`, `copy`, `aac`, `pcm` and `remove`.
 
 Exact boundaries are the default. For Copy and Smart Trim, submit one of the suggested times or pass `--snap nearest` to authorize snapping. Re-encode uses exact source-frame times, including on variable-frame-rate footage. JSON results go to standard output, progress goes to standard error, and errors return a nonzero exit status. Choose a fresh destination path. Control-C cancels the operation.
+
+### Render the saved project you reviewed
+
+For a saved sequence or multicam project, preflight the actual destination. Review the plan, then pass its token back with the same project, output path and options. This example uses `jq` and a fresh output path.
+
+```sh
+mpcut export project render --project interview.cut --output interview.mov --dry-run --json > plan.json
+jq . plan.json
+```
+
+After approving the plan, run the following command.
+
+```sh
+mpcut export project render --project interview.cut --output interview.mov --plan-token "$(jq -er '.plan_token' plan.json)" --json
+```
+
+If you get `stale_render_plan`, generate and review a new plan. The files-only MCP equivalent is `export_file_project_render` with `dry_run: true`, followed by a new render job with the returned `plan_token`.
 
 ### Rearrange and join ranges into one movie
 
@@ -625,20 +647,20 @@ Open **MPCut → Settings…** (⌘,).
 | **General → History** | Set **Maximum undo and redo steps** per project. |
 | **General → Playback** | Adjust **Preview volume**, **Mute preview audio**, or **Play audio while scrubbing**. |
 | **General → Export defaults** | Choose the **Default movie export mode** and **Default JPEG preset**. Use **Warn when an edit lowers the export tier** to control the prompt for manual edits. |
-| **Analysis → Analysis sidecars** | Choose whether to save and reuse analysis, where to store new sidecars, and which caches to clear. |
+| **Analysis → Analysis cutcaches** | Choose whether to save and reuse analysis, where to store new cutcaches, and which caches to clear. |
 | **Analysis → Silence** | Set **Minimum pause**, **Ignore sounds up to**, and **Padding per side** for new scans. |
 
 ## Save and reuse analysis
 
-Completed indexes, scene scans, thumbnails, waveforms and silence results are saved automatically. Choose **File → Save Analysis Sidecars** to save the full edit index and the analysis already completed for each loaded recording. This includes scene cuts and view names, available filmstrip thumbnails, waveforms, calibrated room floors, and silence intervals for the scanned tracks and settings. Each recording has a compressed SQLite sidecar. By default it sits beside the original, such as `interview.mov.cutdb`. Subsequent saves merge completed sections. MPCut writes SQLite sidecar format 5. It stores regular audio packet runs and 20 ms transcription level measurements compactly and applies lossless LZFSE compression to individual analysis payloads when it saves space. The app can read formats 3 and 4 and upgrades them on the next analysis write, including archived reports and scene-scan checkpoints. Earlier MPCut releases can only open their supported formats. A format 1 or 2 sidecar from an early MPCut build is replaced on the next analysis write, keeping its manual silence thresholds, scene boundaries and view names. MPCut preserves sidecars from a newer build and unreadable sidecars because they may contain authored view names or thresholds. Move such a sidecar to a backup location to let MPCut build a fresh cache at the selected destination.
+MPCut saves completed indexes, scene scans, thumbnails, waveforms and silence measurements in SQLite cutcaches. By default, the cache for `Interview.mov` is `Interview.mov.cutcache` beside the media. **File → Save Analysis Sidecars** writes the full edit index and available measurements. MPCut rebuilds missing sections from the recording on demand. Save the project to keep scene names, manual thresholds, pending reviews and transcripts.
 
 Automatic sidecars are on by default. When you open a recording, MPCut loads the saved editing index if it is complete and matches the file. It builds an index when the saved one is missing, out of date, or unreadable. In **MPCut → Settings… → Analysis**, turn off **Save and reuse analysis** to bypass automatic sidecars, including during export checks. An explicit **Save Analysis Sidecars** can still save the current analysis.
 
-In **Settings → Analysis → Save new sidecars**, choose **Next to media**, **In project folder**, or **On cache disk**. Project-folder storage uses an `MPCut Cache` directory beside the saved project. Cache-disk storage uses the folder you choose for all projects. Two recordings named `Interview.mov` have separate entries. Changing this setting directs future saves. When loading a recording, MPCut checks available locations for the freshest compatible analysis. An unsaved project can hold its analysis in memory until you save the project.
+In **Settings → Analysis → Save new cutcaches**, choose **Next to media**, **In project folder**, or **On cache disk**. Project-folder storage uses an `MPCut Cache` directory beside the saved project. Cache-disk storage uses the folder you choose for all projects. Two recordings named `Interview.mov` have separate entries. Changing this setting directs future saves. When loading a recording, MPCut checks available locations for the freshest compatible analysis. An unsaved project can hold its analysis in memory until you save the project.
 
-Choose **Clear Caches…** to preview the recordings in each location. Filter by location or folder to see how many sidecars you can clear and the estimated space you can reclaim. Recordings with the same filename show their source folders. Use **Scan Folder…** to find older sidecars.
+Choose **Clear cutcaches…** to preview recordings and reclaimable space. Inspect the section sizes, SQLite overhead and duplicate copies for each recording. The project size is reported separately. Filter by location or folder, or use **Scan Folder…** to discover additional caches.
 
-**Clear Analysis** keeps saved edits, recognition results and resumable work. To delete those as well, select **Remove entire sidecars** and confirm the number of files shown. The completion report lists what was cleared, the space actually reclaimed, and any skipped sidecars. A disconnected disk can supply its saved analysis again when you reconnect it.
+Clearing skips files in use and reports the bytes reclaimed. Reopening a project after clearing keeps its transcripts, annotations and unfinished reviews.
 
 ```sh
 mpcut analysis sidecar build --json interview.mov

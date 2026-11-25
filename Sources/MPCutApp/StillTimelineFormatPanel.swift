@@ -16,19 +16,48 @@ private final class StillContainerPicker: NSPopUpButton {
     }
 }
 
+/// What the Still Timeline Format panel opens with: Settings → Editing → New stills timeline.
+struct StillTimelineFormatDefaults: Equatable {
+    var width = 1920
+    var height = 1080
+    var frameRate = 30.0
+    var codec = ReencodeCodec.h264
+
+    init() {}
+
+    @MainActor
+    init(preferences: EditorPreferences) {
+        width = preferences.stillTimelineWidth
+        height = preferences.stillTimelineHeight
+        frameRate = preferences.stillTimelineFrameRate
+        codec = preferences.stillTimelineCodec
+    }
+
+    /// The frame rate as the panel's field shows it: "30", "29.97", "23.976".
+    var frameRateText: String {
+        guard frameRate.isFinite, frameRate > 0 else { return "30" }
+        if frameRate.rounded() == frameRate { return String(Int(frameRate)) }
+        var text = String(format: "%.3f", frameRate)
+        while text.hasSuffix("0") { text.removeLast() }
+        return text
+    }
+}
+
 @MainActor
 extension StillPanels {
-    static func format(in window: NSWindow?, completion: @escaping (StillTimelineFormat, StillProgramColorPolicy) -> Void) {
-        let width = NSTextField(string: "1920")
+    static func format(defaults: StillTimelineFormatDefaults = .init(), in window: NSWindow?,
+                       completion: @escaping (StillTimelineFormat, StillProgramColorPolicy) -> Void) {
+        let width = NSTextField(string: String(defaults.width))
         width.toolTip = "Set canvas width"
-        let height = NSTextField(string: "1080")
+        let height = NSTextField(string: String(defaults.height))
         height.toolTip = "Set canvas height"
-        let rate = NSTextField(string: "30")
+        let rate = NSTextField(string: defaults.frameRateText)
         rate.toolTip = "Set frame rate"
         let codecs = ReencodeCodec.allCases.map(\.rawValue)
         let codec = NSPopUpButton()
         codec.toolTip = "Choose video codec"
         codec.addItems(withTitles: codecs)
+        if codecs.contains(defaults.codec.rawValue) { codec.selectItem(withTitle: defaults.codec.rawValue) }
         let container = StillContainerPicker()
         container.toolTip = "Choose file format"
         codec.target = container

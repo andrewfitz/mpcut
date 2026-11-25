@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 
 def timestamp(value):
@@ -43,8 +44,11 @@ class SceneRefresh(unittest.TestCase):
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         self.folder = Path(scratch.name).resolve()
+        preferences = patch.dict(os.environ, {"MPCUT_SIDECAR_HOME": str(self.folder / "preferences")})
+        preferences.start()
+        self.addCleanup(preferences.stop)
         self.source = self.folder / "editor.mp4"
-        self.sidecar = self.folder / "editor.mp4.cutdb"
+        self.sidecar = self.folder / "editor.mp4.cutcache"
         self.project = self.folder / "editor.cut"
 
     def cli(self, *arguments):
@@ -60,7 +64,7 @@ class SceneRefresh(unittest.TestCase):
 
     def write_project(self, start="0", end="50", repeat_file=None):
         document = {
-            "format": "mpcut", "schema_version": 3, "kind": "sequence",
+            "format": "mpcut", "schema_version": 9, "kind": "sequence",
             "clips": [
                 {"id": "trim", "file": self.source.name, "from": start, "to": end},
                 {"id": "repeat", "file": repeat_file or self.source.name, "from": "1", "to": "2"},
@@ -325,12 +329,10 @@ class SceneRefresh(unittest.TestCase):
         replacement = self.folder / "replacement.mp4"
 
         def packet_payloads():
-            # Stream hash version 2 appends ", S=" and a hash of a stream's side data, which holds
-            # the display matrix the first replacement changes on purpose (FFmpeg 9.1 writes it).
-            # Compare the codec configuration and packet payloads without it.
-            output = subprocess.check_output(["ffmpeg", "-nostdin", "-v", "error", "-i", self.source,
+            report = subprocess.check_output(["ffmpeg", "-nostdin", "-v", "error", "-i", self.source,
                                               "-map", "0", "-c", "copy", "-f", "streamhash", "-"], timeout=15)
-            return [line.split(", S=")[0] for line in output.decode().splitlines()]
+            # FFmpeg can append side-data hashes after the stream, size and payload hash.
+            return [line.split(b",", 3)[:3] for line in report.splitlines() if not line.startswith(b"#")]
 
         original_payloads = packet_payloads()
         ffmpeg("-display_rotation:v:0", "90", "-i", self.source, "-map", "0", "-c", "copy", replacement)

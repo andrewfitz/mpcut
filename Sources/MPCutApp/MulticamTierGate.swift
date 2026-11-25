@@ -93,7 +93,7 @@ final class MulticamTierGate {
         let before = Self.program(previous), after = Self.program(project)
         guard before != after else { return }
         // Adding or relinking a source is followed by its index, which is not a tier of the same sources.
-        guard Self.isByHand, !isAsking, model.preferences.warnBeforeLoweringExportTier,
+        guard Self.isByHand, !isAsking, model.preferences.asks(.exportTierDowngrade),
               before.sources.map(\.id) == after.sources.map(\.id), before.sources.map(\.file) == after.sources.map(\.file) else {
             edits = nil
             return
@@ -164,7 +164,7 @@ final class MulticamTierGate {
     /// True while `made` are the last changes to the project and the editor is free to ask about them.
     private func canAsk(_ made: Edits, in model: MulticamEditorModel) -> Bool {
         !isAsking && made.generation == model.mcpGeneration && made.revision == model.mcpRevision
-            && model.preferences.warnBeforeLoweringExportTier && !model.isBusy && model.setup.isEmpty && model.notice == nil
+            && model.preferences.asks(.exportTierDowngrade) && !model.isBusy && model.setup.isEmpty && model.notice == nil
     }
 
     /// Finds off the main actor what the question needs, as `refreshTier` finds the tier: the tier of the program
@@ -232,7 +232,7 @@ final class MulticamTierGate {
             guard let self, let model else { return }
             // What the answer changes is not an edit made by hand.
             defer { self.isAsking = false }
-            if choice.dontAskAgain { model.preferences.warnBeforeLoweringExportTier = false }
+            if choice.dontAskAgain { model.preferences.suppress(.exportTierDowngrade) }
             switch choice.answer {
             case .proceed: break
             case .cancel: self.undo(made, in: model)
@@ -367,6 +367,10 @@ final class MulticamTierGate {
                 var items = project.assemblyItems ?? [.group(project.range)]
                 guard items.indices.contains(edge.range - 1), let range = items[edge.range - 1].group,
                       let moved = MulticamEdgeSuggestion(edge: edge, times: [to]).moving(range, to: to) else { return false }
+                if project.assemblyItems == nil {
+                    project.materializeAssembly()
+                    items = project.assemblyItems ?? items
+                }
                 items[edge.range - 1] = items[edge.range - 1].trimmingGroup(to: moved)
                 project.assemblyItems = items
             }

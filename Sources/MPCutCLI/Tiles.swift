@@ -4,6 +4,7 @@ import MPCutCore
 struct TilesCLI {
     enum Operation: String, CaseIterable {
         case scan, inspect, preview, link, accept, reconcile
+        case readPending = "pending read", stagePending = "pending stage", discardPending = "pending discard"
         case listFeeds = "feeds list", inspectFeed = "feeds inspect", addFeed = "feeds add", renameFeed = "feeds rename"
         case micFeed = "feeds mic", voiceFeed = "feeds voice", preferFeed = "feeds prefer"
         case mergeFeeds = "feeds merge", splitFeed = "feeds split"
@@ -31,7 +32,13 @@ struct TilesCLI {
             case .preview:
                 return project.union(["analysis_file", "at", "clock", "issue_id", "output"])
             case .accept:
-                return project.union(output).union(counts).union(["analysis_file", "clear_count_hints"])
+                return project.union(output).union(counts).union(["analysis_file", "clear_count_hints", "review_token"])
+            case .readPending:
+                return project
+            case .stagePending:
+                return project.union(output).union(["review_token", "choices"])
+            case .discardPending:
+                return project.union(output).union(["review_token"])
             case .link:
                 return feed.union(output).union(range).union(["tile_id", "clear"])
             case .listFeeds:
@@ -165,7 +172,10 @@ struct TilesCLI {
                     throw CLIError("invalid_arguments", "Supply a nonnegative integer for " + token + ".")
                 }
                 values[field] = number
-            } else if field == "slot" || field == "rule" || field == "binding" {
+            } else if ["slot", "rule", "binding", "choices"].contains(field) {
+                if field == "choices", let issue = jsonInputIssue(Data(value.utf8)) {
+                    throw CLIError("invalid_json", "The choices object " + issue + ".")
+                }
                 guard let parsed = (try? JSONSerialization.jsonObject(with: Data(value.utf8))) as? [String: Any] else {
                     throw CLIError("invalid_arguments", "Supply a JSON object for " + token + ".")
                 }
@@ -210,6 +220,8 @@ struct TilesCLI {
             try runDelivery(json: json, useSidecar: useSidecar, interruption: interruption)
         case .useAngles, .proposeSwitches:
             try runAnglesAndSwitches(json: json, useSidecar: useSidecar, interruption: interruption)
+        case .readPending, .stagePending, .discardPending:
+            try runPendingReview(json: json, interruption: interruption)
         case .correctGrid, .reconcile, .confirmFeed, .treatFeed, .setLayout, .listLayouts, .addBox, .setBox, .splitTile, .screenShare:
             try runTileEdits(json: json, useSidecar: useSidecar, interruption: interruption)
         default:
@@ -235,7 +247,7 @@ func mutateProject(_ request: ParticipantRequest, document: URL, action: String,
     try SidecarLocations.$projectURL.withValue(document) { try mutate(&updated) }
     try updated.validate()
     if inPlace, loaded.project != updated {
-        try updated.saveCopy(to: destination, copyingTranscriptsFrom: document,
+        try updated.saveCopy(to: destination,
                              undo: loaded.undo + [.init(action: action, project: loaded.project)],
                              redo: [], mediaSnapshot: loaded.media.mediaSnapshot, replacingExisting: true,
                              expected: loaded.media.diskRevision, check: interruption.check)

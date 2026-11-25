@@ -94,7 +94,7 @@ class ExportModes(unittest.TestCase):
             ("adjacent", "1001/10000", "1001/5000"),
         )
         project.write_text(json.dumps({
-            "format": "mpcut", "schema_version": 3, "kind": "sequence",
+            "format": "mpcut", "schema_version": 9, "kind": "sequence",
             "clips": [{"id": name, "file": str(source), "from": start, "to": end} for name, start, end in cuts],
         }))
         result = subprocess.run(

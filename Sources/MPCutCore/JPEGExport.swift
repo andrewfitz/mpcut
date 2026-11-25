@@ -459,7 +459,7 @@ public enum JPEGExport {
     }
 
     private static func writeDirectory<Manifest: Encodable>(
-        to directory: URL, control: JPEGControl, validate: () throws -> Void,
+        to directory: URL, control: JPEGControl, writeManifest: Bool = true, validate: () throws -> Void,
         produce: (URL, URL) throws -> Manifest
     ) throws -> Manifest {
         let destination = directory.standardizedFileURL
@@ -482,11 +482,13 @@ public enum JPEGExport {
         defer { try? fm.removeItem(at: staging) }
 
         let manifest = try produce(staging, destination)
-        let encoder = JSONEncoder()
-        encoder.keyEncodingStrategy = .convertToSnakeCase
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        let document = try encoder.encode(manifest)
-        try writing("manifest.json") { try document.write(to: staging.appendingPathComponent("manifest.json")) }
+        if writeManifest {
+            let encoder = JSONEncoder()
+            encoder.keyEncodingStrategy = .convertToSnakeCase
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+            let document = try encoder.encode(manifest)
+            try writing("manifest.json") { try document.write(to: staging.appendingPathComponent("manifest.json")) }
+        }
         try validate()
         try control.check()
         guard chmod(staging.path, try publicationPermissions(0o777)) == 0 else {
@@ -957,10 +959,10 @@ extension FrameImageFormat {
 
 extension JPEGExport {
     package static func writeProgramFrameDirectory<Manifest: Encodable>(
-        to directory: URL, cancelled: @escaping @Sendable () -> Bool, validate: () throws -> Void,
-        produce: (URL) throws -> Manifest
+        to directory: URL, cancelled: @escaping @Sendable () -> Bool, writeManifest: Bool = true,
+        validate: () throws -> Void, produce: (URL) throws -> Manifest
     ) throws -> Manifest {
-        try writeDirectory(to: directory, control: JPEGControl(cancelled), validate: validate) { staging, _ in
+        try writeDirectory(to: directory, control: JPEGControl(cancelled), writeManifest: writeManifest, validate: validate) { staging, _ in
             try produce(staging)
         }
     }

@@ -146,7 +146,7 @@ class Waveform(unittest.TestCase):
                 self.assertEqual(json.loads(check_output(inspect))["media"]["duration"], duration)
                 check_output([CLI, "analysis", "sidecar", "build", "--json", "--only", "index", path])
                 self.assertEqual(json.loads(check_output(inspect))["media"]["duration"], duration)
-                with sqlite3.connect(path.with_suffix(".mka.cutdb")) as cache:
+                with sqlite3.connect(path.with_suffix(".mka.cutcache")) as cache:
                     key = "media_index.v1"
                     stamp = cache.execute("SELECT stamp FROM source WHERE id = 1").fetchone()[0]
                     saved = section_bytes(cache, key)
@@ -181,9 +181,9 @@ class Waveform(unittest.TestCase):
         self.addCleanup(scratch.cleanup)
         source = Path(scratch.name) / "stereo.wav"
         shutil.copyfile(self.wav, source)
-        shared_sidecar = self.wav.with_name(self.wav.name + ".cutdb")
+        shared_sidecar = self.wav.with_name(self.wav.name + ".cutcache")
         shared_stamp = shared_sidecar.stat().st_mtime_ns if shared_sidecar.exists() else None
-        sidecar = source.with_name(source.name + ".cutdb")
+        sidecar = source.with_name(source.name + ".cutcache")
 
         def status():
             return json.loads(check_output([CLI, "analysis", "sidecar", "inspect", "--json", source]))

@@ -19,7 +19,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active.",
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
           "format": "uuid"
         },
         "working_directory": {
@@ -77,7 +77,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active.",
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
           "format": "uuid"
         },
         "working_directory": {
@@ -86,6 +86,109 @@
           "maxLength": 4096,
           "description": "Absolute local path.",
           "pattern": "^/"
+        }
+      },
+      "required": [
+        "request",
+        "operation_id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "transcript_file_job_reconcile",
+    "description": "Prepare the recognition job linked to a saved attachment using the current project timing. Use transcript_file_job_run and transcript_file_attachment_import to publish the updated result.",
+    "annotations": {
+      "readOnlyHint": false,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "request": {
+          "type": "object",
+          "properties": {
+            "attachment_id": {
+              "type": "string"
+            },
+            "job_directory": {
+              "type": "string",
+              "pattern": "^/",
+              "description": "Absolute local path."
+            },
+            "progress": {
+              "type": "string"
+            },
+            "project_path": {
+              "type": "string",
+              "pattern": "^/",
+              "description": "Absolute local path."
+            }
+          },
+          "required": [
+            "project_path"
+          ],
+          "additionalProperties": false
+        },
+        "operation_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 36,
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "request",
+        "operation_id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "transcript_file_jobs_list",
+    "description": "List recognition jobs belonging to a saved project in the chosen job directory.",
+    "annotations": {
+      "readOnlyHint": false,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "request": {
+          "type": "object",
+          "properties": {
+            "job_directory": {
+              "type": "string",
+              "pattern": "^/",
+              "description": "Absolute local path."
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500
+            },
+            "project_path": {
+              "type": "string",
+              "pattern": "^/",
+              "description": "Absolute local path."
+            }
+          },
+          "required": [
+            "project_path"
+          ],
+          "additionalProperties": false
+        },
+        "operation_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 36,
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
+          "format": "uuid"
         }
       },
       "required": [
@@ -113,7 +216,8 @@
               "type": "boolean"
             },
             "engine": {
-              "type": "string"
+              "type": "string",
+              "description": "Transcriberrr engine name. Defaults to qwen3. File jobs do not read desktop Settings."
             },
             "expected_speakers": {
               "type": "integer",
@@ -165,7 +269,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active.",
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
           "format": "uuid"
         },
         "working_directory": {
@@ -227,7 +331,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active.",
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
           "format": "uuid"
         },
         "working_directory": {
@@ -277,7 +381,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active.",
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
           "format": "uuid"
         },
         "working_directory": {
@@ -327,7 +431,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active.",
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
           "format": "uuid"
         },
         "working_directory": {
@@ -385,7 +489,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active.",
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
           "format": "uuid"
         },
         "working_directory": {
@@ -509,7 +613,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active.",
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
           "format": "uuid"
         },
         "working_directory": {
@@ -605,7 +709,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active.",
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
           "format": "uuid"
         },
         "working_directory": {
@@ -711,7 +815,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active.",
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
           "format": "uuid"
         },
         "working_directory": {
@@ -769,7 +873,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active.",
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
           "format": "uuid"
         },
         "working_directory": {
@@ -872,7 +976,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active.",
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
           "format": "uuid"
         },
         "working_directory": {
@@ -976,7 +1080,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active.",
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
           "format": "uuid"
         },
         "working_directory": {
@@ -1082,7 +1186,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active.",
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
           "format": "uuid"
         },
         "working_directory": {
@@ -1190,7 +1294,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active.",
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
           "format": "uuid"
         },
         "working_directory": {
@@ -1296,7 +1400,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active.",
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
           "format": "uuid"
         },
         "working_directory": {
@@ -1446,7 +1550,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active.",
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
           "format": "uuid"
         },
         "working_directory": {
@@ -1466,7 +1570,7 @@
   },
   {
     "name": "transcript_file_selection_resolve",
-    "description": "Run transcript words select on saved inputs through the bundled CLI.",
+    "description": "Resolve a saved-project word selection with optional transcript reader expansion through the bundled CLI.",
     "annotations": {
       "readOnlyHint": false,
       "openWorldHint": false
@@ -1557,6 +1661,17 @@
                   "additionalProperties": false
                 }
               ]
+            },
+            "expansion": {
+              "type": "string",
+              "enum": [
+                "earlier",
+                "later",
+                "sentence",
+                "speaker_turn",
+                "preceding_question"
+              ],
+              "description": "Expand phrase endpoints using the transcript reader boundaries in the selected clock."
             }
           },
           "additionalProperties": false,
@@ -1568,7 +1683,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active.",
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
           "format": "uuid"
         },
         "working_directory": {
@@ -1676,7 +1791,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active.",
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
           "format": "uuid"
         },
         "working_directory": {
@@ -1881,7 +1996,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active.",
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
           "format": "uuid"
         },
         "working_directory": {
@@ -2089,7 +2204,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active.",
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
           "format": "uuid"
         },
         "working_directory": {
@@ -2297,7 +2412,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active.",
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
           "format": "uuid"
         },
         "working_directory": {
@@ -2396,7 +2511,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active.",
+          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
           "format": "uuid"
         },
         "working_directory": {
@@ -4183,7 +4298,7 @@
   },
   {
     "name": "transcript_editor_selection_resolve",
-    "description": "Resolve a word selection on the requested clock.",
+    "description": "Resolve a word selection on the requested clock with optional transcript reader expansion.",
     "annotations": {
       "readOnlyHint": true,
       "openWorldHint": false
@@ -4326,6 +4441,17 @@
           "minLength": 1,
           "maxLength": 64,
           "description": "Result identity returned by the attachment or prior transcript page."
+        },
+        "expansion": {
+          "type": "string",
+          "enum": [
+            "earlier",
+            "later",
+            "sentence",
+            "speaker_turn",
+            "preceding_question"
+          ],
+          "description": "Expand phrase endpoints using the transcript reader boundaries in the selected clock."
         }
       },
       "required": [
@@ -4501,7 +4627,7 @@
   },
   {
     "name": "transcript_editor_edit_plan",
-    "description": "Review a transcript edit and retain its exact boundaries for apply or queue.",
+    "description": "Review a transcript edit and retain its exact boundaries for apply or queue. A top-level attachment_id or result_id scopes its selections. To plan across attachments, address each selection by attachment or occurrence IDs.",
     "annotations": {
       "readOnlyHint": false,
       "openWorldHint": false
@@ -6487,7 +6613,8 @@
             "engine": {
               "type": "string",
               "minLength": 1,
-              "maxLength": 512
+              "maxLength": 512,
+              "description": "Transcriberrr engine name. When omitted, the app uses Settings → Transcripts → Preferred engine; Automatic, or a preferred engine that cannot run on this Mac, resolves to qwen3, then the first available engine. File jobs and the CLI use qwen3 and never read desktop Settings."
             },
             "model": {
               "type": "string",

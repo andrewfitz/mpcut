@@ -1,0 +1,36 @@
+[
+  {
+    "name": "review_file_frame_read",
+    "description": "Start a job to read one exact frame from a source video or a saved project's program as a bounded review JPEG. Poll file_job_status_read and then call review_file_frame_result_read with the returned job_id.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct job. Reuse for identical retries."},
+        "file": {"type": "string", "pattern": "^/", "description": "Absolute path to source video. Reads the source clock."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "Absolute path to a saved project."},
+        "at": {"type": "string", "minLength": 1, "description": "Time in seconds, timecode, or exact rational seconds such as 1001/30000."},
+        "clock": {"type": "string", "enum": ["sequence", "group", "assembly"], "description": "Saved-project clock. Defaults to sequence for a sequence project and assembly for a multicam project. Group reads the group switch lane."}
+      },
+      "required": ["operation_id", "at"],
+      "oneOf": [
+        {"required": ["file"], "allOf": [{"not": {"required": ["project_path"]}}, {"not": {"required": ["clock"]}}]},
+        {"required": ["project_path"], "not": {"required": ["file"]}}
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "review_file_frame_result_read",
+    "description": "Read the JPEG and frame metadata for a successful review_file_frame_read job. Returns one image/jpeg content block. The image is at most 640 pixels on either axis and 1 MiB before base64 encoding.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "job_id": {"type": "string", "format": "uuid", "description": "Job ID returned by review_file_frame_read."}
+      },
+      "required": ["job_id"],
+      "additionalProperties": false
+    }
+  }
+]

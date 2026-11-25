@@ -28,9 +28,14 @@ struct SilenceOptions {
     var stdin = false
     var dryRun = false
 
-    func splitTakeCandidates(_ retained: [AudioSpan]) throws -> [AudioSpan] {
-        guard !takeBoundaries.isEmpty else { return retained }
-        var boundaries = takeBoundaries.sorted()[...]
+    func splitTakeCandidates(_ retained: [AudioSpan], saved: Set<RationalTime> = []) throws -> [AudioSpan] {
+        var points = takeBoundaries
+        for point in saved {
+            let first = retained.lowerBound { $0.to > point }
+            if first < retained.endIndex, retained[first].from < point { points.insert(point) }
+        }
+        guard !points.isEmpty else { return retained }
+        var boundaries = points.sorted()[...]
         var candidates: [AudioSpan] = []
         for range in retained {
             var start = range.from

@@ -31,7 +31,7 @@ public enum FCPInterchange {
     }
 
     static func loadDocument(_ location: URL) throws -> XMLDocument {
-        let limit = MulticamProject.maximumFileSize
+        let limit = (64 << 20)
         let fd = open(location.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
         guard fd >= 0 else { throw invalidFCP("Cannot read \(location.path): \(String(cString: strerror(errno))).") }
         let file = FileHandle(fileDescriptor: fd, closeOnDealloc: true)

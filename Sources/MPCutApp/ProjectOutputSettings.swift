@@ -13,6 +13,20 @@ extension ProjectSession {
         return editor.stillProject
     }
 
+    var sourceOutputCanvas: ParticipantCanvas {
+        let project = outputSettingsProject
+        if case .multicam(let multicamProject) = project {
+            let streams = multicamProject.recordings(for: multicamProject.referenceAngle).lazy.compactMap {
+                self.multicam.media[$0.id]?.videoStream
+            }
+            if let canvas = streams.compactMap({ project.sourceOutputCanvas(stream: $0) }).first { return canvas }
+        } else if let stream = editor.stillReviewCanvas?.videoStream,
+                  let canvas = project.sourceOutputCanvas(stream: stream) {
+            return canvas
+        }
+        return project.projectOutputSettings.canvas
+    }
+
     func changeOutputSettings(_ action: String, _ change: (CutProject) throws -> CutProject) throws {
         let current = outputSettingsProject
         let next = try change(current)
@@ -88,21 +102,7 @@ struct ProjectOutputSettingsView: View {
         return stored
     }
 
-    private var sourceCanvas: ParticipantCanvas {
-        let stream: StreamInfo?
-        if session.isMulticam {
-            stream = multicam.project?.pictureSources.lazy.compactMap { multicam.media[$0.id]?.videoStream }.first
-        } else {
-            stream = editor.stillReviewCanvas?.videoStream
-        }
-        var canvas = settings.canvas
-        if let stream {
-            canvas.width = stream.displayWidth + stream.displayWidth % 2
-            canvas.height = stream.displayHeight + stream.displayHeight % 2
-            if stream.frameRate > .zero && stream.frameRate.seconds <= 120 { canvas.frameRate = stream.frameRate }
-        }
-        return canvas
-    }
+    private var sourceCanvas: ParticipantCanvas { session.sourceOutputCanvas }
     private var frameRates: [RationalTime] {
         [.init(numerator: 24000, denominator: 1001), .init(numerator: 24),
          .init(numerator: 25), .init(numerator: 30000, denominator: 1001),

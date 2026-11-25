@@ -588,10 +588,14 @@ class ReencodeTests(unittest.TestCase):
 
     def test_chapters_follow_the_kept_ranges(self):
         listed = self.root / "chapters.ffmeta"
-        titles = ["Intro", "Middle; with = signs", "Late", "End"]
+        titles = ["Intro\r\nsecond line", "Middle; with = and \\\u0301 signs", "Late", "End"]
+
+        def escape_metadata(text):
+            return "".join("\\" + char if char in "=;#\\\r\n" else char for char in text)
+
         listed.write_text(";FFMETADATA1\ntitle=Chaptered\n" + "".join(
             f"[CHAPTER]\nTIMEBASE=1/1000\nSTART={index * 1500}\nEND={(index + 1) * 1500}\n"
-            f"title={title.replace(';', chr(92) + ';').replace('=', chr(92) + '=')}\n" for index, title in enumerate(titles)))
+            f"title={escape_metadata(title)}\n" for index, title in enumerate(titles)))
         plain, source = self.root / "plain.mp4", self.root / "chaptered.mp4"
         ffmpeg("-f", "lavfi", "-i", "testsrc2=s=160x96:r=25:d=6", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=6",
                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "25", "-keyint_min", "25", "-sc_threshold", "0", "-bf", "0",

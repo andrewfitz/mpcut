@@ -1,4 +1,4 @@
-// Run on a logged-in Mac with Accessibility permission for the terminal.
+// Run through Backstage on a logged-in Mac with Accessibility permission for the terminal.
 // Generate the interview media once with Tests/Integration/transcript_fixture.py.
 // Usage: swift Tests/Integration/transcript_gui.swift MPCut.app FIXTURE_DIR
 // Benchmark: swift Tests/Integration/transcript_gui.swift MPCut.app --benchmark NEW_OUTPUT_DIR
@@ -7,7 +7,7 @@
 // Multicam sync: swift Tests/Integration/transcript_gui.swift MPCut.app --reconcile FIXTURE_DIR HELPER
 import AppKit
 import ApplicationServices
-import Compression
+import Darwin
 
 struct Failure: LocalizedError {
     let message: String
@@ -15,9 +15,7 @@ struct Failure: LocalizedError {
     var errorDescription: String? { message }
 }
 
-/// A saved project as its plain JSON object. MPCut writes a project compressed (a 16-byte
-/// header, then raw DEFLATE), with media paths, repeated text and repeated history values
-/// listed once. A project written as plain JSON comes back as it is.
+/// Expand the saved project's references so assertions can inspect its timeline and assets.
 func savedProjectObject(_ url: URL) -> [String: Any]? {
     guard let data = try? Data(contentsOf: url) else { return nil }
     guard var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
@@ -39,7 +37,7 @@ func savedProjectObject(_ url: URL) -> [String: Any]? {
                     return resolved(entry, depth: depth + 1)
                 }
                 return Dictionary(uniqueKeysWithValues: object.map {
-                    ($0.key, $0.key == "media_snapshot" ? $0.value : resolved($0.value, depth: depth + 1))
+                    ($0.key, ["media_snapshot", "embedded_assets"].contains($0.key) ? $0.value : resolved($0.value, depth: depth + 1))
                 })
             }
             return (node as? [Any]).map { $0.map { resolved($0, depth: depth + 1) } } ?? node
@@ -72,6 +70,8 @@ func value<T>(_ node: AXUIElement, _ attribute: String) -> T? {
 
 func descendants(_ node: AXUIElement, depth: Int = 0, skipFileLists: Bool = false) -> [AXUIElement] {
     guard depth < 30 else { return [node] }
+    // Controls and result labels live outside the virtualized dialogue rows.
+    if value(node, "AXIdentifier") as String? == "transcript.dialogue" { return [node] }
     if skipFileLists, value(node, "AXRole") as String? == "AXOutline" { return [node] }
     let children: [AXUIElement] = value(node, "AXChildren") ?? []
     return [node] + children.flatMap { descendants($0, depth: depth + 1, skipFileLists: skipFileLists) }
@@ -79,6 +79,7 @@ func descendants(_ node: AXUIElement, depth: Int = 0, skipFileLists: Bool = fals
 
 struct Editor {
     let application: NSRunningApplication
+    let session: String
     var pid: pid_t { application.processIdentifier }
     var root: AXUIElement { AXUIElementCreateApplication(pid) }
     var windows: [AXUIElement] { value(root, "AXWindows") ?? [] }
@@ -104,25 +105,8 @@ struct Editor {
         guard status == .success else { throw Failure("Could not press \(name) (\(status.rawValue))") }
     }
 
-    func key(_ key: CGKeyCode, _ flags: CGEventFlags = [], text: String? = nil, settle: TimeInterval = 0.15) throws {
-        if NSWorkspace.shared.frontmostApplication?.processIdentifier != pid {
-            application.activate(options: [])
-        }
-        _ = try wait("test editor to be frontmost") {
-            NSWorkspace.shared.frontmostApplication?.processIdentifier == pid ? true : nil
-        }
-        for down in [true, false] {
-            guard let event = CGEvent(keyboardEventSource: nil, virtualKey: key, keyDown: down) else {
-                throw Failure("Could not construct the keyboard event")
-            }
-            event.flags = flags
-            if let text {
-                let units = Array(text.utf16)
-                event.keyboardSetUnicodeString(stringLength: units.count, unicodeString: units)
-            }
-            event.post(tap: .cghidEventTap)
-        }
-        if settle > 0 { RunLoop.current.run(until: Date().addingTimeInterval(settle)) }
+    func backstage(_ arguments: [String]) throws -> Data {
+        try runBackstage(arguments + ["--pid", String(pid)], session: session)
     }
 
     func textField(_ name: String) throws -> AXUIElement {
@@ -139,7 +123,7 @@ struct Editor {
     }
 
     func navigateFilePicker(to path: URL) throws {
-        try key(5, [.maskCommand, .maskShift]) // Go to Folder
+        _ = try backstage(["key", "cmd+shift+g"])
         _ = try wait("native Go to Folder path field") {
             windows.flatMap { descendants($0) }.first {
                 let role: String? = value($0, "AXRole")
@@ -147,10 +131,9 @@ struct Editor {
                     && value($0, "AXFocused") as Bool? == true
             }
         }
-        try key(0, .maskCommand)
-        try key(0, text: path.path)
-        RunLoop.current.run(until: Date().addingTimeInterval(0.5))
-        try key(36)
+        _ = try backstage(["key", "cmd+a"])
+        _ = try backstage(["type", path.path])
+        _ = try backstage(["key", "return"])
     }
 
     func pickerIsIn(_ folder: URL) -> Bool {
@@ -260,7 +243,7 @@ struct Editor {
         }
         fputs("Save Project was not offered through Accessibility. Sending ⌘S.\n", stderr)
         _ = try wait("Save Project command") {
-            guard (try? key(1, .maskCommand)) != nil else { return nil as Bool? }
+            guard (try? backstage(["key", "cmd+s"])) != nil else { return nil as Bool? }
             return saved(since: before, within: 2) ? true : nil
         }
     }
@@ -326,19 +309,7 @@ struct Editor {
     }
 
     func captureWindow(to destination: URL) throws {
-        let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
-            as? [[String: Any]]
-        guard let window = windows?.first(where: {
-            $0[kCGWindowOwnerPID as String] as? Int32 == pid && $0[kCGWindowLayer as String] as? Int == 0
-        }), let windowID = window[kCGWindowNumber as String] as? Int else {
-            throw Failure("No full benchmark editor window to capture")
-        }
-        let capture = Process()
-        capture.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-        capture.arguments = ["-x", "-o", "-l", String(windowID), destination.path]
-        try capture.run()
-        capture.waitUntilExit()
-        guard capture.terminationStatus == 0 else { throw Failure("Benchmark screenshot failed") }
+        _ = try backstage(["screenshot", "-o", destination.path])
     }
 
     func inspectOnFailure() {
@@ -351,57 +322,101 @@ struct Editor {
     }
 }
 
-func withEditor(_ bundle: URL, opening document: URL, home: URL, helper: URL? = nil, activates: Bool = true,
+func runBackstage(_ arguments: [String], session: String) throws -> Data {
+    let process = Process()
+    let output = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    process.arguments = ["backstage"] + arguments
+    var environment = ProcessInfo.processInfo.environment
+    environment["BACKSTAGE_SESSION"] = session
+    process.environment = environment
+    process.standardOutput = output
+    try process.run()
+    let data = try output.fileHandleForReading.readToEnd() ?? Data()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else {
+        throw Failure("Backstage \(arguments[0]) failed: \(String(decoding: data, as: UTF8.self))")
+    }
+    return data
+}
+
+func openTestProject(_ document: URL, pid: pid_t, endpoint: URL) throws {
+    let path = endpoint.appendingPathComponent("control.sock").path
+    let request: [String: Any] = ["version": 2, "tool": "project_open", "arguments": [
+        "project_path": document.path, "operation_id": UUID().uuidString,
+    ]]
+    let frame = try JSONSerialization.data(withJSONObject: request) + Data([10])
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    guard fd >= 0 else { throw Failure("Could not create the test socket") }
+    let connection = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+    defer { try? connection.close() }
+    var address = sockaddr_un()
+    address.sun_family = sa_family_t(AF_UNIX)
+    guard path.utf8.count < MemoryLayout.size(ofValue: address.sun_path) else {
+        throw Failure("The test socket path is too long")
+    }
+    withUnsafeMutableBytes(of: &address.sun_path) { $0.copyBytes(from: path.utf8) }
+    _ = try wait("the Backstage desktop listener") {
+        let connected = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        return connected == 0 ? true : nil
+    }
+    var peer: pid_t = 0
+    var size = socklen_t(MemoryLayout<pid_t>.size)
+    guard getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &peer, &size) == 0, peer == pid else {
+        throw Failure("A different process acquired the test socket")
+    }
+    var timeout = timeval(tv_sec: 20, tv_usec: 0)
+    _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+    var enabled: Int32 = 1
+    _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, socklen_t(MemoryLayout<Int32>.size))
+    try connection.write(contentsOf: frame)
+    let data = try connection.readToEnd() ?? Data()
+    let reply = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+    guard (reply?["result"] as? [String: Any])?["project_handle"] is String else {
+        throw Failure("Opening the test project failed: \(String(decoding: data, as: UTF8.self))")
+    }
+}
+
+func withEditor(_ bundle: URL, opening document: URL, home: URL, helper: URL? = nil,
                 _ exercise: (Editor) throws -> Void) throws {
     let testInstance = "mpcut-test-" + UUID().uuidString.replacingOccurrences(of: "-", with: "")
+    let endpoint = URL(fileURLWithPath: "/tmp", isDirectory: true).appendingPathComponent(testInstance)
     defer {
+        try? FileManager.default.removeItem(at: endpoint)
         let cleanup = Process()
         cleanup.executableURL = URL(fileURLWithPath: "/usr/bin/defaults")
         cleanup.arguments = ["delete", "com.mpcut.test-preferences." + testInstance]
         cleanup.standardError = FileHandle.nullDevice
         if (try? cleanup.run()) != nil { cleanup.waitUntilExit() }
     }
-    let config = NSWorkspace.OpenConfiguration()
-    config.createsNewApplicationInstance = true
-    config.activates = activates
-    config.addsToRecentItems = false
-    config.arguments = [
-        "-ApplePersistenceIgnoreState", "YES", "-NSQuitAlwaysKeepsWindows", "NO",
-        "-AppleLanguages", "(en)", "-automation_local_mcp_enabled", "NO", "-analysis_sidecar_reuse_enabled", "NO",
-        "-timeline_snap_target", "off", "-export_movie_default_mode", "copy",
-    ]
-    var environment = ["CFFIXED_USER_HOME": home.path, "MPCUT_TEST_SOCKET_DIRECTORY": testInstance, "MPCUT_MUTED": "1"]
-    if let helper { environment["MPCUT_TRANSCRIBERRR_HELPER"] = helper.path }
-    config.environment = environment
-    let previousPIDs = Set(NSWorkspace.shared.runningApplications.map(\.processIdentifier))
-    var launch: Result<NSRunningApplication, Error>?
-    NSWorkspace.shared.open([document], withApplicationAt: bundle, configuration: config) { application, error in
-        if let application { launch = .success(application) }
-        else { launch = .failure(error ?? Failure("MPCut did not launch")) }
-    }
-    let app = try wait("isolated MPCut app") { launch }.get()
-    guard !previousPIDs.contains(app.processIdentifier),
-          app.bundleURL?.resolvingSymlinksInPath() == bundle.resolvingSymlinksInPath() else {
-        throw Failure("Launch Services did not open a new instance of the requested test bundle")
-    }
+    var launch = ["launch", bundle.path, "--timeout", "45", "--env", "CFFIXED_USER_HOME=\(home.path)",
+                  "--env", "MPCUT_TEST_SOCKET_DIRECTORY=\(testInstance)", "--env", "MPCUT_MUTED=1"]
+    if let helper { launch += ["--env", "MPCUT_TRANSCRIBERRR_HELPER=\(helper.path)"] }
+    launch += ["--", "-ApplePersistenceIgnoreState", "YES", "-NSQuitAlwaysKeepsWindows", "NO",
+               "-AppleLanguages", "(en)", "-automation_local_mcp_enabled", "YES", "-analysis_sidecar_reuse_enabled", "NO",
+               "-timeline_snap_target", "off", "-export_movie_default_mode", "copy"]
+    let data = try runBackstage(launch, session: testInstance)
+    guard let response = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let pid = response["pid"] as? pid_t else { throw Failure("Backstage returned no editor PID") }
     defer {
-        if !app.isTerminated { app.forceTerminate() }
-        _ = try? wait("isolated app to exit") { app.isTerminated ? true : nil }
+        do { _ = try runBackstage(["quit", "--pid", String(pid), "--force"], session: testInstance) }
+        catch { fputs(error.localizedDescription + "\n", stderr) }
     }
-    let editor = Editor(application: app)
+    guard let app = NSRunningApplication(processIdentifier: pid),
+          app.bundleURL?.resolvingSymlinksInPath() == bundle.resolvingSymlinksInPath() else {
+        throw Failure("Backstage did not launch the requested test bundle")
+    }
+    let editor = Editor(application: app, session: testInstance)
     AXUIElementSetMessagingTimeout(editor.root, 3)
-    if activates { app.activate(options: [.activateAllWindows]) }
+    try openTestProject(document, pid: pid, endpoint: endpoint)
     do {
         let title = document.deletingPathExtension().lastPathComponent
-        let openWindowAfter = Date().addingTimeInterval(4)
-        var requestedWindow = false
         _ = try wait("document window " + title, timeout: 45) {
-            let windows = editor.windows
-            if windows.isEmpty, !requestedWindow, Date() >= openWindowAfter,
-               let command = editor.fileCommand("New Project Window") {
-                requestedWindow = AXUIElementPerformAction(command, kAXPressAction as CFString) == .success
-            }
-            return windows.first { (value($0, "AXTitle") as String?)?.hasPrefix(title) == true }
+            editor.windows.first { (value($0, "AXTitle") as String?)?.hasPrefix(title) == true }
         }
         try exercise(editor)
     } catch {
@@ -428,14 +443,14 @@ func exerciseSequence(_ editor: Editor, project: URL, transcript: URL) throws {
     try editor.press("transcript.binding.apply", role: "AXButton")
     try editor.search("REMOVE!")
     try editor.expectResults("Match 1 of 1")
-    try editor.press("remove", role: "AXButton")
+    try editor.press("transcript.nextMatch", role: "AXButton")
     try editor.expectTime("Timeline position", equals: "00:01.000")
     try editor.choose("Correct Text…", from: "transcript.actions")
     try editor.setText("rewritten", into: "transcript.correction.text")
     try editor.press("transcript.correction.save", role: "AXButton")
     try editor.search("rewritten")
     try editor.expectResults("Match 1 of 1")
-    try editor.press("arrow.uturn.backward", role: "AXButton")
+    try editor.press("editor.history.undo", role: "AXButton")
     try editor.search("rewritten")
     try editor.expectResults("0 matches")
     try editor.search("remove")
@@ -453,7 +468,7 @@ func exerciseSequence(_ editor: Editor, project: URL, transcript: URL) throws {
     try editor.press("transcript.reviewEdit", role: "AXButton")
     try editor.press("transcript.apply", role: "AXButton")
     try editor.expectSavedRanges(project, [["0", "1"], ["2", "4"]])
-    try editor.press("arrow.uturn.backward", role: "AXButton")
+    try editor.press("editor.history.undo", role: "AXButton")
     try editor.expectSavedRanges(project, [["0", "4"]])
     print("Verified native JSON import, normalized search, word seek, correction undo, named queue, and saved deletion undo")
 }
@@ -618,7 +633,7 @@ func benchmarkFiles(in folder: URL, duration: Int) throws -> (project: URL, tran
     let audio = try FileHandle(forWritingTo: media)
     try audio.truncate(atOffset: UInt64(header.count) + UInt64(pcmSize))
     try audio.close()
-    try Data(#"{"format":"mpcut","schema_version":3,"kind":"sequence","clips":[{"id":"benchmark","file":"benchmark.wav","from":"0","to":"\#(duration)"}]}"#.utf8)
+    try Data(#"{"format":"mpcut","schema_version":9,"kind":"sequence","clips":[{"id":"benchmark","file":"benchmark.wav","from":"0","to":"\#(duration)"}]}"#.utf8)
         .write(to: project)
     let script = ["We", "stayed", "for", "a", "while", "and", "talked", "about", "what", "we", "had", "seen."]
     var json = #"{"source":"benchmark.wav","duration_seconds":\#(duration),"metadata":{},"speaker_names":["Host","Guest"],"segments":["#
@@ -647,7 +662,6 @@ func measure(_ action: () throws -> Void) rethrows -> Double {
 }
 
 func runBenchmark(_ bundle: URL, scratch: URL, home: URL, output: URL) throws {
-    guard CGPreflightScreenCaptureAccess() else { throw Failure("Allow Screen Recording access for the test terminal") }
     let duration = 7_200
     guard mkdir(output.path, 0o700) == 0 else {
         throw Failure("Choose an unused benchmark output directory under an existing folder")
@@ -746,7 +760,7 @@ func runBenchmark(_ bundle: URL, scratch: URL, home: URL, output: URL) throws {
             let label = try wait("transcript results") { editor.controls("transcript.results").first }
             var disabled = 0.0
             metrics["undoMilliseconds"] = try measure {
-                try editor.press("arrow.uturn.backward", role: "AXButton")
+                try editor.press("editor.history.undo", role: "AXButton")
                 var last = DispatchTime.now().uptimeNanoseconds
                 metrics["labelAfterUndo"] = try wait("results ending in of 120", timeout: 60, interval: 0.005) {
                     let now = DispatchTime.now().uptimeNanoseconds
@@ -802,8 +816,10 @@ func exerciseTranscription(_ editor: Editor, project: URL) throws {
               let attachments = transcripts["attachments"] as? [[String: Any]], attachments.count == 1 else { return nil }
         return attachments
     }
-    guard let asset = attachments[0]["asset"] as? [String: Any], let file = asset["file"] as? String,
-          let transcript = projectJSON(project.deletingLastPathComponent().appendingPathComponent(file)),
+    guard let asset = attachments[0]["asset"] as? [String: Any], let digest = asset["sha256"] as? String,
+          let assets = projectJSON(project)?["embedded_assets"] as? [String: Any],
+          let transcripts = assets["transcripts"] as? [String: [String: Any]],
+          let transcript = transcripts[digest],
           let words = transcript["words"] as? [[String: Any]], !words.isEmpty else {
         throw Failure("Transcription finished without a saved result containing words")
     }
@@ -852,7 +868,7 @@ func exerciseCameraSwitch(_ bundle: URL, fixture: URL, scratch: URL, home: URL) 
     }
     let project = scratch.appendingPathComponent("Transcript camera switch.cut")
     let initialProject = """
-    {"format":"mpcut","schema_version":3,"kind":"multicam","reference_angle_id":"wide",
+    {"format":"mpcut","schema_version":9,"kind":"multicam","reference_angle_id":"wide",
      "group_range":{"from":"0","to":"4"},"angles":[{"id":"wide","file":"wide.mov"},
                                            {"id":"close","file":"close.mov","offset":"2"}],
      "audio_sources":[{"id":"lav","file":"lav.wav"}],"audio":{"mode":"fixed","source_id":"lav","audio_stream_index":0},
@@ -865,7 +881,7 @@ func exerciseCameraSwitch(_ bundle: URL, fixture: URL, scratch: URL, home: URL) 
                      "--transcript", scratch.appendingPathComponent("queue-words.json").path,
                      "--source-id", "lav", "--audio-stream-index", "0", "--json"])
 
-    try withEditor(bundle, opening: project, home: home, activates: false) { editor in
+    try withEditor(bundle, opening: project, home: home) { editor in
         try editor.showTranscript()
         try editor.search("queuing excerpts")
         try editor.expectResults("Match 1 of 2")

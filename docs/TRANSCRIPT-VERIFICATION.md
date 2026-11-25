@@ -78,7 +78,7 @@ swift Tests/Integration/transcript_gui.swift "$app" --switch-cameras /tmp/mpcut-
 python3 Tests/Integration/transcript_lifecycle.py "$app" --scratch-dir "$PWD/.build/recovery-process"
 ```
 
-The native window test needs a logged-in Mac with Accessibility permission. Run it separately from the live MCP suite because both control a foreground instance of MPCut. The Go suite launches its own copy of the bundle, starts the packaged MCP server and reads back the resulting project and exports.
+The native window and lifecycle tests need a logged-in Mac, Backstage, and Accessibility permission. They launch muted MPCut instances on Backstage’s hidden display. The Go suite launches its own copy of the bundle, starts the packaged MCP server and reads back the resulting project and exports.
 
 ```sh
 go test -C mcp -v ./integration -run '^TestLiveBundle$/^Transcript' -count=1 \

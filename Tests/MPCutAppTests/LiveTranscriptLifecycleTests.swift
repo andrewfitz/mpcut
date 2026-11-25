@@ -7,6 +7,45 @@ import XCTest
 
 final class LiveTranscriptLifecycleTests: XCTestCase {
     @MainActor
+    func testClosingBeforeQueuedDocumentEventDoesNotDiscoverJobs() async throws {
+        _ = NSApplication.shared
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let document = folder.appendingPathComponent("Empty.cut").resolvingSymlinksInPath()
+        let owner = UUID()
+        var project = CutProject.sequence([])
+        project.transcripts.documentID = owner
+        try project.save(to: document)
+
+        let movie = try XCTUnwrap(Bundle.module.url(forResource: "Pause-Quiet", withExtension: "mov",
+                                                     subdirectory: "Fixtures"))
+        let recording = folder.appendingPathComponent("Camera.mov")
+        try FileManager.default.copyItem(at: movie, to: recording)
+        var store = TranscriptJobStore(directory: LiveTranscriptController.jobsDirectory)
+        store.stagesAudioForStandaloneProvider = false
+        defer { try? store.discard(documentID: document.path) }
+        let input = CutProject.sequence([CutSequenceClip(id: "camera", file: recording.path, from: .zero,
+                                                         to: .init(numerator: 1))])
+        let record = try store.prepare(project: input, documentID: document.path, relativeTo: document,
+                                       documentIdentity: owner)
+
+        let preferences = EditorPreferences()
+        preferences.useAnalysisSidecars = false
+        let closing = ProjectSession(id: UUID(), preferences: preferences)
+        let controller = closing.transcript
+        try closing.editor.openProject([], at: document)
+        controller.prepareForWindowEnd(preservingDraft: true)
+
+        let open = ProjectSession(id: UUID(), preferences: preferences)
+        let openController = open.transcript
+        try open.editor.openProject([], at: document)
+        defer { closing.end(); open.end() }
+        try await until("the open window discovers the job") { openController.job?.id == record.id }
+        XCTAssertNil(controller.job)
+    }
+
+    @MainActor
     func testInterruptRestoreReconfigureAndReplayActiveJob() async throws {
         _ = NSApplication.shared
         let files = FileManager.default

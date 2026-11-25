@@ -31,8 +31,8 @@ final class ProjectSavedLayoutTests: XCTestCase {
         XCTAssertFalse(lines.contains { $0.contains("\"refs\"") || $0.contains("\"~") })
         // Each clip names its file in full. The undo step repeats none of them.
         XCTAssertEqual(lines.filter { $0.contains(#""file": "media/a recording.mov""#) }.count, 3)
-        let reordered = Data(#"{"schema_version":4,"kind":"sequence","format":"mpcut","clips":[{"to":"1","id":"clip-0","from":"0","file":"media/a recording.mov"}]}"#.utf8)
-        let ordered = Data(#"{"clips":[{"file":"media/a recording.mov","from":"0","id":"clip-0","to":"1"}],"format":"mpcut","kind":"sequence","schema_version":4}"#.utf8)
+        let reordered = Data(#"{"schema_version":9,"kind":"sequence","format":"mpcut","clips":[{"to":"1","id":"clip-0","from":"0","file":"media/a recording.mov"}]}"#.utf8)
+        let ordered = Data(#"{"clips":[{"file":"media/a recording.mov","from":"0","id":"clip-0","to":"1"}],"format":"mpcut","kind":"sequence","schema_version":9}"#.utf8)
         XCTAssertEqual(try CutProject.readableDocument(saved: reordered), try CutProject.readableDocument(saved: ordered))
         // The text is a project.
         try text.write(to: url)
@@ -46,7 +46,7 @@ final class ProjectSavedLayoutTests: XCTestCase {
         let other = #""Interviews 2026/the second camera.mov""#
         func project(_ clips: [(String, String)]) -> Data {
             let rows = clips.map { #"{"file":\#($0.1),"from":"0","id":"\#($0.0)","to":"1"}"# }.joined(separator: ",")
-            return Data(#"{"clips":[\#(rows)],"format":"mpcut","kind":"sequence","schema_version":4}"#.utf8)
+            return Data(#"{"clips":[\#(rows)],"format":"mpcut","kind":"sequence","schema_version":9}"#.utf8)
         }
         func saved(_ document: Data) throws -> [String: Any] {
             let keyed = try XCTUnwrap(ProjectKeyedLayout.compacted(document))
@@ -75,6 +75,30 @@ final class ProjectSavedLayoutTests: XCTestCase {
         XCTAssertEqual((home["clips"] as? [[String: Any]])?.map { $0["file"] as? String }, ["~~/Movies/a.mov", "~~"])
     }
 
+    func testEscapedReferenceNamesAndMarkersResolveToTheSameValues() throws {
+        let keyed = Data(#"{"clips":[{"\u007e":"\u0063lip"},{"file":"\u007e\u007Ecamera","from":"0","id":"b","to":"1"}],"format":"mpcut","kind":"sequence","\u0072efs":{"\u0063lip":{"file":"\u007E\u0070ath","from":"0","id":"a","to":"1"},"path":"camera.mov"},"schema_version":9}"#.utf8)
+        let clips = try XCTUnwrap(CutProject.decode(keyed).sequenceClips)
+        XCTAssertEqual(clips.map(\.file), ["camera.mov", "~camera"])
+        let literal = Data(#"{"path":"\u007etilde"}"#.utf8)
+        let compact = try XCTUnwrap(ProjectKeyedLayout.compacted(literal))
+        XCTAssertEqual(try ProjectKeyedLayout.expanded(compact), literal)
+    }
+
+    func testKeyedDocumentWithUTF8BOMOpensAndExpands() throws {
+        let path = "media/a long recording name.mov"
+        let clips = ["a", "b"].map {
+            CutSequenceClip(id: $0, file: path, from: .zero, to: .init(numerator: 1))
+        }
+        let expected = CutProject.sequence(clips)
+        let plain = try ProjectFile.encoded(expected, compact: true)
+        let keyed = try XCTUnwrap(ProjectKeyedLayout.compacted(plain))
+        let withBOM = Data([0xEF, 0xBB, 0xBF]) + keyed
+
+        XCTAssertEqual(try CutProject.decode(withBOM), expected)
+        XCTAssertEqual(try CutProject.documentJSON(saved: withBOM), plain)
+        XCTAssertEqual(try CutProject.readableDocument(saved: withBOM), try CutProject.readableDocument(saved: plain))
+    }
+
     func testHistoryWritesRepeatedValuesOnceUnderContentKeys() throws {
         func clip(_ index: Int, to: Int) -> String {
             #"{"file":"Interviews 2026/a long recording name.mov","from":"\#(index)","id":"clip-number-\#(index)","to":"\#(to)"}"#
@@ -82,7 +106,7 @@ final class ProjectSavedLayoutTests: XCTestCase {
         let steps = (0..<10).map { step in
             #"{"action":"Trim Clip","clips":[\#((0..<30).map { clip($0, to: $0 == step ? 99 : $0 + 1) }.joined(separator: ","))]}"#
         }
-        let project = Data(#"{"clips":[\#((0..<30).map { clip($0, to: $0 + 1) }.joined(separator: ","))],"format":"mpcut","history":{"undo":[\#(steps.joined(separator: ","))]},"kind":"sequence","schema_version":4}"#.utf8)
+        let project = Data(#"{"clips":[\#((0..<30).map { clip($0, to: $0 + 1) }.joined(separator: ","))],"format":"mpcut","history":{"undo":[\#(steps.joined(separator: ","))]},"kind":"sequence","schema_version":9}"#.utf8)
         let keyed = try XCTUnwrap(ProjectKeyedLayout.compacted(project))
         XCTAssertEqual(try ProjectKeyedLayout.expanded(keyed), project)
         XCTAssertLessThan(keyed.count * 2, project.count)
@@ -116,35 +140,54 @@ final class ProjectSavedLayoutTests: XCTestCase {
             return String(decoding: document, as: UTF8.self)
         }
         // An entry nothing refers to, and text written in full beside references, are both read.
-        XCTAssertEqual(try expanded(#"{"clips":[{"file":"~k1"},{"file":"b.mov"},{"file":"~~/c.mov"}],"refs":{"k1":"a.mov","unused":"z.mov"},"schema_version":4}"#),
-                       #"{"clips":[{"file":"a.mov"},{"file":"b.mov"},{"file":"~/c.mov"}],"schema_version":4}"#)
-        XCTAssertEqual(try expanded(#"{"history":{"undo":[{"~":"v2"},{"~":"v1"}]},"refs":{"p":"a.mov","v1":{"file":"~p"},"v2":[{"~":"v1"},{"~":"v1"}]},"schema_version":4}"#),
-                       #"{"history":{"undo":[[{"file":"a.mov"},{"file":"a.mov"}],{"file":"a.mov"}]},"schema_version":4}"#)
+        XCTAssertEqual(try expanded(#"{"clips":[{"file":"~k1"},{"file":"b.mov"},{"file":"~~/c.mov"}],"refs":{"k1":"a.mov","unused":"z.mov"},"schema_version":9}"#),
+                       #"{"clips":[{"file":"a.mov"},{"file":"b.mov"},{"file":"~/c.mov"}],"schema_version":9}"#)
+        XCTAssertEqual(try expanded(#"{"history":{"undo":[{"~":"v2"},{"~":"v1"}]},"refs":{"p":"a.mov","v1":{"file":"~p"},"v2":[{"~":"v1"},{"~":"v1"}]},"schema_version":9}"#),
+                       #"{"history":{"undo":[[{"file":"a.mov"},{"file":"a.mov"}],{"file":"a.mov"}]},"schema_version":9}"#)
         // A snapshot is carried exactly, marker and all.
-        XCTAssertEqual(try expanded(#"{"media_snapshot":{"entries":[{"file":"~/a.mov","id":"~7"}]},"refs":{},"schema_version":4}"#),
-                       #"{"media_snapshot":{"entries":[{"file":"~/a.mov","id":"~7"}]},"schema_version":4}"#)
+        XCTAssertEqual(try expanded(#"{"media_snapshot":{"entries":[{"file":"~/a.mov","id":"~7"}]},"refs":{},"schema_version":9}"#),
+                       #"{"media_snapshot":{"entries":[{"file":"~/a.mov","id":"~7"}]},"schema_version":9}"#)
         // Text with no table is not this layout.
-        XCTAssertNil(try ProjectKeyedLayout.expanded(Data(#"{"clips":[{"file":"~k1"}],"schema_version":4}"#.utf8)))
+        XCTAssertNil(try ProjectKeyedLayout.expanded(Data(#"{"clips":[{"file":"~k1"}],"schema_version":9}"#.utf8)))
 
         // A reference whose entry a merge dropped names the entry, so it can be restored.
-        XCTAssertThrowsError(try expanded(#"{"clips":[{"file":"~gone"}],"refs":{},"schema_version":4}"#)) {
+        XCTAssertThrowsError(try expanded(#"{"clips":[{"file":"~gone"}],"refs":{},"schema_version":9}"#)) {
             XCTAssertEqual(($0 as? CutError)?.code, "invalid_cut_project")
             XCTAssertTrue((($0 as? CutError)?.message ?? "").contains("‘gone’"), "\($0)")
         }
         let refused = [
-            #"{"clips":[{"file":"~v"}],"refs":{"v":{"a":1}},"schema_version":4}"#,
-            #"{"history":{"undo":[{"~":"p"}]},"refs":{"p":"a.mov"},"schema_version":4}"#,
-            #"{"history":{"undo":[{"~":7}]},"refs":{},"schema_version":4}"#,
-            #"{"history":{"undo":[{"~":"a"}]},"refs":{"a":[{"~":"b"}],"b":[{"~":"a"}]},"schema_version":4}"#,
-            #"{"clips":[],"refs":[],"schema_version":4}"#,
-            #"{"clips":[{"file":"~"}],"refs":{},"schema_version":4}"#
+            #"{"clips":[{"file":"~v"}],"refs":{"v":{"a":1}},"schema_version":9}"#,
+            #"{"history":{"undo":[{"~":"p"}]},"refs":{"p":"a.mov"},"schema_version":9}"#,
+            #"{"history":{"undo":[{"~":7}]},"refs":{},"schema_version":9}"#,
+            #"{"history":{"undo":[{"~":"a"}]},"refs":{"a":[{"~":"b"}],"b":[{"~":"a"}]},"schema_version":9}"#,
+            #"{"clips":[],"refs":[],"schema_version":9}"#,
+            #"{"clips":[{"file":"~"}],"refs":{},"schema_version":9}"#
         ]
         for text in refused {
             XCTAssertThrowsError(try expanded(text), text) { XCTAssertEqual(($0 as? CutError)?.code, "invalid_cut_project") }
         }
         // Each entry doubles the one before it. Expanding must stop long before memory does.
         let doubling = (1..<40).map { #""e\#($0)":[{"~":"e\#($0 - 1)"},{"~":"e\#($0 - 1)"}]"# }.joined(separator: ",")
-        XCTAssertThrowsError(try expanded(#"{"history":{"undo":[{"~":"e39"}]},"refs":{"e0":["0123456789abcdef"],\#(doubling)},"schema_version":4}"#))
+        XCTAssertThrowsError(try expanded(#"{"history":{"undo":[{"~":"e39"}]},"refs":{"e0":["0123456789abcdef"],\#(doubling)},"schema_version":9}"#))
+    }
+
+    func testLargeExpandedReferencesAndOpaqueEmbeddedPayloads() throws {
+        let literal = String(repeating: "x", count: 1 << 20)
+        let count = 130
+        let references = Array(repeating: #""~p""#, count: count).joined(separator: ",")
+        let input = Data(#"{"paths":[\#(references)],"embedded_assets":{"transcripts":{"hash":{"literal":"~p"}}},"refs":{"p":"\#(literal)"}}"#.utf8)
+        let expanded = try XCTUnwrap(ProjectKeyedLayout.expanded(input))
+        let header = #"{"paths":["#
+        let tail = #"],"embedded_assets":{"transcripts":{"hash":{"literal":"~p"}}}}"#
+        XCTAssertEqual(expanded.count, header.utf8.count + count * (literal.utf8.count + 2) + count - 1 + tail.utf8.count)
+        XCTAssertEqual(expanded.prefix(header.utf8.count), Data(header.utf8))
+        XCTAssertEqual(expanded.suffix(tail.utf8.count), Data(tail.utf8))
+        for i in 0..<count {
+            let offset = header.utf8.count + i * (literal.utf8.count + 3)
+            XCTAssertEqual(expanded[offset], 0x22)
+            XCTAssertEqual(expanded[offset + 1], 0x78)
+            XCTAssertEqual(expanded[offset + literal.utf8.count + 1], 0x22)
+        }
     }
 
     func testRefsBoundAliasDepthAndCachedExpandedDepth() throws {
@@ -203,7 +246,7 @@ final class ProjectSavedLayoutTests: XCTestCase {
         XCTAssertEqual(text.components(separatedBy: path).count, 2)
         let key = String(decoding: ProjectKeyedLayout.key(Array("\"\(path)\"".utf8)), as: UTF8.self)
         let root = try object(file)
-        XCTAssertEqual(root["schema_version"] as? Int, 4)
+        XCTAssertEqual(root["schema_version"] as? Int, CutProject.schemaVersion)
         XCTAssertEqual((root["refs"] as? [String: Any])?[key] as? String, path)
         XCTAssertEqual((root["clips"] as? [[String: Any]])?.first?["file"] as? String, "~" + key)
         // The plain document is what the file stands for.

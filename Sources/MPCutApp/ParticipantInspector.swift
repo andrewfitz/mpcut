@@ -54,8 +54,9 @@ struct ParticipantInspector: View {
     @State private var reviewCards: [TilesReviewCard] = []
     @State private var displayedReviewCards: [TilesReviewCard] = []
     @State private var acceptedReview: ParticipantScanResult?
-    @State private var reviewStoreRevision = UUID()
+    @State private var loadedReviewDigest: String?
     @State private var peakTiles = 0
+    @State private var rawPeakTiles = 0
     @State private var selectedRecordingID: String?
     @State private var showingISOExport = false
     @State private var showFind = false
@@ -148,21 +149,19 @@ struct ParticipantInspector: View {
         else { session.editor.projectURL ?? session.editor.draft.url }
     }
 
-    private var reviewStore: TilesPendingReviewStore? {
-        guard let recording, let reviewProjectURL else { return nil }
-        return .init(project: reviewProjectURL, recordingID: recording.id)
+    private var pendingReview: PendingTileReview? {
+        project.pendingReviews.first { $0.sourceID == recording?.id }
     }
 
     private struct ReviewLocation: Equatable {
         let project: URL?
         let recording: ScanSource?
-        let acceptedAnalysis: String?
-        let storeRevision: UUID
+        let pending: PendingTileReview?
+        let idle: Bool
     }
 
     private var reviewLoadKey: ReviewLocation {
-        .init(project: reviewProjectURL, recording: recording, acceptedAnalysis: source?.analysisIdentity,
-              storeRevision: reviewStoreRevision)
+        .init(project: reviewProjectURL, recording: recording, pending: pendingReview, idle: operation == nil)
     }
 
     private var currentPosition: ParticipantMonitorPosition? {
@@ -198,7 +197,7 @@ struct ParticipantInspector: View {
                 HStack {
                     Text("Tiles").font(.headline)
                     Spacer()
-                    PanelDockToggle()
+                    PanelDockToggle(preferences: session.editor.preferences)
                 }
                 .padding(10)
                 Divider()
@@ -255,16 +254,21 @@ struct ParticipantInspector: View {
             if let selection, inspectorSource != selection {
                 inspectorSource = selection
                 showFind = false
-                restoreScanLayout(source?.feedLayout ?? (ParticipantAnalysis.isAvailable ? .meeting : .fixed(columns: 2, rows: 2)))
+                if let saved = source?.feedLayout {
+                    restoreScanLayout(saved)
+                } else {
+                    // No saved layout: start from Settings → Media & Analysis → Find Tiles.
+                    let defaults = TilesScanDefaults(preferences: session.editor.preferences)
+                    scanColumns = String(defaults.columns)
+                    scanRows = String(defaults.rows)
+                    scanDetail = defaults.detail
+                    restoreScanLayout(defaults.layout)
+                }
             }
             updateScanPreview()
         }
         .onChange(of: recording?.id) { _, _ in layoutSlots = nil }
         .task(id: reviewLoadKey) { await loadPendingReview() }
-        .onReceive(NotificationCenter.default.publisher(for: .didSaveTileReview).receive(on: DispatchQueue.main)) { event in
-            guard event.object as? URL == reviewStore?.scanURL, operation == nil else { return }
-            reviewStoreRevision = UUID()
-        }
         .onChange(of: displayedSource) { _, _ in updateScanPreview() }
         .onChange(of: presentation.pinnedParticipant) { _, _ in personName = selectedPerson?.name ?? "" }
         .onChange(of: presentation.pickedParticipantAppearance) { _, _ in resetScope() }
@@ -320,6 +324,7 @@ struct ParticipantInspector: View {
         .sheet(isPresented: $showingISOExport) {
             if let recording {
                 TilesISOExportSheet(session: session, recordingID: recording.id, recordingName: recording.url.lastPathComponent,
+                                    recordingURL: recording.url,
                                     openProject: { _ = openProjects([$0]) })
             }
         }
@@ -385,7 +390,8 @@ struct ParticipantInspector: View {
     }
 
     private var currentReview: ParticipantScanResult? {
-        guard showsScan, let review, let recording, let media = recordings[recording.id], review.source.matches(media) else { return nil }
+        guard showsScan, let review, let pending = pendingReview, loadedReviewDigest == pending.scanSHA256,
+              let recording, let media = recordings[recording.id], review.source.matches(media) else { return nil }
         return review
     }
 
@@ -633,9 +639,14 @@ struct ParticipantInspector: View {
     }
 
     private func updateChoices(_ edit: (inout TilesReviewChoices) -> Void) {
-        edit(&choices)
-        do { try reviewStore?.save(choices) }
-        catch { self.error = error.localizedDescription }
+        guard var pending = pendingReview, pending.scanSHA256 == loadedReviewDigest else { return }
+        edit(&pending.choices)
+        do {
+            var next = project
+            next.setPendingReview(pending)
+            try session.commitParticipants(next, action: "Edit Tile Review")
+            choices = pending.choices
+        } catch { self.error = error.localizedDescription }
     }
 
     private func mergeReview(_ from: String, into to: String) {
@@ -648,53 +659,72 @@ struct ParticipantInspector: View {
     }
 
     private func loadPendingReview() async {
-        guard let store = reviewStore, let recording, operation == nil else { return }
+        guard operation == nil else { return }
+        guard let pending = pendingReview, let recording else {
+            resetPendingReview()
+            return
+        }
+        if showsScan, let review, loadedReviewDigest == pending.scanSHA256 {
+            if choices.grids != pending.choices.grids {
+                let raw = rawPeakTiles
+                let adjusted = await Task.detached(priority: .utility) {
+                    pending.choices.maximumVisibleTiles(in: review, rawMaximum: raw)
+                }.value
+                guard !Task.isCancelled, pendingReview == pending else { return }
+                peakTiles = adjusted
+            }
+            choices = pending.choices
+            displayedReviewCards = TilesReviewCard.applyingMerges(choices.merged, to: reviewCards)
+            updateScanPreview()
+            return
+        }
+        resetPendingReview()
         let location = reviewLoadKey
         let load = Task.detached(priority: .utility) {
             Result {
+                let scan = try pending.load(recording: recording.url, cancelled: { Task.isCancelled })
                 try Task.checkCancellation()
-                return try store.load(recording: recording.url).map { scan, choices in
-                    try Task.checkCancellation()
-                    let raw = TilesReviewCard.list(scan)
-                    let visible = choices.maximumVisibleTiles(in: scan, rawMaximum: raw.visible)
-                    let displayed = TilesReviewCard.applyingMerges(choices.merged, to: raw.cards)
-                    return (scan, choices, raw.cards, displayed, visible)
-                }
+                let raw = TilesReviewCard.list(scan)
+                return (scan, raw.cards, raw.visible)
             }
         }
         let result = await withTaskCancellationHandler { await load.value } onCancel: { load.cancel() }
         guard !Task.isCancelled, operation == nil, reviewLoadKey == location else { return }
         do {
-            guard let (scan, choices, raw, displayed, visible) = try result.get(),
-                  let media = recordings[recording.id], scan.source.matches(media) else { return }
-            if scan.analysisIdentity == source?.analysisIdentity, !staleGeometry {
-                acceptedReview = scan
-                review = nil
-                updateScanPreview()
-                return
-            }
+            let (scan, raw, visible) = try result.get()
+            guard let media = recordings[recording.id], scan.source.matches(media) else { return }
             restoreScanLayout(scan.configuration.feedLayout)
             scanDetail = scan.configuration.sampling
             scannedSource = recording
             review = scan
-            self.choices = choices
+            scanProgress = scan.savedProgress
+            rawPeakTiles = visible
+            choices = pending.choices
+            loadedReviewDigest = pending.scanSHA256
             reviewCards = raw
-            displayedReviewCards = displayed
-            peakTiles = visible
+            displayedReviewCards = TilesReviewCard.applyingMerges(choices.merged, to: raw)
+            peakTiles = choices.maximumVisibleTiles(in: scan, rawMaximum: visible)
             updateScanPreview()
         } catch { self.error = error.localizedDescription }
     }
 
+    private func resetPendingReview() {
+        loadedReviewDigest = nil
+        review = nil
+        reviewCards = []
+        displayedReviewCards = []
+        choices = .init()
+        scanProgress = nil
+        updateScanPreview()
+    }
+
     private func clearPendingReview() {
+        guard let pending = pendingReview else { return }
         do {
-            try reviewStore?.remove()
-            review = nil
-            acceptedReview = nil
-            reviewCards = []
-            displayedReviewCards = []
-            choices = .init()
-            scanProgress = nil
-            updateScanPreview()
+            var next = project
+            next.pendingReviews.removeAll { $0.id == pending.id }
+            try session.commitParticipants(next, action: "Discard Tile Review")
+            resetPendingReview()
         } catch { self.error = error.localizedDescription }
     }
 
@@ -1002,7 +1032,7 @@ struct ParticipantInspector: View {
             updateChoices { $0.grids.append(.init(range: range, columns: columns, rows: rows)) }
             updateScanPreview()
             let choices = self.choices
-            let originalMaximum = peakTiles
+            let originalMaximum = rawPeakTiles
             Task {
                 let maximum = await Task.detached(priority: .utility) {
                     choices.maximumVisibleTiles(in: scan, rawMaximum: originalMaximum)
@@ -1353,14 +1383,12 @@ struct ParticipantInspector: View {
 
     private func scan() {
         guard let target = recording, let feedLayout, operation == nil else { return }
-        let store: TilesPendingReviewStore
-        do { store = try .init(project: session.transcript.assetContext(), recordingID: target.id) }
-        catch { self.error = error.localizedDescription; return }
+        let previous = pendingReview
+        let path = session.multicam.project?.pictureSources.first { $0.id == target.id }?.file ?? target.id
         let token = EditCancellation()
         let url = target.url
         let useSidecar = session.isMulticam ? session.multicam.useAnalysisSidecars : session.editor.useAnalysisSidecars
         let partial = resumableScan
-        let priorChoices = choices
         selectedRecordingID = target.id
         if !showsScan { review = nil }
         let options = partial?.configuration.options(useSidecar: useSidecar)
@@ -1382,12 +1410,12 @@ struct ParticipantInspector: View {
                 guard target.identity.isCurrentSnapshot(at: url) else {
                     throw CutError(code: "stale_scan", message: "The recording changed during the scan. Find tiles again.")
                 }
-                try store.save(scan)
+                let pending = try PendingTileReview(scan: scan, sourceID: target.id, file: path, previous: previous)
                 let raw = TilesReviewCard.list(scan)
-                let choices = priorChoices.analysisIdentity == scan.analysisIdentity ? priorChoices : .init(scan: scan)
+                let choices = pending.choices
                 let displayed = TilesReviewCard.applyingMerges(choices.merged, to: raw.cards)
                 let visible = choices.maximumVisibleTiles(in: scan, rawMaximum: raw.visible)
-                return (scan, choices, raw.cards, displayed, visible)
+                return (scan, pending, raw.cards, displayed, visible, raw.visible)
             }
             // Submit completion through the same serial queue as the status events.
             // A fast cache hit must publish its final percentage before releasing the token.
@@ -1396,17 +1424,31 @@ struct ParticipantInspector: View {
                 operation = nil
                 status = nil
                 switch result {
-                case .success(let (scan, choices, raw, displayed, visible)):
+                case .success(let (scan, pending, raw, displayed, visible, rawVisible)):
                     guard let media = recordings[target.id], scan.source.matches(media) else {
                         scanProgress = nil
                         error = "The source for \(url.lastPathComponent) changed. Refresh the recording and scan again."
                         return
                     }
+                    guard project.pendingReviews.first(where: { $0.sourceID == target.id }) == previous else {
+                        error = "The tile review changed during the scan. Reload the review and try again."
+                        return
+                    }
+                    do {
+                        var next = project
+                        next.setPendingReview(pending)
+                        try session.commitParticipants(next, action: "Find Tiles")
+                    } catch {
+                        self.error = error.localizedDescription
+                        return
+                    }
+                    loadedReviewDigest = pending.scanSHA256
                     review = scan
-                    self.choices = choices
+                    self.choices = pending.choices
                     reviewCards = raw
                     displayedReviewCards = displayed
                     peakTiles = visible
+                    rawPeakTiles = rawVisible
                     showFind = false
                     if recording == target { presentation.participantMonitorSource = true }
                     updateScanPreview()
@@ -1505,13 +1547,14 @@ struct ParticipantInspector: View {
     }
 
     private func applyScan(_ scan: ParticipantScanResult, sourceID: String, reviewed: ParticipantReconciliation? = nil) {
-        guard operation == nil else { return }
+        guard operation == nil, let pending = pendingReview, pending.sourceID == sourceID,
+              pending.scanSHA256 == loadedReviewDigest, pending.choices.analysisIdentity == scan.analysisIdentity else { return }
         let revision = ParticipantSpeakerIndexKey(session: session)
         let original = session.transcript.project
         let recording = URL(fileURLWithPath: scan.source.file)
         let url = reviewProjectURL ?? recording
         let action = reviewed == nil ? "Use These Tiles" : "Reconcile Tiles"
-        let choices = self.choices
+        let choices = pending.choices
         let token = EditCancellation()
         operation = token
         scanProgress = nil
@@ -1523,16 +1566,15 @@ struct ParticipantInspector: View {
                     var document = original
                     if let reviewed {
                         try document.reconcileParticipantAnalysis(scan, sourceID: sourceID, relativeTo: url,
-                                                                  reviewed: reviewed, cancelled: { token.isCancelled })
+                                                                  reviewed: reviewed, applying: choices,
+                                                                  cancelled: { token.isCancelled })
                     } else {
                         try document.acceptParticipantAnalysis(scan, sourceID: sourceID, relativeTo: url,
                                                                cancelled: { token.isCancelled })
+                        try choices.apply(to: &document.participants, sourceID: sourceID, analysisIdentity: scan.analysisIdentity)
                     }
-                    var participants = document.participants
-                    if reviewed?.retainedCopiedGeometry != true {
-                        try choices.apply(to: &participants, sourceID: sourceID, analysisIdentity: scan.analysisIdentity)
-                    }
-                    return (participants, identity)
+                    document.participants.pendingReviews.removeAll { $0.id == pending.id }
+                    return (document.participants, identity)
                 }
             }.value
             guard operation === token else { return }

@@ -177,25 +177,22 @@ private struct TimelineComparisonView: View {
                         + "\(timelineTime(comparison.afterDuration.seconds, milliseconds: true)) now."
                         + (comparison.projectFields.isEmpty ? "" : " Changed: " + comparison.projectFields.map(label).joined(separator: ", ") + ".")) {
             Group {
-                if comparison.changes.isEmpty {
+                if comparison.changes.isEmpty && comparison.participantChanges.isEmpty {
                     ContentUnavailableView("No occurrence changes", systemImage: "timeline.selection",
                                            description: Text("Both states place the same clips at the same times."))
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
-                    List(comparison.changes) { change in
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(label(change.kind.rawValue)).font(.callout.weight(.semibold))
-                            if let before = change.before { occurrence(before, name: "Selected") }
-                            if let after = change.after { occurrence(after, name: "Current") }
-                            if !change.fields.isEmpty {
-                                Text(change.fields.map(label).joined(separator: ", "))
-                                    .font(.callout)
-                                    .foregroundStyle(.secondary)
+                    List {
+                        ForEach(comparison.changes) { change in
+                            occurrenceChange(change)
+                        }
+                        if !comparison.participantChanges.isEmpty {
+                            Section("Participant Changes") {
+                                ForEach(comparison.participantChanges.indices, id: \.self) { index in
+                                    participantChange(comparison.participantChanges[index])
+                                }
                             }
                         }
-                        .padding(.vertical, 2)
-                        .textSelection(.enabled)
-                        .accessibilityElement(children: .combine)
                     }
                     .listStyle(.inset(alternatesRowBackgrounds: true))
                 }
@@ -207,6 +204,50 @@ private struct TimelineComparisonView: View {
             Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
         }
         .frame(width: 580)
+    }
+
+    private func occurrenceChange(_ change: TimelineComparison.Change) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label(change.kind.rawValue)).font(.callout.weight(.semibold))
+            if let before = change.before { occurrence(before, name: "Selected") }
+            if let after = change.after { occurrence(after, name: "Current") }
+            if !change.fields.isEmpty {
+                Text(change.fields.map(label).joined(separator: ", "))
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 2)
+        .textSelection(.enabled)
+        .accessibilityElement(children: .combine)
+    }
+
+    private func participantChange(_ change: TimelineComparison.ParticipantChange) -> some View {
+        let source = URL(fileURLWithPath: change.sourceID).lastPathComponent
+        let subject = [source, change.tileID].compactMap { $0 }.joined(separator: " · ")
+        return VStack(alignment: .leading, spacing: 4) {
+            Text("\(label(change.kind.rawValue)) · \(label(change.category.rawValue))")
+                .font(.callout.weight(.semibold))
+            Text(subject).help(change.sourceID)
+            if let point = change.time { Text("Source time \(point.description)") }
+            participantState("Selected", range: change.beforeRange, participantID: change.beforeParticipantID)
+            participantState("Current", range: change.afterRange, participantID: change.afterParticipantID)
+            Text(change.fields.map(label).joined(separator: ", "))
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 2)
+        .textSelection(.enabled)
+        .accessibilityElement(children: .combine)
+    }
+
+    @ViewBuilder
+    private func participantState(_ name: String, range: MulticamRange?, participantID: String?) -> some View {
+        let details = [range?.displayBounds, participantID].compactMap { $0 }
+        if !details.isEmpty {
+            Text("\(name)  \(details.joined(separator: " · "))")
+                .font(.system(size: 12, design: .monospaced))
+        }
     }
 
     private func label(_ field: String) -> String {

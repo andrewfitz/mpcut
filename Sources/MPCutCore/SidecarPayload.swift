@@ -3,7 +3,7 @@ import Foundation
 
 /// A zero logical size denotes verbatim SQLite storage. Otherwise the first byte
 /// selects plain LZFSE (1), packed activity (2/3), packed packet runs (4/5), packed
-/// activity in Transcriberrr's layout (6/7), packed frame rows (8/9), or transposed
+/// provider activity in durable job artifacts (6/7), packed frame rows (8/9), or transposed
 /// samples (11). Odd tags apply LZFSE after packing. Transposing alone saves nothing,
 /// so its even tag (10) is reserved and never stored.
 struct SidecarPayload {
@@ -11,7 +11,7 @@ struct SidecarPayload {
     let logicalSize: Int
     static let minimumSize = 4096
 
-    static func encode(_ value: Data, key: String = "", cancelled: () -> Bool) throws -> Self {
+    static func encode(_ value: Data, key: String = "", providerActivity: Bool = false, cancelled: () -> Bool) throws -> Self {
         guard value.count <= Int(Int32.max) else { throw sidecarError("Section exceeds the maximum logical size.") }
         let raw = Self(bytes: value, logicalSize: 0)
         guard value.count >= minimumSize else { return raw }
@@ -21,13 +21,13 @@ struct SidecarPayload {
         // can pack to more than plain compression gives. Those must beat it to be kept.
         var contested = false
         if key.hasPrefix("transcript_activity.v1.") {
-            // MPCut's own layout keeps the tags that earlier builds decode.
-            if let own = try SidecarActivityPacking.pack(value, cancelled: cancelled) {
-                packed = own
-                tag = 2
-            } else {
+            let local = try SidecarActivityPacking.pack(value, cancelled: cancelled)
+            if local == nil, providerActivity {
                 packed = try SidecarActivityPacking.packProviderLayout(value, cancelled: cancelled)
                 tag = 6
+            } else {
+                packed = local
+                tag = 2
             }
         } else if key == "media_index_audio.v1" {
             packed = try SidecarPacketPacking.pack(value, cancelled: cancelled)
@@ -82,7 +82,7 @@ struct SidecarPayload {
         case 1:
             let result = try Self.decompress(bytes.dropFirst(), limit: logicalSize, cancelled: cancelled)
             return result?.count == logicalSize ? result : nil
-        case 2...11:
+        case 2...9, 11:
             let packed: Data
             if tag.isMultiple(of: 2) {
                 packed = bytes.dropFirst()

@@ -184,9 +184,30 @@ final class QueueSnapshotTests: XCTestCase {
         XCTAssertEqual(plan["skipped_needs_replan"] as? [String], [second.id.uuidString])
 
         let args: [String: Any] = ["id": second.id.uuidString, "mode": "replace"]
-        editor.selectRange(0, editor.mcpDuration.seconds)
+        try editor.setTranscriptMarks(.init(from: .init(numerator: 1, denominator: 10),
+                                            to: .init(numerator: 2, denominator: 10)))
         _ = try await sessions.mcpOutputs(tool: "export_queue_entry_revise", arguments: args, session: session, checkAccess: {})
         XCTAssertTrue(editor.invalidatedQueueIDs.isEmpty)
+        let revised = try XCTUnwrap(editor.queuedRanges.last)
+        XCTAssertEqual(revised.id, second.id)
+        XCTAssertNotEqual(revised.contentID, second.contentID)
+        XCTAssertEqual(revised.excerpt?.name, "Other")
+        let revisedOutput = directory.appendingPathComponent("Revised.cut")
+        try XCTUnwrap(revised.excerpt).save(to: revisedOutput)
+        let saved = try XCTUnwrap(CutProject.loadDocument(from: revisedOutput, limit: 1).project.sequenceClips?.first)
+        XCTAssertEqual(saved.from, revised.clips.first?.from)
+        XCTAssertEqual(saved.to, revised.clips.first?.to)
+
+        editor.invalidateQueuedMedia(at: [source])
+        try editor.setTranscriptMarks(.init(from: .init(numerator: 2, denominator: 10),
+                                            to: .init(numerator: 3, denominator: 10)))
+        try editor.replanQueuedRange(second.id)
+        let recaptured = try XCTUnwrap(editor.queuedRanges.last)
+        let recapturedOutput = directory.appendingPathComponent("Replanned.cut")
+        try XCTUnwrap(recaptured.excerpt).save(to: recapturedOutput)
+        let savedReplan = try XCTUnwrap(CutProject.loadDocument(from: recapturedOutput, limit: 1).project.sequenceClips?.first)
+        XCTAssertEqual(savedReplan.from, recaptured.clips.first?.from)
+        XCTAssertNotEqual(savedReplan.from, saved.from)
 
         editor.invalidateQueuedMedia(at: [source])
         XCTAssertEqual(editor.invalidatedQueueIDs, [first.id, second.id])
@@ -276,6 +297,29 @@ final class QueueSnapshotTests: XCTestCase {
         model.removeQueuedRange(withCard.id)
         XCTAssertTrue(model.invalidatedQueueIDs.isEmpty)
         XCTAssertEqual(model.readyQueuedRanges.map(\.id), [interview.id])
+    }
+
+    func testPictureQueueTracksOnlyStillsIntersectingItsProgramRange() {
+        let document = URL(fileURLWithPath: "/queue/Session.cut")
+        let card = StillAsset(id: "card", file: "card.png", displayName: "Card", fingerprint: String(repeating: "0", count: 64))
+        let later = StillAsset(id: "later", file: "later.png", displayName: "Later", fingerprint: card.fingerprint)
+        let second = RationalTime(numerator: 1)
+        let cadence = RationalTime(numerator: 1, denominator: 25)
+        let insert = StillInsert(id: "first", assetID: card.id, duration: second, cadence: cadence)
+        let laterInsert = StillInsert(id: "second", assetID: later.id, duration: second, cadence: cadence)
+        let soundtrack = CutSequenceClip(id: "sound", file: "sound.wav", from: .zero, to: second, audioTrack: 0)
+        let format = StillTimelineFormat(width: 160, height: 90, cadence: cadence, codec: .h264, container: "mov")
+        let project = CutProject.stillSequence(.init(items: [.still(insert), .still(laterInsert)],
+                                                     stillAssets: [card, later], stillFormat: format,
+                                                     stillSoundtrack: soundtrack))
+        let entry = QueuedRange(start: .zero, end: second, clips: [], media: [:], pictureProject: project,
+                                pictureDocument: document)
+        let firstURL = URL(fileURLWithPath: "/queue/card.png")
+        let soundtrackURL = URL(fileURLWithPath: "/queue/sound.wav")
+        XCTAssertEqual(entry.mediaDependencies, [firstURL, soundtrackURL])
+        var targets = QueueMediaTargets()
+        entry.addMediaTargets(to: &targets)
+        XCTAssertEqual(targets.presenceOnlyByURL, [firstURL: true, soundtrackURL: false])
     }
 
 }

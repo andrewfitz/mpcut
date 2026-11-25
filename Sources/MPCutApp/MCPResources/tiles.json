@@ -26,12 +26,13 @@
   },
   {
     "name": "tiles_editor_scan",
-    "description": "Scan a recording for visible tiles, distinct feeds and layout changes.",
+    "description": "Find visible tiles, feeds and layout changes. Save a pending review in the project or supply an output for a separate report.",
     "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": false},
     "inputSchema": {
       "type": "object",
       "properties": {
         "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt."},
         "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
         "output": {"type": "string", "pattern": "^/", "description": "The destination for the command’s output."},
         "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
@@ -49,7 +50,7 @@
       },
       "required": ["project_handle"],
       "additionalProperties": false,
-      "allOf": [{"if": {"required": ["accept"], "properties": {"accept": {"const": true}}}, "then": {"required": ["expected_revision"]}}]
+      "allOf": [{"if": {"not": {"required": ["output"]}}, "then": {"required": ["expected_revision"]}}, {"if": {"required": ["accept"], "properties": {"accept": {"const": true}}}, "then": {"required": ["expected_revision"]}}]
     }
   },
   {
@@ -145,7 +146,7 @@
   },
   {
     "name": "tiles_file_accept",
-    "description": "Accept a saved scan or revise the saved count hints for a recording.",
+    "description": "Accept a pending tile review or an explicit scan, or revise count hints for accepted tiles.",
     "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
     "inputSchema": {
       "type": "object",
@@ -156,6 +157,7 @@
         "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
         "out_project": {"type": "string", "pattern": "^/", "description": "Write the updated project to this .cut path."},
         "in_place": {"type": "boolean", "description": "Update the saved project in place.", "const": true},
+        "review_token": {"type": "string", "pattern": "^[a-f0-9]{64}$", "description": "Optional token from pending read or stage to accept only the reviewed pending choices."},
         "expected_feeds": {"type": "integer", "minimum": 1, "description": "The expected number of unique feeds. A mismatch requires review."},
         "max_visible_tiles": {"type": "integer", "minimum": 1, "description": "The expected maximum visible tiles in one frame. A mismatch requires review."},
         "clear_count_hints": {"type": "boolean", "const": true, "description": "Clear both count hints without changing the accepted tiles or feed IDs."},
@@ -163,19 +165,21 @@
       },
       "required": ["operation_id", "project_path"],
       "additionalProperties": false,
-      "allOf": [{"oneOf": [{"required": ["out_project"]}, {"required": ["in_place"], "properties": {"in_place": {"const": true}}}]}, {"not": {"allOf": [{"not": {"required": ["analysis_file"]}}, {"not": {"required": ["expected_feeds"]}}, {"not": {"required": ["max_visible_tiles"]}}, {"not": {"required": ["clear_count_hints"]}}]}}, {"not": {"required": ["clear_count_hints", "expected_feeds"]}}, {"not": {"required": ["clear_count_hints", "max_visible_tiles"]}}]
+      "allOf": [{"oneOf": [{"required": ["out_project"]}, {"required": ["in_place"], "properties": {"in_place": {"const": true}}}]}, {"not": {"required": ["clear_count_hints", "expected_feeds"]}}, {"not": {"required": ["clear_count_hints", "max_visible_tiles"]}}, {"not": {"required": ["review_token", "analysis_file"]}}, {"not": {"required": ["review_token", "expected_feeds"]}}, {"not": {"required": ["review_token", "max_visible_tiles"]}}, {"not": {"required": ["review_token", "clear_count_hints"]}}]
     }
   },
   {
     "name": "tiles_editor_accept",
-    "description": "Accept a saved scan or revise the saved count hints for a recording.",
+    "description": "Accept a pending tile review or an explicit scan, or revise count hints for accepted tiles.",
     "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
     "inputSchema": {
       "type": "object",
       "properties": {
         "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt."},
         "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
         "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "review_token": {"type": "string", "pattern": "^[a-f0-9]{64}$", "description": "Optional token from pending read or stage to accept only the reviewed pending choices."},
         "expected_feeds": {"type": "integer", "minimum": 1, "description": "The expected number of unique feeds. A mismatch requires review."},
         "max_visible_tiles": {"type": "integer", "minimum": 1, "description": "The expected maximum visible tiles in one frame. A mismatch requires review."},
         "clear_count_hints": {"type": "boolean", "const": true, "description": "Clear both count hints without changing the accepted tiles or feed IDs."},
@@ -183,7 +187,167 @@
       },
       "required": ["project_handle", "expected_revision"],
       "additionalProperties": false,
-      "allOf": [{"not": {"allOf": [{"not": {"required": ["analysis_file"]}}, {"not": {"required": ["expected_feeds"]}}, {"not": {"required": ["max_visible_tiles"]}}, {"not": {"required": ["clear_count_hints"]}}]}}, {"not": {"required": ["clear_count_hints", "expected_feeds"]}}, {"not": {"required": ["clear_count_hints", "max_visible_tiles"]}}]
+      "allOf": [{"not": {"required": ["clear_count_hints", "expected_feeds"]}}, {"not": {"required": ["clear_count_hints", "max_visible_tiles"]}}, {"not": {"required": ["review_token", "analysis_file"]}}, {"not": {"required": ["review_token", "expected_feeds"]}}, {"not": {"required": ["review_token", "max_visible_tiles"]}}, {"not": {"required": ["review_token", "clear_count_hints"]}}]
+    }
+  },
+  {
+    "name": "tiles_file_pending_read",
+    "description": "Read the saved pending Tiles review and all staged choices for one recording.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."}
+      },
+      "required": ["operation_id", "project_path"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_file_pending_stage",
+    "description": "Replace the choices staged for one pending Tiles review.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "review_token": {"type": "string", "pattern": "^[a-f0-9]{64}$", "description": "The current review token from pending read."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "out_project": {"type": "string", "pattern": "^/", "description": "Write the updated project to this .cut path."},
+        "in_place": {"type": "boolean", "description": "Update the saved project in place.", "const": true},
+        "choices": {
+          "type": "object",
+          "description": "Complete replacement choices from pending read. Omitted fields take their empty defaults.",
+          "properties": {
+            "analysis_identity": {"type": "string", "description": "The pending scan identity. Omit to bind to the selected scan."},
+            "names": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Display names by choice feed ID."},
+            "unchecked": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "Choice feed IDs to leave unassigned."},
+            "merged": {"type": "object", "additionalProperties": {"type": "string", "minLength": 1}, "description": "Removed choice feed IDs mapped directly to surviving IDs."},
+            "expected_feeds": {"type": "string", "description": "Expected unique feed count, as text. Use an empty string to clear."},
+            "expected_tiles": {"type": "string", "description": "Expected peak visible tile count, as text. Use an empty string to clear."},
+            "edited_hints": {"type": "boolean", "description": "Set true when explicitly changing or clearing count hints."},
+            "grids": {
+              "type": "array",
+              "description": "Source-time grid corrections in application order.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "range": {"type": "object", "properties": {"from": {"type": "string"}, "to": {"type": "string"}}, "required": ["from", "to"], "additionalProperties": false},
+                  "columns": {"type": "integer", "minimum": 1, "maximum": 64},
+                  "rows": {"type": "integer", "minimum": 1, "maximum": 64}
+                },
+                "required": ["range", "columns", "rows"],
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "required": ["operation_id", "project_path", "review_token", "choices"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["out_project"]}, {"required": ["in_place"], "properties": {"in_place": {"const": true}}}]}]
+    }
+  },
+  {
+    "name": "tiles_file_pending_discard",
+    "description": "Discard one pending Tiles review as an undoable edit.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "review_token": {"type": "string", "pattern": "^[a-f0-9]{64}$", "description": "The current review token from pending read."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "out_project": {"type": "string", "pattern": "^/", "description": "Write the updated project to this .cut path."},
+        "in_place": {"type": "boolean", "description": "Update the saved project in place.", "const": true}
+      },
+      "required": ["operation_id", "project_path", "review_token"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["out_project"]}, {"required": ["in_place"], "properties": {"in_place": {"const": true}}}]}]
+    }
+  },
+  {
+    "name": "tiles_editor_pending_read",
+    "description": "Read the saved pending Tiles review and all staged choices for one recording.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."}
+      },
+      "required": ["project_handle"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_editor_pending_stage",
+    "description": "Replace the choices staged for one pending Tiles review.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "review_token": {"type": "string", "pattern": "^[a-f0-9]{64}$", "description": "The current review token from pending read."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "choices": {
+          "type": "object",
+          "description": "Complete replacement choices from pending read. Omitted fields take their empty defaults.",
+          "properties": {
+            "analysis_identity": {"type": "string", "description": "The pending scan identity. Omit to bind to the selected scan."},
+            "names": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Display names by choice feed ID."},
+            "unchecked": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "Choice feed IDs to leave unassigned."},
+            "merged": {"type": "object", "additionalProperties": {"type": "string", "minLength": 1}, "description": "Removed choice feed IDs mapped directly to surviving IDs."},
+            "expected_feeds": {"type": "string", "description": "Expected unique feed count, as text. Use an empty string to clear."},
+            "expected_tiles": {"type": "string", "description": "Expected peak visible tile count, as text. Use an empty string to clear."},
+            "edited_hints": {"type": "boolean", "description": "Set true when explicitly changing or clearing count hints."},
+            "grids": {
+              "type": "array",
+              "description": "Source-time grid corrections in application order.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "range": {"type": "object", "properties": {"from": {"type": "string"}, "to": {"type": "string"}}, "required": ["from", "to"], "additionalProperties": false},
+                  "columns": {"type": "integer", "minimum": 1, "maximum": 64},
+                  "rows": {"type": "integer", "minimum": 1, "maximum": 64}
+                },
+                "required": ["range", "columns", "rows"],
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "required": ["project_handle", "expected_revision", "review_token", "choices"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_editor_pending_discard",
+    "description": "Discard one pending Tiles review as an undoable edit.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "review_token": {"type": "string", "pattern": "^[a-f0-9]{64}$", "description": "The current review token from pending read."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."}
+      },
+      "required": ["project_handle", "expected_revision", "review_token"],
+      "additionalProperties": false
     }
   },
   {
@@ -218,6 +382,7 @@
       "type": "object",
       "properties": {
         "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt."},
         "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
         "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
         "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
@@ -327,6 +492,7 @@
       "type": "object",
       "properties": {
         "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt."},
         "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
         "name": {"type": "string", "minLength": 1, "description": "The display name for the feed."}
       },
@@ -363,6 +529,7 @@
       "type": "object",
       "properties": {
         "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt."},
         "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
         "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
         "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."},
@@ -404,6 +571,7 @@
       "type": "object",
       "properties": {
         "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt."},
         "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
         "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
         "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."},
@@ -448,6 +616,7 @@
       "type": "object",
       "properties": {
         "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt."},
         "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
         "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
         "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."},
@@ -492,6 +661,7 @@
       "type": "object",
       "properties": {
         "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt."},
         "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
         "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
         "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
@@ -533,6 +703,7 @@
       "type": "object",
       "properties": {
         "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt."},
         "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
         "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
         "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."},
@@ -575,6 +746,7 @@
       "type": "object",
       "properties": {
         "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt."},
         "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
         "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
         "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
@@ -618,6 +790,7 @@
       "type": "object",
       "properties": {
         "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt."},
         "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
         "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
         "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."},
@@ -658,6 +831,7 @@
       "type": "object",
       "properties": {
         "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt."},
         "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
         "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
         "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
@@ -847,6 +1021,7 @@
       "type": "object",
       "properties": {
         "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt."},
         "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
         "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
         "all": {"type": "boolean", "description": "Select all feeds on the recording."},
@@ -971,6 +1146,7 @@
       "type": "object",
       "properties": {
         "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt."},
         "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
         "proposal": {"type": "object", "description": "The revision-bound proposal from tiles_editor_switches_propose."}
       },
@@ -995,7 +1171,7 @@
         "apply": {"type": "boolean", "description": "Apply the reviewed reconciliation to the project.", "const": true},
         "review": {"type": "string", "minLength": 1, "description": "Review token returned by a reconciliation preview."}
       },
-      "required": ["operation_id", "analysis_file", "project_path"],
+      "required": ["operation_id", "project_path"],
       "additionalProperties": false,
       "allOf": [{"if": {"required": ["apply"], "properties": {"apply": {"const": true}}}, "then": {"allOf": [{"oneOf": [{"required": ["out_project"]}, {"required": ["in_place"], "properties": {"in_place": {"const": true}}}]}, {"required": ["review"]}]}}]
     }
@@ -1008,13 +1184,14 @@
       "type": "object",
       "properties": {
         "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt."},
         "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
         "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
         "analysis_file": {"type": "string", "pattern": "^/", "description": "A saved Tiles scan JSON file."},
         "apply": {"type": "boolean", "description": "Apply the reviewed reconciliation to the project.", "const": true},
         "review": {"type": "string", "minLength": 1, "description": "Review token returned by a reconciliation preview."}
       },
-      "required": ["project_handle", "analysis_file"],
+      "required": ["project_handle"],
       "additionalProperties": false,
       "allOf": [{"if": {"required": ["apply"], "properties": {"apply": {"const": true}}}, "then": {"required": ["expected_revision", "review"]}}]
     }
@@ -1049,6 +1226,7 @@
       "type": "object",
       "properties": {
         "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt."},
         "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
         "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
         "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
@@ -1095,6 +1273,7 @@
       "type": "object",
       "properties": {
         "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt."},
         "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
         "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
         "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
@@ -1177,6 +1356,7 @@
       "type": "object",
       "properties": {
         "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt."},
         "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
         "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
         "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
@@ -1221,6 +1401,7 @@
       "type": "object",
       "properties": {
         "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt."},
         "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
         "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
         "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
@@ -1263,6 +1444,7 @@
       "type": "object",
       "properties": {
         "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt."},
         "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
         "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
         "tile_id": {"type": "string", "minLength": 1, "description": "The tile ID from inspect."},
@@ -1303,6 +1485,7 @@
       "type": "object",
       "properties": {
         "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "A unique ID for this live operation. Reuse it with identical arguments to replay the result or job receipt."},
         "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
         "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
         "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},

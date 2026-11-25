@@ -123,12 +123,17 @@ struct ReencodeChapter: Sendable {
     }
 
     /// The chapters as an FFMETADATA document, which the helper reads as an input without streams.
-    static func metadata(_ chapters: [ReencodeChapter]) -> String {
+    static func metadata(_ chapters: [ReencodeChapter]) throws -> String {
         func escaped(_ text: String) -> String {
             var result = ""
-            for character in text {
-                if "=;#\\\n".contains(character) { result.append("\\") }
-                result.append(character)
+            // FFmpeg parses escapes byte by byte. CRLF and a special character
+            // followed by a combining mark can each be a single Swift Character.
+            for scalar in text.unicodeScalars {
+                switch scalar {
+                case "=", ";", "#", "\\", "\r", "\n": result.append("\\")
+                default: break
+                }
+                result.unicodeScalars.append(scalar)
             }
             return result
         }
@@ -141,11 +146,9 @@ struct ReencodeChapter: Sendable {
             let common = chapter.start.denominator.multipliedReportingOverflow(by: chapter.end.denominator / max(1, scale))
             let exact = !common.overflow && common.partialValue <= Int64(Int32.max)
             let clock = exact ? common.partialValue : 1_000_000_000
-            func ticks(_ time: RationalTime) -> Int64 {
-                if exact { return time.numerator * (clock / time.denominator) }
-                return Int64((Double(time.numerator) / Double(time.denominator) * Double(clock)).rounded())
-            }
-            lines += ["[CHAPTER]", "TIMEBASE=1/\(clock)", "START=\(ticks(chapter.start))", "END=\(ticks(chapter.end))"]
+            let start = try chapter.start.roundedToSamples(Int(clock))
+            let end = try chapter.end.roundedToSamples(Int(clock))
+            lines += ["[CHAPTER]", "TIMEBASE=1/\(clock)", "START=\(start)", "END=\(end)"]
             lines += chapter.tags.map { "\(escaped($0.key))=\(escaped($0.value))" }
         }
         return lines.joined(separator: "\n") + "\n"

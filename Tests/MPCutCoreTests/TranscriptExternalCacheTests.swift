@@ -94,10 +94,10 @@ final class TranscriptExternalCacheTests: XCTestCase {
         func removeExchangeFiles(for job: TranscriptJobRecord) {
             guard let cacheDirectory = try? TranscriptRecognitionClaims.directory() else { return }
             for track in job.sessions.flatMap(\.tracks) {
-                guard let stream = track.streamIndex, let result = track.result,
+                guard track.streamIndex != nil, let result = track.result,
                       let key = TranscriptRecognitionCache.Artifacts(result: result, activity: track.activity)?.recognitionKey
                 else { continue }
-                let scope = TranscriptExternalCacheDescriptor.scope(for: track.file, stream: stream)
+                let scope = track.evidence
                 let id = TranscriptExternalCacheDescriptor.claimID(scope: scope, key: key)
                 try? FileManager.default.removeItem(at: cacheDirectory.appendingPathComponent(id + ".json"))
                 try? FileManager.default.removeItem(at: cacheDirectory.appendingPathComponent(id + ".mpx"))
@@ -129,10 +129,8 @@ final class TranscriptExternalCacheTests: XCTestCase {
         XCTAssertEqual(try store.status(prepared.id).state, .partial)
         let artifact = try XCTUnwrap(TranscriptRecognitionCache.Artifacts(result: firstResult, activity: healthy.activity))
         let key = try XCTUnwrap(artifact.recognitionKey)
-        let sidecar = AnalysisSidecar(source: media, identity: try SourceIdentity(media))
-        let cache = TranscriptRecognitionCache(sidecar: sidecar, key: key, evidence: healthy.evidence,
-                                               stream: try XCTUnwrap(healthy.streamIndex))
-        XCTAssertNotNil(sidecar.read(cache.section))
+        let cache = TranscriptRecognitionCache(key: key, evidence: healthy.evidence)
+        XCTAssertEqual(cache.read(cancelled: { false })?.result, artifact.result)
         let retry = try JSONDecoder().decode(Receipt.self, from: mpcut(["job", "retry"], ["--job-id", prepared.id.uuidString]))
         let retried = try providerEvents(XCTUnwrap(retry.sessions.first?.command))
         XCTAssertEqual(retried.last?["status"] as? String, "completed")

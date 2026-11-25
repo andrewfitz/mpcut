@@ -246,6 +246,7 @@ struct ProjectMediaJobStatus: View {
 @MainActor
 struct ProjectMediaSheet: View {
     @ObservedObject var jobs: ProjectMediaJobs
+    let preferences: EditorPreferences
     let request: ProjectMediaRequest
     let archive: () -> LiveProjectMediaArchive?
     let revision: () -> ProjectMediaViewRevision
@@ -258,7 +259,10 @@ struct ProjectMediaSheet: View {
     let showUse: (ProjectMediaUse) -> Void
 
     @Environment(\.dismiss) private var dismiss
-    @AppStorage("project_media_last_locate_folder") private var lastFolder = ""
+    private var lastFolder: String {
+        get { preferences.projectMediaLastLocateFolder }
+        nonmutating set { preferences.projectMediaLastLocateFolder = newValue }
+    }
     @State private var inventory: [ProjectMediaRow] = []
     @State private var filter = ProjectMediaFilter.all
     @State private var selected: String?
@@ -282,7 +286,7 @@ struct ProjectMediaSheet: View {
         let stillFraming: StillImageFraming?
         var scopeUses: [ProjectMediaUse] {
             var seen = Set<String>()
-            return uses.filter { seen.insert($0.id).inserted }
+            return uses.filter { $0.kind.canReplaceDirectly && seen.insert($0.id).inserted }
         }
         var options: MediaReplaceOptions
         var preview: MediaReplacePreview?
@@ -398,7 +402,9 @@ struct ProjectMediaSheet: View {
                 .foregroundStyle(Color(nsColor: informational ? .secondaryLabelColor : state.editorColor))
             Menu {
                 Button(locateTitle(row)) { locate(row) }
-                Button("Replace Source File…") { chooseReplacement(row, useID: nil) }
+                if row.uses.contains(where: { $0.kind.canReplaceDirectly }) {
+                    Button("Replace Source File…") { chooseReplacement(row, useID: nil) }
+                }
                 if state == .offline || state == .checking {
                     Button("Leave Offline") { run { try ignore(row.path); await reload() } }
                 }
@@ -893,6 +899,8 @@ private extension ProjectMediaUse.Kind {
         case .transcriptAnchor: "transcript anchor"
         case .participant: "participant use"
         case .participantAudio: "participant audio selection"
+        case .analysisAnnotation: "analysis annotation"
+        case .pendingTileReview: "pending tile review"
         }
     }
 }

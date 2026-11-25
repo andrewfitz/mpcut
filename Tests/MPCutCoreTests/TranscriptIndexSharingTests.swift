@@ -115,7 +115,7 @@ final class TranscriptIndexSharingTests: XCTestCase {
 
     private func attachment(_ bindings: [TranscriptBinding]) -> TranscriptAttachment {
         let digest = String(repeating: "a", count: 64)
-        return .init(id: "dialogue", asset: .init(file: "Interview.transcripts/\(digest).json", sha256: digest),
+        return .init(id: "dialogue", asset: .init(sha256: digest),
                      bindings: bindings)
     }
 

@@ -22,10 +22,12 @@ struct MPCutApp: App {
         .windowResizability(.contentSize)
         .defaultPosition(.center)
         Settings {
-            EditorSettings(preferences: application.sessions.preferences) {
+            SettingsWindow(preferences: application.sessions.preferences) {
                 SidecarClearContext(sessions: application.sessions)
             }
         }
+        .defaultSize(width: 760, height: 560)
+        .windowResizability(.contentMinSize)
     }
 }
 
@@ -184,10 +186,10 @@ private struct ProjectFileItems: View {
         if session.isMulticam {
             Button("Save Analysis Sidecars", action: multicam.saveAnalysisSidecars)
                 .disabled(!multicam.canSaveSidecars)
-                .help("Save the edit index and analysis to the sidecar location chosen in Settings.")
+                .help("Save the edit index and analysis to the cutcache location chosen in Settings → Storage.")
         } else {
             Button("Save Analysis Sidecars", action: editor.saveAnalysisSidecars)
-                .help("Save the edit index and analysis to the sidecar location chosen in Settings.")
+                .help("Save the edit index and analysis to the cutcache location chosen in Settings → Storage.")
                 .disabled(!editor.canSaveAnalysisSidecars)
         }
     }
@@ -279,6 +281,9 @@ private struct ExportCommands: View {
             Button("Export JPEG Frames…", action: multicam.chooseJPEGExport)
                 .disabled(multicam.project == nil || multicam.isBusy)
                 .help("Export frames as JPEGs")
+            Button("Show Last Export in Finder", action: multicam.showExportInFinder)
+                .disabled(multicam.lastExportedURL == nil)
+                .help("Reveal last export")
             Divider()
             Button("Cancel Multicam Operation", action: multicam.cancel)
                 .disabled(!multicam.isBusy)

@@ -47,6 +47,16 @@ public enum ProjectConverter {
         guard !input.requiresPictureProcessing else { throw ParticipantProjectExport.unsupported(destination) }
         var warnings = [String]()
         var project = input
+        if !project.analysisAnnotations.isEmpty {
+            warnings.append("\(destination) omits MPCut analysis annotations, including saved scene, silence and pause decisions.")
+            project.analysisAnnotations = .init()
+        }
+        if !project.participants.pendingReviews.isEmpty {
+            warnings.append("\(destination) omits MPCut pending tile reviews.")
+            var participants = project.participants
+            participants.pendingReviews = []
+            project.participants = participants
+        }
         if !input.transcripts.isEmpty {
             if !input.transcripts.attachments.isEmpty || !input.transcripts.authoring.isEmpty {
                 warnings.append("\(destination) omits MPCut transcript attachments, speaker corrections and transcript selects.")
@@ -285,7 +295,7 @@ public enum ProjectConverter {
             return try state.rebased(from: input, to: output, paths: &paths, makeRelative: makeRelative)
         }
         let document = try rebase(project)
-        try document.saveNewCopy(to: output, copyingTranscriptsFrom: input, undo: undo.map(rebaseState),
+        try document.saveNewCopy(to: output, undo: undo.map(rebaseState),
                                  redo: redo.map(rebaseState), mediaSnapshot: mediaSnapshot.rebased(
                                      from: input, to: output, makeRelative: makeRelative
                                  )) {

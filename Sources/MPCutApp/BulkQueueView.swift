@@ -11,6 +11,8 @@ struct BulkQueueView: View {
     init(editor: EditorModel) {
         self.editor = editor
         var value = ExportSheetOptions()
+        // A fresh queue sheet starts from Settings → Export. A project's own still format and the export rules come first.
+        value.seedEncoding(from: editor.preferences)
         value.copyContainer = ""
         value.placements = editor.readyQueuedRanges.map(\.placements).max(by: { $0.rawValue < $1.rawValue }) ?? .none
         if editor.readyQueuedRanges.contains(where: { $0.placements != .none }) {
@@ -20,6 +22,13 @@ struct BulkQueueView: View {
                 value.codec = format.codec
                 value.encodeContainer = ""
                 value.proResContainer = ""
+            } else {
+                // Show the container still placements can use when the Settings one is not among them.
+                let eligible = ExportRules.stillContainers(mode: .encode, tracks: .all, codec: value.codec, audio: value.audio)
+                if value.codec != .prores, !eligible.isEmpty, !eligible.contains(value.encodeContainer),
+                   editor.preferences.reencodeContainer != .automatic {
+                    value.encodeContainer = eligible[0]
+                }
             }
         } else {
             value.mode = editor.defaultExportMode
@@ -158,7 +167,7 @@ struct BulkQueueView: View {
                                                                      revise: { try editor.reviseQueuedRange(range.id, extending: $0) })
                                             },
                                             saveExcerpt: range.excerpt.map { excerpt in
-                                                { excerpt.presentSave(in: editor.editorWindow, canSave: editor.canSaveProjectTo) }
+                                                { excerpt.presentSave(in: editor.editorWindow, canSave: editor.canSaveProjectTo, preferences: editor.preferences) }
                                             },
                                             replan: editor.invalidatedQueueIDs.contains(range.id)
                                                 ? { try editor.replanQueuedRange(range.id) } : nil) {

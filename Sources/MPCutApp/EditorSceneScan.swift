@@ -66,10 +66,13 @@ final class EditorSceneScan {
     }
 
     func pruneCheckpoints(keeping media: [MediaInfo]) {
-        let identities = Set(media.map(\.identity))
-        checkpointRequests.removeAll { !identities.contains($0.media.identity) }
-        inspections = inspections.filter { identities.contains($0.key.identity) }
-        if progress == nil, requests.contains(where: { !identities.contains($0.media.identity) }) {
+        let identities = Dictionary(grouping: media.map(\.identity), by: { $0 })
+        func contains(_ identity: SourceIdentity) -> Bool {
+            identities[identity]?.contains(where: identity.matchesSnapshot) == true
+        }
+        checkpointRequests.removeAll { !contains($0.media.identity) }
+        inspections = inspections.filter { contains($0.key.identity) }
+        if progress == nil, requests.contains(where: { !contains($0.media.identity) }) {
             requests = []
             coverage = [:]
             status = nil

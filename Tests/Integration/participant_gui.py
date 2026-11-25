@@ -22,19 +22,21 @@ from saved_project import read_project
 
 
 @contextlib.contextmanager
-def hidden_editor(bundle, project, folder):
+def hidden_editor(bundle, project, folder, launch_environment=None, *, use_sidecars=False):
     operation = uuid.uuid4()
     name = "mpcut-test-" + operation.hex
     endpoint = Path("/tmp") / name
     home = folder / "home"
     (home / "Library" / "Preferences").mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, BACKSTAGE_SESSION=name)
+    extra = [arg for key, value in (launch_environment or {}).items() for arg in ("--env", f"{key}={value}")]
     result = subprocess.run(
         ["backstage", "launch", str(bundle), "--timeout", "75", "--env", f"CFFIXED_USER_HOME={home}",
-         "--env", f"MPCUT_TEST_SOCKET_DIRECTORY={name}", "--env", "MPCUT_MUTED=1",
+         "--env", f"MPCUT_TEST_SOCKET_DIRECTORY={name}", "--env", "MPCUT_MUTED=1", *extra,
          "--", "-automation_local_mcp_enabled", "YES",
          "-ApplePersistenceIgnoreState", "YES", "-NSQuitAlwaysKeepsWindows", "NO",
-         "-analysis_sidecar_reuse_enabled", "NO", "-export_tier_downgrade_warning_enabled", "NO"],
+         "-analysis_sidecar_reuse_enabled", "YES" if use_sidecars else "NO",
+         "-export_tier_downgrade_warning_enabled", "NO"],
         env=env, capture_output=True, text=True, timeout=90)
     if result.returncode:
         raise RuntimeError(f"Backstage launch failed: {result.stdout} {result.stderr}")
@@ -72,7 +74,7 @@ def create_fixture(cli, directory):
     gallery, recorder, iso_offset = generate(directory)
     base = directory / "Participant GUI Base.cut"
     base.write_text(json.dumps({
-        "format": "mpcut", "schema_version": 4, "kind": "multicam",
+        "format": "mpcut", "schema_version": 9, "kind": "multicam",
         "reference_angle_id": "gallery", "group_range": interval(0, 5),
         "angles": [{"id": "gallery", "file": str(gallery), "audio_stream_index": 1}],
         "audio_sources": [{"id": "recorder", "file": str(recorder), "offset": str(iso_offset)}],
@@ -153,7 +155,7 @@ def main():
             ffmpeg("-stream_loop", "39", "-i", cycle, "-c", "copy", movie)
             project = directory / "Camera feeds.cut"
             project.write_text(json.dumps({
-                "format": "mpcut", "schema_version": 4, "kind": "multicam",
+                "format": "mpcut", "schema_version": 9, "kind": "multicam",
                 "reference_angle_id": "gallery", "group_range": interval(0, 4),
                 "angles": [{"id": "gallery", "file": str(movie)}, {"id": "alternate", "file": str(cycle)}],
                 "audio": {"mode": "none"},

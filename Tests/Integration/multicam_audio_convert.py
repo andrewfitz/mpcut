@@ -40,7 +40,7 @@ class MulticamAudioConversionTests(unittest.TestCase):
         project = self.root / f"project-{second.stem}.cut"
         project.write_text(json.dumps({
             "format": "mpcut",
-            "schema_version": 3,
+            "schema_version": 9,
             "kind": "multicam",
             "reference_angle_id": "cam",
             "group_range": {"from": "0", "to": "3"},
@@ -178,7 +178,7 @@ class MulticamAudioConversionTests(unittest.TestCase):
                 def render(other, label):
                     project = self.root / ("shared-" + label + ".cut")
                     project.write_text(json.dumps({
-                        "format": "mpcut", "schema_version": 3, "kind": "multicam", "reference_angle_id": "cam",
+                        "format": "mpcut", "schema_version": 9, "kind": "multicam", "reference_angle_id": "cam",
                         "group_range": {"from": "0", "to": "3"},
                         "angles": [{"id": "cam", "file": self.angle.name}],
                         "audio_sources": [{"id": "a", "file": source.name}, {"id": "b", "file": other.name}],

@@ -34,6 +34,9 @@ extension ProjectSessions {
         case "preferences_set":
             try preferences.mcpSet(arguments)
             return preferences.mcpValues
+        case "recent_files_list", "recent_files_clear":
+            if tool == "recent_files_clear" { preferences.recentFiles.clear() }
+            return ["paths": preferences.recentFiles.urls.map(\.path)]
         case "project_drafts_list":
             return ["drafts": try ProjectDraft.recoverable().map { url -> [String: Any] in
                 let date = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
@@ -71,7 +74,7 @@ extension ProjectSessions {
                                  ?? "The project did not finish opening.")
             }
             return lifecycleState(target)
-        case "project_media_add", "project_save", "project_close", "project_window_focus", "history_panel_show",
+        case "project_media_add", "project_save", "project_close", "project_window_focus", "history_panel_show", "history_panel_close",
              "playback_monitor_visibility_set", "multicam_setup_read", "multicam_setup_confirm", "multicam_setup_dismiss", "workspace_notice_dismiss":
             guard let session else { throw lifecycleInvalid("Supply a project handle.") }
             if ["multicam_setup_confirm", "multicam_setup_dismiss", "multicam_setup_read"].contains(tool) {
@@ -104,6 +107,21 @@ extension ProjectSessions {
             case "playback_monitor_visibility_set":
                 guard let visible = lifecycleBool(arguments["visible"]) else { throw lifecycleInvalid("Supply visible.") }
                 if visible { session.showMonitor() } else { session.monitor?.close() }
+            case "history_panel_close":
+                if session.isHistoryPresented {
+                    session.historyDismissingSheet = session.window?.attachedSheet
+                    session.isHistoryPresented = false
+                }
+                // A second close while SwiftUI is dismissing waits for the same sheet.
+                if let sheet = session.historyDismissingSheet {
+                    let deadline = ContinuousClock.now + .seconds(5)
+                    while session.window?.attachedSheet === sheet {
+                        try checkAccess()
+                        guard ContinuousClock.now < deadline else { throw lifecycleBusy() }
+                        try await Task.sleep(for: .milliseconds(20))
+                    }
+                    session.historyDismissingSheet = nil
+                }
             default:
                 if session.isHistoryPresented { return lifecycleState(session) }
                 guard !session.hasLifecycleModal,
@@ -121,7 +139,8 @@ extension ProjectSessions {
         return ["project_handle": session.mcpHandle, "revision": session.mcpRevision,
                 "kind": session.isMulticam ? "multicam" : "sequence",
                 "dirty": session.hasUnsavedDocument, "project_path": url?.path as Any? ?? NSNull(),
-                "setup_pending": !session.multicam.setup.isEmpty, "monitor_visible": session.monitor?.isVisible == true]
+                "setup_pending": !session.multicam.setup.isEmpty, "monitor_visible": session.monitor?.isVisible == true,
+                "history_visible": session.isHistoryPresented]
     }
 
     private func waitForLoad(_ session: ProjectSession, worker: MCPNativeOperation?, owned: Bool,
@@ -181,7 +200,14 @@ extension ProjectSessions {
         }
         // A distinct hard link or symbolic link can be a Save As destination.
         // Only the current pathname grants implicit replacement.
-        let replacing = current?.standardizedFileURL == url || lifecycleBool(arguments["replace_existing"]) == true
+        let savesInPlace = current?.standardizedFileURL == url
+        let requestsReplacement = lifecycleBool(arguments["replace_existing"]) == true
+        if requestsReplacement, !savesInPlace, !preferences.agentsReplaceFiles,
+           FileManager.default.fileExists(atPath: url.path) {
+            throw MCPFailure("file_replace_disabled", Self.fileReplaceDisabledMessage)
+        }
+        // With the switch off, a file that appears after the check is never replaced.
+        let replacing = savesInPlace || (requestsReplacement && preferences.agentsReplaceFiles)
         do {
             if session.isMulticam { try session.multicam.writeProject(to: url, replacingExisting: replacing) }
             else { try session.editor.writeProject(to: url, replacingExisting: replacing) }
@@ -288,6 +314,11 @@ extension ProjectSessions {
     }
 }
 
+extension ProjectSessions {
+    nonisolated static let fileReplaceDisabledMessage =
+        "Agents cannot replace existing project files. Turn on Settings → Automation → Let agents replace existing project files."
+}
+
 private func lifecycleBusy() -> MCPFailure { MCPFailure("busy", "Finish the current editor operation or close its sheet.") }
 private func lifecycleInvalid(_ message: String) -> MCPFailure { MCPFailure("invalid_arguments", message) }
 
@@ -330,33 +361,138 @@ private func lifecycleInteger(_ value: Any?, _ key: String) throws -> Int {
 }
 
 @MainActor
-private extension EditorPreferences {
+extension EditorPreferences {
+    /// `preferences_read`: every schedule key with its current value.
     var mcpValues: [String: Any] {
-        [
-            Key.automationLocalMcpEnabled.rawValue: localMCPEnabled,
-            Key.mediaAutoRefreshEnabled.rawValue: automaticallyRefreshMedia,
-            Key.analysisSidecarReuseEnabled.rawValue: useAnalysisSidecars,
-            Key.historyMaxSteps.rawValue: historyLimit,
-            Key.timelineSnapTarget.rawValue: snapTarget.rawValue,
-            Key.timelineSourceTimeTicksEnabled.rawValue: sourceTimeTicks,
-            Key.timelineLargePreviewsEnabled.rawValue: largeThumbnails,
-            Key.playbackPreviewVolumeFraction.rawValue: volume,
-            Key.playbackPreviewMuted.rawValue: isMuted,
-            Key.playbackScrubAudioEnabled.rawValue: scrubSoundEnabled,
-            Key.exportMovieDefaultMode.rawValue: defaultExportMode.rawValue,
-            Key.exportJpegDefaultPreset.rawValue: jpegPreset.rawValue,
-            Key.exportTierDowngradeWarningEnabled.rawValue: warnBeforeLoweringExportTier,
-            Key.silenceMinPauseSeconds.rawValue: minimumPause,
-            Key.silenceMaxBlipSeconds.rawValue: maxBlip,
-            Key.silencePaddingPerSideSeconds.rawValue: padding
-        ]
+        Dictionary(uniqueKeysWithValues: Key.allCases.map { ($0.rawValue, mcpValue($0)) })
+    }
+
+    func mcpValue(_ key: Key) -> Any {
+        switch key {
+        case .automationLocalMcpEnabled: localMCPEnabled
+        case .mediaAutoRefreshEnabled: automaticallyRefreshMedia
+        case .analysisSidecarReuseEnabled: useAnalysisSidecars
+        case .historyMaxSteps: historyLimit
+        case .timelineSnapTarget: snapTarget.rawValue
+        case .timelineSourceTimeTicksEnabled: sourceTimeTicks
+        case .timelineLargePreviewsEnabled: largeThumbnails
+        case .playbackPreviewVolumeFraction: volume
+        case .playbackPreviewMuted: isMuted
+        case .playbackScrubAudioEnabled: scrubSoundEnabled
+        case .exportMovieDefaultMode: defaultExportMode.rawValue
+        case .exportJpegDefaultPreset: jpegPreset.rawValue
+        case .exportTierDowngradeWarningEnabled: warnBeforeLoweringExportTier
+        case .silenceMinPauseSeconds: minimumPause
+        case .silenceMaxBlipSeconds: maxBlip
+        case .silencePaddingPerSideSeconds: padding
+        case .openMultipleRecordingsDefaultAction: multipleRecordingsAction.rawValue
+        case .recentFilesMaxCount: recentFilesLimit
+        case .draftRecoveryPromptEnabled: offersDraftRecovery
+        case .sceneRescanConfirmationEnabled: confirmsSceneRescan
+        case .projectExportCompletionMessageEnabled: showsProjectExportMessage
+        case .timelineCutSectionsDefaultEnabled: showsCutSections
+        case .workspaceFullHeightSidebarEnabled: fullHeightSidebar
+        case .multicamTrackLabelWidthPoints: trackLabelWidth
+        case .stillPlacementDefaultDurationSeconds: stillDuration
+        case .gapDefaultDurationSeconds: gapDuration
+        case .gapDefaultColor: gapColor
+        case .stillTimelineDefaultWidthPixels: stillTimelineWidth
+        case .stillTimelineDefaultHeightPixels: stillTimelineHeight
+        case .stillTimelineDefaultFrameRate: stillTimelineFrameRate
+        case .stillTimelineDefaultCodec: stillTimelineCodec.rawValue
+        case .timelineTimeDisplay: timeDisplay.rawValue
+        case .playbackDefaultSpeed: Double(playbackSpeed.rawValue)
+        case .playbackCutPreviewPrerollSeconds: cutPreviewPreroll
+        case .playbackCutPreviewPostrollSeconds: cutPreviewPostroll
+        case .playbackViewerForceSdrEnabled: viewerForceSDR
+        case .playbackMonitorForceSdrEnabled: monitorForceSDR
+        case .playbackMonitorCleanFeedEnabled: monitorCleanFeed
+        case .playbackMonitorPlacement: monitorPlacement.rawValue
+        case .analysisSceneAutoScanEnabled: autoScanScenes
+        case .analysisSilenceAutoScanEnabled: autoScanSilence
+        case .tilesScanDefaultLayout: tilesScanLayout.rawValue
+        case .tilesScanDefaultGridColumns: tilesScanColumns
+        case .tilesScanDefaultGridRows: tilesScanRows
+        case .tilesScanDefaultDetail: tilesScanDetail.rawValue
+        case .tilesDialogueDefaultMinHoldSeconds: dialogueMinimumHold
+        case .tilesDialogueDefaultOverlapPolicy: dialogueOverlap.rawValue
+        case .tilesDialogueDefaultOffscreenPolicy: dialogueOffscreen.rawValue
+        case .transcriptDefaultEngine: transcriptEngine
+        case .transcriptDefaultSpeakerIdentificationEnabled: identifiesSpeakers
+        case .transcriptDefaultModelDownloadEnabled: downloadsModels
+        case .transcriptFollowPlaybackDefaultEnabled: followsPlayback
+        case .transcriptReaderTextSizePoints: readerTextSize
+        case .transcriptEditDefaultBoundaryPolicy: boundaryPolicy.rawValue
+        case .transcriptTightenDefaultRetainedPauseSeconds: retainedPause
+        case .transcriptDefaultFillerTerms: fillerTerms
+        case .transcriptExportDefaultFormat: transcriptExportFormat.rawValue
+        case .transcriptCaptionMaxLineCharacters: captionLineCharacters
+        case .transcriptCaptionMaxLines: captionLines
+        case .transcriptCaptionMaxCueSeconds: captionCueSeconds
+        case .transcriptCaptionSpeakerLabelsEnabled: captionSpeakerLabels
+        case .exportReencodeDefaultCodec: reencodeCodec.rawValue
+        case .exportReencodeDefaultQuality: reencodeQuality.rawValue
+        case .exportProresDefaultQuality: proresQuality.rawValue
+        case .exportReencodeDefaultContainer: reencodeContainer.rawValue
+        case .exportMulticamDefaultAudioLayout: multicamAudioLayout.rawValue
+        case .exportResultJsonDefaultEnabled: savesExportResult
+        case .resolveSendOpenTimelineDefaultEnabled: opensResolveTimeline
+        case .exportStartFolderMode: exportStartFolder.rawValue
+        case .exportFinishedRevealEnabled: revealsFinishedExport
+        case .exportFinishedNotificationEnabled: notifiesFinishedExport
+        case .exportFinishedSoundEnabled: playsFinishedExportSound
+        case .analysisSharedCacheMaxBytes: sharedCacheLimitBytes
+        case .draftRetentionDays: draftRetentionDays
+        case .automationPreferencesWriteEnabled: agentsChangeSettings
+        case .automationFileReplaceEnabled: agentsReplaceFiles
+        }
     }
 
     func mcpSet(_ arguments: [String: Any]) throws {
+        try checkAgentWrite()
         guard let key = arguments["key"] as? String, let value = arguments["value"] else { throw lifecycleInvalid("Supply key and value.") }
         func flag() throws -> Bool {
             guard let b = lifecycleBool(value) else { throw lifecycleInvalid("Supply a Boolean for \(key).") }
             return b
+        }
+        func integer(_ range: ClosedRange<Int>, _ name: String, _ unit: String = "") throws -> Int {
+            let v = try lifecycleInteger(value, key)
+            guard range.contains(v) else {
+                throw lifecycleInvalid("\(name) must be between \(range.lowerBound) and \(range.upperBound)\(unit.isEmpty ? "" : " " + unit).")
+            }
+            return v
+        }
+        func pixels(_ name: String) throws -> Int {
+            let v = try lifecycleInteger(value, key)
+            let range = Self.stillTimelinePixelRange
+            guard range.contains(v), v % 2 == 0 else {
+                throw lifecycleInvalid("\(name) must be an even number of pixels between \(range.lowerBound) and \(range.upperBound).")
+            }
+            return v
+        }
+        func number(_ range: ClosedRange<Double>, _ name: String, _ unit: String) throws -> Double {
+            let v = try lifecycleNumber(value, key)
+            guard range.contains(v) else {
+                throw lifecycleInvalid("\(name) must be between \(range.lowerBound.formatted()) and \(range.upperBound.formatted()) \(unit).")
+            }
+            return v
+        }
+        func choice<Value: RawRepresentable & Equatable>(_ allowed: [Value]) throws -> Value where Value.RawValue == String {
+            guard let s = value as? String, let v = Value(rawValue: s), allowed.contains(v) else {
+                let names = allowed.map(\.rawValue)
+                throw lifecycleInvalid("Choose " + (names.count > 2 ? names.dropLast().joined(separator: ", ") + ", or " : names.dropLast().joined() + " or ")
+                    + (names.last ?? "") + ".")
+            }
+            return v
+        }
+        func option<Value: RawRepresentable & CaseIterable & Equatable>(_: Value.Type) throws -> Value where Value.RawValue == String {
+            try choice(Array(Value.allCases))
+        }
+        func text(_ limit: Int) throws -> String {
+            guard let s = value as? String, s.unicodeScalars.count <= limit, !s.utf8.contains(0) else {
+                throw lifecycleInvalid("Supply a string of up to \(limit) characters for \(key).")
+            }
+            return s
         }
         guard let preference = Key(rawValue: key) else { throw lifecycleInvalid("Unknown preference \(key).") }
         switch preference {
@@ -393,7 +529,79 @@ private extension EditorPreferences {
         case .exportJpegDefaultPreset:
             guard let s = value as? String, let v = JPEGPreset(rawValue: s) else { throw lifecycleInvalid("Choose review or full.") }
             jpegPreset = v
-        case .automationLocalMcpEnabled: throw lifecycleInvalid("Local MCP access is controlled in Settings.")
+        case .automationLocalMcpEnabled: throw lifecycleInvalid("Local MCP access is controlled in Settings → Automation.")
+        case .automationPreferencesWriteEnabled, .automationFileReplaceEnabled:
+            throw lifecycleInvalid("Agent permissions are controlled in Settings → Automation.")
+        case .draftRetentionDays, .analysisSharedCacheMaxBytes:
+            throw lifecycleInvalid("\(key) removes files, so it is controlled in Settings → Storage.")
+
+        case .openMultipleRecordingsDefaultAction: multipleRecordingsAction = try option(MultipleRecordingsAction.self)
+        case .recentFilesMaxCount: recentFilesLimit = try integer(Self.recentFilesRange, "Recent items")
+        case .draftRecoveryPromptEnabled: offersDraftRecovery = try flag()
+        case .sceneRescanConfirmationEnabled: confirmsSceneRescan = try flag()
+        case .projectExportCompletionMessageEnabled: showsProjectExportMessage = try flag()
+        case .timelineCutSectionsDefaultEnabled: showsCutSections = try flag()
+        case .workspaceFullHeightSidebarEnabled: fullHeightSidebar = try flag()
+        case .multicamTrackLabelWidthPoints: trackLabelWidth = try number(Self.trackLabelWidthRange, "Track label width", "points")
+        case .stillPlacementDefaultDurationSeconds: stillDuration = try number(Self.stillDurationRange, "Still duration", "seconds")
+        case .gapDefaultDurationSeconds: gapDuration = try number(Self.stillDurationRange, "Gap duration", "seconds")
+        case .gapDefaultColor:
+            guard let s = value as? String, let color = Self.hexColor(s) else { throw lifecycleInvalid("Supply the gap color as #RRGGBB.") }
+            gapColor = color
+        case .stillTimelineDefaultWidthPixels: stillTimelineWidth = try pixels("Still timeline width")
+        case .stillTimelineDefaultHeightPixels: stillTimelineHeight = try pixels("Still timeline height")
+        case .stillTimelineDefaultFrameRate:
+            stillTimelineFrameRate = try number(Self.stillTimelineFrameRateRange, "Still timeline frame rate", "frames per second")
+        case .stillTimelineDefaultCodec: stillTimelineCodec = try choice(Self.stillTimelineCodecs)
+        case .timelineTimeDisplay: timeDisplay = try option(TimelineTimeDisplay.self)
+        case .playbackDefaultSpeed:
+            let v = try lifecycleNumber(value, key)
+            guard let speed = PlaybackSpeed.allCases.first(where: { Double($0.rawValue) == v }) else {
+                throw lifecycleInvalid("Choose a playback speed of " + PlaybackSpeed.allCases.map { Double($0.rawValue).formatted() }
+                    .joined(separator: ", ") + ".")
+            }
+            playbackSpeed = speed
+        case .playbackCutPreviewPrerollSeconds: cutPreviewPreroll = try number(Self.cutPreviewRange, "Seconds before a cut", "seconds")
+        case .playbackCutPreviewPostrollSeconds: cutPreviewPostroll = try number(Self.cutPreviewRange, "Seconds after a cut", "seconds")
+        case .playbackViewerForceSdrEnabled: viewerForceSDR = try flag()
+        case .playbackMonitorForceSdrEnabled: monitorForceSDR = try flag()
+        case .playbackMonitorCleanFeedEnabled: monitorCleanFeed = try flag()
+        case .playbackMonitorPlacement: monitorPlacement = try option(VideoMonitorPlacement.self)
+        case .analysisSceneAutoScanEnabled: autoScanScenes = try flag()
+        case .analysisSilenceAutoScanEnabled: autoScanSilence = try flag()
+        case .tilesScanDefaultLayout: tilesScanLayout = try option(TilesScanLayout.self)
+        case .tilesScanDefaultGridColumns: tilesScanColumns = try integer(Self.tilesGridRange, "Grid columns")
+        case .tilesScanDefaultGridRows: tilesScanRows = try integer(Self.tilesGridRange, "Grid rows")
+        case .tilesScanDefaultDetail: tilesScanDetail = try choice(Self.tilesScanDetails)
+        case .tilesDialogueDefaultMinHoldSeconds: dialogueMinimumHold = try number(Self.dialogueHoldRange, "Minimum hold", "seconds")
+        case .tilesDialogueDefaultOverlapPolicy: dialogueOverlap = try option(ParticipantDialogueOptions.Overlap.self)
+        case .tilesDialogueDefaultOffscreenPolicy: dialogueOffscreen = try option(ParticipantDialogueOptions.Offscreen.self)
+        case .transcriptDefaultEngine: transcriptEngine = try text(128)
+        case .transcriptDefaultSpeakerIdentificationEnabled: identifiesSpeakers = try flag()
+        case .transcriptDefaultModelDownloadEnabled: downloadsModels = try flag()
+        case .transcriptFollowPlaybackDefaultEnabled: followsPlayback = try flag()
+        case .transcriptReaderTextSizePoints: readerTextSize = try number(Self.readerTextSizeRange, "Reader text size", "points")
+        case .transcriptEditDefaultBoundaryPolicy: boundaryPolicy = try choice(Self.boundaryPolicies)
+        case .transcriptTightenDefaultRetainedPauseSeconds:
+            retainedPause = try number(Self.retainedPauseRange, "Pause to keep", "seconds")
+        case .transcriptDefaultFillerTerms: fillerTerms = try text(4096)
+        case .transcriptExportDefaultFormat: transcriptExportFormat = try choice(Self.transcriptExportFormats)
+        case .transcriptCaptionMaxLineCharacters:
+            captionLineCharacters = try integer(Self.captionLineCharacterRange, "Characters per line", "characters")
+        case .transcriptCaptionMaxLines: captionLines = try integer(Self.captionLineRange, "Caption lines")
+        case .transcriptCaptionMaxCueSeconds: captionCueSeconds = try number(Self.captionCueRange, "Longest cue", "seconds")
+        case .transcriptCaptionSpeakerLabelsEnabled: captionSpeakerLabels = try flag()
+        case .exportReencodeDefaultCodec: reencodeCodec = try choice(Self.reencodeCodecs)
+        case .exportReencodeDefaultQuality: reencodeQuality = try choice(Self.reencodeQualities)
+        case .exportProresDefaultQuality: proresQuality = try choice(Self.proresQualities)
+        case .exportReencodeDefaultContainer: reencodeContainer = try option(ExportContainerChoice.self)
+        case .exportMulticamDefaultAudioLayout: multicamAudioLayout = try option(MulticamAudioOutput.self)
+        case .exportResultJsonDefaultEnabled: savesExportResult = try flag()
+        case .resolveSendOpenTimelineDefaultEnabled: opensResolveTimeline = try flag()
+        case .exportStartFolderMode: exportStartFolder = try option(ExportStartFolderMode.self)
+        case .exportFinishedRevealEnabled: revealsFinishedExport = try flag()
+        case .exportFinishedNotificationEnabled: notifiesFinishedExport = try flag()
+        case .exportFinishedSoundEnabled: playsFinishedExportSound = try flag()
         }
     }
 }

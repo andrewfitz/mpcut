@@ -16,10 +16,9 @@ import (
 var transcriptFixturePath = flag.String("transcript-fixture", "", "generated interview fixture directory for multicam transcript parity")
 
 type transcriptProjectSnapshot struct {
-	Files []string
 	Clips []struct {
 		ID   string
-		File savedTranscriptPath
+		File string
 		From string
 		To   string
 	}
@@ -27,40 +26,18 @@ type transcriptProjectSnapshot struct {
 		Undo []struct{ Action string }
 		Redo []struct{ Action string }
 	}
+	EmbeddedAssets struct {
+		Transcripts map[string]json.RawMessage
+	} `json:"embedded_assets"`
 	Transcripts struct {
 		Revision    uint64
 		Attachments []struct {
 			ID    string
 			Asset struct {
-				File   savedTranscriptPath
 				SHA256 string
 			}
 		}
 	}
-}
-
-type savedTranscriptPath struct {
-	path  string
-	index *int
-}
-
-func (p *savedTranscriptPath) UnmarshalJSON(data []byte) error {
-	if len(data) != 0 && data[0] == '"' {
-		return json.Unmarshal(data, &p.path)
-	}
-	return json.Unmarshal(data, &p.index)
-}
-
-func (p *savedTranscriptPath) expand(t *testing.T, files []string) {
-	t.Helper()
-	if p.index == nil {
-		return
-	}
-	if *p.index < 0 || *p.index >= len(files) {
-		t.Fatalf("invalid file index %d in saved project", *p.index)
-	}
-	p.path = files[*p.index]
-	p.index = nil
 }
 
 func readTranscriptProject(t *testing.T, path string) transcriptProjectSnapshot {
@@ -76,11 +53,10 @@ func readTranscriptProject(t *testing.T, path string) transcriptProjectSnapshot 
 	if err := json.Unmarshal(data, &project); err != nil {
 		t.Fatalf("decode saved project %s: %v", path, err)
 	}
-	for i := range project.Clips {
-		project.Clips[i].File.expand(t, project.Files)
-	}
-	for i := range project.Transcripts.Attachments {
-		project.Transcripts.Attachments[i].Asset.File.expand(t, project.Files)
+	for _, attachment := range project.Transcripts.Attachments {
+		if _, ok := project.EmbeddedAssets.Transcripts[attachment.Asset.SHA256]; !ok {
+			t.Fatalf("saved project %s lacks embedded transcript %s", path, attachment.Asset.SHA256)
+		}
 	}
 	return project
 }
@@ -104,7 +80,7 @@ func checkTranscriptEditParity(t *testing.T, ctx context.Context, contents, dir 
 		}
 		return path
 	}
-	const original = `{"format":"mpcut","schema_version":3,"kind":"sequence","clips":[{"id":"clip","file":"parity.wav","from":"0","to":"4"}]}`
+	const original = `{"format":"mpcut","schema_version":9,"kind":"sequence","clips":[{"id":"clip","file":"parity.wav","from":"0","to":"4"}]}`
 	const nativeWords = `{"source":"parity.wav","duration_seconds":4,"sample_zero":{"numerator":0,"denominator":1},
 	  "speaker_names":["Guest"],"metadata":{},"segments":[{"start":0,"end":4,"speaker":0,"words":[
 	    {"text":"Keep","start":0.25,"end":0.5},
@@ -186,7 +162,7 @@ func checkTranscriptEditParity(t *testing.T, ctx context.Context, contents, dir 
 	if !reflect.DeepEqual(cliSaved.Clips, liveSaved.Clips) {
 		t.Fatalf("CLI saved ranges %v differ from live MCP ranges %v", cliSaved.Clips, liveSaved.Clips)
 	}
-	if len(cliSaved.Clips) != 2 || cliSaved.Clips[0].File.path == "" || cliSaved.Clips[1].File != cliSaved.Clips[0].File ||
+	if len(cliSaved.Clips) != 2 || cliSaved.Clips[0].File == "" || cliSaved.Clips[1].File != cliSaved.Clips[0].File ||
 		cliSaved.Clips[0].From != "0" || cliSaved.Clips[0].To != "1" ||
 		cliSaved.Clips[1].From != "2" || cliSaved.Clips[1].To != "4" {
 		t.Fatalf("expected half-open retained ranges [0,1) and [2,4), got %v", cliSaved.Clips)
@@ -334,7 +310,7 @@ func checkTranscriptQueueParity(t *testing.T, ctx context.Context, contents, saf
 	}
 	// Use the fixtures' distinct camera colors and fixed recorder. Zero offsets put
 	// both camera clocks on the same 25 fps grid for an exact encode comparison.
-	const projectJSON = `{"format":"mpcut","schema_version":3,"kind":"multicam","reference_angle_id":"wide",
+	const projectJSON = `{"format":"mpcut","schema_version":9,"kind":"multicam","reference_angle_id":"wide",
 	  "group_range":{"from":"0","to":"4"},"angles":[{"id":"wide","file":"wide.mov"},{"id":"close","file":"close.mov"}],
 	  "audio_sources":[{"id":"lav","file":"lav.wav"}],"audio":{"mode":"fixed","source_id":"lav","audio_stream_index":0},
 	  "switches":[{"group_time":"0","angle_id":"wide"},{"group_time":"2","angle_id":"close"}]}`
@@ -380,12 +356,11 @@ func checkTranscriptQueueParity(t *testing.T, ctx context.Context, contents, saf
 		items, ok := words["items"].([]any)
 		if !ok || words["total"] != float64(2) || len(items) != 2 ||
 			items[0].(object)["text"] != "Queuing" || items[1].(object)["text"] != "excerpts" {
-			t.Fatalf("reopened excerpt cannot read its copied transcript store: %v", words)
+			t.Fatalf("reopened excerpt cannot read its embedded transcript: %v", words)
 		}
 		copy := readTranscriptProject(t, path).Transcripts.Attachments
-		if len(copy) != 1 || copy[0].Asset.File == attachment.Asset.File ||
-			copy[0].Asset.SHA256 != attachment.Asset.SHA256 {
-			t.Fatalf("expected a separate transcript asset with the same content identity: %v", copy)
+		if len(copy) != 1 || copy[0].Asset.SHA256 != attachment.Asset.SHA256 {
+			t.Fatalf("excerpt lost the imported transcript identity: %v", copy)
 		}
 	}
 	live := call("project_open", object{"project_path": pathLive, "operation_id": "open-transcript-queue"}, "")["project_handle"]
@@ -407,6 +382,12 @@ func checkTranscriptQueueParity(t *testing.T, ctx context.Context, contents, saf
 			"attachment_id": attachment.ID, "result_id": attachment.Asset.SHA256,
 			"expected_revision": state()["revision"], "expected_transcript_revision": seed.Transcripts.Revision}
 	}
+	mark := stamp("mark-camera-quote")
+	mark["selection"] = object{"first_word_id": "s0-w0", "last_word_id": "s0-w1", "space": "current_cut", "trailing_padding": "2"}
+	call("transcript_editor_selection_mark", mark, "invalid_transcript_selection")
+	mark = stamp("mark-camera-quote-valid")
+	mark["selection"] = selection
+	call("transcript_editor_selection_mark", mark, "")
 	plan := stamp("plan-camera-quote")
 	plan["edit"] = edit
 	reviewed := call("transcript_editor_edit_plan", plan, "")

@@ -23,7 +23,6 @@ guard CommandLine.arguments.count == 3, let pid = Int32(CommandLine.arguments[1]
 guard AXIsProcessTrusted() else { exit(77) }
 let arguments = CommandLine.arguments[2].components(separatedBy: "\n")
 let app = AXUIElementCreateApplication(pid)
-_ = NSRunningApplication(processIdentifier: pid)?.activate(options: [])
 
 func waitFor(_ description: String, diagnostic: () -> String = { "" }, condition: () -> Bool) {
     let deadline = Date().addingTimeInterval(10)

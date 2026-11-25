@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// The JSON text of a project, read and written without decoding it: a parser that keeps each
@@ -8,7 +9,7 @@ enum ProjectSavedLayout {
     // MARK: Document text
 
     indirect enum Node: Equatable {
-        /// A string, number or literal exactly as written.
+        /// A string, number, literal or self-contained embedded asset exactly as written.
         case scalar([UInt8])
         case array([Node])
         case object([Member])
@@ -18,6 +19,47 @@ enum ProjectSavedLayout {
         /// The name as written, with its quotes.
         var key: [UInt8]
         var value: Node
+
+        func hasKey(_ canonical: [UInt8]) -> Bool {
+            ProjectSavedLayout.matches(key, canonical)
+        }
+    }
+
+    /// Reserved names are ASCII. An escaped spelling is always longer and must
+    /// decode to the same name before it can select a layout operation.
+    static func matches(_ quoted: [UInt8], _ canonical: [UInt8]) -> Bool {
+        if quoted == canonical { return true }
+        guard quoted.count > canonical.count, quoted.contains(0x5c),
+              let name = try? JSONDecoder().decode(String.self, from: Data(quoted)) else { return false }
+        return name.utf8.elementsEqual(canonical.dropFirst().dropLast())
+    }
+
+    static func mayContain(_ token: Data, in data: Data) -> Bool {
+        if data.range(of: token) != nil { return true }
+        // At the first escape in a reserved name, the preceding bytes still match its
+        // quoted prefix. Ignore Unicode escapes in unrelated keys and large text values.
+        let quoted = Array(token)
+        let hex = Array("0123456789abcdef".utf8)
+        return data.withUnsafeBytes { raw in
+            let bytes = raw.bindMemory(to: UInt8.self)
+            guard let start = bytes.baseAddress, bytes.count >= 6 else { return false }
+            var cursor = 0
+            while let next = memchr(start + cursor, 0x5C, bytes.count - cursor) {
+                let i = start.distance(to: next.assumingMemoryBound(to: UInt8.self))
+                guard i <= bytes.count - 6 else { break }
+                cursor = i + 1
+                guard bytes[i + 1] == 0x75, bytes[i + 2] == 0x30, bytes[i + 3] == 0x30 else { continue }
+                for prefix in 1..<(quoted.count - 1) where i >= prefix {
+                    let byte = quoted[prefix]
+                    if bytes[i + 4] == hex[Int(byte >> 4)],
+                       bytes[i + 5] | 0x20 == hex[Int(byte & 15)],
+                       bytes[(i - prefix)..<i].elementsEqual(quoted[..<prefix]) {
+                        return true
+                    }
+                }
+            }
+            return false
+        }
     }
 
     struct Malformed: Error {}
@@ -35,7 +77,7 @@ enum ProjectSavedLayout {
             }
         }
 
-        mutating func string() throws -> [UInt8] {
+        mutating func stringRange() throws -> Range<Int> {
             guard index < bytes.count, bytes[index] == 0x22 else { throw Malformed() }
             let start = index
             index += 1
@@ -43,7 +85,7 @@ enum ProjectSavedLayout {
                 switch bytes[index] {
                 case 0x22:
                     index += 1
-                    return Array(bytes[start..<index])
+                    return start..<index
                 case 0x5C:
                     index += 2
                 default:
@@ -53,10 +95,17 @@ enum ProjectSavedLayout {
             throw Malformed()
         }
 
-        mutating func value(depth: Int = 0) throws -> Node {
+        /// Validate asset structure while keeping the entire payload as one value. The
+        /// layout needs only its digest key; a typed decoder handles the words and frames.
+        mutating func value(depth: Int = 0, inAssets: Bool = false, keep: Bool = true) throws -> Node? {
             guard depth < ProjectSavedLayout.maximumDepth else { throw Malformed() }
             skipSpace()
             guard index < bytes.count else { throw Malformed() }
+            if inAssets, depth == 3 {
+                let start = index
+                _ = try value(depth: depth, keep: false)
+                return .scalar(Array(bytes[start..<index]))
+            }
             switch bytes[index] {
             case 0x7B:
                 index += 1
@@ -64,20 +113,23 @@ enum ProjectSavedLayout {
                 skipSpace()
                 if index < bytes.count, bytes[index] == 0x7D {
                     index += 1
-                    return .object(members)
+                    return keep ? .object(members) : nil
                 }
                 while true {
                     skipSpace()
-                    let key = try string()
+                    let keyRange = try stringRange()
+                    let key = keep ? Array(bytes[keyRange]) : []
                     skipSpace()
                     guard index < bytes.count, bytes[index] == 0x3A else { throw Malformed() }
                     index += 1
-                    members.append(Member(key: key, value: try value(depth: depth + 1)))
+                    let assets = inAssets || (depth == 0 && ProjectSavedLayout.matches(key, ProjectSavedLayout.embeddedAssets))
+                    let child = try value(depth: depth + 1, inAssets: assets, keep: keep)
+                    if let child { members.append(Member(key: key, value: child)) }
                     skipSpace()
                     guard index < bytes.count else { throw Malformed() }
                     if bytes[index] == 0x7D {
                         index += 1
-                        return .object(members)
+                        return keep ? .object(members) : nil
                     }
                     guard bytes[index] == 0x2C else { throw Malformed() }
                     index += 1
@@ -88,21 +140,23 @@ enum ProjectSavedLayout {
                 skipSpace()
                 if index < bytes.count, bytes[index] == 0x5D {
                     index += 1
-                    return .array(items)
+                    return keep ? .array(items) : nil
                 }
                 while true {
-                    items.append(try value(depth: depth + 1))
+                    let child = try value(depth: depth + 1, keep: keep)
+                    if let child { items.append(child) }
                     skipSpace()
                     guard index < bytes.count else { throw Malformed() }
                     if bytes[index] == 0x5D {
                         index += 1
-                        return .array(items)
+                        return keep ? .array(items) : nil
                     }
                     guard bytes[index] == 0x2C else { throw Malformed() }
                     index += 1
                 }
             case 0x22:
-                return .scalar(try string())
+                let range = try stringRange()
+                return keep ? .scalar(Array(bytes[range])) : nil
             default:
                 let start = index
                 scan: while index < bytes.count {
@@ -114,7 +168,7 @@ enum ProjectSavedLayout {
                     }
                 }
                 guard index > start else { throw Malformed() }
-                return .scalar(Array(bytes[start..<index]))
+                return keep ? .scalar(Array(bytes[start..<index])) : nil
             }
         }
     }
@@ -122,45 +176,91 @@ enum ProjectSavedLayout {
     static func parse(_ data: Data) -> Node? {
         data.withUnsafeBytes { raw -> Node? in
             var parser = Parser(bytes: raw.bindMemory(to: UInt8.self))
+            if parser.bytes.starts(with: [0xEF, 0xBB, 0xBF]) { parser.index = 3 }
             guard let node = try? parser.value() else { return nil }
             parser.skipSpace()
             return parser.index == parser.bytes.count ? node : nil
         }
     }
 
-    private static func write(_ node: Node, to output: inout Data) {
+    private static func emit(_ node: Node, bytes: ([UInt8]) throws -> Void) rethrows {
         switch node {
         case .scalar(let text):
-            output.append(contentsOf: text)
+            try bytes(text)
         case .array(let items):
-            output.append(0x5B)
+            try bytes([0x5B])
             for (position, item) in items.enumerated() {
-                if position > 0 { output.append(0x2C) }
-                write(item, to: &output)
+                if position > 0 { try bytes([0x2C]) }
+                try emit(item, bytes: bytes)
             }
-            output.append(0x5D)
+            try bytes([0x5D])
         case .object(let members):
-            output.append(0x7B)
+            try bytes([0x7B])
             for (position, member) in members.enumerated() {
-                if position > 0 { output.append(0x2C) }
-                output.append(contentsOf: member.key)
-                output.append(0x3A)
-                write(member.value, to: &output)
+                if position > 0 { try bytes([0x2C]) }
+                try bytes(member.key)
+                try bytes([0x3A])
+                try emit(member.value, bytes: bytes)
             }
-            output.append(0x7D)
+            try bytes([0x7D])
         }
     }
 
-    /// The number of bytes `text` writes for a value.
-    private static func length(_ node: Node) -> Int {
-        switch node {
-        case .scalar(let text):
-            return text.count
-        case .array(let items):
-            return items.reduce(2 + max(0, items.count - 1)) { $0 + length($1) }
-        case .object(let members):
-            return members.reduce(2 + max(0, members.count - 1)) { $0 + $1.key.count + 1 + length($1.value) }
+    private static func write(_ node: Node, to output: inout Data) {
+        emit(node) { output.append(contentsOf: $0) }
+    }
+
+    /// Keep large reference expansions out of the heap. The temporary file has no
+    /// directory entry, so interruption or a failed write cannot leave a partial document.
+    static func expandedBytes(_ node: Node, size: Int, verifyingHistory: Bool) throws -> Data {
+        try CutProject.checkDocumentRead()
+        // Verify against the expanded tree while the embedded payloads are still opaque.
+        // For large reference expansions, check disk capacity before traversing the edit.
+        func checked() -> Node? { verifyingHistory ? ProjectHistoryStamp.verified(node) : nil }
+        guard size > 32 << 20 else { return text(checked() ?? node, capacity: size) }
+        var path = Array(FileManager.default.temporaryDirectory.appendingPathComponent("mpcut-expand.XXXXXX").path.utf8CString)
+        let descriptor = mkstemp(&path)
+        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer { close(descriptor) }
+        guard unlink(path) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        var volume = statfs()
+        guard fstatfs(descriptor, &volume) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        let block = Int(volume.f_bsize)
+        guard block > 0, UInt64(size / block + (size % block == 0 ? 0 : 1)) <= volume.f_bavail else {
+            throw POSIXError(.ENOSPC)
         }
+
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+        let batchSize = 1 << 20
+        var buffer = Data(capacity: batchSize)
+        func flush() throws {
+            try CutProject.checkDocumentRead()
+            guard !buffer.isEmpty else { return }
+            try handle.write(contentsOf: buffer)
+            buffer.removeAll(keepingCapacity: true)
+        }
+        let verified = checked()
+        try emit(verified ?? node) { bytes in
+            if bytes.count >= batchSize {
+                try flush()
+                try bytes.withUnsafeBytes { raw in
+                    try handle.write(contentsOf: Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!),
+                                                       count: raw.count, deallocator: .none))
+                }
+            } else {
+                if buffer.count > batchSize - bytes.count { try flush() }
+                buffer.append(contentsOf: bytes)
+            }
+        }
+        try flush()
+        let length = try handle.offset()
+        // Removing the stamp or a stale history shortens the serialized document.
+        guard length > 0, length <= UInt64(size), verified != nil || length == UInt64(size) else {
+            throw POSIXError(.EIO)
+        }
+        let mapped = mmap(nil, Int(length), PROT_READ, MAP_PRIVATE, descriptor, 0)
+        guard mapped != MAP_FAILED, let mapped else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .ENOMEM) }
+        return Data(bytesNoCopy: mapped, count: Int(length), deallocator: .unmap)
     }
 
     /// The document with one member or element to a line, as version control wants it: a
@@ -169,7 +269,7 @@ enum ProjectSavedLayout {
     /// that is already in this form comes back the same.
     static func readable(_ document: Data) -> Data? {
         guard let root = parse(document), case .object = root else { return nil }
-        return readable(root, capacity: document.count * 2)
+        return readable(root, capacity: document.count)
     }
 
     static func readable(_ root: Node, capacity: Int) -> Data {
@@ -258,6 +358,7 @@ enum ProjectSavedLayout {
 
     // MARK: Names
 
+    static let embeddedAssets = Array(#""embedded_assets""#.utf8)
     static let history = Array(#""history""#.utf8)
     static let marker = Array(#""~""#.utf8)
     static let mediaSnapshot = Array(#""media_snapshot""#.utf8)

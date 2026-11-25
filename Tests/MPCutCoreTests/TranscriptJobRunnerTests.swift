@@ -8,6 +8,7 @@ final class TranscriptJobRunnerTests: XCTestCase {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent("MPCut-runner-\(UUID())", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
         addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+        isolateRecognitionResults(in: folder)
         return folder
     }
 

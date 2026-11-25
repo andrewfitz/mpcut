@@ -28,6 +28,11 @@ struct MulticamExportChoices: Equatable, Sendable {
     var standardQuality = ExportRules.defaultQuality(.h264) { didSet { qualityChosen = true } }
     var proResQuality = ExportRules.defaultQuality(.prores) { didSet { qualityChosen = true } }
     var qualityChosen = false
+    /// The Settings container for an H.264 or HEVC re-encode. Nil is Automatic: the export rules' own first choice.
+    var preferredContainer: String?
+    /// Whether the last settled selection re-encoded with H.264 or HEVC. The preferred container is taken when a
+    /// selection starts doing so, and a container chosen after that is kept.
+    private var encodedStandardVideo = false
 
     init(entry: ExportEntryPoint, preferred: ExportMode = ExportRules.defaultMode(for: .multicam)) {
         self.entry = entry
@@ -124,8 +129,21 @@ struct MulticamExportChoices: Equatable, Sendable {
             audio = .pcm
         }
         let listed = containers(mode: mode)
+        let encodes = encodesStandardVideo(mode: mode)
+        if encodes, !encodedStandardVideo, let preferredContainer, listed.contains(preferredContainer) {
+            container = preferredContainer
+        }
+        encodedStandardVideo = encodes
         if !listed.contains(container), let first = listed.first { container = first }
     }
+
+    /// True when the selection re-encodes picture with H.264 or HEVC, the case the container preference names.
+    func encodesStandardVideo(mode: ExportMode? = nil) -> Bool {
+        (mode ?? effectiveMode) == .encode && tracks != .audio && codec != .prores
+    }
+
+    /// Records the current selection as settled, so that a container set by hand stays.
+    mutating func keepContainer() { encodedStandardVideo = encodesStandardVideo() }
 
     /// The selection an alternative of the export rules stands for.
     mutating func apply(_ alternative: ExportAlternative) {
@@ -145,6 +163,33 @@ struct MulticamExportChoices: Equatable, Sendable {
             requireCameraCopy = alternative.arguments.contains("--require-camera-copy")
             pictureTiming = alternative.argument("--still-timing").flatMap(StillPictureTiming.init(rawValue:)) ?? pictureTiming
         }
+        // The alternative names its container. The preference does not replace it.
+        keepContainer()
+    }
+
+    /// Fresh choices start from the Settings export defaults. The export rules still decide what the selection can use:
+    /// `settle` replaces a default the selection cannot take, and the controls show the effective choice.
+    @MainActor
+    mutating func seed(from preferences: EditorPreferences) {
+        // A starting value from Settings is not a quality chosen in the inspector or the queue.
+        let chosen = qualityChosen
+        defer { qualityChosen = chosen }
+        codec = preferences.reencodeCodec
+        standardQuality = preferences.reencodeQuality
+        proResQuality = preferences.proresQuality
+        audioOutput = preferences.multicamAudioLayout
+        // A downmix renders the program sound, so it cannot copy the original tracks.
+        if audioOutput != .separateTracks && audio == .copyOriginal { audio = .auto }
+        // Another codec can list other containers.
+        if !containers().contains(container), let first = containers().first { container = first }
+        // Automatic keeps the multicam split: the export rules list MOV first. ProRes is always MOV.
+        switch preferences.reencodeContainer {
+        case .automatic: preferredContainer = nil
+        case .mp4, .mov, .mkv: preferredContainer = preferences.reencodeContainer.rawValue
+        }
+        guard let preferredContainer else { return }
+        if encodesStandardVideo(), containers().contains(preferredContainer) { container = preferredContainer }
+        keepContainer()
     }
 }
 

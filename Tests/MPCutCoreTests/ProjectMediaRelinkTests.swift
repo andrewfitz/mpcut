@@ -4,6 +4,60 @@ import XCTest
 @testable import MPCutCore
 
 final class ProjectMediaRelinkTests: XCTestCase {
+    func testRelinkMovesAnnotationPathsAcrossHistoryEvenWithoutAClipUsingThePath() throws {
+        let folder = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let document = folder.appendingPathComponent("edit.cut")
+        let original = folder.appendingPathComponent("Missing.wav")
+        let moved = folder.appendingPathComponent("Moved.wav")
+        try wave().write(to: original)
+        let engine = CutEngine(useSidecar: false)
+        let media = try engine.inspect(original)
+        let stream = try XCTUnwrap(media.audio.first?.stream.index)
+        var current = CutProject.sequence([clip("current", path: "Different.wav")])
+        XCTAssertTrue(current.analysisAnnotations.setThreshold(-45, for: media, stream: stream))
+        var earlier = CutProject.sequence([clip("removed")])
+        earlier.analysisAnnotations = current.analysisAnnotations
+        let history = [CutHistoryState(action: "Remove Clip", project: earlier)]
+        try FileManager.default.moveItem(at: original, to: moved)
+        let inventory = ProjectMedia.inventory(project: current, relativeTo: document)
+        XCTAssertEqual(inventory.first { $0.url.lastPathComponent == original.lastPathComponent }?.status, .offline)
+
+        let result = try ProjectMedia.relink(project: current, undo: history, relativeTo: document,
+                                             from: original.lastPathComponent, to: moved)
+        XCTAssertEqual(result.project.analysisAnnotations.silence.first?.file, moved.lastPathComponent)
+        XCTAssertEqual(result.undo.first?.project.analysisAnnotations.silence.first?.file, moved.lastPathComponent)
+        XCTAssertEqual(result.undo.first?.project.sequenceClips?.first?.file, moved.lastPathComponent)
+        XCTAssertEqual(result.project.sequenceClips?.first?.file, "Different.wav")
+        let resolved = result.project.withAbsoluteMediaPaths(relativeTo: document)
+        XCTAssertEqual(resolved.analysisAnnotations.threshold(for: try engine.inspect(moved), stream: stream), -45)
+    }
+
+    func testReplacingNamedSelectRetainsItsStaleThresholdForReview() throws {
+        let folder = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let document = folder.appendingPathComponent("edit.cut")
+        let original = folder.appendingPathComponent("Original.wav")
+        let candidate = folder.appendingPathComponent("Replacement.wav")
+        try wave().write(to: original)
+        try wave(amplitude: 200).write(to: candidate)
+        let engine = CutEngine(useSidecar: false)
+        let media = try engine.inspect(original)
+        let stream = try XCTUnwrap(media.audio.first?.stream.index)
+        let select = try NamedSourceSelect(id: "select", name: "Select",
+            range: .init(file: original.lastPathComponent, from: .zero, to: .init(numerator: 1, denominator: 2)))
+        var project = CutProject.stillSequence(.init(items: [.source(clip("current", path: "Different.wav"))],
+                                                     sourceSelects: [select]))
+        XCTAssertTrue(project.analysisAnnotations.setThreshold(-45, for: media, stream: stream))
+
+        let preview = try ProjectMediaReplace.preview(project, relativeTo: document, source: original.path,
+                                                      candidate: candidate, options: .init(useID: select.id))
+        let result = try preview.applying(to: project)
+        XCTAssertEqual(result.analysisAnnotations.silence.map(\.file), [candidate.lastPathComponent])
+        let resolved = result.withAbsoluteMediaPaths(relativeTo: document)
+        XCTAssertTrue(resolved.analysisAnnotations.needsThresholdReview(for: try engine.inspect(candidate), stream: stream))
+    }
+
     func testRelinkFittedSoundtrackRetainsExactDurationAndSavedHistory() throws {
         let folder = try temporaryFolder()
         defer { try? FileManager.default.removeItem(at: folder) }
@@ -146,8 +200,7 @@ final class ProjectMediaRelinkTests: XCTestCase {
         XCTAssertEqual(linked.redo.first?.project.sequenceClips?.map(\.file), ["Destination.wav"])
         XCTAssertEqual(linked.undo.first?.origin, .agent)
 
-        let encoded = try linked.project.encodedArchive(undo: linked.undo, redo: linked.redo, mediaSnapshot: linked.snapshot,
-                                                       byteLimit: MulticamProject.maximumFileSize).0
+        let encoded = try linked.project.encodedArchive(undo: linked.undo, redo: linked.redo, mediaSnapshot: linked.snapshot).0
         let reopened = try CutProject.decodeEditorDocument(encoded, limit: 10)
         let reopenedSnapshot = reopened.media.mediaSnapshot
         XCTAssertTrue(ProjectMedia.inventory(project: reopened.project, undo: reopened.undo, redo: reopened.redo,
@@ -185,7 +238,7 @@ final class ProjectMediaRelinkTests: XCTestCase {
                                       sourceFingerprint: otherFingerprint, sourceConfirmed: false)
         let unverified = TranscriptBinding(trackID: "c", file: "Missing.wav", streamIndex: 0)
         let digest = String(repeating: "a", count: 64)
-        let asset = TranscriptAsset(file: "Edit.transcripts/\(digest).json", sha256: digest)
+        let asset = TranscriptAsset(sha256: digest)
         let attachment = TranscriptAttachment(id: "attachment", asset: asset, bindings: [matching, stale, unverified])
         let timing = MulticamRange(from: .zero, to: RationalTime(numerator: 1, denominator: 4))
         let record = TranscriptAuthoredRecord(id: "record", attachmentID: attachment.id,
@@ -397,7 +450,7 @@ final class ProjectMediaRelinkTests: XCTestCase {
         let digest = String(repeating: "a", count: 64)
         let binding = TranscriptBinding(trackID: "a", file: "Missing.wav", streamIndex: 0,
                                         offset: .init(numerator: 1, denominator: 3))
-        let asset = TranscriptAsset(file: "Edit.transcripts/\(digest).json", sha256: digest)
+        let asset = TranscriptAsset(sha256: digest)
         let attachment = TranscriptAttachment(id: "attachment", asset: asset, bindings: [binding],
                                               importOrigin: .init(numerator: 1, denominator: 3))
         let timing = MulticamRange(from: .zero, to: .init(numerator: 1, denominator: 2))

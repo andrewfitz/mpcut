@@ -40,7 +40,7 @@ def make_fixture(directory, duration):
     step = duration // (SWITCH_COUNT + 1)
     split = 10 * step + step // 2
     project = {
-        "format": "mpcut", "schema_version": 3, "kind": "multicam", "reference_angle_id": "wide",
+        "format": "mpcut", "schema_version": 9, "kind": "multicam", "reference_angle_id": "wide",
         "group_range": {"from": "0", "to": str(duration)},
         "angles": [{"id": angle, "file": f"{angle}.mov", "offset": "0"} for angle in ANGLE_IDS],
         "audio_sources": [{"id": "lav", "file": "lav.wav", "offset": "0"}],
@@ -188,7 +188,7 @@ def review_frames(cli, project, output):
 
 def benchmark(cli, project, runs, scratch):
     assets = [project.parent / f"{angle}.mov" for angle in ANGLE_IDS] + [project.parent / "lav.wav"]
-    sidecars = [path.with_name(path.name + ".cutdb") for path in assets]
+    sidecars = [path.with_name(path.name + ".cutcache") for path in assets]
     sidecar_files = [path.with_name(path.name + suffix)
                      for path in sidecars for suffix in ("", "-wal", "-shm", "-journal")]
     if any(path.exists() or path.is_symlink() for path in sidecar_files):

@@ -1,6 +1,69 @@
 import Foundation
 
+package enum TranscriptSelectionExpansion: String, Decodable, Sendable {
+    case earlier, later, sentence
+    case speakerTurn = "speaker_turn"
+    case precedingQuestion = "preceding_question"
+
+    package func endpoints(from firstWord: TranscriptOccurrence, to lastWord: TranscriptOccurrence,
+                           in index: TranscriptIndex, space: TranscriptSpace)
+        -> (first: TranscriptOccurrence, last: TranscriptOccurrence)? {
+        let words = index.readAll(space: space, filter: space == .source
+            ? .init(trackID: firstWord.trackID, includeInferred: true) : .init())
+        guard let first = words.firstIndex(where: { $0.id == firstWord.id }),
+              let last = words.firstIndex(where: { $0.id == lastWord.id }), first <= last else { return nil }
+
+        func sameTurn(_ item: TranscriptOccurrence) -> Bool {
+            item.speakerID == firstWord.speakerID && item.trackID == firstWord.trackID
+                && item.clipID == firstWord.clipID && item.assemblyIndex == firstWord.assemblyIndex
+        }
+        func punctuation(_ item: TranscriptOccurrence) -> Bool {
+            item.text.last.map { ".?!".contains($0) } == true
+        }
+
+        var from = first
+        var to = last
+        switch self {
+        case .earlier: from = max(0, first - 1)
+        case .later: to = min(words.count - 1, last + 1)
+        case .sentence, .speakerTurn:
+            while from > 0 && sameTurn(words[from - 1]) && (self == .speakerTurn || !punctuation(words[from - 1])) {
+                from -= 1
+            }
+            while to + 1 < words.count && sameTurn(words[to + 1]) && (self == .speakerTurn || !punctuation(words[to])) {
+                to += 1
+            }
+        case .precedingQuestion:
+            if let question = words[..<first].lastIndex(where: { $0.text.hasSuffix("?") }) {
+                from = question
+                while from > 0 && words[from - 1].speakerID == words[question].speakerID && !punctuation(words[from - 1]) {
+                    from -= 1
+                }
+            }
+        }
+        return (words[from], words[to])
+    }
+}
+
 public enum TranscriptEditPlanner {
+    package static func select(_ selection: TranscriptWordSelection, expansion: TranscriptSelectionExpansion?,
+                               in index: TranscriptIndex) throws -> TranscriptResolvedSelection {
+        let resolved = try select(selection, in: index)
+        guard let expansion else { return resolved }
+        guard selection.kind == .phrase else {
+            throw transcriptEditError("Selection expansion requires a phrase.")
+        }
+        guard let expanded = expansion.endpoints(from: resolved.first, to: resolved.last,
+                                                 in: index, space: selection.space) else {
+            throw transcriptEditError("The selected words are unavailable in the reader.",
+                                      code: "unknown_transcript_occurrence")
+        }
+        return try select(.init(firstWordID: expanded.first.wordID, lastWordID: expanded.last.wordID,
+                                space: selection.space, firstOccurrenceID: expanded.first.id, lastOccurrenceID: expanded.last.id,
+                                leadingPadding: selection.leadingPadding, trailingPadding: selection.trailingPadding,
+                                attachmentID: selection.attachmentID), in: index)
+    }
+
     public static func select(_ selection: TranscriptWordSelection, in index: TranscriptIndex) throws -> TranscriptResolvedSelection {
         guard selection.attachmentID == nil || selection.attachmentID == index.attachment?.id else {
             throw transcriptEditError("Open the attachment named by this selection.", code: "unknown_transcript_attachment")
@@ -48,6 +111,20 @@ public enum TranscriptEditPlanner {
             throw transcriptEditError("Select the phrase endpoints in display order.")
         }
 
+        let range = try range(selection, from: first, to: last)
+        var seen = Set<String>()
+        let overlapping = index.overlapping(range, space: selection.space).compactMap { word -> String? in
+            guard word.id != first.id, word.id != last.id, word.range.to > range.from,
+                  selection.space != .source || word.trackID == first.trackID,
+                  seen.insert(word.wordID).inserted else { return nil }
+            return word.wordID
+        }
+        return .init(space: selection.space, kind: selection.kind, range: range,
+                     first: first, last: last, overlappingWordIDs: overlapping, attachmentID: index.attachment?.id)
+    }
+
+    package static func range(_ selection: TranscriptWordSelection, from first: TranscriptOccurrence,
+                              to last: TranscriptOccurrence) throws -> MulticamRange {
         let leading = selection.leadingPadding ?? .zero
         let trailing = selection.trailingPadding ?? .zero
         guard leading >= .zero, trailing >= .zero else {
@@ -70,15 +147,7 @@ public enum TranscriptEditPlanner {
                 throw transcriptEditError("The requested padding leaves no pause to select.", code: "no_transcript_gap")
             }
         }
-        var seen = Set<String>()
-        let overlapping = index.overlapping(.init(from: from, to: to), space: selection.space).compactMap { word -> String? in
-            guard word.id != first.id, word.id != last.id, word.range.to > from,
-                  selection.space != .source || word.trackID == first.trackID,
-                  seen.insert(word.wordID).inserted else { return nil }
-            return word.wordID
-        }
-        return .init(space: selection.space, kind: selection.kind, range: .init(from: from, to: to),
-                     first: first, last: last, overlappingWordIDs: overlapping, attachmentID: index.attachment?.id)
+        return .init(from: from, to: to)
     }
 
     private struct SpeechKey: Hashable {
@@ -134,8 +203,9 @@ public enum TranscriptEditPlanner {
             }
             if indexes[binding.id] == nil { indexes[binding.id] = additional }
         }
+        let attachmentIDs = project.transcripts.attachments.map(\.id)
         func resolve(_ selection: TranscriptWordSelection) throws -> TranscriptResolvedSelection {
-            let id = selection.attachmentID ?? attachment.id
+            let id = try selection.attachmentOwner(in: attachmentIDs) ?? attachment.id
             guard let selectedIndex = indexes[id] else {
                 throw transcriptEditError("Attachment ‘\(id)’ is unavailable for this selection.",
                                           code: "unknown_transcript_attachment")

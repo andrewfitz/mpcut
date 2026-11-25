@@ -75,7 +75,7 @@
   },
   {
     "name": "history_editor_compare",
-    "description": "Compare a retained undo or redo state with the current timeline without moving the history cursor. Reports affected occurrences and their ranges.",
+    "description": "Compare a retained undo or redo state with the current timeline without moving the history cursor. Reports affected occurrences and participant changes with source IDs, tile IDs, and source intervals where applicable. The page limit covers occurrence and participant rows together.",
     "annotations": {"readOnlyHint": true, "openWorldHint": false},
     "inputSchema": {
       "type": "object",

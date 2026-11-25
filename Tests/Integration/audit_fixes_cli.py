@@ -77,6 +77,60 @@ class CLIAuditFixes(unittest.TestCase):
         error = self.failure(*args, request={**request, "mode": "smart"})
         self.assertIn("Replacement audio requires copy mode", error["message"])
 
+    def test_multicam_authoring_preserves_occurrence_identity_and_layout(self):
+        source = self.root / "authored-multicam.cut"
+        document = {
+            "format": "mpcut", "schema_version": 9, "kind": "multicam", "reference_angle_id": "wide",
+            "group_range": {"from": "0", "to": "2"},
+            "angles": [{"id": "wide", "file": "x.mp4"}, {"id": "close", "file": "x.mp4"}],
+            "audio": {"mode": "none"}, "switches": [{"group_time": "0", "angle_id": "wide"}],
+            "assembly": [{"kind": "group", "from": "0", "to": "2", "id": "authored",
+                          "tile_layouts": [{"range": {"from": "0", "to": "2"}, "layout": "original"}]}],
+            "analysis_annotations": {"scenes": [], "silence": [], "pause_reviews": [
+                {"kind": "marker", "occurrence_id": "group/authored", "from": {"numerator": 1, "denominator": 2}, "sources": []},
+                {"kind": "marker", "occurrence_id": "group/authored", "from": {"numerator": 3, "denominator": 2}, "sources": []},
+            ]},
+        }
+        source.write_text(json.dumps(document))
+
+        def edit(input_path, output_path, operations):
+            self.report("project", "edit", "--stdin", "--json",
+                        request={"project_path": str(input_path), "out_project": output_path, "operations": operations})
+            return json.loads(self.run_cli("project", "document", "print", output_path).stdout)
+
+        result = edit(source, "authored-split.cut", [
+            {"action": "trim", "index": 0, "from": "1/4", "to": "7/4"},
+            {"action": "angle_set", "index": 0, "angle_id": "close"},
+            {"action": "angle_clear", "index": 0},
+            {"action": "split", "index": 0, "at": "1"},
+        ])
+        first, second = result["assembly"]
+        self.assertEqual(first["id"], "authored")
+        self.assertNotEqual(second["id"], first["id"])
+        self.assertNotIn("angle_id", first)
+        self.assertNotIn("angle_id", second)
+        self.assertEqual(first["tile_layouts"][0]["range"], {"from": "0", "to": "1"})
+        self.assertEqual(second["tile_layouts"][0]["range"], {"from": "1", "to": "2"})
+        self.assertEqual([row["occurrence_id"] for row in result["analysis_annotations"]["pause_reviews"]],
+                         ["group/" + first["id"], "group/" + second["id"]])
+
+        del document["assembly"]
+        for row in document["analysis_annotations"]["pause_reviews"]:
+            row["occurrence_id"] = "whole-group"
+        source.write_text(json.dumps(document))
+        result = edit(source, "authored-append.cut", [{"action": "append", "from": "0", "to": "1"}])
+        first, second = result["assembly"]
+        self.assertNotIn("id", second)
+        self.assertEqual([row["occurrence_id"] for row in result["analysis_annotations"]["pause_reviews"]],
+                         ["group/" + first["id"], "group/" + first["id"]])
+
+    def test_resolve_edit_request_rejects_render_only_camera_copy_option(self):
+        output = "render-only-option.fcpxml"
+        error = self.failure("project", "resolve", "export", "--stdin", "--json",
+                             request={"output": output, "file": "x.mp4", "clips": [{}], "require_camera_copy": True})
+        self.assertEqual(error["code"], "invalid_arguments")
+        self.assertFalse((self.root / output).exists())
+
     def test_parent_reference_through_a_missing_folder_is_rejected(self):
         before = set(self.root.iterdir())
         for dry_run in ([], ["--dry-run"]):
@@ -185,15 +239,10 @@ class CLIAuditFixes(unittest.TestCase):
                 self.assertEqual((error["code"], error["message"]),
                                  ("invalid_json", f"{location} has an unknown field 'x'."))
 
-    def test_standard_input_is_limited_to_64_megabytes(self):
-        limit = 64 * 1024 * 1024
-        for verb in ("export clips join", "export ranges separate"):
-            with self.subTest(verb=verb):
-                error = self.failure(*verb.split(), "--json", "--stdin", "--dry-run", request=b" " * (limit + 1))
-                self.assertEqual(error["code"], "invalid_json")
-                self.assertIn("64 MB", error["message"])
+    def test_standard_input_accepts_requests_above_64_megabytes(self):
         request = json.dumps({"output": "o.mp4", "clips": [{"file": "x.mp4"}]}).encode()
-        self.report("export", "clips", "join", "--json", "--stdin", "--dry-run", request=request.rjust(limit))
+        self.report("export", "clips", "join", "--json", "--stdin", "--dry-run",
+                    request=request.rjust((64 << 20) + 1))
 
     def test_large_inspection_reports_preserve_order_and_half_open_windows(self):
         # Both the frame and packet reply exceed the in-memory buffer.

@@ -23,10 +23,6 @@ public struct StillTimelineFormat: Codable, Hashable, Sendable {
         }
     }
 
-    var requiresExtendedStillSchema: Bool {
-        codec == .jpeg || !["mov", "mp4"].contains(container)
-    }
-
     public func validate() throws {
         guard (2...8192).contains(width), (2...8192).contains(height),
               width.isMultiple(of: 2), height.isMultiple(of: 2), width * height <= 16_777_216 else {

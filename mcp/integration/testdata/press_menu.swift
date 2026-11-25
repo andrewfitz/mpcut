@@ -15,7 +15,6 @@ func children(_ item: AXUIElement) -> [AXUIElement] {
 guard CommandLine.arguments.count == 3, let pid = Int32(CommandLine.arguments[1]) else { exit(2) }
 guard AXIsProcessTrusted() else { exit(77) }
 
-_ = NSRunningApplication(processIdentifier: pid)?.activate(options: [])
 let title = CommandLine.arguments[2]
 let app = AXUIElementCreateApplication(pid)
 func control(_ item: AXUIElement, named name: String) -> AXUIElement? {
@@ -30,7 +29,29 @@ func control(_ item: AXUIElement, named name: String) -> AXUIElement? {
     return rows.lazy.compactMap { control($0, named: name) }.first
 }
 
+/// The Settings sidebar row for the Automation page, which holds "Enable local MCP control".
+func automationPage(_ item: AXUIElement) -> AXUIElement? {
+    if get(item, "AXIdentifier") as? String == "settings.page.automation" { return item }
+    if get(item, kAXRoleAttribute) as? String == kAXRowRole,
+       children(item).flatMap({ [$0] + children($0) }).contains(where: {
+           get($0, kAXValueAttribute) as? String == "Automation" || get($0, kAXTitleAttribute) as? String == "Automation"
+       }) {
+        return item
+    }
+    return children(item).lazy.compactMap(automationPage).first
+}
+
+func select(_ page: AXUIElement) {
+    var row: AXUIElement? = page
+    while let current = row, get(current, kAXRoleAttribute) as? String != kAXRowRole {
+        row = get(current, kAXParentAttribute).map { $0 as! AXUIElement }
+    }
+    if let row, AXUIElementSetAttributeValue(row, kAXSelectedAttribute as CFString, kCFBooleanTrue) == .success { return }
+    _ = AXUIElementPerformAction(page, kAXPressAction as CFString)
+}
+
 var nextSettingsRequest = Date.distantPast
+var nextPageRequest = Date.distantPast
 let deadline = Date().addingTimeInterval(15)
 while Date() < deadline {
     if let raw = get(app, kAXMenuBarAttribute), CFGetTypeID(raw) == AXUIElementGetTypeID() {
@@ -39,12 +60,15 @@ while Date() < deadline {
             let windows = get(app, kAXWindowsAttribute) as? [AXUIElement] ?? []
             if let toggle = windows.lazy.compactMap({ control($0, named: "Enable local MCP control") }).first {
                 if AXUIElementPerformAction(toggle, kAXPressAction as CFString) == .success { exit(0) }
+            } else if Date() >= nextPageRequest, let page = windows.lazy.compactMap(automationPage).first {
+                // Settings reopens its last page; the switch is on Automation.
+                select(page)
+                nextPageRequest = Date().addingTimeInterval(1)
             } else if Date() >= nextSettingsRequest,
                       let entry = children(bar).flatMap(children).flatMap(children).first(where: {
                           (get($0, kAXTitleAttribute) as? String)?.hasPrefix("Settings") == true &&
                           get($0, kAXEnabledAttribute) as? Bool == true
                       }) {
-                _ = NSRunningApplication(processIdentifier: pid)?.activate(options: [])
                 _ = AXUIElementPerformAction(entry, kAXPressAction as CFString)
                 nextSettingsRequest = Date().addingTimeInterval(1)
             }

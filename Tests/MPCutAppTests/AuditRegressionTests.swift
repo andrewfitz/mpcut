@@ -13,7 +13,7 @@ final class AuditRegressionTests: XCTestCase {
         XCTAssertTrue(isCutDocument(folder.appendingPathComponent("Interview.CUT")))
         XCTAssertFalse(isCutDocument(folder.appendingPathComponent("Interview.json")))
         XCTAssertFalse(isCutDocument(folder.appendingPathComponent("Interview.mov")))
-        XCTAssertFalse(isCutDocument(folder.appendingPathComponent("Interview.mov.cutdb")))
+        XCTAssertFalse(isCutDocument(folder.appendingPathComponent("Interview.mov.cutcache")))
     }
 
     @MainActor

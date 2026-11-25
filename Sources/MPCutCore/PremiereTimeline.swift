@@ -360,7 +360,7 @@ extension PremiereTimeline {
         let data: Data
         do { data = try ProjectFile.readBytes(from: xml) }
         catch { throw issue(error.localizedDescription) }
-        guard data.count <= MulticamProject.maximumFileSize else { throw issue("Premiere sequence description exceeds the project size limit.") }
+        guard data.count <= (64 << 20) else { throw issue("Premiere sequence description exceeds the interchange size limit.") }
         guard let text = String(data: data, encoding: .utf8), !text.contains("\0"), !text.contains("<!ENTITY"),
               !text.contains("<!DOCTYPE") || text.range(of: #"<!DOCTYPE(?!\s+xmeml\s*>)"#, options: .regularExpression) == nil else {
             throw issue("Expected UTF-8 Premiere sequence XML without entity declarations or external DTDs.")

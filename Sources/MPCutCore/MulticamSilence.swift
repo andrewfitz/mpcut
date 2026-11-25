@@ -70,6 +70,13 @@ package struct MulticamSilenceRoute {
         self.laneID = laneID
     }
 
+    package func roomTonePeak(in span: AudioSpan, waveform: AudioWaveform) -> Float? {
+        guard let overlap = MulticamSilencePlanner.intersection(span, MulticamSilencePlanner.span(group)),
+              let from = try? overlap.from.subtracting(offset),
+              let to = try? overlap.to.subtracting(offset) else { return nil }
+        return waveform.peak(from: from.seconds, to: to.seconds)
+    }
+
     package func project(_ time: RationalTime) -> RationalTime? { try? time.adding(offset) }
 }
 
@@ -152,6 +159,8 @@ package enum MulticamSilencePlanner {
                              occurrenceScopes: [AudioSpan?]? = nil,
                              assemblyIndices: [Int]? = nil,
                              retainedSeconds: [MulticamPauseEdit.ID: Double] = [:],
+                             reviewed: [Int: Set<AudioSpan>] = [:],
+                             protectedByOccurrence: [Int: Set<AudioSpan>] = [:],
                              mapping: MulticamPlan? = nil,
                              analysisRouting: [Int: MulticamSilenceRouting]? = nil,
                              requireCopySound: Bool = true,
@@ -163,9 +172,10 @@ package enum MulticamSilencePlanner {
         return plan(project: project, media: media, ranges: ranges, scope: scope, minimum: minimum,
                     padding: padding, protected: protected, keyframesOnly: keyframesOnly, container: container,
                     occurrenceScopes: occurrenceScopes, assemblyIndices: assemblyIndices, mapping: mapping,
-                    audioRouting: routing, requireCopySound: requireCopySound,
+                    audioRouting: routing, protectedByOccurrence: protectedByOccurrence, requireCopySound: requireCopySound,
                     requestedRetainedSeconds: requestedRetainedSeconds ?? { retainedSeconds[$0] }) { occurrence in
-            routing[occurrence]?.pauses(silences: silences, maxBlip: maxBlip) ?? []
+            ProjectPauseReview.preserving(reviewed[occurrence] ?? [],
+                in: routing[occurrence]?.pauses(silences: silences, maxBlip: maxBlip) ?? [])
         }
     }
 
@@ -175,6 +185,7 @@ package enum MulticamSilencePlanner {
                              occurrenceScopes: [AudioSpan?]? = nil, assemblyIndices: [Int]? = nil,
                              mapping: MulticamPlan,
                              audioRouting: [Int: MulticamSilenceRouting],
+                             protectedByOccurrence: [Int: Set<AudioSpan>] = [:],
                              requireCopySound: Bool = true,
                              requestedRetainedSeconds: (MulticamPauseEdit.ID) -> Double? = { _ in nil },
                              pausesForOccurrence: (Int) -> [AudioSpan])
@@ -202,7 +213,7 @@ package enum MulticamSilencePlanner {
                       let duration = try? visible.to.subtracting(visible.from),
                       duration.seconds >= minimum else { return nil }
                 let requested = requestedRetainedSeconds(.init(occurrence: occurrence, span: pause))
-                let keep = protected.contains { intersection($0, pause) != nil }
+                let keep = protected.contains { intersection($0, pause) != nil } || protectedByOccurrence[occurrence]?.contains(pause) == true
                 var removal: AudioSpan?
                 if !keep {
                     let edges = pictureEdges(in: visible, intervals: intervals,
@@ -307,13 +318,6 @@ package enum MulticamSilencePlanner {
         // exporter handles the remaining outer edges (e.g. a complete file).
         return (try? MulticamEngine().checkSoundBoundary(input: input, output: output, media: media, start: start,
                                                         first: false, last: false, container: container, segment: 1)) != nil
-    }
-
-    package static func savedThreshold(for media: MediaInfo, stream: Int,
-                                       cancelled: () -> Bool) -> Double? {
-        AnalysisSidecar(media: media).read(AnalysisSidecar.silenceThresholdOverridesKey, cancelled: cancelled)
-            .flatMap { try? JSONDecoder().decode([Int: Double].self, from: $0)[stream] }
-            .flatMap { (-120...0).contains($0) ? $0 : nil }
     }
 
     package static func routing(plan: MulticamPlan?, project: MulticamProject, media: [String: MediaInfo],

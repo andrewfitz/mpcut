@@ -55,6 +55,18 @@ public struct TranscriptWordSelection: Codable, Sendable {
         self.attachmentID = attachmentID
     }
 
+    package func attachmentOwner(in attachmentIDs: [String]) throws -> String? {
+        let endpointOwners = [firstOccurrenceID, lastOccurrenceID].compactMap { occurrence in
+            occurrence.flatMap { address in attachmentIDs.first { address.hasPrefix("\($0.count):\($0):") } }
+        }
+        let owners = Set(endpointOwners + [attachmentID].compactMap { $0 })
+        guard owners.count <= 1 else {
+            throw transcriptEditError("Both selection endpoints must name the same transcript attachment.",
+                                      code: "invalid_transcript_selection")
+        }
+        return owners.first
+    }
+
     public init(from decoder: Decoder) throws {
         try ProjectField.rejectUnknown(CodingKeys.self, in: decoder, code: "invalid_transcript_request")
         let fields = try decoder.container(keyedBy: CodingKeys.self)

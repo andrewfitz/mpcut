@@ -118,7 +118,7 @@ extension ReencodeEngine {
         }
         for (file, identity) in plan.edit.identities { try verifyIdentity(file, identity) }
         try checkCancellation()
-        let failure = publishExclusively(from: partial, to: destination)
+        let failure = try MediaExportPublication.publish(from: partial, to: destination)
         guard failure == 0 else {
             if failure == EEXIST { throw CutError(code: "output_exists", message: "A file already exists at the destination.") }
             throw CutError(code: "write_failed", message: String(cString: strerror(failure)))
@@ -509,9 +509,9 @@ extension ReencodeEngine {
     /// Nil when the plan has none, which leaves the helper's arguments as they are for a source without chapters.
     private func chapterArguments(_ plan: ReencodePlan, in staging: URL, inputIndex: Int, inputs: inout [String]) throws -> [String]? {
         guard !plan.chapters.isEmpty else { return nil }
+        let metadata = try ReencodeChapter.metadata(plan.chapters)
         do {
-            try ReencodeChapter.metadata(plan.chapters).write(to: staging.appendingPathComponent("chapters.ffmeta"),
-                                                              atomically: true, encoding: .utf8)
+            try metadata.write(to: staging.appendingPathComponent("chapters.ffmeta"), atomically: true, encoding: .utf8)
         } catch {
             throw CutError(code: "write_failed", message: error.localizedDescription)
         }

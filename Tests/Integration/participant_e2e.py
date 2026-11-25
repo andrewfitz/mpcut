@@ -139,7 +139,7 @@ class ParticipantFixtureCase(unittest.TestCase):
         base = self.folder / f"{name}.cut"
         payload = {
             "format": "mpcut",
-            "schema_version": 4,
+            "schema_version": 9,
             "kind": "multicam",
             "reference_angle_id": "gallery",
             "group_range": interval(0, 5),
@@ -258,7 +258,7 @@ class ParticipantE2E(ParticipantFixtureCase):
         os.link(self.gallery, alias)
         document = self.folder / "sequence.cut"
         document.write_text(json.dumps({
-            "format": "mpcut", "schema_version": 4, "kind": "sequence",
+            "format": "mpcut", "schema_version": 9, "kind": "sequence",
             "clips": [{"id": "gallery", "file": str(self.gallery), "from": "0", "to": "5"}],
             "participants": {
                 "people": [{"id": "host", "name": "Host",
@@ -363,7 +363,7 @@ class ParticipantE2E(ParticipantFixtureCase):
         self.assertEqual([rational(item["timestamp"]) for item in analysis["observations"]],
                          [Fraction(index, FPS) for index in range(FRAME_COUNT)])
         self.assertEqual({item["backend"] for item in analysis["diagnostics"]}, {"cpu"})
-        self.assertFalse(self.gallery.with_name("gallery.mov.cutdb").exists())
+        self.assertFalse(self.gallery.with_name("gallery.mov.cutcache").exists())
 
         scan = self.folder / "gallery-scan.json"
         scan.write_text(json.dumps(report))
@@ -512,7 +512,7 @@ class ParticipantE2E(ParticipantFixtureCase):
         guest = generate_camera(self.folder / "guest.mov", GUEST, 2)
         project = self.folder / "cameras.cut"
         project.write_text(json.dumps({
-            "format": "mpcut", "schema_version": 4, "kind": "multicam",
+            "format": "mpcut", "schema_version": 9, "kind": "multicam",
             "reference_angle_id": "host-camera", "group_range": interval(0, 5),
             "angles": [{"id": "host-camera", "file": str(host)},
                        {"id": "guest-camera", "file": str(guest), "offset": "1",
@@ -589,7 +589,7 @@ class ParticipantE2E(ParticipantFixtureCase):
         participants["people"][1].pop("audio")
         sequence = self.folder / "clip-layout.cut"
         sequence.write_text(json.dumps({
-            "format": "mpcut", "schema_version": 4, "kind": "sequence",
+            "format": "mpcut", "schema_version": 9, "kind": "sequence",
             "clips": [{"id": "first", "file": str(self.gallery), **interval(0, 2)},
                       {"id": "second", "file": str(self.gallery), **interval(0, 2)}],
             "participants": participants,
@@ -662,7 +662,7 @@ class ParticipantE2E(ParticipantFixtureCase):
         participants = self.cli("participants", "project", "inspect", "--project", str(multicam))
         participants["sources"][0]["source_id"] = str(self.gallery)
         participants["people"][1].pop("audio")
-        sequence.write_text(json.dumps({"format": "mpcut", "schema_version": 4, "kind": "sequence",
+        sequence.write_text(json.dumps({"format": "mpcut", "schema_version": 9, "kind": "sequence",
                                         "clips": [{"id": "gallery", "file": str(self.gallery), **interval(0, 5)}],
                                         "participants": participants}))
         for project in (multicam, sequence):

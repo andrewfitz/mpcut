@@ -337,7 +337,7 @@ class TilesE2E(ParticipantFixtureCase):
         span = interval(0, 1)
         source = str(recording)
         project = self.folder / "edit.cut"
-        payload = {"format": "mpcut", "schema_version": 4, "kind": "sequence",
+        payload = {"format": "mpcut", "schema_version": 9, "kind": "sequence",
                    "clips": [{"id": "clip", "file": source, **span}],
                    "participants": {"people": [{"id": "host", "name": "Host"}], "sources": [
                        {"source_id": source, "appearances": [{"id": "main", "participant_id": "host",
@@ -464,7 +464,7 @@ class TilesE2E(ParticipantFixtureCase):
         ffmpeg("-f", "rawvideo", "-pixel_format", "rgb24", "-video_size", f"{WIDTH}x{HEIGHT}",
                "-framerate", str(FPS), "-i", "-", *PRORES, recording, input=bytes(raw))
         base = self.folder / "sequence.cut"
-        base.write_text(json.dumps({"format": "mpcut", "schema_version": 4, "kind": "sequence",
+        base.write_text(json.dumps({"format": "mpcut", "schema_version": 9, "kind": "sequence",
                                    "clips": [{"id": "gallery", "file": str(recording), **interval(0, 2)}]}))
         project = self.folder / "reviewed.cut"
         self.cli("participants", "project", "apply", request={
@@ -634,14 +634,40 @@ class TilesE2E(ParticipantFixtureCase):
         self.assertEqual([(rational(proposal["at"]), proposal["angle_id"]) for proposal in proposals],
                          [(0, angles["Host"]), (1, angles["Guest"])])
         self.assertTrue(all(proposal["project_revision"] == result["project_revision"] for proposal in proposals))
-        cuts = [{"action": "switch_set", "at": str(rational(cut["at"])), "angle_id": cut["angle_id"]}
-                for cut in proposals]
-        cuts[0]["project_revision"] = result["project_revision"]
+        revision = result["project_revision"]
+        cuts = [{"action": "switch_set", "at": str(rational(cut["at"])), "angle_id": cut["angle_id"],
+                 "project_revision": revision} for cut in proposals]
         switched = self.folder / "switched.cut"
-        self.cli("project", "edit", request={
+        request = {
             "project_path": str(converted), "out_project": str(switched),
-            "operations": cuts,
+            "project_revision": revision, "operations": cuts,
+        }
+        stale = self.cli("project", "edit", request={**request, "project_revision": "stale"}, ok=False)
+        self.assertEqual(stale["error"]["code"], "stale_tile_switch")
+        self.assertFalse(switched.exists())
+        wrong_row = [cuts[0], {**cuts[1], "project_revision": "stale"}]
+        stale = self.cli("project", "edit", request={**request, "operations": wrong_row}, ok=False)
+        self.assertEqual(stale["error"]["code"], "stale_tile_switch")
+        self.assertFalse(switched.exists())
+        self.cli("project", "edit", request=request)
+
+        voice = proposals[0]["voice"]
+        linked = self.folder / "linked.cut"
+        self.cli("project", "edit", request={
+            "project_path": str(converted), "out_project": str(linked),
+            "operations": [{"action": "voice_angle_set", **voice, "angle_id": angles["Guest"]}],
         })
+        self.assertEqual(read_project(linked)["speaker_angles"], [{"voice": voice, "angle_id": angles["Guest"]}])
+        linked_result = self.tiles("switches", "propose", linked, "--attachment-id", attachment["id"],
+                                   "--minimum-hold", "1/2")
+        self.assertEqual(next(link for link in linked_result["links"] if link["voice"] == voice)["angle_id"],
+                         angles["Guest"])
+        cleared = self.folder / "cleared.cut"
+        self.cli("project", "edit", request={
+            "project_path": str(linked), "out_project": str(cleared),
+            "operations": [{"action": "voice_angle_clear", **voice}],
+        })
+        self.assertNotIn("speaker_angles", read_project(cleared))
         self.assertEqual(set(self.folder.rglob("*.mov")), existing_movies)
         output = self.folder / "edit.mov"
         render = ("export", "project", "render", "--project", str(switched), "--output", str(output))

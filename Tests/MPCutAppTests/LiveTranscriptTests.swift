@@ -66,7 +66,7 @@ final class LiveTranscriptTests: XCTestCase {
         ])
         let digest = String(repeating: "a", count: 64)
         let attachment = TranscriptAttachment(id: "dialogue",
-            asset: .init(file: "project.cut.transcripts/\(digest).json", sha256: digest),
+            asset: .init(sha256: digest),
             bindings: [.init(trackID: track.id, file: "recording.mov", streamIndex: 1)])
         let project = CutProject.sequence([.init(id: "clip", file: "recording.mov", from: .zero, to: t(5))])
         let index = try TranscriptIndex(document: document, attachment: attachment, project: project)
@@ -162,6 +162,32 @@ final class LiveTranscriptTests: XCTestCase {
     }
 
     @MainActor
+    func testSavedJobsWithIdenticalSessionFingerprintsUseTheAttachmentsOrigin() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("Recording.wav")
+        try writeSourceAudio(to: source)
+        var store = TranscriptJobStore(directory: directory.appendingPathComponent("Jobs"))
+        store.stagesAudioForStandaloneProvider = false
+        var original = try store.prepare(media: source, documentID: source.path)
+        var replacement = original
+        replacement.id = UUID()
+        original.attached = true
+        replacement.attached = true
+        let fingerprint = try XCTUnwrap(replacement.sessions.first?.fingerprint)
+        let result = TranscriptDocument(clock: .session, jobID: replacement.id.uuidString, fingerprint: fingerprint)
+        let asset = try TranscriptStore.put(result)
+        let attachment = TranscriptAttachment(id: "recording", asset: asset, bindings: [], fingerprint: fingerprint)
+        let session = ProjectSession(id: UUID(), preferences: EditorPreferences())
+        defer { session.end() }
+        try session.editor.setTranscriptState(.init(attachments: [attachment]))
+
+        XCTAssertFalse(session.transcript.isAttached(original))
+        XCTAssertTrue(session.transcript.isAttached(replacement))
+    }
+
+    @MainActor
     func testImportNamingAnAttachmentReplacesItsResultAndKeepsItsBinding() async throws {
         _ = NSApplication.shared
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -192,7 +218,16 @@ final class LiveTranscriptTests: XCTestCase {
         let bound = try XCTUnwrap(controller.state.attachments.first)
 
         // A corrected caption file supersedes the result under the same attachment.
-        try Data("1\n00:00:00,030 --> 00:00:00,060\nA corrected line\n".utf8).write(to: captions, options: .atomic)
+        try Data("""
+        1
+        00:00:00,030 --> 00:00:00,060
+        A corrected line
+
+        2
+        00:00:00,120 --> 00:00:00,150
+        Another line
+
+        """.utf8).write(to: captions, options: .atomic)
         let replaced = try controller.importTranscript(captions, format: .srt, replacing: first.id)
         XCTAssertEqual(controller.state.attachments.count, 1)
         XCTAssertEqual(replaced.id, first.id)
@@ -213,6 +248,32 @@ final class LiveTranscriptTests: XCTestCase {
                                                         session: session, checkAccess: {})
         let selection = resolved?["selection"] as? [String: Any]
         XCTAssertEqual(selection?["attachment_id"] as? String, second.id)
+        let address: [String: Any] = ["first_word_id": word.wordID, "first_occurrence_id": word.id]
+        let edit: [String: Any] = ["action": "queue", "selections": [address], "boundary_policy": "exact"]
+        let plan = try await registry.mcpTranscript(tool: "transcript_editor_edit_plan", arguments: ["edit": edit],
+                                                    session: session, checkAccess: {})
+        XCTAssertEqual(plan?["result_id"] as? String, second.resultID)
+        let selections = plan?["selections"] as? [[String: Any]]
+        XCTAssertEqual(selections?.first?["attachment_id"] as? String, second.id)
+        do {
+            _ = try await registry.mcpTranscript(tool: "transcript_editor_edit_plan",
+                                                 arguments: ["edit": edit, "attachment_id": first.id],
+                                                 session: session, checkAccess: {})
+            XCTFail("A plan must reject a selection outside the pinned attachment.")
+        } catch let error as MCPCommandError {
+            XCTAssertEqual(error.code, "stale_transcript_plan")
+        }
+        let sourceWords = try controller.index(attachmentID: second.id).readAll(space: .source,
+                                                                                filter: .init(includeInferred: true))
+        XCTAssertEqual(sourceWords.count, 2)
+        let endpoints = (try XCTUnwrap(sourceWords.first), try XCTUnwrap(sourceWords.last))
+        let padding = RationalTime(numerator: 1, denominator: 100)
+        let gap = TranscriptWordSelection(firstWordID: endpoints.0.wordID, lastWordID: endpoints.1.wordID, space: .source,
+                                           firstOccurrenceID: endpoints.0.id, lastOccurrenceID: endpoints.1.id, kind: .gap,
+                                           leadingPadding: padding, trailingPadding: padding)
+        let marked = try controller.mark(gap)
+        XCTAssertEqual(editor.markIn, marked.range.from.seconds)
+        XCTAssertEqual(editor.markOut, marked.range.to.seconds)
         var pinned = request
         pinned["attachment_id"] = first.id
         do {
@@ -306,7 +367,7 @@ final class LiveTranscriptTests: XCTestCase {
     }
 
     @MainActor
-    func testStagedImportPreservesReviewedDocumentAndRejectsModifiedAsset() async throws {
+    func testStagedImportPreservesReviewedDocumentWhenImportFileChanges() async throws {
         _ = NSApplication.shared
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -345,14 +406,9 @@ final class LiveTranscriptTests: XCTestCase {
         XCTAssertEqual(reviewedIndex.search("a sample line", space: .currentCut).total, 1)
         XCTAssertEqual(reviewedIndex.search("replacement file", space: .currentCut).total, 0)
         XCTAssertEqual(try controller.document(attachmentID: reviewedAttachment.id), reviewedDocument)
-        let assetURL = try XCTUnwrap(TranscriptStore.assetLocation(reviewedAttachment.asset, relativeTo: controller.assetContext()))
-        try Data("changed".utf8).write(to: assetURL, options: .atomic)
-        do {
-            _ = try await controller.indexedTranscript(attachmentID: reviewedAttachment.id)
-            XCTFail("A warm index must not hide a modified asset.")
-        } catch {
-            XCTAssertEqual((error as? CutError)?.code, "damaged_transcript")
-        }
+        try FileManager.default.removeItem(at: captions)
+        let restored = try await controller.indexedTranscript(attachmentID: reviewedAttachment.id)
+        XCTAssertEqual(restored.search("a sample line", space: .currentCut).total, 1)
     }
 
     private func writeSourceAudio(to url: URL) throws {

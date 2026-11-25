@@ -62,7 +62,7 @@ final class SidecarConcurrentReadTests: XCTestCase {
         XCTAssertEqual(sidecar.read("a"), Data([1]))
         XCTAssertThrowsError(try sidecar.save(["b": Data()]))
         sidecar.saveAutomatically(["b": Data()])
-        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path).sorted(), ["shot.mov", "shot.mov.cutdb"])
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path).sorted(), ["shot.mov", "shot.mov.cutcache"])
     }
 
     func testSectionReadObservesCancellationBeforeReturning() throws {
@@ -97,7 +97,7 @@ final class SidecarConcurrentReadTests: XCTestCase {
         }
         XCTAssertEqual(try Data(contentsOf: sidecar.url), original)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: source.deletingLastPathComponent().path).sorted(),
-                       ["shot.mov", "shot.mov.cutdb"])
+                       ["shot.mov", "shot.mov.cutcache"])
     }
 
     func testMetadataSaveSucceedsWhileSceneReportIsRead() throws {
@@ -115,13 +115,13 @@ final class SidecarConcurrentReadTests: XCTestCase {
         var failure: Error?
         DispatchQueue.global(qos: .utility).async(group: group) {
             do {
-                try AnalysisSidecar(media: source).save([:], updating: [AnalysisSidecar.viewNameSectionKey: { _ in Data("{}".utf8) }])
+                try AnalysisSidecar(media: source).save([:], updating: ["updated.analysis": { _ in Data("{}".utf8) }])
             } catch { lock.withLock { failure = error } }
         }
         for _ in 0..<3 { _ = sidecar.sceneReport(for: source) }
         group.wait()
         XCTAssertNil(lock.withLock { failure }.map { "\($0)" })
-        XCTAssertEqual(sidecar.read(AnalysisSidecar.viewNameSectionKey), Data("{}".utf8))
+        XCTAssertEqual(sidecar.read("updated.analysis"), Data("{}".utf8))
     }
 
     func testSceneScanHonorsSwiftTaskCancellationByDefault() async throws {

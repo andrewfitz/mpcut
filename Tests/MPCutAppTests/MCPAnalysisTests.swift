@@ -312,12 +312,32 @@ final class MCPAnalysisTests: XCTestCase {
         let listed = try await call("scenes_editor_boundaries_list", ["source_id": source, "limit": 1])
         let first = try XCTUnwrap((listed["items"] as? [[String: Any]])?.first)
         let view = try XCTUnwrap(first["view"] as? Int)
-        _ = try await call("scenes_view_rename", ["source_id": source, "view": view, "name": "  Wide shot  "])
+        let scopedID = try XCTUnwrap(clipScenes["report_id"] as? String)
+        let sourceID = try XCTUnwrap(listed["report_id"] as? String)
+        XCTAssertNotEqual(scopedID, sourceID)
+        let fields: [String: Any] = ["project_handle": "fixture", "expected_revision": 1, "operation_id": UUID().uuidString,
+                                     "source_id": source, "view": view, "name": "Wrong"]
+        let schemas = try MCPSchemas.loaded.get()
+        XCTAssertThrowsError(try schemas.validate(tool: "scenes_view_rename", arguments: fields))
+        XCTAssertNoThrow(try schemas.validate(tool: "scenes_view_rename", arguments: fields.merging(["report_id": sourceID]) { _, new in new }))
+        do {
+            _ = try await call("scenes_view_rename", ["source_id": source, "view": view, "report_id": scopedID, "name": "Wrong"])
+            XCTFail("A scoped report cannot identify a full-source view")
+        } catch let issue as MCPCommandError {
+            XCTAssertEqual(issue.code, "stale_scene_report")
+        }
+        _ = try await call("scenes_view_rename", ["source_id": source, "view": view, "report_id": sourceID, "name": "  Wide shot  "])
         let saved = try await waitForJob(call("analysis_editor_sidecars_save"))
         XCTAssertEqual(saved["status"] as? String, "succeeded")
         XCTAssertEqual(saved["outputs"] as? [String], [AnalysisSidecar.url(for: copy).path])
-        let reopened = try XCTUnwrap(AnalysisSidecar(media: media.value).sceneReport(for: media.value))
-        XCTAssertEqual(reopened.views.first { $0.view == view }?.name, "Wide shot")
+        let cached = try XCTUnwrap(AnalysisSidecar(media: media.value).sceneReport(for: media.value))
+        XCTAssertNil(cached.views.first { $0.view == view }?.name)
+        let document = folder.appendingPathComponent("review.cut")
+        XCTAssertTrue(project.editor.saveProject(to: document))
+        let reopened = try CutProject.load(from: document).withAbsoluteMediaPaths(relativeTo: document)
+        let reviewed = try XCTUnwrap(reopened.analysisAnnotations.scene(for: media.value))
+        XCTAssertEqual(reviewed.views.first { $0.view == view }?.name, "Wide shot")
+        XCTAssertEqual(reviewed.scenes, cached.scenes)
 
         let unchanged = try await waitForJob(call("project_editor_media_refresh"))
         XCTAssertEqual(unchanged["status"] as? String, "succeeded")
@@ -390,6 +410,9 @@ final class MCPAnalysisTests: XCTestCase {
         let kept = try await call("silence_editor_pause_review", ["pause": id, "action": "protect"])
         XCTAssertEqual(kept["review_open"] as? Bool, false)
         XCTAssertEqual(model.multicamPausePlan.filter(\.isProtected).map(\.id.occurrence), [0, 1])
+        let protectedRevision = project.mcpRevision
+        _ = try await call("silence_editor_pause_review", ["pause": id, "action": "protect"])
+        XCTAssertEqual(project.mcpRevision, protectedRevision)
         _ = try await call("silence_editor_pause_review", ["pause": id, "action": "unprotect"])
 
         guard let duration = try? whole.to.subtracting(whole.from) else { return XCTFail("Invalid fixture range") }
@@ -415,6 +438,55 @@ final class MCPAnalysisTests: XCTestCase {
         XCTAssertNil(model.analysis.pauseThreshold)
         XCTAssertNotNil(model.analysis.threshold(for: .init(source: "wide", stream: first)))
         XCTAssertNotNil(model.analysis.threshold(for: .init(source: "wide", stream: second)))
+    }
+
+    func testMulticamPausePreviewStaysOpenWhenProtectionCannotVerifySource() async throws {
+        let prefs = EditorPreferences()
+        prefs.useAnalysisSidecars = false
+        prefs.minimumPause = 0.4
+        prefs.padding = 0.05
+        let sessions = ProjectSessions(preferences: prefs)
+        let project = ProjectSession(id: UUID(), preferences: prefs)
+        project.isMulticam = true
+        let model = project.multicam
+        defer { model.reset() }
+        let fixture = try XCTUnwrap(Bundle.module.url(forResource: "Pause-Quiet", withExtension: "mov", subdirectory: "Fixtures"))
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent(fixture.lastPathComponent)
+        try FileManager.default.copyItem(at: fixture, to: url)
+        let media = try CutEngine(useSidecar: false).inspectMulticamSource(url)
+        let stream = try XCTUnwrap(media.audio.first?.stream.index)
+        let camera = MulticamEditorModel.SourceDraft(source: .init(id: "wide", file: url.path, audioStream: stream), media: media)
+        model.confirmSetup(drafts: [camera], opening: "wide", audio: .follow)
+        func call(_ name: String, _ args: [String: Any] = [:]) async throws -> [String: Any] {
+            let result = try await sessions.mcpAnalysis(tool: name, arguments: args, session: project) {}
+            return try XCTUnwrap(result)
+        }
+        _ = try await call("silence_editor_threshold_set", ["silence_threshold_db": -45])
+        let started = try await call("silence_editor_scan")
+        let receipt = try sessions.mcpAnalysisJobs.lookup(started["job_id"] as? String, session: project)
+        let deadline = ContinuousClock.now + .seconds(15)
+        while receipt.state == "running" && ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertEqual(receipt.state, "succeeded")
+        let listed = try await call("silence_editor_pauses_list")
+        let rows = try XCTUnwrap(listed["items"] as? [[String: Any]])
+        let row = try XCTUnwrap(rows.first { $0["removal"] is [String: Any] })
+        let id = try XCTUnwrap(row["id"] as? String)
+        let opened = try await call("silence_editor_pause_review", ["pause": id, "action": "preview"])
+        XCTAssertEqual(opened["review_open"] as? Bool, true)
+        let revision = project.mcpRevision
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1)], ofItemAtPath: url.path)
+        do {
+            _ = try await call("silence_editor_pause_review", ["pause": id, "action": "protect"])
+            XCTFail("Protection requires matching source evidence")
+        } catch let error as MCPCommandError {
+            XCTAssertTrue(error.localizedDescription.contains("could not be protected"), error.localizedDescription)
+        }
+        XCTAssertNotNil(model.pauseEdits.review)
+        XCTAssertEqual(project.mcpRevision, revision)
+        XCTAssertTrue(try XCTUnwrap(model.project).analysisAnnotations.pauseReviews.isEmpty)
     }
 
     func testRevocationPrecedesAnalysis() async {

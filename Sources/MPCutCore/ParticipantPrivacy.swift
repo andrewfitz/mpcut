@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 
 /// An explicit review of this feed over a half-open interval of the accepted recording.
-public struct ParticipantPrivacyConfirmation: Codable, Equatable, Sendable {
+public struct ParticipantPrivacyConfirmation: Codable, Hashable, Sendable {
     public let participantID: String
     public let range: MulticamRange
     let analysisIdentity: String?

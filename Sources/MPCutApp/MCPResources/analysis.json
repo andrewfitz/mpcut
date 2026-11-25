@@ -350,7 +350,7 @@
   },
   {
     "name": "scenes_view_rename",
-    "description": "Set the name for every matching view in an analyzed source. An empty name restores the default.",
+    "description": "Set the name for every matching view in a full-source analysis. Supply the report_id from the source boundaries to guard the reviewed view. An empty name restores the default.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -367,6 +367,11 @@
         "source_id": {
           "type": "string"
         },
+        "report_id": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$",
+          "description": "Report ID returned by scenes_editor_boundaries_list with source_id."
+        },
         "view": {
           "type": "integer",
           "minimum": 1
@@ -379,6 +384,7 @@
       "required": [
         "project_handle",
         "source_id",
+        "report_id",
         "view",
         "name",
         "expected_revision",

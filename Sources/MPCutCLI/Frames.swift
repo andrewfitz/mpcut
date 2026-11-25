@@ -8,6 +8,7 @@ struct FrameExportOptions {
     }
     let source: Source
     let output: String
+    let mcpImage: Bool
     let preset: JPEGPreset
     let format: FrameImageFormat
 
@@ -21,6 +22,7 @@ struct FrameExportOptions {
         var iterator = arguments.makeIterator()
         var seen = Set<String>()
         var positional = false
+        var mcpImage = false
         func invalid(_ text: String) -> CLIError { CLIError("invalid_arguments", text) }
         func value(_ flag: String) throws -> String {
             guard let next = iterator.next(), !next.isEmpty, !next.hasPrefix("--") else { throw invalid("Missing value for \(flag).") }
@@ -36,6 +38,7 @@ struct FrameExportOptions {
             switch flag {
             case "--": positional = true
             case "--json": break
+            case "--mcp-image": mcpImage = true
             case "--output": output = try value(flag)
             case "--project": project = try value(flag)
             case "--clock":
@@ -79,10 +82,20 @@ struct FrameExportOptions {
             default: throw invalid("Unknown frames option '\(flag)'.")
             }
         }
+        if mcpImage {
+            guard output == nil, times.count == 1, times[0] >= .zero, preset == nil, format == nil,
+                  mode == nil, sample == nil, limit == nil, stream == nil, threshold == nil, minimum == nil,
+                  let jobDirectory = ProcessInfo.processInfo.environment["MPCUT_REVIEW_JOB_DIRECTORY"],
+                  jobDirectory.hasPrefix("/") else {
+                throw invalid("Supply one nonnegative --at time for a review image job.")
+            }
+            output = URL(fileURLWithPath: jobDirectory, isDirectory: true).appendingPathComponent("frames").path
+        }
         guard let output, (file == nil) != (project == nil) else {
             throw invalid("Supply a source video or --project PROJECT, and --output NEW_DIRECTORY.")
         }
         self.output = output
+        self.mcpImage = mcpImage
         self.preset = preset ?? .review
         self.format = format ?? .jpeg
         if let project {

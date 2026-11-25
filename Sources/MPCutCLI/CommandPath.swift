@@ -5,7 +5,7 @@ enum CommandPath {
     static let transcript: [String: TranscriptCLI.Operation] = [
         "transcript provider capabilities": .capabilities, "transcript tracks list": .tracks,
         "transcript job run": .runJob, "transcript job prepare": .prepareSession, "transcript job status": .status, "transcript job cancel": .cancel,
-        "transcript job retry": .retry, "transcript attachment import": .import, "transcript attachment inspect": .inspect,
+        "transcript job retry": .retry, "transcript job list": .listJobs, "transcript job reconcile": .reconcile, "transcript attachment import": .import, "transcript attachment inspect": .inspect,
         "transcript attachment bind": .bind, "transcript attachment detach": .detach, "transcript words read": .read,
         "transcript words search": .search, "transcript words locate": .locate, "transcript words compare": .compare,
         "transcript script align": .alignScript, "transcript words suggest": .suggest, "transcript words correct": .correct,
@@ -26,14 +26,20 @@ enum CommandPath {
         "still soundtrack attach": .attachSoundtrack, "still soundtrack fit": .fitSoundtrack,
         "still soundtrack detach": .detachSoundtrack
     ]
+    static let sidecarCache = Dictionary(uniqueKeysWithValues: SidecarCacheOptions.Operation.allCases.map {
+        ("analysis cache " + $0.rawValue, $0)
+    })
     static let paths = Set([
+        "project output read", "project output set",
         "project create", "project edit", "multicam switch coverage", "project convert", "project document print", "project merge", "project resolve import", "project resolve export", "analysis sidecar inspect",
         "analysis sidecar build", "still project create", "silence shorten", "silence scan", "silence plan", "silence export",
+        "silence pause protect", "silence room-tone calibrate", "scenes view rename",
         "scenes scan", "scenes export", "project media refresh", "project media list", "project media relink", "project media locate", "project media replace",
+        "project media leave-offline", "project media revert",
         "multicam sync suggest", "waveform envelope read", "review frames export",
-        "timeline range map", "history compare", "media inspect", "project inspect", "export ranges separate", "export project render",
+        "timeline range map", "history compare", "history restore-copy", "media inspect", "project inspect", "export ranges separate", "export project render",
         "export clips join", "export soundtrack replace", "export ranges join"
-    ]).union(transcript.keys).union(stills.keys).union(participants.keys).union(tiles.keys)
+    ]).union(transcript.keys).union(stills.keys).union(participants.keys).union(tiles.keys).union(sidecarCache.keys)
 
     static func match(_ tokens: [String]) -> String? {
         for count in [3, 2] where tokens.count >= count {

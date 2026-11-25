@@ -6,7 +6,7 @@ extension CutProject {
         let result: CutProject
         if var project = stillSequenceValue {
             try sequence(&project)
-            result = project.hasStillContent || !project.transcripts.isEmpty || !project.sourceSelects.isEmpty || !project.participants.isEmpty
+            result = project.hasStillContent || !project.transcripts.isEmpty || !project.sourceSelects.isEmpty || !project.participants.isEmpty || !project.analysisAnnotations.isEmpty
                 ? .stillSequence(project) : .sequence(project.items.compactMap(\.source))
         } else if case .multicam(var project) = self {
             try multicam(&project)
@@ -222,7 +222,7 @@ extension CutProject {
     }
 
     public func splittingStill(id: String, at offset: RationalTime, newID: String = ProjectIdentifier.make()) throws -> CutProject {
-        try editingInsert(id: id) { insert in
+        var updated = try editingInsert(id: id) { insert in
             var left = insert
             left.duration = offset
             left.usesExactDuration = false
@@ -231,6 +231,17 @@ extension CutProject {
             right.id = newID
             return [left, right]
         }
+        let prefix = sequenceItems == nil ? "still/" : ""
+        let owned = analysisAnnotations.pauseReviews.filter { $0.occurrenceID == prefix + id }
+        if !owned.isEmpty {
+            updated.analysisAnnotations.pauseReviews.removeAll { $0.occurrenceID == prefix + id && $0.from >= offset }
+            for var row in owned where row.from >= offset {
+                row.occurrenceID = prefix + newID
+                row.from = try row.from.subtracting(offset)
+                updated.analysisAnnotations.pauseReviews.append(row)
+            }
+        }
+        return updated
     }
 
     private func editingInsert(id: String, preserveGapAsset: Bool = false,
@@ -285,7 +296,8 @@ extension CutProject {
             guard position == start else { throw stillError("Insertion lies outside the timeline") }
             project.items.append(.still(insert))
         }, multicam: { project in
-            var items = project.assemblyItems ?? [.group(project.range)]
+            project.materializeAssembly()
+            guard var items = project.assemblyItems else { return }
             var start = RationalTime.zero
             for (index, item) in items.enumerated() {
                 if position == start { items.insert(.still(insert), at: index); project.assemblyItems = items; return }
@@ -293,11 +305,14 @@ extension CutProject {
                 if position < end {
                     guard let range = item.group else { throw insertConflict(item.still!.id) }
                     let split = try range.from.adding(position.subtracting(start))
+                    var origin = Array(items.indices)
+                    origin.insert(index, at: index + 1)
                     items.replaceSubrange(index...index, with: [
-                        item.groupPiece(.init(from: range.from, to: split), to: split), .still(insert),
+                        item.groupPiece(.init(from: range.from, to: split), to: split),
                         item.groupPiece(.init(from: split, to: range.to), from: split, keepingID: false)
                     ])
-                    project.assemblyItems = items
+                    project.replaceAssembly(items, carryingPauseReviewsFrom: origin)
+                    project.assemblyItems?.insert(.still(insert), at: index + 1)
                     return
                 }
                 start = end
@@ -331,6 +346,7 @@ extension CutProject {
     public func removingSequenceClip(id: String) throws -> CutProject {
         try editSequenceClip(id: id) { project, index in
             project.items.remove(at: index)
+            project.analysisAnnotations.pauseReviews.removeAll { $0.occurrenceID == id }
             project.stillReplacements = project.stillReplacements.compactMap { replacement in
                 guard case .sequence(let fragments) = replacement.coverage else { return replacement }
                 let remainder = fragments.filter { $0.clipID != id }
@@ -347,6 +363,8 @@ extension CutProject {
                                         checkCancellation: () throws -> Void) throws -> CutProject {
         guard !removals.isEmpty else { return self }
         return try editingStills(sequence: { project in
+            let ownedReviews = Dictionary(grouping: project.analysisAnnotations.pauseReviews, by: \.occurrenceID)
+            var reviews = project.analysisAnnotations.pauseReviews.filter { removals[$0.occurrenceID ?? ""] == nil }
             var fragmentPieces: [String: [(id: String, from: RationalTime?, to: RationalTime?)]] = [:]
             project.items = try project.items.flatMap { item -> [StillSequenceItem] in
                 try checkCancellation()
@@ -370,8 +388,14 @@ extension CutProject {
                     let to = index + 1 < pieces.count ? pieces[index + 1].from : nil
                     return (piece.id, from, to)
                 }
+                for piece in pieces {
+                    reviews += try (ownedReviews[original.id] ?? []).compactMap {
+                        try $0.retained(by: piece.id, within: .init(from: piece.from, to: piece.to))
+                    }
+                }
                 return pieces.map(StillSequenceItem.source)
             }
+            project.analysisAnnotations.pauseReviews = reviews
             guard !project.items.isEmpty else {
                 throw CutError(code: "empty_edit", message: "The selected pauses cover the entire sequence. Increase --padding-per-side-seconds to retain footage.")
             }
@@ -400,6 +424,12 @@ extension CutProject {
             guard var clip = project.items[index].source else { throw unknownStill(id) }
             clip.id = newID
             project.items.insert(.source(clip), at: index + 1)
+            project.analysisAnnotations.pauseReviews += project.analysisAnnotations.pauseReviews.compactMap { original in
+                guard original.occurrenceID == id else { return nil }
+                var copy = original
+                copy.occurrenceID = newID
+                return copy
+            }
             let copies = project.stillReplacements.compactMap { replacement -> StillReplacement? in
                 guard case .sequence(let fragments) = replacement.coverage else { return nil }
                 let added = fragments.filter { $0.clipID == id }.map { StillReplacementFragment(clipID: newID, range: $0.range) }
@@ -434,6 +464,11 @@ private extension StillSequenceProject {
         right.from = time
         right.tileLayouts = original.tileLayouts.compactMap { $0.limited(from: time, to: nil) }
         items.replaceSubrange(index...index, with: [.source(left), .source(right)])
+        let owned = analysisAnnotations.pauseReviews.filter { $0.occurrenceID == original.id }
+        analysisAnnotations.pauseReviews.removeAll { $0.occurrenceID == original.id }
+        for piece in [left, right] {
+            analysisAnnotations.pauseReviews += try owned.compactMap { try $0.retained(by: piece.id, within: .init(from: piece.from, to: piece.to)) }
+        }
         for placement in stillReplacements.indices {
             guard case .sequence(let fragments) = stillReplacements[placement].coverage else { continue }
             stillReplacements[placement].coverage = .sequence(fragments.flatMap { fragment in

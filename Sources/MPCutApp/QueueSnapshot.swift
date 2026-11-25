@@ -170,18 +170,26 @@ extension MulticamQueuedRange {
 }
 
 private extension CutProject {
-    var queuedStillImages: Set<URL> {
+    func queuedStillImages(in selection: MulticamRange? = nil, document: URL? = nil) -> Set<URL> {
         guard !stillAssets.isEmpty else { return [] }
         let placements = stillInserts.map { ($0.id, $0.assetID) } + stillReplacements.map { ($0.id, $0.assetID) }
         let byPlacement = Dictionary(placements, uniquingKeysWith: { first, _ in first })
         let used = (try? resolveStills()).map { plan in
-            Set(plan.spans.compactMap { $0.placementID.flatMap { byPlacement[$0] } })
+            Set<String>(plan.spans.compactMap { span in
+                guard selection.map({ span.output.from < $0.to && $0.from < span.output.to }) ?? true else { return nil }
+                return span.placementID.flatMap { byPlacement[$0] }
+            })
         } ?? Set(byPlacement.values)
         return Set(stillAssets.compactMap { asset in
             guard !asset.isGap, used.contains(asset.id) else { return nil }
-            return ProjectMediaVolume.watchURL(URL(fileURLWithPath: asset.file))
+            return queueMediaURL(asset.file, document: document)
         })
     }
+}
+
+private func queueMediaURL(_ path: String, document: URL?) -> URL {
+    ProjectMediaVolume.watchURL(document.map { CutProject.mediaURL(path, relativeTo: $0) }
+                                ?? URL(fileURLWithPath: path))
 }
 
 struct QueueMediaTargets {
@@ -200,19 +208,32 @@ struct QueueMediaTargets {
 
 extension QueuedRange {
     private var recordingURLs: Set<URL> {
-        var urls = Set(clips.map(\.file))
-        for reference in [stillProject?.stillAudioReference, stillProject?.stillSoundtrack].compactMap({ $0 }) {
-            urls.insert(URL(fileURLWithPath: reference.file))
+        var urls = Set(clips.map { ProjectMediaVolume.watchURL($0.file) })
+        let project = pictureProject ?? stillProject
+        for reference in [project?.stillAudioReference, project?.stillSoundtrack].compactMap({ $0 }) {
+            urls.insert(queueMediaURL(reference.file, document: pictureDocument))
         }
-        return Set(urls.map(ProjectMediaVolume.watchURL))
+        if let project, project.requiresPictureProcessing {
+            let audio = project.projectOutputSettings.audio
+            if audio.mode == .iso, let id = audio.ids.first,
+               let source = project.participants.audioBinding(for: id)?.selection?.source {
+                urls.insert(queueMediaURL(source, document: pictureDocument))
+            }
+        }
+        return urls
+    }
+
+    private var stillURLs: Set<URL> {
+        let selection = pictureProject.map { _ in MulticamRange(from: start, to: end) }
+        return (pictureProject ?? stillProject)?.queuedStillImages(in: selection, document: pictureDocument) ?? []
     }
 
     var mediaDependencies: Set<URL> {
-        recordingURLs.union(stillProject?.queuedStillImages ?? [])
+        recordingURLs.union(stillURLs)
     }
 
     func addMediaTargets(to targets: inout QueueMediaTargets) {
-        targets.include(recordings: recordingURLs, stills: stillProject?.queuedStillImages ?? [], media: media.values)
+        targets.include(recordings: recordingURLs, stills: stillURLs, media: media.values)
     }
 }
 
@@ -256,15 +277,16 @@ extension MulticamQueuedRange {
     }
 
     private var recordingURLs: Set<URL> {
-        Set(recordingDependencies.map { ProjectMediaVolume.watchURL(URL(fileURLWithPath: $0.file)) })
+        Set(recordingDependencies.map { queueMediaURL($0.file, document: document) })
     }
 
     var mediaDependencies: Set<URL> {
-        recordingURLs.union(CutProject.multicam(snapshot).queuedStillImages)
+        recordingURLs.union(CutProject.multicam(snapshot).queuedStillImages(document: document))
     }
 
     func addMediaTargets(to targets: inout QueueMediaTargets) {
-        targets.include(recordings: recordingURLs, stills: CutProject.multicam(snapshot).queuedStillImages, media: media.values)
+        targets.include(recordings: recordingURLs, stills: CutProject.multicam(snapshot).queuedStillImages(document: document),
+                        media: media.values)
     }
 }
 

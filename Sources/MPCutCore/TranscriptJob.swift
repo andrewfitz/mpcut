@@ -116,6 +116,7 @@ public struct TranscriptJobTrack: Codable, Equatable, Sendable, Identifiable {
         case stagedAudioSnapshot = "staged_audio_snapshot"
         case result
         case activity
+        case measuredActivitySHA256 = "measured_activity_sha256"
         case recognitionKey = "recognition_key"
         case recognitionSettingsKey = "recognition_settings_key"
         case message
@@ -148,6 +149,7 @@ public struct TranscriptJobTrack: Codable, Equatable, Sendable, Identifiable {
     var stagedAudioSnapshot: TranscriptExternalCacheDescriptor.Snapshot?
     public var result: URL?
     public var activity: URL?
+    var measuredActivitySHA256: String?
     public var recognitionKey: String?
     public var recognitionSettingsKey: String?
     public var message: String?
@@ -190,6 +192,7 @@ public struct TranscriptJobSession: Codable, Equatable, Sendable, Identifiable {
     public var fingerprint: String
     public var manifest: URL
     public var output: URL
+    public var resultSHA256: String?
     public var tracks: [TranscriptJobTrack]
 
     public var bindings: [TranscriptBinding] {
@@ -210,6 +213,22 @@ public struct TranscriptJobSession: Codable, Equatable, Sendable, Identifiable {
     /// outcome. A recognition track still waiting for its provider is pending or staged.
     var isResolved: Bool {
         !tracks.contains { [.pending, .staged].contains($0.state) }
+    }
+}
+
+extension TranscriptJobSession {
+    /// Some providers give the session only words and return the levels separately.
+    func transcript(from bytes: Data) throws -> TranscriptDocument {
+        var document = try TranscriptCodec.decode(bytes, format: .json)
+        if let resultSHA256, TranscriptStore.digest(bytes) == resultSHA256 { return document }
+        let inputs = Dictionary(uniqueKeysWithValues: tracks.map { ($0.id, $0) })
+        for index in document.tracks.indices where document.tracks[index].activity.isEmpty {
+            let output = document.tracks[index]
+            guard let input = inputs[output.id], output.streamEvidence == .string(input.evidence),
+                  output.origin == input.origin else { continue }
+            document.tracks[index].activity = try TranscriptRecognitionCache.providerActivity(for: input)
+        }
+        return document
     }
 }
 
@@ -959,10 +978,18 @@ public struct TranscriptJobStore: Sendable {
         try list { $0.documentIdentity == documentIdentity }
     }
 
+    package func list(document: URL, identity: UUID?, linkedJobs: Set<UUID>) throws -> [TranscriptJobRecord] {
+        let path = document.resolvingSymlinksInPath().standardizedFileURL.path
+        return try list { $0.belongs(to: path, identity: identity, linkedJobs: linkedJobs) }
+    }
+
     private func list(where match: (TranscriptJobRecord) -> Bool) throws -> [TranscriptJobRecord] {
         try matchingRecords(where: match)
             .compactMap { try? status($0.id) }
-            .sorted { $0.updatedAt > $1.updatedAt }
+            .sorted {
+                if $0.updatedAt != $1.updatedAt { return $0.updatedAt > $1.updatedAt }
+                return $0.id.uuidString < $1.id.uuidString
+            }
     }
 
     /// Read candidates without recovering owners or verifying provider output.
@@ -993,6 +1020,7 @@ public struct TranscriptJobStore: Sendable {
                 guard current.ownerToken == nil else {
                     throw jobError("transcript_job_running", "Stop this transcript job before discarding its data.")
                 }
+                if holdsRecognition(current) { return }
                 if FileManager.default.fileExists(atPath: current.workingDirectory.path) {
                     try FileManager.default.removeItem(at: current.workingDirectory)
                 }
@@ -1002,19 +1030,18 @@ public struct TranscriptJobStore: Sendable {
         }
     }
 
-    /// Removes jobs nothing has touched for `age` seconds, with their staged audio, artifacts
-    /// and lock files, and returns their IDs. A saved project's jobs are otherwise kept for ever:
-    /// only a discarded draft removes its own.
-    ///
-    /// A job stays while a process owns it or holds its lock, while any of its files is newer
-    /// than the cutoff, and while it holds a finished result whose document still exists: an
-    /// unattached result is not stored anywhere else, and an attached one is reconciled from
-    /// this record. An attached result goes once the document has attached others in place of
-    /// all of it. Everything a pruned job held can be staged or recognized again from the
-    /// media and its sidecar.
-    ///
-    /// A job that stays gives up the attached session outputs that only repeat its track
-    /// results, whatever its age, and keeps each finished track's result and levels packed.
+    /// A job can have provider output even before a standalone helper has reported
+    /// completion. Keep those jobs independent of their document's location or attachment.
+    private func holdsRecognition(_ record: TranscriptJobRecord) -> Bool {
+        if FileManager.default.fileExists(atPath: resultDirectory(record.id).path) { return true }
+        return record.sessions.contains { session in
+            FileManager.default.fileExists(atPath: session.output.path) ||
+                session.tracks.contains { $0.result.map(TranscriptJobArtifact.exists) == true }
+        }
+    }
+
+    /// Discard abandoned scratch after the age cutoff. A locked job or a job with
+    /// any provider result is retained even when its project has moved.
     @discardableResult
     public func prune(olderThan age: TimeInterval, now: Date = Date()) throws -> [UUID] {
         let manager = FileManager.default
@@ -1039,15 +1066,6 @@ public struct TranscriptJobStore: Sendable {
             guard ["", "json", "lock"].contains(entry.pathExtension) else { return nil }
             return UUID(uuidString: entry.pathExtension.isEmpty ? name : entry.deletingPathExtension().lastPathComponent)
         })
-        /// The transcripts each document holds on disk, read once however many jobs it has.
-        /// Nil for a path that is not a project this version can read.
-        var documents: [String: ProjectTranscripts?] = [:]
-        func transcripts(of document: String) -> ProjectTranscripts? {
-            if let known = documents[document] { return known }
-            let saved = try? CutProject.load(from: URL(fileURLWithPath: document)).transcripts
-            documents.updateValue(saved, forKey: document)
-            return saved
-        }
         var removed: [UUID] = []
         for id in ids.sorted(by: { $0.uuidString < $1.uuidString }) where isIdle(id) {
             guard let fd = try? lock(id, wait: false) else { continue }
@@ -1059,11 +1077,24 @@ public struct TranscriptJobStore: Sendable {
                 if record.ownerToken != nil {
                     guard let owner = record.ownerPID, Self.ownerIsGone(owner, lastSeen: record.updatedAt) else { continue }
                 }
-                // An attached result is what Reconcile reads after a sync change, however old.
-                if [.completed, .partial].contains(record.state), manager.fileExists(atPath: record.documentID) {
-                    guard record.attached, let current = transcripts(of: record.documentID),
-                          isSuperseded(record, by: current) else { continue }
+                if holdsRecognition(record) { continue }
+                if [.completed, .partial].contains(record.state),
+                   manager.fileExists(atPath: record.documentID) { continue }
+            } else if manager.fileExists(atPath: workURL(id).path) {
+                // Without a record, preserve potential session and track results in either
+                // storage form. Staged WAVs and input manifests are disposable.
+                var inspected = true
+                guard let entries = manager.enumerator(at: workURL(id), includingPropertiesForKeys: nil,
+                    errorHandler: { _, _ in inspected = false; return false }) else { continue }
+                var hasResult = false
+                for case let entry as URL in entries {
+                    let name = entry.lastPathComponent
+                    if name != "manifest.json" && (name.hasSuffix(".json") || name.hasSuffix(".json.z")) {
+                        hasResult = true
+                        break
+                    }
                 }
+                guard inspected && !hasResult else { continue }
             }
             do {
                 // A lock file can outlive its job. Removing one alone is not a pruned job.
@@ -1102,9 +1133,18 @@ public struct TranscriptJobStore: Sendable {
     /// only a second import of the same job reads these files.
     private func attachedOutputs(_ record: TranscriptJobRecord) -> [URL] {
         guard record.attached, record.ownerToken == nil, [.completed, .partial].contains(record.state) else { return [] }
-        // Look for the output first: the other question reads each track's result.
-        return record.sessions.filter { FileManager.default.fileExists(atPath: $0.output.path) && holdsOutputAsCopy($0) }
-            .map(\.output)
+        return record.sessions.compactMap { session in
+            guard let digest = session.resultSHA256, TranscriptStore.validDigest(digest),
+                  let snapshot = try? SourceIdentity(session.output), holdsOutputAsCopy(session),
+                  let stored = try? Data(contentsOf: resultDirectory(record.id).appendingPathComponent(digest + ".json"),
+                                         options: .mappedIfSafe),
+                  TranscriptStore.digest(stored) == digest,
+                  let handoff = try? Data(contentsOf: session.output, options: .mappedIfSafe),
+                  let document = try? session.transcript(from: handoff),
+                  (try? TranscriptCodec.encodeStored(document)) == stored,
+                  snapshot.isCurrentSnapshot(at: session.output) else { return nil }
+            return session.output
+        }
     }
 
     /// Whether a session's output repeats what the job holds elsewhere: the session has been
@@ -1122,35 +1162,11 @@ public struct TranscriptJobStore: Sendable {
         }
     }
 
-    /// Whether the document of an attached job has since attached other results in place of
-    /// every session of this one. Reconcile starts from the job an attached transcript names,
-    /// and none of the document's transcripts came from this job, so nothing reads it again.
-    /// A job whose result was never attached holds the only copy and is not superseded.
-    /// A transcript that cannot be read, or a document that belongs to another project,
-    /// leaves the job in place.
-    private func isSuperseded(_ record: TranscriptJobRecord, by transcripts: ProjectTranscripts) -> Bool {
-        guard record.attached, record.ownerToken == nil else { return false }
-        if let owner = record.documentIdentity, transcripts.documentID != owner { return false }
-        let fingerprints = Set(record.sessions.map(\.fingerprint))
-        if transcripts.attachments.contains(where: { $0.fingerprint.map(fingerprints.contains) ?? false }) { return false }
-        // A stored transcript names its job. That outlives a retry, which gives the job's
-        // sessions new fingerprints, and it is all an older transcript carries.
-        let document = URL(fileURLWithPath: record.documentID)
-        for attachment in transcripts.attachments {
-            guard let bytes = try? TranscriptStore.read(attachment.asset, relativeTo: document),
-                  let transcript = try? TranscriptCodec.decode(bytes, format: .json) else { return false }
-            if transcript.jobID.flatMap(UUID.init(uuidString:)) == record.id { return false }
-        }
-        return true
-    }
-
     /// The folder where MPCut and a standalone Transcriberrr exchange recognition results.
     public static func sharedRecognitionDirectory() throws -> URL { try TranscriptRecognitionClaims.directory() }
 
-    /// Removes shared recognition results, and the claim files beside them, that were last
-    /// written more than `age` seconds before `now` and that no process has claimed. Returns
-    /// the number of results removed. A removed result is recognized again when next needed,
-    /// unless the media's own sidecar already holds a copy.
+    /// Removes idle claim files. Published shared recognition remains available to standalone providers.
+    /// The return value counts recognition results removed.
     @discardableResult
     public static func pruneSharedRecognition(in directory: URL, olderThan age: TimeInterval,
                                               now: Date = Date()) -> Int {
@@ -1169,8 +1185,18 @@ public struct TranscriptJobStore: Sendable {
     /// has to attach never finds its output gone.
     @discardableResult
     public func markAttached(_ id: UUID, expectedPreparationID: UUID? = nil) throws -> TranscriptJobRecord {
+        try markAttached(id, expectedPreparationID: expectedPreparationID, persisted: nil)
+    }
+
+    package func markAttached(_ id: UUID, expectedPreparationID: UUID?,
+                              persisted: (document: URL, snapshot: SourceIdentity)?) throws -> TranscriptJobRecord {
         try withLock(id) {
             var record = try read(id)
+            if let persisted {
+                guard record.documentID == persisted.document.path,
+                      record.preparationID == expectedPreparationID,
+                      persisted.snapshot.isCurrentSnapshot(at: persisted.document) else { return record }
+            }
             if let expectedPreparationID, record.preparationID != expectedPreparationID {
                 throw jobError("stale_transcript_job", "The job was retried before the attachment was written.")
             }
@@ -1295,6 +1321,12 @@ public struct TranscriptJobStore: Sendable {
         guard plan.sessions.contains(where: { !$0.tracks.isEmpty }) else {
             throw jobError("no_transcript_tracks", "This project contains no media sources.")
         }
+        // An independently launched provider can finish a session before its job is imported.
+        // Preserve that output before preparing paths a new attempt may overwrite.
+        for track in initial.sessions.flatMap(\.tracks) {
+            try TranscriptRecognitionCache.preserve(track: track, in: resultDirectory(initial.id), cancelled: cancelled)
+        }
+        for session in initial.sessions { try preserveHandoff(session, jobID: initial.id) }
         if initial.policy == .restart, FileManager.default.fileExists(atPath: initial.workingDirectory.path) {
             try FileManager.default.removeItem(at: initial.workingDirectory)
         }
@@ -1315,6 +1347,7 @@ public struct TranscriptJobStore: Sendable {
                           prior.channel == track.channel, track.unavailable == nil else { continue }
                     track.recognitionKey = prior.recognitionKey
                     track.recognitionSettingsKey = prior.recognitionSettingsKey
+                    track.measuredActivitySHA256 = prior.measuredActivitySHA256
                     track.downmixChannel = prior.downmixChannel
                     // Establish the new durable artifact paths before the record stops
                     // pointing to the old membership. A crash during this step can retry.
@@ -1426,7 +1459,7 @@ public struct TranscriptJobStore: Sendable {
                     }
                     track.state = track.recognize ? .staged : .skipped
                     do {
-                        if let warning = try prepareActivity(track, media: media, audio: audio, measured: measured,
+                        if let warning = try prepareActivity(&track, media: media, audio: audio, measured: measured,
                                                              cancelled: cancelled) { notes.append(warning) }
                         // A track that is not recognized is staged only to be measured, and its
                         // levels are now saved: the run hands the provider those and no audio.
@@ -1516,9 +1549,8 @@ public struct TranscriptJobStore: Sendable {
     }
 
     /// `measured` holds the levels of PCM this preparation extracted. They describe the staged
-    /// file exactly, so they take the place of any saved copy, including one measured from an
-    /// earlier extraction of the same stream.
-    private func prepareActivity(_ track: TranscriptJobTrack, media: MediaInfo, audio: URL, measured: [Float]?,
+    /// file exactly. A retained provider result keeps the levels supplied alongside it.
+    private func prepareActivity(_ track: inout TranscriptJobTrack, media: MediaInfo, audio: URL, measured: [Float]?,
                                  cancelled: () -> Bool) throws -> String? {
         guard let stream = track.streamIndex, let levels = track.activity else { return nil }
         let duration = try track.duration.roundedToSamples(16_000)
@@ -1534,8 +1566,16 @@ public struct TranscriptJobStore: Sendable {
         if let measured, let fresh = try? transcriptActivityDocument(levels: measured, duration: duration,
                                                                      evidence: track.evidence, cancelled: cancelled) {
             data = fresh
-            if TranscriptJobArtifact.read(levels) != data {
-                try data.write(to: levels, options: .atomic)
+            let existing = TranscriptJobArtifact.read(levels)
+            let keepsProviderLevels = existing.map { levels in
+                track.measuredActivitySHA256 != TranscriptStore.digest(levels) && matches(levels) &&
+                    track.result.flatMap(TranscriptJobArtifact.read).map {
+                        TranscriptRecognitionCache.Artifacts(result: $0, activity: levels).belongs(to: track)
+                    } == true
+            } ?? false
+            if !keepsProviderLevels {
+                track.measuredActivitySHA256 = TranscriptStore.digest(data)
+                if existing != data { try data.write(to: levels, options: .atomic) }
             }
             guard canShare && AnalysisSidecar.automaticWritesEnabled,
                   sidecar.readTranscriptActivity(key, cancelled: cancelled) != data else { return nil }
@@ -1544,11 +1584,13 @@ public struct TranscriptJobStore: Sendable {
             if cancelled() { throw CancellationError() }
             if let data = TranscriptJobArtifact.read(levels), matches(data) { return nil }
             if canShare, let data = sidecar.readTranscriptActivity(key, cancelled: cancelled), matches(data) {
+                track.measuredActivitySHA256 = TranscriptStore.digest(data)
                 try data.write(to: levels, options: .atomic)
                 return nil
             }
             data = try measureTranscriptActivity(audio: audio, duration: duration,
                                                  evidence: track.evidence, cancelled: cancelled)
+            track.measuredActivitySHA256 = TranscriptStore.digest(data)
             try data.write(to: levels, options: .atomic)
             guard canShare && AnalysisSidecar.automaticWritesEnabled else { return nil }
             replacing = false
@@ -1682,7 +1724,8 @@ public struct TranscriptJobStore: Sendable {
         if currentFingerprints != recordedFingerprints {
             let valid = current.filter { recordedFingerprints.contains($0.fingerprint) }
             let published = record.sessions.contains {
-                currentFingerprints.contains($0.fingerprint) && FileManager.default.fileExists(atPath: $0.output.path)
+                currentFingerprints.contains($0.fingerprint)
+                    && ($0.resultSHA256 != nil || FileManager.default.fileExists(atPath: $0.output.path))
             }
             switch project {
             case .sequence, .stillSequence:
@@ -1735,10 +1778,76 @@ public struct TranscriptJobStore: Sendable {
         }, uniquingKeysWith: { first, _ in first })
     }
 
+    func resultDirectory(_ id: UUID) -> URL {
+        directory.appendingPathComponent("Results", isDirectory: true).appendingPathComponent(id.uuidString, isDirectory: true)
+    }
+
+    func preserveHandoff(_ session: TranscriptJobSession, jobID: UUID) throws {
+        guard FileManager.default.fileExists(atPath: session.output.path) else { return }
+        let data = try Data(contentsOf: session.output, options: .mappedIfSafe)
+        if let document = try? session.transcript(from: data),
+           document.jobID.flatMap(UUID.init(uuidString:)) == jobID, document.fingerprint == session.fingerprint {
+            _ = try saveResult(document, jobID: jobID)
+        }
+    }
+
+    private func ownsOutput(_ session: TranscriptJobSession, of id: UUID) -> Bool {
+        guard TranscriptStore.validDigest(session.id) else { return false }
+        let expected = directory.resolvingSymlinksInPath().appendingPathComponent(id.uuidString)
+            .appendingPathComponent(session.id).appendingPathComponent("session.json")
+        return session.output.resolvingSymlinksInPath().standardizedFileURL.path == expected.standardizedFileURL.path
+    }
+
+    /// Store the same canonical document that the project embeds. It survives restaging
+    /// the job, including a restart with a different session fingerprint.
+    func saveResult(_ document: TranscriptDocument, jobID: UUID) throws -> String {
+        let bytes = try TranscriptCodec.encodeStored(document)
+        let digest = TranscriptStore.digest(bytes)
+        let folder = resultDirectory(jobID)
+        let file = folder.appendingPathComponent(digest + ".json")
+        do {
+            if (try? Data(contentsOf: file, options: .mappedIfSafe)) == bytes { return digest }
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+            try bytes.write(to: file, options: .atomic)
+            guard try Data(contentsOf: file, options: .mappedIfSafe) == bytes else {
+                throw jobError("transcript_job_storage", "The saved transcript differs from the provider result.")
+            }
+            return digest
+        } catch {
+            throw jobError("transcript_job_storage", "Could not preserve the transcript result: " + error.localizedDescription)
+        }
+    }
+
+    private func restoreResult(_ session: TranscriptJobSession, of record: TranscriptJobRecord) throws {
+        guard let digest = session.resultSHA256, TranscriptStore.validDigest(digest),
+              !FileManager.default.fileExists(atPath: session.output.path) else { return }
+        guard ownsOutput(session, of: record.id) else {
+            throw jobError("transcript_job_storage", "The transcript output is outside its job directory.")
+        }
+        try withLock(record.id) {
+            let current = try read(record.id)
+            guard current.ownerToken == nil, current.preparationID == record.preparationID,
+                  current.sessions.contains(where: { $0.id == session.id && $0.resultSHA256 == digest }) else {
+                throw jobError("stale_transcript_job", "The transcript job changed during recovery.")
+            }
+            guard !FileManager.default.fileExists(atPath: session.output.path) else { return }
+            let file = resultDirectory(record.id).appendingPathComponent(digest + ".json")
+            let data = try Data(contentsOf: file, options: .mappedIfSafe)
+            guard TranscriptStore.digest(data) == digest else {
+                throw jobError("transcript_job_storage", "The saved transcript is damaged.")
+            }
+            try FileManager.default.createDirectory(at: session.output.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+            try data.write(to: session.output, options: .atomic)
+        }
+    }
+
     private func verify(_ record: TranscriptJobRecord, current: [TranscriptJobSession], allowMissing: Bool = false) throws
         -> (record: TranscriptJobRecord, outputs: [TranscriptJobOutput]) {
         var records: [String: TranscriptTrack] = [:]
         var outputs: [TranscriptJobOutput] = []
+        var digests: [String: String] = [:]
         // Sessions whose result the project already holds, and whose output was removed as a
         // copy of their track results. Their tracks keep the outcome read then.
         var attached: [TranscriptJobSession] = []
@@ -1746,6 +1855,7 @@ public struct TranscriptJobStore: Sendable {
         let requested = record.sessions.flatMap(\.tracks).contains(where: \.recognize)
         let currentFingerprints = Set(current.map(\.fingerprint))
         for session in record.sessions where currentFingerprints.contains(session.fingerprint) {
+            try restoreResult(session, of: record)
             guard let data = try? Data(contentsOf: session.output) else {
                 if !FileManager.default.fileExists(atPath: session.output.path) {
                     if record.attached, holdsOutputAsCopy(session) {
@@ -1757,7 +1867,7 @@ public struct TranscriptJobStore: Sendable {
                 }
                 throw jobError("transcript_job_unavailable", "Session output is missing. Run the prepared manifest with Transcriberrr.")
             }
-            let result = try TranscriptCodec.decode(data, format: .json)
+            let result = try session.transcript(from: data)
             let expected = Dictionary(uniqueKeysWithValues: session.tracks.map { ($0.id, $0) })
             guard result.clock == .session, result.jobID.flatMap(UUID.init(uuidString:)) == record.id,
                   result.fingerprint == session.fingerprint,
@@ -1773,6 +1883,7 @@ public struct TranscriptJobStore: Sendable {
                 }
                 records[track.id] = track
             }
+            digests[session.id] = try saveResult(result, jobID: record.id)
             outputs.append(.init(url: session.output, document: result, preparationID: record.preparationID))
             resolved.insert(session.id)
         }
@@ -1788,6 +1899,7 @@ public struct TranscriptJobStore: Sendable {
             throw jobError("transcript_job_unavailable", "No transcript session completed successfully.")
         }
         let currentStamps = Dictionary(uniqueKeysWithValues: current.flatMap(\.tracks).compactMap { track in track.sourceStamp.map { (track.id, $0) } })
+        let recognizedIDs = Set(records.values.filter { $0.coverage == .recognized }.map(\.id))
         let finished = try update(record.id) {
             guard $0.state.permitsOutputVerification,
                   $0.preparationID == record.preparationID,
@@ -1798,6 +1910,10 @@ public struct TranscriptJobStore: Sendable {
             guard $0.ownerToken == nil else {
                 throw jobError("transcript_job_running", "Wait for the transcript job to finish before attaching it.")
             }
+            // Keep a retry from replacing the standalone provider's track files while
+            // verification reads and preserves them.
+            try TranscriptRecognitionCache.promoteExternal(in: $0, stamps: currentStamps, recognizedIDs: recognizedIDs,
+                                                           jobResults: resultDirectory(record.id))
             $0.state = outputs.count + attached.count < record.sessions.count
                 || records.values.contains { $0.coverage == .failed } || earlier.contains { $0.state == .failed }
                 ? .partial : .completed
@@ -1806,6 +1922,7 @@ public struct TranscriptJobStore: Sendable {
                 if !$0.warnings.contains(warning) { $0.warnings.append(warning) }
             }
             for session in $0.sessions.indices {
+                if let digest = digests[$0.sessions[session].id] { $0.sessions[session].resultSHA256 = digest }
                 for index in $0.sessions[session].tracks.indices {
                     var track = $0.sessions[session].tracks[index]
                     guard let output = records[track.id] else {
@@ -1830,8 +1947,6 @@ public struct TranscriptJobStore: Sendable {
             // A session not yet recognized keeps every recording its manifest names.
             if $0.state == .completed { removeStagedAudio($0) } else { removeFinishedAudio($0, sessions: resolved) }
         }
-        let recognizedIDs = Set(records.values.filter { $0.coverage == .recognized }.map(\.id))
-        TranscriptRecognitionCache.promoteExternal(in: finished, stamps: currentStamps, recognizedIDs: recognizedIDs)
         // Nothing reads a finished track's files again before a retry, which restores them.
         packArtifacts(record.id, wait: true)
         return (finished, outputs)
@@ -1854,4 +1969,11 @@ func jobError(_ code: String, _ message: String) -> CutError { CutError(code: co
 
 private func digest(_ data: Data) -> String {
     SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+}
+
+extension TranscriptJobRecord {
+    package func belongs(to path: String, identity: UUID?, linkedJobs: Set<UUID> = []) -> Bool {
+        if let documentIdentity { return identity == documentIdentity }
+        return documentID == path || linkedJobs.contains(id)
+    }
 }

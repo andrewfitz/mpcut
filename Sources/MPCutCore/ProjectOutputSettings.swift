@@ -22,6 +22,67 @@ extension CutProject {
         return settings
     }
 
+    package func sourceOutputCanvas(width: Int, height: Int, frameRate: RationalTime) -> ParticipantCanvas? {
+        guard width > 0, height > 0 else { return nil }
+        let scale = min(1, 8192 / Double(max(width, height)))
+        func even(_ dimension: Int) -> Int {
+            max(2, Int((Double(dimension) * scale / 2).rounded()) * 2)
+        }
+        var canvas = projectOutputSettings.canvas
+        canvas.width = even(width)
+        canvas.height = even(height)
+        if frameRate > .zero, frameRate.seconds <= 120, frameRate.numerator <= Int64(Int32.max) {
+            canvas.frameRate = frameRate
+        }
+        return canvas
+    }
+
+    package func sourceOutputCanvas(stream: StreamInfo) -> ParticipantCanvas? {
+        sourceOutputCanvas(width: stream.displayWidth, height: stream.displayHeight, frameRate: stream.frameRate)
+    }
+
+    package func inspectSourceOutputCanvas(relativeTo document: URL, engine: CutEngine) throws -> ParticipantCanvas? {
+        let candidates: [String]
+        if case .multicam(let multicam) = self {
+            candidates = multicam.recordings(for: multicam.referenceAngle).map(\.file)
+        } else {
+            candidates = sequenceClips?.map(\.file) ?? []
+        }
+        var seen: Set<URL> = []
+        for path in candidates {
+            try engine.checkCancellation()
+            let file = Self.mediaURL(path, relativeTo: document)
+            guard seen.insert(file).inserted, let stream = try? engine.inspectSummary(file).videoStream else { continue }
+            if let canvas = sourceOutputCanvas(stream: stream) { return canvas }
+        }
+        try engine.checkCancellation()
+        return nil
+    }
+
+    package func settingProjectOutput(width: Int?, height: Int?, frameRate: RationalTime?, background: UInt32?,
+                                      audio: ParticipantRenderAudio?, privacy: ParticipantUnresolvedPrivacy?,
+                                      defaultCanvas: ParticipantCanvas) throws -> Self {
+        let editsCanvas = width != nil || height != nil || frameRate != nil || background != nil
+        var settings = projectOutputSettings
+        if !hasStoredOutputCanvas { settings.canvas = defaultCanvas }
+        if let width { settings.canvas.width = width }
+        if let height { settings.canvas.height = height }
+        if let frameRate { settings.canvas.frameRate = frameRate }
+        if let background { settings.canvas.background = background }
+        if stillFormat != nil {
+            guard background == nil, audio == nil, privacy == nil else {
+                throw CutError(code: "invalid_project_output",
+                               message: "Still timelines only support size and frame rate here. Use the still soundtrack controls.")
+            }
+            return editsCanvas ? try settingProjectOutputCanvas(settings.canvas) : self
+        }
+        guard editsCanvas || audio.map({ $0 != settings.audio }) == true
+            || privacy.map({ $0 != settings.unresolvedPrivacy }) == true else { return self }
+        if let audio { settings.audio = audio }
+        if let privacy { settings.unresolvedPrivacy = privacy }
+        return try settingProjectTileOutput(settings, explicitCanvas: editsCanvas)
+    }
+
     public func settingProjectOutputCanvas(_ canvas: ParticipantCanvas) throws -> Self {
         if let format = stillFormat {
             guard canvas.frameRate > .zero else {
@@ -105,5 +166,22 @@ extension CutProject {
     private var isMulticam: Bool {
         if case .multicam = self { return true }
         return false
+    }
+}
+
+
+package struct ProjectOutputSettingsSnapshot: Encodable {
+    package let settings: TileOutputSettings
+    package let hasStoredCanvas: Bool
+    package let stillFormat: StillTimelineFormat?
+    package let stillSoundtrack: CutSequenceClip?
+
+    package init(project: CutProject, defaultCanvas: ParticipantCanvas) {
+        hasStoredCanvas = project.hasStoredOutputCanvas
+        var output = project.projectOutputSettings
+        if !hasStoredCanvas { output.canvas = defaultCanvas }
+        settings = output
+        stillFormat = project.stillFormat
+        stillSoundtrack = project.stillSoundtrack
     }
 }

@@ -12,12 +12,16 @@ struct EditorWorkspace<Viewer: View, Transport: View, Timeline: View, Status: Vi
 
     var showsSidebar = false
     @ViewBuilder let sidebar: () -> Sidebar
-    @AppStorage("workspace_full_height_sidebar_enabled", store: EditorPreferences.applicationDefaults) private var fullHeight = false
+    let preferences: EditorPreferences
+    // Follows the shared preference without redrawing the workspace for every other setting.
+    @State private var fullHeight: Bool
     @State private var panelWidth: CGFloat = 440
 
-    init(viewer: Viewer, transport: Transport, timeline: Timeline, status: Status,
+    init(viewer: Viewer, transport: Transport, timeline: Timeline, status: Status, preferences: EditorPreferences,
          showsTimeline: Bool, showsStatus: Bool, allowsTimelineResize: Bool = false,
          showsSidebar: Bool = false, @ViewBuilder sidebar: @escaping () -> Sidebar = { EmptyView() }) {
+        self.preferences = preferences
+        _fullHeight = State(initialValue: preferences.fullHeightSidebar)
         self.viewer = viewer
         self.transport = transport
         self.timeline = timeline
@@ -55,6 +59,7 @@ struct EditorWorkspace<Viewer: View, Transport: View, Timeline: View, Status: Vi
                 status
             }
         }
+        .onReceive(preferences.$fullHeightSidebar) { if fullHeight != $0 { fullHeight = $0 } }
     }
 
     @ViewBuilder private var editingArea: some View {
@@ -139,12 +144,13 @@ private struct PanelWidthBinding: NSViewRepresentable {
 }
 
 struct PanelDockToggle: View {
-    @AppStorage("workspace_full_height_sidebar_enabled", store: EditorPreferences.applicationDefaults) private var fullHeight = false
+    @ObservedObject var preferences: EditorPreferences
 
     var body: some View {
+        let fullHeight = preferences.fullHeightSidebar
         PaneIconButton(title: "Full-height panel", symbol: "arrow.up.and.down", active: fullHeight,
                        help: fullHeight ? "Tuck panel above timeline" : "Extend panel beside timeline") {
-            fullHeight.toggle()
+            preferences.fullHeightSidebar.toggle()
         }
         .accessibilityValue(fullHeight ? "On" : "Off")
         .accessibilityIdentifier("editor.fullHeightPanel")

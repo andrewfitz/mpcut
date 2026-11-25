@@ -74,9 +74,15 @@ MPJPEGReader *mp_jpeg_open(const char *path, int stream, int (*cancelled)(void *
     r->packet = av_packet_alloc();
     if (!r->format || !r->frame || !r->packet) goto fail;
     r->format->interrupt_callback = (AVIOInterruptCB){ cancelled, context };
+    if (cancelled && cancelled(context)) { ret = AVERROR_EXIT; goto fail; }
     if ((ret = avformat_open_input(&r->format, path, NULL, NULL)) < 0 ||
         (ret = avformat_find_stream_info(r->format, NULL)) < 0) goto fail;
-    if (stream < 0 || stream >= r->format->nb_streams) { ret = AVERROR_STREAM_NOT_FOUND; goto fail; }
+    if (stream < 0 || stream >= r->format->nb_streams ||
+        r->format->streams[stream]->codecpar->codec_type != AVMEDIA_TYPE_VIDEO ||
+        (r->format->streams[stream]->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
+        ret = AVERROR_STREAM_NOT_FOUND;
+        goto fail;
+    }
     r->stream = r->format->streams[stream];
     const AVCodecParameters *p = r->stream->codecpar;
     const AVPacketSideData *matrix = av_packet_side_data_get(p->coded_side_data, p->nb_coded_side_data,
@@ -154,7 +160,7 @@ static bool skip_damage(MPJPEGReader *r, int ret)
 static int read_to(MPJPEGReader *r, int64_t pts)
 {
     int failures = 0;
-    while (!r->cancelled(r->context)) {
+    while (!r->cancelled || !r->cancelled(r->context)) {
         int ret = avcodec_receive_frame(r->codec, r->frame);
         if (failures < 64 && skip_damage(r, ret)) { failures++; continue; }
         if (ret >= 0) {
@@ -195,10 +201,12 @@ static int read_to(MPJPEGReader *r, int64_t pts)
                 if (r->first_dts == AV_NOPTS_VALUE && !r->sought)
                     r->first_dts = r->packet->dts != AV_NOPTS_VALUE ? r->packet->dts : r->packet->pts;
                 ret = avcodec_send_packet(r->codec, r->packet);
-                if (skip_damage(r, ret)) ret = 0;
-                if (r->clean_pts == INT64_MAX && r->resume_pts == INT64_MAX &&
-                    (r->packet->flags & AV_PKT_FLAG_KEY) && r->packet->pts != AV_NOPTS_VALUE)
+                if (ret == 0 && r->clean_pts == INT64_MAX && r->resume_pts == INT64_MAX &&
+                    (r->packet->flags & AV_PKT_FLAG_KEY) && r->packet->pts != AV_NOPTS_VALUE) {
                     r->resume_pts = r->packet->pts;
+                } else if (skip_damage(r, ret)) {
+                    ret = 0;
+                }
             }
             av_packet_unref(r->packet);
         }
@@ -490,7 +498,7 @@ int mp_jpeg_frame(MPJPEGReader *r, int64_t pts, int64_t seek_dts, int max_edge,
     if (ret >= 0) ret = read_to(r, pts);
     // Some container indexes seek past an open GOP or a reordered target.
     // Retry from the beginning and still require the exact presentation tick.
-    if (ret < 0 && seek_dts != AV_NOPTS_VALUE && !r->cancelled(r->context)) {
+    if (ret < 0 && seek_dts != AV_NOPTS_VALUE && (!r->cancelled || !r->cancelled(r->context))) {
         // INT64_MIN is AV_NOPTS_VALUE, which MOV seeks backward from the end
         // and AVI rejects. The first presentation time follows reordered
         // packets in MPEG-TS, so prefer the decode time of the first packet.

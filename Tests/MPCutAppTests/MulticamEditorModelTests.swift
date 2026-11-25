@@ -37,7 +37,7 @@ final class MulticamEditorModelTests: XCTestCase {
                 XCTAssertEqual(receipt.snapshot["outputs"] as? [String], [path.path])
                 XCTAssertTrue(FileManager.default.fileExists(atPath: path.path))
             }
-            XCTAssertFalse(FileManager.default.fileExists(atPath: source.appendingPathExtension("cutdb").path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: source.appendingPathExtension("cutcache").path))
         }
     }
 
@@ -58,7 +58,7 @@ final class MulticamEditorModelTests: XCTestCase {
         let camera = MulticamEditorModel.SourceDraft(source: .init(id: "wide", file: source.path, audioStream: stream), media: media)
         model.confirmSetup(drafts: [camera], opening: "wide", audio: .none)
         let draft = try model.transcriptAssetContext()
-        let data = Data("{\"version\":1}".utf8)
+        let data = try TranscriptCodec.encodeStored(TranscriptDocument(clock: .presentation))
         let asset = try TranscriptStore.put(data, relativeTo: draft, draft: true)
         let binding = TranscriptBinding(trackID: "mic", file: source.path, streamIndex: stream)
         try model.setTranscriptState(.init(attachments: [.init(id: "dialogue", asset: asset, bindings: [binding])]))
@@ -70,7 +70,7 @@ final class MulticamEditorModelTests: XCTestCase {
             XCTAssertEqual((error as? CutError)?.code, "destination_exists")
         }
         XCTAssertEqual(try CutProject.load(from: destination), occupiedProject)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: TranscriptStore.folder(relativeTo: destination).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.appendingPathExtension("transcripts").path))
         XCTAssertEqual(try TranscriptStore.read(asset, relativeTo: draft), data)
 
         try model.writeProject(to: destination)
@@ -333,7 +333,7 @@ final class MulticamEditorModelTests: XCTestCase {
                                       angles: [.init(id: "a", file: "A.mov"), .init(id: "b", file: "B.mov")],
                                       audio: .none, switches: [.init(at: .zero, angle: "a")])
         var prior = current
-        prior.angles.append(.init(id: "offline", file: "A.mov.cutdb"))
+        prior.angles.append(.init(id: "offline", file: "A.mov.cutcache"))
         let named = root.appendingPathComponent("Multi.cut")
         try CutProject.multicam(current).save(to: named, undo: [.init(action: "Remove Camera", project: .multicam(prior))], redo: [])
         let preferences = EditorPreferences()

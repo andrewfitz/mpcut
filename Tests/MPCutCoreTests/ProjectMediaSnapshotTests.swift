@@ -16,7 +16,7 @@ final class ProjectMediaSnapshotTests: XCTestCase {
     }
 
     func testPreservesUnknownEntryFieldsAndIgnoresUnknownVersion() throws {
-        let json = #"{"format":"mpcut","schema_version":4,"kind":"sequence","clips":[{"id":"one","file":"A.wav","from":"0","to":"1"}],"media_snapshot":{"version":1,"entries":[{"path":"A.wav","future":{"file":4,"fraction":0.25,"bindings":[null,{"offset":"anything"}]}}]}}"#
+        let json = #"{"format":"mpcut","schema_version":9,"kind":"sequence","clips":[{"id":"one","file":"A.wav","from":"0","to":"1"}],"media_snapshot":{"version":1,"entries":[{"path":"A.wav","future":{"file":4,"fraction":0.25,"bindings":[null,{"offset":"anything"}]}}]}}"#
         let loaded = try CutProject.decodeDocument(Data(json.utf8), limit: 0)
         let file = try temporaryDirectory().appendingPathComponent("saved.cut")
         try loaded.project.save(to: file, mediaSnapshot: loaded.mediaSnapshot)
@@ -26,57 +26,30 @@ final class ProjectMediaSnapshotTests: XCTestCase {
         let unknown = json.replacingOccurrences(of: #""version":1"#, with: #""version":99"#)
             .replacingOccurrences(of: #""entries":"#, with: #""future_shape":"#)
         XCTAssertEqual(try CutProject.decodeDocument(Data(unknown.utf8), limit: 0).mediaSnapshot, .empty)
-        let legacy = #"{"format":"mpcut","schema_version":3,"kind":"sequence","clips":[]}"#
-        XCTAssertEqual(try CutProject.decodeDocument(Data(legacy.utf8), limit: 0).mediaSnapshot, .empty)
+        let withoutSnapshot = #"{"format":"mpcut","schema_version":9,"kind":"sequence","clips":[]}"#
+        XCTAssertEqual(try CutProject.decodeDocument(Data(withoutSnapshot.utf8), limit: 0).mediaSnapshot, .empty)
     }
 
-    func testWholeEntriesUseRemainingSpaceAfterHistorySelection() throws {
+    func testSnapshotKeepsEntriesReferencedByCurrentAndHistory() throws {
         let current = CutProject.sequence([clip("now")])
         let undo: [CutHistoryState] = [.init(action: "Undo", project: .sequence([clip("a-undo")]))]
         let redo: [CutHistoryState] = [.init(action: "Redo", project: .sequence([clip("b-redo")]))]
         let snapshot = ProjectMediaSnapshot(entries: ["a-undo", "b-redo", "now"].map { .init(path: $0) })
-        let unbounded = MulticamProject.maximumFileSize
-        let (base, _) = try current.encodedArchive(undo: undo, redo: redo, mediaSnapshot: .empty, byteLimit: unbounded)
-        let (withHistory, _) = try current.encodedArchive(undo: undo, redo: redo, mediaSnapshot: snapshot, byteLimit: unbounded)
-        let full = try CutProject.decodeDocument(withHistory, limit: 10)
-        XCTAssertEqual(full.mediaSnapshot.entries.map(\.path), ["now", "a-undo", "b-redo"])
-        XCTAssertEqual(full.undo, undo)
-        XCTAssertEqual(full.redo, redo)
-
-        let single = ProjectMediaSnapshot(entries: [.init(path: "now")])
-        let onlyCurrent = try single.appending(to: base, current: ["now"], retained: [], byteLimit: base.count + 80)
-        let historyOnlyBudget = base.count + 8
-        for (limit, expectedPaths) in [(historyOnlyBudget, [String]()), (onlyCurrent.count, ["now"])] {
-            let (bytes, _) = try current.encodedArchive(undo: undo, redo: redo, mediaSnapshot: snapshot, byteLimit: limit)
-            let (plain, _) = try current.encodedArchive(undo: undo, redo: redo, mediaSnapshot: .empty, byteLimit: limit)
-            let reopened = try CutProject.decodeDocument(bytes, limit: 10)
-            let baseline = try CutProject.decodeDocument(plain, limit: 10)
-            XCTAssertLessThanOrEqual(bytes.count, limit)
-            XCTAssertEqual(baseline.undo, undo)
-            XCTAssertEqual(baseline.redo, redo)
-            XCTAssertEqual(reopened.undo, baseline.undo)
-            XCTAssertEqual(reopened.redo, baseline.redo)
-            XCTAssertEqual(reopened.mediaSnapshot.entries.map(\.path), expectedPaths)
-        }
-
-        let emptyHistory = try ProjectFile.encoded(current, compact: true)
-        let (noSteps, _) = try current.encodedArchive(undo: undo, redo: redo, mediaSnapshot: snapshot,
-                                                       byteLimit: emptyHistory.count + 64)
-        let minimal = try CutProject.decodeDocument(noSteps, limit: 10)
-        XCTAssertTrue(minimal.undo.isEmpty && minimal.redo.isEmpty)
-        XCTAssertEqual(minimal.mediaSnapshot.entries.map(\.path), ["now"])
+        let (bytes, _) = try current.encodedArchive(undo: undo, redo: redo, mediaSnapshot: snapshot)
+        let reopened = try CutProject.decodeDocument(bytes, limit: 10)
+        XCTAssertEqual(reopened.mediaSnapshot.entries.map(\.path), ["now", "a-undo", "b-redo"])
+        XCTAssertEqual(reopened.undo, undo)
+        XCTAssertEqual(reopened.redo, redo)
     }
 
-    func testSnapshotCapSkipsOversizedEntryAndContinuesToNextPath() throws {
+    func testLargeSnapshotKeepsAllReferencedEntries() throws {
         let current = CutProject.sequence([clip("a", id: "one"), clip("b", id: "two")])
-        var oversized = ProjectMediaSnapshot.Entry(path: "a")
-        oversized.unknownFields["future"] = .string(String(repeating: "x", count: ProjectMediaSnapshot.maximumBytes))
-        let snapshot = ProjectMediaSnapshot(entries: [oversized, .init(path: "b")])
-        let (bytes, _) = try current.encodedArchive(undo: [], redo: [], mediaSnapshot: snapshot,
-                                                     byteLimit: MulticamProject.maximumFileSize)
+        var entry = ProjectMediaSnapshot.Entry(path: "a")
+        entry.unknownFields["future"] = .string(String(repeating: "x", count: 4 << 20))
+        let snapshot = ProjectMediaSnapshot(entries: [entry, .init(path: "b")])
+        let (bytes, _) = try current.encodedArchive(undo: [], redo: [], mediaSnapshot: snapshot)
         let reopened = try CutProject.decodeDocument(bytes, limit: 0)
-        XCTAssertEqual(reopened.project, current)
-        XCTAssertEqual(reopened.mediaSnapshot.entries.map(\.path), ["b"])
+        XCTAssertEqual(reopened.mediaSnapshot, snapshot)
     }
 
     func testRevisionStageAndCopyKeepCurrentAndHistoryOnlyEntries() throws {
@@ -89,7 +62,7 @@ final class ProjectMediaSnapshotTests: XCTestCase {
         let snapshot = ProjectMediaSnapshot(entries: [.init(path: "now"), .init(path: "older")])
         _ = try current.saveRevision(to: source, undo: undo, redo: [], mediaSnapshot: snapshot, expected: nil)
         try current.saveStaged(to: stage, undo: undo, redo: [], mediaSnapshot: snapshot)
-        try current.saveNewCopy(to: destination, copyingTranscriptsFrom: source, undo: undo, redo: [],
+        try current.saveNewCopy(to: destination, undo: undo, redo: [],
                                 mediaSnapshot: snapshot, check: {})
         for url in [source, stage, destination] {
             let document = try CutProject.loadDocument(from: url, limit: 10)
@@ -111,8 +84,7 @@ final class ProjectMediaSnapshotTests: XCTestCase {
     }
 
     func testBindingHistoryAppliesBothWaysAndKeepsLaterAttachment() throws {
-        let digest = String(repeating: "0", count: 64)
-        let asset = TranscriptAsset(file: "edit.transcripts/\(digest).json", sha256: digest, unavailable: .missing)
+        let asset = try TranscriptStore.put(TranscriptDocument(clock: .presentation))
         let later = TranscriptAttachment(id: "later", asset: asset, bindings: [.init(trackID: "other", file: "third.wav", streamIndex: 0)])
         func project(_ path: String, laterAttachment: Bool = false) -> CutProject {
             var result = CutProject.sequence([clip(path)])
@@ -124,8 +96,7 @@ final class ProjectMediaSnapshotTests: XCTestCase {
         let undo: [CutHistoryState] = [.init(action: "Replace", project: project("old.wav"))]
         let redo: [CutHistoryState] = [.init(action: "Replace", project: project("future.wav"))]
         let snapshot = ProjectMediaSnapshot(entries: ["old.wav", "future.wav"].map { .init(path: $0) })
-        let (data, _) = try current.encodedArchive(undo: undo, redo: redo, mediaSnapshot: snapshot,
-                                                    byteLimit: MulticamProject.maximumFileSize)
+        let (data, _) = try current.encodedArchive(undo: undo, redo: redo, mediaSnapshot: snapshot)
         let loaded = try CutProject.decodeEditorDocument(data, limit: 10)
         XCTAssertEqual(loaded.project, current)
         XCTAssertEqual(loaded.undo.first?.project.transcripts.attachments.first?.bindings.first?.file, "old.wav")
@@ -141,7 +112,7 @@ final class ProjectMediaSnapshotTests: XCTestCase {
         try FileManager.default.createDirectory(at: copyDirectory, withIntermediateDirectories: false)
         let source = directory.appendingPathComponent("original.cut")
         let destination = copyDirectory.appendingPathComponent("copied.cut")
-        let asset = try TranscriptStore.put(Data("{}".utf8), relativeTo: source)
+        let asset = try TranscriptStore.put(TranscriptDocument(clock: .presentation))
         var project = CutProject.sequence([clip("program.wav")])
         let before = TranscriptBinding(trackID: "speech", file: "after.wav", streamIndex: 0)
         let after = TranscriptBinding(trackID: "speech", file: "before.wav", streamIndex: 0)

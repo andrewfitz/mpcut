@@ -13,7 +13,7 @@ public struct ParticipantDialogueLine: Sendable {
 }
 
 public struct ParticipantDialogueOptions: Equatable, Sendable {
-    public enum Overlap: String, CaseIterable, Sendable { case hold, visibleSpeaker }
+    public enum Overlap: String, CaseIterable, Sendable { case hold, visibleSpeaker = "visible_speaker" }
     public enum Offscreen: String, CaseIterable, Sendable { case hold, original, reaction }
 
     public var minimumHold: RationalTime

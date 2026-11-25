@@ -45,7 +45,7 @@ final class ClipEditCSVTests: XCTestCase {
         try Data([0xff, 0xfe, 0x30]).write(to: file)
         fails(file, with: "invalid_csv")
         let handle = try FileHandle(forWritingTo: file)
-        try handle.truncate(atOffset: UInt64(MulticamProject.maximumFileSize) + 1)
+        try handle.truncate(atOffset: (64 << 20) + 1)
         try handle.close()
         fails(file, with: "invalid_csv")
     }

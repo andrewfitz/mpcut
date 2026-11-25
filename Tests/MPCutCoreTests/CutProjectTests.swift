@@ -3,6 +3,45 @@ import MPCutCore
 import XCTest
 
 final class CutProjectTests: XCTestCase {
+    func testOpenOldDatabaseReportsUnsupportedAndPreservesItsBytes() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("recording.cutdb")
+        let header = Data("SQLite format 3\0".utf8)
+        try header.write(to: file)
+        let engine = CutEngine(useSidecar: false)
+        for open: () throws -> Void in [
+            { _ = try CutProject.load(from: file) },
+            { _ = try CutProject.readableDocument(at: file) },
+            { _ = try engine.inspectSummary(file) }
+        ] {
+            XCTAssertThrowsError(try open()) {
+                XCTAssertEqual(($0 as? CutError)?.code, "unsupported_cutcache_version")
+            }
+        }
+        XCTAssertEqual(try Data(contentsOf: file), header)
+        let media = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("MPCutAppTests/Fixtures/ProRes-2997.mov")
+        try Data(contentsOf: media).write(to: file)
+        XCTAssertTrue(try engine.inspectSummary(file).hasVideo)
+    }
+
+    func testOpeningLegacyDatabaseThroughNamedSymlinkReportsUnsupported() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let files = FileManager.default
+        try files.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? files.removeItem(at: directory) }
+        let target = directory.appendingPathComponent("recording")
+        let alias = directory.appendingPathComponent("recording.cutdb")
+        try Data("SQLite format 3\0".utf8).write(to: target)
+        try files.createSymbolicLink(at: alias, withDestinationURL: target)
+
+        XCTAssertThrowsError(try CutProject.loadDocument(from: alias, limit: 5)) {
+            XCTAssertEqual(($0 as? CutError)?.code, "unsupported_cutcache_version")
+        }
+    }
+
     func testSequenceRoundTripAndRebase() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let out = dir.appendingPathComponent("exports", isDirectory: true)
@@ -47,6 +86,7 @@ final class CutProjectTests: XCTestCase {
         try Data([2]).write(to: directory.appendingPathComponent("shot.mov"))
         let clip = CutSequenceClip(id: "a", file: "shot.mov", from: .zero, to: .init(numerator: 1))
         try CutProject.sequence([clip]).save(to: url)
+        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         try fm.createSymbolicLink(atPath: link.path, withDestinationPath: "actual/edit.cut")
 
         let read = try CutProject.load(from: link)
@@ -59,6 +99,7 @@ final class CutProjectTests: XCTestCase {
         try CutProject.sequence([]).save(to: link)
         XCTAssertEqual(try fm.destinationOfSymbolicLink(atPath: link.path), "actual/edit.cut")
         XCTAssertEqual(try CutProject.load(from: url), .sequence([]))
+        XCTAssertEqual(try fm.attributesOfItem(atPath: url.path)[.posixPermissions] as? Int, 0o600)
     }
 
     func testOfflineMediaCannotBecomeTheNewProject() throws {
@@ -121,11 +162,11 @@ final class CutProjectTests: XCTestCase {
              "clips":[{"id":"a","file":"shot.mov","from":"0","to":"1","track_ordinal":\(track)}]}
             """.utf8)
         }
-        for version in ["3.00000000000000000001", "300000000000000000001e-20"] {
+        for version in ["9.00000000000000000001", "900000000000000000001e-20"] {
             XCTAssertThrowsError(try CutProject.decode(project(version, track: "0")))
         }
-        XCTAssertThrowsError(try CutProject.decode(project("3", track: "1e-1000")))
-        XCTAssertNoThrow(try CutProject.decode(project("30e-1", track: "1.00e1")))
+        XCTAssertThrowsError(try CutProject.decode(project("9", track: "1e-1000")))
+        XCTAssertNoThrow(try CutProject.decode(project("90e-1", track: "1.00e1")))
     }
 
     func testRetiredProjectsRejectBeforeReadingTimelineContents() throws {
@@ -134,7 +175,7 @@ final class CutProjectTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: folder) }
         let url = folder.appendingPathComponent("original.cut")
         for kind in ["sequence", "multicam"] {
-            for version in [1, 2] {
+            for version in 1...8 {
                 for key in ["schemaVersion", "schema_version"] {
                     let input = Data(#"{"format":"mpcut","\#(key)":\#(version),"kind":"\#(kind)","clips":false}"#.utf8)
                     try input.write(to: url)
@@ -148,7 +189,7 @@ final class CutProjectTests: XCTestCase {
     }
 
     func testCurrentVersionRejectsRetiredFieldsAndItemWrappers() {
-        let header = #""format":"mpcut","schema_version":3,"kind":"sequence""#
+        let header = #""format":"mpcut","schema_version":9,"kind":"sequence""#
         let clip = #""id":"a","file":"offline.wav","from":"0","to":"1""#
         let inputs = [
             "{\(header),\"schemaVersion\":3,\"clips\":[]}",
@@ -162,11 +203,11 @@ final class CutProjectTests: XCTestCase {
     }
 
     func testRejectsMalformedAndIncompatibleDocuments() throws {
-        let header = #""format":"mpcut","schema_version":3,"kind":"sequence""#
+        let header = #""format":"mpcut","schema_version":9,"kind":"sequence""#
         let cases = [
             "{\(header),\"clips\":[],\"clips\":[]}",
             "{\(header),\"clips\":[],\"unknown\":true}",
-            #"{"schema_version":3,"kind":"sequence","clips":[]}"#,
+            #"{"schema_version":9,"kind":"sequence","clips":[]}"#,
             #"{"schema_version":1000,"format":"mpcut","kind":"sequence","clips":[]}"#,
             "{\(header),\"clips\":[{\"id\":\"a\",\"file\":\"file\",\"from\":\"1\",\"to\":\"1\"}]}",
         ]

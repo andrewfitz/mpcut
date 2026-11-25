@@ -16,7 +16,7 @@ final class SidecarEditorTests: XCTestCase {
             try SidecarLocations.setMode(.project)
             let editors = [EditorModel(), EditorModel()]
             defer { editors.forEach { $0.endSession() } }
-            let adjacent = source.appendingPathExtension("cutdb")
+            let adjacent = source.appendingPathExtension("cutcache")
             for (number, editor) in editors.enumerated() {
                 // An untitled import stays in memory. Explicit save works even with auto-save disabled.
                 editor.useAnalysisSidecars = false
@@ -69,8 +69,8 @@ final class SidecarEditorTests: XCTestCase {
             XCTAssertTrue(FileManager.default.fileExists(atPath: singleURL.path))
             try SidecarLocations.$projectURL.withValue(single) {
                 let media = try XCTUnwrap(CutEngine().cachedIndex(source))
-                let overrides = try XCTUnwrap(AnalysisSidecar(media: media).read(AnalysisSidecar.silenceThresholdOverridesKey))
-                XCTAssertEqual(try JSONDecoder().decode([Int: Double].self, from: overrides).values.first, -47)
+                XCTAssertNil(AnalysisSidecar(media: media).read("silence_threshold_overrides_db.v1"))
+                XCTAssertEqual(try CutProject.load(from: single).analysisAnnotations.silence.first?.thresholdDB, -47)
             }
 
             let other = directory.appendingPathComponent("Camera.mov")
@@ -89,13 +89,13 @@ final class SidecarEditorTests: XCTestCase {
             XCTAssertTrue(FileManager.default.fileExists(atPath: multiURL.path))
             XCTAssertNotNil(try SidecarLocations.$projectURL.withValue(multi) { try CutEngine().cachedIndex(other) })
             for recording in [source, other] {
-                XCTAssertFalse(FileManager.default.fileExists(atPath: recording.appendingPathExtension("cutdb").path))
+                XCTAssertFalse(FileManager.default.fileExists(atPath: recording.appendingPathExtension("cutcache").path))
             }
         }
     }
 
     @MainActor
-    func testClearingAnOpenEditorPreservesNamedScenesAndDropsWholeSidecarMetadata() async throws {
+    func testClearingAnOpenEditorPreservesNamedScenesAndThreshold() async throws {
         let source = try scratchRecording("Pause-Quiet")
         let settings = source.deletingLastPathComponent().appendingPathComponent("settings")
         try await SidecarLocations.$storageDirectory.withValue(settings) {
@@ -110,28 +110,21 @@ final class SidecarEditorTests: XCTestCase {
             editor.manualThresholdDB = -45
             editor.saveAnalysisSidecars()
             try await wait { !editor.isSavingSidecars }
-            func clear(whole: Bool) throws {
-                let entry = try XCTUnwrap(SidecarCacheCleaner.preview(sources: [source]).first {
-                    $0.source.resolvingSymlinksInPath() == source.resolvingSymlinksInPath() && $0.issue == nil
-                })
-                let result = SidecarCacheCleaner.clear([entry], wholeSidecars: whole)
-                XCTAssertEqual(result.cleared, [entry.url])
-                NotificationCenter.default.post(name: .sidecarCachesDidClear, object: Set([source]),
-                                                userInfo: ["wholeSidecars": whole])
-            }
-            try clear(whole: false)
+            let entry = try XCTUnwrap(SidecarCacheCleaner.preview(sources: [source]).first {
+                $0.source.resolvingSymlinksInPath() == source.resolvingSymlinksInPath() && $0.issue == nil
+            })
+            let result = SidecarCacheCleaner.clear([entry])
+            XCTAssertEqual(result.cleared, [entry.url])
+            NotificationCenter.default.post(name: .sidecarCachesDidClear, object: Set([source]),
+                                            userInfo: ["wholeSidecars": true])
             XCTAssertEqual(editor.viewNamesBySource[id]?[1], "Interview")
             XCTAssertFalse(editor.scenesBySource[id]?.isEmpty ?? true)
             XCTAssertEqual(editor.manualThresholdDB, -45)
-            try clear(whole: true)
-            XCTAssertNil(editor.viewNamesBySource[id])
-            XCTAssertNil(editor.scenesBySource[id])
-            XCTAssertNil(editor.manualThresholdDB)
             editor.saveAnalysisSidecars()
             try await wait { !editor.isSavingSidecars }
             let sidecar = try AnalysisSidecar(source: source)
-            XCTAssertNil(sidecar.read(AnalysisSidecar.silenceThresholdOverridesKey))
-            XCTAssertNil(sidecar.read(AnalysisSidecar.viewNameSectionKey))
+            XCTAssertNil(sidecar.read("silence_threshold_overrides_db.v1"))
+            XCTAssertNil(sidecar.read("scenes_view_names.v1"))
         }
     }
 
@@ -141,8 +134,7 @@ final class SidecarEditorTests: XCTestCase {
         let stream = try XCTUnwrap(media.audio.first?.stream.index)
         let coarse = try AudioAnalysis.envelope(media, stream: stream, from: 0, to: media.duration.seconds,
                                                 columns: 16, useSidecar: false)
-        let snapshot = DesktopAnalysisSnapshot(sourceID: UUID(), media: media, scenes: nil, viewNames: [:],
-                                               thresholdOverrides: [:], edits: EditorMetadataEdits(), waveforms: [:],
+        let snapshot = DesktopAnalysisSnapshot(sourceID: UUID(), media: media, scenes: nil, waveforms: [:],
                                                envelopeOverviews: [stream: coarse], silence: [], filmstrip: [])
         let fine = try AudioAnalysis.envelope(media, stream: stream, from: 0, to: media.duration.seconds, columns: 64)
         try snapshot.save(cancelled: { false })
@@ -227,8 +219,10 @@ final class SidecarEditorTests: XCTestCase {
         XCTAssertEqual(sidecar.silence(for: media, stream: stream, thresholdDB: -45,
                                       minimum: editor.minimumPause)?.pauses, expected)
 
+        let document = directory.appendingPathComponent("Interview.cut")
+        try editor.writeProject(to: document)
         editor.endSession()
-        editor.importFiles([source])
+        try editor.openProject([], at: document)
         try await wait { !editor.isBusy && editor.pauseAnalysisReady }
         let restored = try XCTUnwrap(editor.timelineClips.first?.sourceID)
         XCTAssertFalse(editor.canScanScenes)
@@ -250,95 +244,61 @@ final class SidecarEditorTests: XCTestCase {
     }
 
     @MainActor
-    func testBlindSavesIndependentEditorsAndExplicitMetadataResets() async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let fixture = try XCTUnwrap(Bundle.module.url(forResource: "Pause-Quiet", withExtension: "mov", subdirectory: "Fixtures"))
-        let source = directory.appendingPathComponent("Interview.mov")
-        try FileManager.default.copyItem(at: fixture, to: source)
-        let first = EditorModel(), blind = EditorModel(), second = EditorModel()
-        defer { first.endSession(); blind.endSession(); second.endSession() }
-        let sidecar = try AnalysisSidecar(source: source)
-        func save(_ editor: EditorModel) async throws {
-            XCTAssertTrue(editor.canSaveAnalysisSidecars)
-            editor.saveAnalysisSidecars()
-            try await wait { !editor.isSavingSidecars }
-            XCTAssertNil(editor.alert)
-        }
+    func testEditorsSharingARecordingSaveIndependentNamesAndThresholds() async throws {
+        let source = try scratchRecording("Pause-Quiet")
+        let folder = source.deletingLastPathComponent()
+        let first = EditorModel(), second = EditorModel()
+        defer { first.endSession(); second.endSession() }
+        let firstFile = folder.appendingPathComponent("First.cut")
+        let secondFile = folder.appendingPathComponent("Second.cut")
+
         first.importFiles([source])
-        try await wait { !first.isBusy && first.canEdit }
+        try await wait { first.canEdit }
         first.scanForScenes()
         try await wait { first.currentSceneLabel != nil && first.sceneProgress == nil }
         let id = try XCTUnwrap(first.timelineClips.first?.sourceID)
-        first.setViewName("Camera", source: id, view: 1)
-        first.manualThresholdDB = -43
-        try await save(first)
-
-        blind.useAnalysisSidecars = false
-        blind.importFiles([source])
-        try await wait { !blind.isBusy && blind.canEdit }
-        XCTAssertNil(blind.manualThresholdDB)
-        blind.scanForScenes()
-        try await wait { blind.currentSceneLabel != nil && blind.sceneProgress == nil }
-        try await save(blind)
+        first.setViewName("Interview", source: id, view: 1)
+        first.manualThresholdDB = -37.5
+        try first.writeProject(to: firstFile)
+        first.saveAnalysisSidecars()
+        try await wait { !first.isSavingSidecars }
 
         second.importFiles([source])
-        try await wait { !second.isBusy && second.canEdit }
-        XCTAssertEqual(second.manualThresholdDB, -43)
-        XCTAssertEqual(second.jpegSourceAtPlayhead?.scenes?.views.first?.name, "Camera")
-        second.analysisTrack = 1
-        second.manualThresholdDB = -35
-        try await save(second)
-        first.manualThresholdDB = -52
-        first.setViewName("", source: id, view: 1)
-        try await save(first)
-        let media = try XCTUnwrap(CutEngine().cachedIndex(source))
-        let stream = media.audio.map(\.stream.index)
-        XCTAssertEqual(stream.count, 2)
-        func savedThresholds() throws -> [Int: Double] {
-            try JSONDecoder().decode([Int: Double].self, from: XCTUnwrap(sidecar.read("silence_threshold_overrides_db.v1")))
-        }
-        XCTAssertEqual(try savedThresholds(), [stream[0]: -52, stream[1]: -35])
-        let savedReport = try XCTUnwrap(sidecar.sceneReport(for: media))
-        XCTAssertNil(try XCTUnwrap(savedReport.views.first).name)
-        first.manualThresholdDB = nil
-        first.saveAnalysisSidecars()
-        var quitCanProceed = false
-        XCTAssertTrue(first.cancelAndWaitForExport { quitCanProceed = true })
-        try await wait { quitCanProceed }
-        XCTAssertEqual(try savedThresholds(), [stream[1]: -35])
+        try await wait { second.canEdit }
+        XCTAssertNil(second.manualThresholdDB)
+        XCTAssertNil(second.jpegSourceAtPlayhead?.scenes?.views.first?.name)
+        second.manualThresholdDB = -52
+        try second.writeProject(to: secondFile)
+
+        let savedFirst = try CutProject.load(from: firstFile).analysisAnnotations
+        let savedSecond = try CutProject.load(from: secondFile).analysisAnnotations
+        XCTAssertEqual(savedFirst.silence.first?.thresholdDB, -37.5)
+        XCTAssertEqual(savedFirst.scenes.first?.views.first?.name, "Interview")
+        XCTAssertEqual(savedSecond.silence.first?.thresholdDB, -52)
+        XCTAssertTrue(savedSecond.scenes.isEmpty)
     }
 
     @MainActor
-    func testAutomaticMetadataSurvivesImmediateReopenAndPreservesLaterExternalEdits() async throws {
+    func testSavingCutcacheAfterResetDoesNotRecreateAProjectThreshold() async throws {
         let source = try scratchRecording("Pause-Quiet")
+        let project = source.deletingLastPathComponent().appendingPathComponent("Edit.cut")
         let editor = EditorModel()
         defer { editor.endSession() }
         editor.importFiles([source])
         try await wait { editor.canEdit }
         editor.manualThresholdDB = -42
+        try editor.writeProject(to: project)
         editor.endSession()
-        editor.importFiles([source])
+        try editor.openProject([], at: project)
         try await wait { editor.canEdit }
         XCTAssertEqual(editor.manualThresholdDB, -42)
 
-        editor.manualThresholdDB = -45
-        var drained = false
-        XCTAssertTrue(editor.cancelAndWaitForExport { drained = true })
-        try await wait { drained }
-        let media = try XCTUnwrap(CutEngine().cachedIndex(source))
-        let stream = try XCTUnwrap(media.audio.first?.stream.index)
-        let sidecar = AnalysisSidecar(media: media)
-        let section = "silence_threshold_overrides_db.v1"
-        func thresholds() throws -> [Int: Double] {
-            try JSONDecoder().decode([Int: Double].self, from: XCTUnwrap(sidecar.read(section)))
-        }
-        XCTAssertEqual(try thresholds(), [stream: -45])
-        try sidecar.save([section: JSONEncoder().encode([stream: -51.0])])
+        editor.manualThresholdDB = nil
         editor.saveAnalysisSidecars()
         try await wait { !editor.isSavingSidecars }
-        XCTAssertEqual(try thresholds(), [stream: -51])
+        try editor.writeProject(to: project)
+        let persisted = try CutProject.load(from: project)
+        XCTAssertTrue(persisted.analysisAnnotations.silence.isEmpty)
     }
 
     @MainActor

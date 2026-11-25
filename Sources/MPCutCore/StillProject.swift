@@ -484,6 +484,7 @@ public struct StillSequenceProject: Equatable, Sendable {
     public var programColorPolicy: StillProgramColorPolicy?
     public var stillFormat: StillTimelineFormat?
     public var transcripts: ProjectTranscripts
+    public var analysisAnnotations = ProjectAnalysisAnnotations()
     public var sourceSelects: [NamedSourceSelect]
     public var participants: ParticipantProject
     // A selection consisting only of inserts still has its parent program's

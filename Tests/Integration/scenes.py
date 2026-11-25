@@ -3,10 +3,12 @@
 import argparse
 from fractions import Fraction
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 CLI = None
@@ -21,6 +23,11 @@ class Scenes(unittest.TestCase):
     def setUpClass(cls):
         temporary = tempfile.TemporaryDirectory()
         cls.addClassCleanup(temporary.cleanup)
+        settings = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(settings.cleanup)
+        env = patch.dict(os.environ, {"MPCUT_SIDECAR_HOME": settings.name})
+        env.start()
+        cls.addClassCleanup(env.stop)
         cls.source = Path(temporary.name) / "Montage.mp4"
         graph = ("color=red:s=320x96:r=25:d=0.44[v0];color=blue:s=320x96:r=25:d=0.52[v1];"
                  "color=red:s=320x96:r=25:d=0.68[v2];[v0][v1][v2]concat=n=3:v=1:a=0")
@@ -61,7 +68,7 @@ class Scenes(unittest.TestCase):
                          [0, Fraction(11, 25), Fraction(24, 25)])
         self.assertEqual([time(scene["end"]) for scene in report["scenes"]],
                          [Fraction(11, 25), Fraction(24, 25), Fraction(41, 25)])
-        self.assertEqual(set(self.source.parent.iterdir()), {self.source, Path(str(self.source) + ".cutdb")})
+        self.assertEqual(set(self.source.parent.iterdir()), {self.source, Path(str(self.source) + ".cutcache")})
 
     def test_scene_files_match_chronology_and_frame_counts(self):
         report = self.cli("--export-to", self.output, self.source)
@@ -135,6 +142,44 @@ class Scenes(unittest.TestCase):
                                  [0, Fraction(9, 25), Fraction(18, 25)])
                 self.assertEqual([scene["view_label"] for scene in report["scenes"]], ["A", "A", "A"])
                 self.assertEqual(time(report["scenes"][-1]["end"]), Fraction(27, 25))
+
+    def test_saved_view_names_flow_from_project_scan_to_export_and_reset(self):
+        project = self.output / "scene-input.cut"
+        project.write_text(json.dumps({"format": "mpcut", "schema_version": 9, "kind": "sequence",
+                                       "clips": [{"id": "piece", "file": str(self.source),
+                                                  "from": "1/5", "to": "7/5"}]}))
+
+        def rename(source, destination, label, report_id, expected=0):
+            result = subprocess.run([CLI, "scenes", "view", "rename", "--json", "--no-sidecar",
+                                     "--project", source, "--out-project", destination,
+                                     "--source", self.source, "--report-id", report_id, "--view", "1", "--name", label],
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+            return json.loads(result.stdout)
+
+        requested = self.cli("--project", project, "--no-sidecar")["sources"][0]["outcome"]
+        scoped_before = self.cli("--project", project, "--clip-id", "piece", "--no-sidecar")["sources"][0]["outcome"]
+        self.assertNotEqual(scoped_before["report_id"], requested["report_id"])
+        named = self.output / "scene-named.cut"
+        name = "Équipe / Wide"
+        self.assertEqual(rename(project, named, name, scoped_before["report_id"], expected=2)["error"]["code"],
+                         "stale_scene_report")
+        self.assertFalse(named.exists())
+        renamed = rename(project, named, name, requested["report_id"])
+        self.assertEqual(renamed["report"]["views"][0]["name"], name)
+        saved = self.cli("--project", named, "--no-sidecar")["sources"][0]["outcome"]["report"]
+        self.assertEqual(saved["views"][0]["name"], name)
+        scoped = self.cli("--project", named, "--clip-id", "piece", "--no-sidecar")["sources"][0]["outcome"]["report"]
+        self.assertEqual(time(scoped["scenes"][0]["start"]), Fraction(1, 5))
+        self.assertEqual(scoped["views"][0]["name"], name)
+        export = self.cli("--stdin", "--group-by", "view", "--export-to", self.output, "--dry-run", request=saved)
+        first = export["outputs"][0]
+        self.assertEqual(first["view_label"], name)
+        self.assertEqual(Path(first["export"]["output"]).name, "Montage-view-001-Equipe-Wide.mp4")
+        reset = self.output / "scene-reset.cut"
+        self.assertNotIn("name", rename(named, reset, "", renamed["report_id"])["report"]["views"][0])
+        reopened = self.cli("--project", reset, "--no-sidecar")["sources"][0]["outcome"]["report"]
+        self.assertNotIn("name", reopened["views"][0])
 
     def test_saved_report_joins_each_view_in_source_order(self):
         detection = self.cli(self.source)

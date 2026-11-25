@@ -34,10 +34,13 @@ extension MulticamEditorModel {
         guard !isBusy, let suggestion = currentEdgeSuggestion else { return false }
         let index = suggestion.edge.range - 1
         guard let range = assemblyRange(at: index), let moved = suggestion.moving(range, to: time) else { return false }
-        var items = assemblyItems
-        items[index] = items[index].trimmingGroup(to: moved)
         preview.pause()
-        guard edit("Move Range Edge", { $0.assemblyItems = items }) else { return false }
+        guard edit("Move Range Edge", { project in
+            project.materializeAssembly()
+            if let item = project.assemblyItems?[index] {
+                project.assemblyItems?[index] = item.trimmingGroup(to: moved)
+            }
+        }) else { return false }
         edgeSuggestion = nil
         exportAlternatives = []
         return true

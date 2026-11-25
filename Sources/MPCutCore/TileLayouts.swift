@@ -337,7 +337,11 @@ extension CutProject {
                 guard item.tileLayouts != layouts else { return }
                 items[index] = .group(group, angle: item.angleOverride,
                                       id: id, layouts: layouts)
-                project.assemblyItems = items
+                if project.assemblyItems == nil {
+                    project.replaceAssembly(items, carryingPauseReviewsFrom: [index])
+                } else {
+                    project.assemblyItems = items
+                }
             }
         })
     }

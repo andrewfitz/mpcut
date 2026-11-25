@@ -7,15 +7,24 @@ extension Notification.Name {
     static let sidecarCachesDidClear = Notification.Name("MPCutSidecarCachesDidClear")
 }
 
+/// What clearing must leave alone. `protected` holds every recording an open project references, including the
+/// recordings of its retained undo and redo history and of the saved file, plus project and draft files.
 struct SidecarClearContext: Sendable {
     var sources = Set<URL>()
     var protected = Set<URL>()
     var projects = Set<URL>()
+    /// A window is still opening a project or importing, so its recordings are not all listed yet.
+    var isSettling = false
 
     init() {}
 
     @MainActor init(sessions: ProjectSessions) {
+        isSettling = sessions.hasPendingOpens
         for session in sessions.sessions.values {
+            if session.editor.openingProjectURL != nil || session.multicam.openingProjectURL != nil
+                || session.editor.isImporting || session.multicam.isBusy {
+                isSettling = true
+            }
             for path in session.editor.mcpOutputProtectedMedia.keys {
                 sources.insert(URL(fileURLWithPath: path))
             }
@@ -73,17 +82,18 @@ struct SidecarStorageSettings: View {
 
     var body: some View {
         Section {
-            Toggle("Save and reuse analysis", isOn: $preferences.useAnalysisSidecars)
+            Toggle(SettingsRow.reuseAnalysis.title, isOn: $preferences.useAnalysisSidecars)
                 .accessibilityLabel("Save and reuse analysis")
+                .settingsRow(.reuseAnalysis)
                 .help("Reuse saved media analysis")
-            Picker("Save new sidecars", selection: Binding(get: { mode }, set: { selectMode($0) })) {
+            Picker("Save new cutcaches", selection: Binding(get: { mode }, set: { selectMode($0) })) {
                 ForEach(SidecarStorageMode.allCases, id: \.self) { location in
                     Text(location.settingsTitle).tag(location)
                 }
             }
             .disabled(!loaded || saving)
-            .accessibilityLabel("Save new sidecars")
-            .accessibilityIdentifier("sidecars.storage-location")
+            .accessibilityLabel("Save new cutcaches")
+            .settingsRow(.cutcacheLocation)
             if mode == .disk {
                 LabeledContent("Shared cache folder") {
                     VStack(alignment: .trailing, spacing: 3) {
@@ -99,9 +109,10 @@ struct SidecarStorageSettings: View {
                     }
                 }
             }
-            Button("Clear Caches…") { showClear = true }
+            Button(SettingsRow.clearCutcaches.title) { showClear = true }
+                .settingsRow(.clearCutcaches)
         } header: {
-            Text("Analysis sidecars")
+            Text("Analysis cutcaches")
         } footer: {
             SettingsFootnote(locationFootnote)
         }
@@ -113,8 +124,9 @@ struct SidecarStorageSettings: View {
         .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didMountNotification)) { _ in refreshID = UUID() }
         .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didUnmountNotification)) { _ in refreshID = UUID() }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in refreshID = UUID() }
+        .onReceive(NotificationCenter.default.publisher(for: .sidecarStorageDidChange)) { _ in refreshID = UUID() }
         .sheet(isPresented: $showClear) { SidecarClearSheet(context: cacheContext) }
-        .alert("Couldn’t Save Sidecar Location", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
+        .alert("Couldn’t Save Cutcache Location", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
             Button("OK") { error = nil }
         } message: { Text(error ?? "") }
     }
@@ -189,10 +201,9 @@ private struct SidecarClearSheet: View {
     @State private var scope: SidecarStorageMode?
     @State private var root: String?
     @State private var revision = UUID()
-    @State private var wholeSidecars = false
+    @State private var projectBytes: Int64 = 0
     @State private var loading = true
     @State private var clearing = false
-    @State private var confirmRemoval = false
     @State private var result: SidecarClearResult?
 
     private var locationEntries: [SidecarCacheEntry] { entries.filter { scope == nil || $0.location == scope } }
@@ -202,32 +213,25 @@ private struct SidecarClearSheet: View {
     }
     private var selected: [SidecarCacheEntry] { locationEntries.filter { root == nil || $0.rootIdentity == root } }
     private var eligible: [SidecarCacheEntry] {
-        selected.filter { $0.issue == nil && (wholeSidecars || $0.rebuildableBytes > 0) }
+        selected.filter { $0.issue == nil }
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Clear Caches").font(.title2.bold()).accessibilityAddTraits(.isHeader)
+            Text("Clear cutcaches").font(.title2.bold()).accessibilityAddTraits(.isHeader)
             if let result {
                 let count = result.cleared.count
-                let summary = wholeSidecars ? "Removed \(sidecarCount(count))" : "Cleared analysis from \(sidecarCount(count))"
-                Text("\(summary). Reclaimed \(size(result.reclaimedBytes)).")
+                Text("Removed \(sidecarCount(count)). Reclaimed \(size(result.reclaimedBytes)).")
                 if !result.skippedEntries.isEmpty {
                     Text("Skipped locations may still supply cached results when available.")
                 }
-                let skippedIDs = Set(result.skippedEntries.map(\.id))
-                let clearedEntries = Dictionary(grouping: selected.filter { !skippedIDs.contains($0.id) }, by: \.url)
                 let byID = Dictionary(uniqueKeysWithValues: selected.map { ($0.id, $0) })
                 let duplicates = duplicateSourceNames
                 List {
                     if !result.cleared.isEmpty {
-                        Section(wholeSidecars ? "Removed" : "Analysis cleared") {
-                            ForEach(result.cleared.sorted(by: { $0.path < $1.path }), id: \.self) { url in
-                                if let entry = clearedEntries[url]?.first {
-                                    cacheIdentity(entry, duplicates: duplicates)
-                                } else {
-                                    pathLabel(url)
-                                }
+                        Section("Removed") {
+                            ForEach(result.clearedEntries.sorted(by: { $0.url.path < $1.url.path })) { entry in
+                                cacheIdentity(entry, duplicates: duplicates)
                             }
                         }
                     }
@@ -264,15 +268,10 @@ private struct SidecarClearSheet: View {
             let current = context()
             let found = await Self.discover(folders, context: current)
             guard !Task.isCancelled else { return }
-            entries = found
+            entries = found.entries
+            projectBytes = found.projectBytes
             if let root, !rootEntries.contains(where: { $0.rootIdentity == root }) { self.root = nil }
             loading = false
-        }
-        .alert("Remove \(sidecarCount(eligible.count))?", isPresented: $confirmRemoval) {
-            Button("Cancel", role: .cancel) {}
-            Button("Remove Sidecars", role: .destructive, action: clear)
-        } message: {
-            Text("This permanently deletes the files, including any saved edits, recognition results and resumable scans they contain.")
         }
     }
 
@@ -289,14 +288,14 @@ private struct SidecarClearSheet: View {
             .onChange(of: scope) { _, _ in root = nil }
             Spacer()
             Button("Scan Folder…") {
-                chooseSidecarFolder(title: "Find sidecars in a folder", allowCreation: false) { url in
+                chooseSidecarFolder(title: "Find cutcaches in a folder", allowCreation: false) { url in
                     folders.removeAll { $0 == url }
                     folders.append(url)
                     loading = true
                     revision = UUID()
                 }
             }
-            .help("Search this folder and its subfolders for additional sidecars")
+            .help("Search this folder and its subfolders for additional cutcaches")
         }
         let roots = rootEntries
         if scope != nil && roots.count > 1 {
@@ -312,23 +311,17 @@ private struct SidecarClearSheet: View {
             }
             .help(roots.first { $0.rootIdentity == root }?.rootURL.path ?? "Include every folder in this location")
         }
-        Toggle("Remove entire sidecars", isOn: $wholeSidecars)
-            .accessibilityLabel("Remove entire sidecars")
-            .accessibilityIdentifier("sidecars.remove-whole")
-        if wholeSidecars {
-            Text("Includes saved edits, recognition results and resumable scans in the listed sidecars.")
-                .font(.callout)
-        } else {
-            Text("Clears rebuildable analysis and keeps saved edits, recognition results and resumable scans.")
-                .font(.callout)
+        if projectBytes > 0 {
+            Text("Saved projects · \(size(projectBytes))").font(.callout)
         }
         if loading {
-            ProgressView("Finding sidecars…").frame(maxWidth: .infinity, maxHeight: .infinity)
+            ProgressView("Finding cutcaches…").frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if selected.isEmpty {
-            Text("No known sidecars in this location. Use Scan Folder to find older caches.")
+            Text("No known cutcaches in this location.")
                 .foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             let duplicates = duplicateSourceNames
+            let copies = Dictionary(grouping: entries.filter { $0.usage != nil }, by: \.source)
             List {
                 ForEach(SidecarStorageMode.allCases, id: \.self) { mode in
                     let group = selected.filter { $0.location == mode }
@@ -340,18 +333,35 @@ private struct SidecarClearSheet: View {
                                         cacheIdentity(entry, duplicates: duplicates, showLocation: false)
                                         Spacer()
                                         if entry.issue == nil {
-                                            Text(size(wholeSidecars ? entry.bytes : entry.rebuildableBytes))
+                                            Text(size(entry.bytes))
                                                 .monospacedDigit().fixedSize()
                                         }
                                     }
                                     if let issue = entry.issue {
                                         Label(issue, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.secondary)
-                                    } else if !entry.retained.isEmpty {
-                                        Text((wholeSidecars ? "Also removes " : "Keeps ") + entry.retained.joined(separator: ", "))
-                                            .font(.caption).foregroundStyle(.secondary)
+                                    }
+                                    if let usage = entry.usage {
+                                        DisclosureGroup("Storage details") {
+                                            VStack(alignment: .leading) {
+                                                Text("Database · \(size(usage.databaseBytes))")
+                                                Text("SQLite overhead · \(size(usage.sqliteOverheadBytes))")
+                                                if let count = copies[entry.source]?.count, count > 1 {
+                                                    Text("\(count) cutcache copies for this recording")
+                                                }
+                                                ForEach(usage.sectionBytes.keys.sorted(), id: \.self) { name in
+                                                    Text("\(name) · \(size(usage.sectionBytes[name] ?? 0))")
+                                                }
+                                                ForEach(usage.archivedSectionBytes.keys.sorted(), id: \.self) { name in
+                                                    Text("Archived \(name) · \(size(usage.archivedSectionBytes[name] ?? 0))")
+                                                }
+                                                if usage.checkpointBytes > 0 { Text("Scene checkpoints · \(size(usage.checkpointBytes))") }
+                                                if usage.markerBytes > 0 { Text("Scene markers · \(size(usage.markerBytes))") }
+                                            }
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                        }
+                                        .font(.caption)
                                     }
                                 }
-                                .accessibilityElement(children: .combine)
                             }
                         }
                     }
@@ -364,9 +374,9 @@ private struct SidecarClearSheet: View {
                 ProgressView("Clearing…").controlSize(.small)
             } else if !loading {
                 let skipped = selected.filter { $0.issue != nil }.count
-                let bytes = eligible.reduce(Int64.zero) { $0 + (wholeSidecars ? $1.bytes : $1.rebuildableBytes) }
+                let bytes = eligible.reduce(Int64.zero) { $0 + $1.bytes }
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("\(sidecarCount(eligible.count)) to \(wholeSidecars ? "remove" : "clear")")
+                    Text("\(sidecarCount(eligible.count)) to clear")
                     Text(skipped > 0 ? "Estimated \(size(bytes)) · \(skipped) skipped" : "Estimated \(size(bytes))")
                         .font(.caption).foregroundStyle(.secondary)
                 }
@@ -374,38 +384,40 @@ private struct SidecarClearSheet: View {
             }
             Spacer()
             Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
-            Button(wholeSidecars ? "Remove Sidecars…" : "Clear Analysis", role: .destructive) {
-                if wholeSidecars { confirmRemoval = true } else { clear() }
-            }
+            Button("Clear cutcaches", role: .destructive, action: clear)
             .disabled(loading || eligible.isEmpty)
         }
     }
 
     private func clear() {
         guard !clearing else { return }
-        let current = context(), whole = wholeSidecars
-        let chosen = selected.filter { whole || $0.issue != nil || $0.rebuildableBytes > 0 }
+        let current = context()
+        let chosen = selected
         clearing = true
         Task {
-            let outcome = await Self.remove(chosen, whole: whole, protected: current.protected)
-            let cleared = Set(outcome.cleared)
-            let sources = Set(chosen.filter { $0.issue == nil && cleared.contains($0.url) }.map(\.source))
+            let outcome = await Self.remove(chosen, protected: current.protected)
+            let sources = outcome.clearedSources
             if !sources.isEmpty {
-                NotificationCenter.default.post(name: .sidecarCachesDidClear, object: sources, userInfo: ["wholeSidecars": whole])
+                NotificationCenter.default.post(name: .sidecarCachesDidClear, object: sources, userInfo: ["wholeSidecars": true])
             }
             result = outcome
             clearing = false
         }
     }
 
-    private nonisolated static func discover(_ folders: [URL], context: SidecarClearContext) async -> [SidecarCacheEntry] {
-        SidecarCacheCleaner.preview(scanning: folders, protected: context.protected, sources: Array(context.sources),
-                                   projects: Array(context.projects))
+    private nonisolated static func discover(_ folders: [URL], context: SidecarClearContext) async
+        -> (entries: [SidecarCacheEntry], projectBytes: Int64) {
+        let entries = SidecarCacheCleaner.preview(scanning: folders, protected: context.protected, sources: Array(context.sources),
+                                                  projects: Array(context.projects))
+        let bytes = Set(context.projects.map { $0.standardizedFileURL.resolvingSymlinksInPath() }).reduce(Int64.zero) {
+            $0 + Int64((try? $1.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        }
+        return (entries, bytes)
     }
 
-    private nonisolated static func remove(_ entries: [SidecarCacheEntry], whole: Bool,
+    private nonisolated static func remove(_ entries: [SidecarCacheEntry],
                                            protected: Set<URL>) async -> SidecarClearResult {
-        SidecarCacheCleaner.clear(entries, wholeSidecars: whole, protected: protected)
+        SidecarCacheCleaner.clear(entries, protected: protected)
     }
 
     private var duplicateSourceNames: Set<String> {
@@ -437,7 +449,7 @@ private struct SidecarClearSheet: View {
     }
 
     private func sidecarCount(_ count: Int) -> String {
-        "\(count) \(count == 1 ? "sidecar" : "sidecars")"
+        "\(count) \(count == 1 ? "cutcache" : "cutcaches")"
     }
 
     private func size(_ bytes: Int64) -> String {

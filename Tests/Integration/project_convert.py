@@ -2,13 +2,16 @@
 """Exercise project conversion and .cut playback through the installed CLI."""
 import argparse
 import json
+import os
 from pathlib import Path
 import signal
+import shlex
 import shutil
 import subprocess
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
 from media_regression import ffmpeg, frames
@@ -20,11 +23,14 @@ class ProjectConversion(unittest.TestCase):
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         self.folder = Path(scratch.name).resolve()
+        preferences = patch.dict(os.environ, {"MPCUT_SIDECAR_HOME": str(self.folder / "preferences")})
+        preferences.start()
+        self.addCleanup(preferences.stop)
         self.camera = self.folder / "source & A.mov"
         ffmpeg("-f", "lavfi", "-i", "testsrc2=size=160x90:rate=24:duration=3",
                "-c:v", "prores_ks", self.camera)
         self.project = self.folder / "rough.cut"
-        self.document = dict(format="mpcut", schema_version=3, kind="sequence", clips=[
+        self.document = dict(format="mpcut", schema_version=9, kind="sequence", clips=[
             dict(id=name, file=self.camera.name, **{"from": a, "to": b})
             for name, a, b in [("second", "1", "2"), ("first", "0", "1"), ("repeat", "1", "2")]
         ])
@@ -48,6 +54,74 @@ class ProjectConversion(unittest.TestCase):
         self.cli("export", "project", "render", "--project", self.project, "--output", output)
         original = frames(self.camera)
         self.assertEqual(frames(output), original[24:48] + original[:24] + original[24:48])
+
+    def test_project_render_plan_binds_project_source_options_and_output(self):
+        output = self.folder / "reviewed.mov"
+        another_output = self.folder / "different.mov"
+        command = ("export", "project", "render", "--project", self.project, "--output", output)
+        report = self.cli(*command, "--dry-run")
+        token = report["plan_token"]
+        self.assertFalse(output.exists())
+        self.assertEqual(self.cli(*command, "--dry-run")["plan_token"], token)
+
+        def stale(*args, stdin=None):
+            report = self.cli(*args, status=1, stdin=stdin)
+            self.assertEqual(report["error"]["code"], "stale_render_plan")
+            self.assertFalse(output.exists())
+            self.assertFalse(another_output.exists())
+
+        stale(*command, "--mode", "encode", "--plan-token", token)
+        stale("export", "project", "render", "--project", self.project, "--output", another_output,
+              "--plan-token", token)
+
+        reviewed = self.project.read_bytes()
+        changed = {**self.document, "clips": self.document["clips"][:1]}
+        self.project.write_text(json.dumps(changed))
+        stale(*command, "--plan-token", token)
+        self.project.write_bytes(reviewed)
+
+        replacement = self.camera.with_name("replacement.mov")
+        shutil.copyfile(self.camera, replacement)
+        replacement.replace(self.camera)
+        stale(*command, "--plan-token", token)
+
+        request = {"project_path": str(self.project), "output": str(output)}
+        json_command = ("export", "project", "render", "--stdin")
+        report = self.cli(*json_command, "--dry-run", stdin=json.dumps(request))
+        request["plan_token"] = report["plan_token"]
+        result = self.cli(*json_command, stdin=json.dumps(request))
+        self.assertEqual(result["duration"], report["duration"])
+        self.assertTrue(output.is_file())
+
+    def test_project_change_during_render_prevents_publication(self):
+        helper = self.folder / "render-helper"
+        actual_helper = shutil.which("ffmpeg")
+        replacement = self.folder / "new-revision.cut"
+        replacement.write_text(json.dumps({**self.document, "clips": self.document["clips"][:1]}))
+        # Hardware preflight runs in a different directory. Change the project only
+        # after FFmpeg has written the render to the CLI's private staging directory.
+        helper.write_text(
+            f'#!/bin/sh\n{shlex.quote(actual_helper)} "$@" || exit $?\n'
+            f'case "${{PWD##*/}}" in\n  .mpcut-*) mv {shlex.quote(str(replacement))} '
+            f'{shlex.quote(str(self.project))} ;;\nesac\n'
+        )
+        helper.chmod(0o755)
+        output = self.folder / "reviewed.mov"
+        command = [CLI, "--json", "export", "project", "render", "--project", self.project,
+                   "--output", output, "--mode", "encode", "--audio", "remove", "--no-sidecar"]
+        environment = {**os.environ, "MPCUT_FFMPEG_HELPER": str(helper)}
+        preview = subprocess.run([*command, "--dry-run"], env=environment, text=True, capture_output=True, timeout=30)
+        report = json.loads(preview.stdout)
+        if report.get("error", {}).get("code") == "encoder_unavailable":
+            self.skipTest(report["error"]["message"])
+        self.assertEqual(preview.returncode, 0, preview.stdout + preview.stderr)
+        render = subprocess.run([*command, "--plan-token", report["plan_token"]], env=environment,
+                                text=True, capture_output=True, timeout=30)
+        self.assertEqual(render.returncode, 1, render.stdout + render.stderr)
+        self.assertEqual(json.loads(render.stdout)["error"]["code"], "stale_render_plan")
+        self.assertFalse(replacement.exists(), "the encode helper did not replace the reviewed project")
+        self.assertFalse(output.exists())
+        self.assertFalse(list(self.folder.glob(".mpcut-*")))
 
     def test_cancelled_conversion_leaves_no_project(self):
         document = self.document.copy()
@@ -78,7 +152,7 @@ class ProjectConversion(unittest.TestCase):
 
     def test_multicam_outputs_preserve_offline_camera_path(self):
         output = self.folder / "offline.mov"
-        document = dict(format="mpcut", schema_version=3, kind="multicam", reference_angle_id="a",
+        document = dict(format="mpcut", schema_version=9, kind="multicam", reference_angle_id="a",
                         angles=[{"id": "a", "file": self.camera.name}, {"id": "b", "file": output.name}],
                         audio={"mode": "none"}, switches=[{"group_time": "0", "angle_id": "a"}],
                         group_range={"from": "0", "to": "1"})
@@ -114,7 +188,7 @@ class ProjectConversion(unittest.TestCase):
         for operation in ("frames-stdin", "frames-file", "silence", "mixed-export"):
             with self.subTest(operation=operation):
                 output = self.folder / (operation + ".mov")
-                encoded = json.dumps(dict(format="mpcut", schema_version=3, kind="multicam", reference_angle_id="a",
+                encoded = json.dumps(dict(format="mpcut", schema_version=9, kind="multicam", reference_angle_id="a",
                     angles=[{"id": "a", "file": self.camera.name}], group_range={"from": "0", "to": "1"},
                     audio={"mode": "none"}, switches=[{"group_time": "0", "angle_id": "a"}],
                     history={"redo": [{"action": "Add Camera", "angles": [[0, 1], {"id": "b", "file": output.name}]}]}))
@@ -137,7 +211,7 @@ class ProjectConversion(unittest.TestCase):
     def test_frame_export_cannot_create_an_offline_history_file_inside_its_folder(self):
         output = self.folder / "review"
         history = {"undo": [{"action": "Remove Recorder", "audio_sources": [{"id": "rec", "file": "review/manifest.json"}]}]}
-        project = dict(format="mpcut", schema_version=3, kind="multicam", reference_angle_id="a",
+        project = dict(format="mpcut", schema_version=9, kind="multicam", reference_angle_id="a",
                        angles=[{"id": "a", "file": self.camera.name}], group_range={"from": "0", "to": "1"},
                        audio={"mode": "none"}, switches=[{"group_time": "0", "angle_id": "a"}], history=history)
         self.project.write_text(json.dumps(project))
@@ -149,7 +223,7 @@ class ProjectConversion(unittest.TestCase):
         safe = self.folder / "second.mov"
         shutil.copyfile(self.camera, safe)
         clip = self.document["clips"][0]
-        protected = self.camera.with_suffix(".mov.cutdb")
+        protected = self.camera.with_suffix(".mov.cutcache")
         self.document["clips"].append(dict(clip, id="another", file=safe.name))
         self.document["history"] = {"redo": [{"action": "Replace Audio", "clips": [
             dict(clip, original_file=protected.name), [1, 3]
@@ -157,12 +231,12 @@ class ProjectConversion(unittest.TestCase):
         self.project.write_text(json.dumps(self.document))
         self.cli("export", "project", "render", "--project", self.project, "--output", "sequence.mov", "--dry-run", sidecars=True)
         self.assertFalse(protected.exists())
-        self.assertEqual(safe.with_suffix(".mov.cutdb").read_bytes()[:16], b"SQLite format 3\0")
+        self.assertEqual(safe.with_suffix(".mov.cutcache").read_bytes()[:16], b"SQLite format 3\0")
         self.cli("project", "convert", self.project, "--output", "handoff.fcpxml", sidecars=True)
         self.assertFalse(protected.exists())
 
         # The first plain clip must respect the later project's offline camera.
-        multicam = dict(format="mpcut", schema_version=3, kind="multicam", reference_angle_id="a",
+        multicam = dict(format="mpcut", schema_version=9, kind="multicam", reference_angle_id="a",
                         angles=[{"id": "a", "file": safe.name}], group_range={"from": "0", "to": "1"},
                         audio={"mode": "none"}, switches=[{"group_time": "0", "angle_id": "a"}],
                         history={"undo": [{"action": "Remove Camera", "angles": [[0, 1],
@@ -215,7 +289,7 @@ class ProjectConversion(unittest.TestCase):
         self.document["clips"][0]["file"] = "link/../camera.mov"
         inspected = self.cli("project", "inspect", "--project", "-", stdin=json.dumps(self.document))
         self.assertEqual(Path(inspected["sources"]["second"]).resolve(), self.camera)
-        multicam = dict(format="mpcut", schema_version=3, kind="multicam", reference_angle_id="a",
+        multicam = dict(format="mpcut", schema_version=9, kind="multicam", reference_angle_id="a",
                         angles=[{"id": "a", "file": "link/../camera.mov"}], audio={"mode": "none"},
                         switches=[{"group_time": "0", "angle_id": "a"}], group_range={"from": "0", "to": "1"})
         result = self.cli("review", "frames", "export", "--project", "-", "--at", "0", "--output", "review",

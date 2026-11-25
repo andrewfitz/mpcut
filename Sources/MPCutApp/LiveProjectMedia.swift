@@ -97,16 +97,8 @@ struct LiveProjectMediaArchive: Sendable {
     }
 
     mutating func ignore(_ path: String) throws {
-        guard ProjectMedia.references(in: project).contains(where: { url($0.path) == url(path) }) else {
-            throw CutError(code: "missing_source", message: "This path does not reference project media.")
-        }
-        let absolute = url(path).path
-        if let index = snapshot.entries.firstIndex(where: { url($0.path).path == absolute }) {
-            snapshot.entries[index].ignored = true
-        } else {
-            var entry = ProjectMediaSnapshot.Entry(path: absolute)
-            entry.ignored = true
-            snapshot.entries.append(entry)
+        try ProjectMediaVolume.$checking.withValue(checkingVolumes) {
+            try ProjectMedia.leaveOffline(path, project: project, relativeTo: documentURL, snapshot: &snapshot)
         }
     }
 }

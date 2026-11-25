@@ -524,6 +524,8 @@ final class MulticamPreview: ObservableObject {
             volume = preferences.volume
             isMuted = preferences.isMuted
             scrubSoundEnabled = preferences.scrubSoundEnabled
+            // A new window starts at the Settings speed. A later change in Settings leaves this window's speed alone.
+            forwardSpeed = preferences.playbackSpeed
             updateGain()
             preferenceObserver = preferences.observeChanges { [weak self, weak preferences] change in
                 guard let self, let preferences else { return }
@@ -1160,11 +1162,13 @@ final class MulticamPreview: ObservableObject {
 
 struct MulticamPreviewView: NSViewRepresentable {
     let preview: MulticamPreview
+    /// Force SDR and clean feed. Nil keeps the factory values for this surface.
+    let preferences: EditorPreferences?
     var isVideoMonitor = false
 
     func makeNSView(context: Context) -> PreviewSurface {
         let surface = PreviewSurface(frame: .zero)
-        surface.setMonitor(isVideoMonitor)
+        surface.setMonitor(isVideoMonitor, preferences: preferences)
         surface.windowChanged = { [weak preview] surface in
             if surface.window == nil { preview?.detach(surface) }
             else { preview?.attach(surface) }

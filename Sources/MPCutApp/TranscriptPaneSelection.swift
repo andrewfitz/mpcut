@@ -122,7 +122,6 @@ struct TranscriptReaderPlace {
     let scope: TranscriptPane.BrowseScope
     let searchText: String
     let query: String
-    let followPlayback: Bool
     let anchor: TranscriptOccurrence?
     /// The visible word’s position in the current reader filter.
     let anchorIndex: Int
@@ -137,6 +136,9 @@ struct TranscriptReaderPlace {
 @MainActor
 final class TranscriptPaneMemory {
     var place: TranscriptReaderPlace?
+    /// The folder this window's transcript, caption or ISO save panel last chose. Under a Settings
+    /// starting folder other than Automatic it starts those panels for the rest of the session.
+    var exportFolder: URL?
 }
 
 struct TranscriptPaneWordList {

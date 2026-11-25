@@ -140,7 +140,7 @@ class ParticipantFeeds(ParticipantFixtureCase):
     def accept_feeds(self, path, scan):
         project = self.folder / "source.cut"
         project.write_text(json.dumps({
-            "format": "mpcut", "schema_version": 4, "kind": "multicam",
+            "format": "mpcut", "schema_version": 9, "kind": "multicam",
             "reference_angle_id": "burned-in", "group_range": interval(0, 4),
             "angles": [{"id": "burned-in", "file": str(path)}],
             "audio": {"mode": "none"}, "switches": [{"group_time": "0", "angle_id": "burned-in"}],
@@ -185,7 +185,7 @@ class ParticipantFeeds(ParticipantFixtureCase):
         scan = self.scan(self.feeds, "2x2")
         self.assertEqual(scan["configuration"]["feed_layout"], "2x2")
         self.assert_grid(scan, self.size, self.regions, tolerance=0.01)
-        self.assertFalse(self.feeds.with_suffix(".mov.cutdb").exists())
+        self.assertFalse(self.feeds.with_suffix(".mov.cutcache").exists())
         self.assert_feed_export(self.feeds, self.size, self.regions, scan)
 
     def test_auto_detects_guttered_grid_and_exports_feed_through_slot_swap(self):

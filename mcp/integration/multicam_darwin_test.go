@@ -20,7 +20,7 @@ func checkMulticamWorkflows(t *testing.T, call func(name string, args object, ex
 		t.Fatal(err)
 	}
 	path := filepath.Join(dir, "Replays.cut")
-	doc := `{"format":"mpcut","schema_version":3,"kind":"multicam","reference_angle_id":"wide",
+	doc := `{"format":"mpcut","schema_version":9,"kind":"multicam","reference_angle_id":"wide",
 		"group_range":{"from":"0","to":"1001/2500"},
 		"angles":[{"id":"wide","file":"media.mov"},{"id":"close","file":"close.mov"}],
 		"audio":{"mode":"none"},"switches":[{"group_time":"0","angle_id":"wide"}],
@@ -171,7 +171,7 @@ func checkMulticamRecordingGap(t *testing.T, call func(string, object, string) o
 		t.Fatal(err)
 	}
 	path := filepath.Join(dir, "Recording restart.cut")
-	doc := `{"format":"mpcut","schema_version":3,"kind":"multicam","reference_angle_id":"wide",
+	doc := `{"format":"mpcut","schema_version":9,"kind":"multicam","reference_angle_id":"wide",
 		"group_range":{"from":"0","to":"1001/2500"},
 		"angles":[{"id":"wide","file":"media.mov","group_coverage":{"from":"0","to":"1001/7500"},
 			"additional_recordings":[{"id":"wide-restart","file":"camera-restart.mov","offset":"1001/5000",

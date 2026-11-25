@@ -4,6 +4,21 @@ import XCTest
 @testable import MPCutApp
 
 final class StillFrameExportTests: XCTestCase {
+    func testPrivateFrameDirectorySkipsManifestEncoding() throws {
+        struct UnserializableManifest: Encodable {
+            func encode(to encoder: Encoder) throws {
+                throw EncodingError.invalidValue(0, .init(codingPath: [], debugDescription: "Unexpected manifest encoding"))
+            }
+        }
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("mpcut-private-frame-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        _ = try JPEGExport.writeProgramFrameDirectory(to: folder, cancelled: { false }, writeManifest: false, validate: {}) { staging in
+            try Data([1]).write(to: staging.appendingPathComponent("frame.jpg"))
+            return UnserializableManifest()
+        }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path), ["frame.jpg"])
+    }
+
     @MainActor
     func testEditorUsesExactCutAndTrimAuditionFrames() async throws {
         let source = try fixture("ProRes-2997")

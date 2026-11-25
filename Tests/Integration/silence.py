@@ -2,6 +2,7 @@
 """Check the peak map, silence reports, replay and both joined export modes."""
 import argparse
 from fractions import Fraction
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from saved_project import read_project
 
 
@@ -28,6 +30,9 @@ class Silence(unittest.TestCase):
     def setUpClass(cls):
         temp = tempfile.TemporaryDirectory()
         cls.addClassCleanup(temp.cleanup)
+        config = patch.dict(os.environ, {"MPCUT_SIDECAR_HOME": str(Path(temp.name) / "cache-settings")})
+        config.start()
+        cls.addClassCleanup(config.stop)
         cls.source = Path(temp.name) / "Stereo.mov"
         # The channels cancel in a mono mix. Track 2 stays audible in the gap.
         tone = "0.25*sin(2*PI*440*t)*if(between(t,1,5),0,1)"
@@ -47,7 +52,7 @@ class Silence(unittest.TestCase):
 
     def project(self, location, *, audio, switches, assembly=None):
         doc = {
-            "format": "mpcut", "schema_version": 3, "kind": "multicam", "reference_angle_id": "a",
+            "format": "mpcut", "schema_version": 9, "kind": "multicam", "reference_angle_id": "a",
             "group_range": {"from": "0", "to": "6"},
             "angles": [
                 {"id": "a", "file": self.source.name, "audio_stream_index": 1},
@@ -75,7 +80,7 @@ class Silence(unittest.TestCase):
 
     def test_project_pause_overrides_and_take_boundaries(self):
         sequence = self.source.parent / "take-candidates.cut"
-        sequence.write_text(json.dumps({"format": "mpcut", "schema_version": 3, "kind": "sequence",
+        sequence.write_text(json.dumps({"format": "mpcut", "schema_version": 9, "kind": "sequence",
                                         "clips": [{"id": "take=one", "file": self.source.name, "from": "0", "to": "6"},
                                                   {"id": "two", "file": self.source.name, "from": "0", "to": "6"}]}))
         multicam = self.source.parent / "take-assembly.cut"
@@ -105,9 +110,135 @@ class Silence(unittest.TestCase):
                 self.assertTrue(shortened.is_file())
                 self.assertEqual(json.loads(saved.stdout)["retained_duration"], override["retained_duration"])
 
+    def test_protect_and_calibrate_multicam_in_saved_projects(self):
+        project = self.source.parent / "calibration-input.cut"
+        self.project(project, audio={"mode": "fixed", "source_id": "a", "audio_stream_index": 1},
+                     switches=[{"group_time": "0", "angle_id": "a"}], assembly=[(1, 5), (1, 5)])
+        recording = project.with_suffix(".mov")
+        shutil.copy2(self.source, recording)
+        original = json.loads(project.read_text())
+        original["angles"][0]["file"] = recording.name
+        original["assembly"] = [dict(item, kind="group", id=key)
+                                for item, key in zip(original["assembly"], ("first", "second"))]
+        project.write_text(json.dumps(original))
+
+        def edit(action, destination, *options, expected=0):
+            result = subprocess.run([CLI, "silence", *action, "--json", "--no-sidecar", "--project", project,
+                                     "--out-project", destination, *options], capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+            return json.loads(result.stdout)
+
+        args = ("--no-sidecar", "--min-pause-seconds", "0.5")
+        scan = self.cli("--project", project, *args)
+        first, second = scan["pauses"]
+        self.assertTrue(scan["removals"])
+        protected = self.source.parent / "calibration-protected.cut"
+        edit(("pause", "protect"), protected, "--protect-pause", first["id"], "--min-pause-seconds", "0.5")
+        protection = self.cli("--project", protected, *args)
+        self.assertEqual([pause["id"] for pause in protection["pauses"]], [first["id"], second["id"]])
+        self.assertEqual(protection["removals"], [])
+        self.assertTrue(all(pause["is_protected"] for pause in protection["pauses"]))
+        self.assertEqual(seconds(protection["duration"]), 8)
+        invalid = self.source.parent / "calibration-invalid.cut"
+        self.assertEqual(edit(("pause", "protect"), invalid, "--protect-pause", "stale", expected=2)["error"]["code"],
+                         "invalid_arguments")
+        self.assertFalse(invalid.exists())
+        self.assertEqual(edit(("pause", "protect"), invalid, "--protect-pause", first["id"], "--min-pause-seconds", "0.6",
+                              expected=2)["error"]["code"], "invalid_arguments")
+        reordered = dict(original, assembly=list(reversed(original["assembly"])))
+        project.write_text(json.dumps(reordered))
+        self.assertEqual(edit(("pause", "protect"), invalid, "--protect-pause", first["id"], "--min-pause-seconds", "0.5",
+                              expected=2)["error"]["code"], "invalid_arguments")
+        project.write_text(json.dumps(original))
+        # Same source, stream and timing produce the same quiet span through a different route.
+        routed = json.loads(project.read_text())
+        alias = dict(routed["angles"][0], id="alias")
+        routed["angles"].append(alias)
+        routed["audio"]["source_id"] = "alias"
+        project.write_text(json.dumps(routed))
+        changed = self.cli("--project", project, *args)["pauses"][0]
+        self.assertEqual(changed["group"], first["group"])
+        self.assertNotEqual(changed["id"], first["id"])
+        self.assertEqual(edit(("pause", "protect"), invalid, "--protect-pause", first["id"], "--min-pause-seconds", "0.5",
+                              expected=2)["error"]["code"], "invalid_arguments")
+        self.assertFalse(invalid.exists())
+        project.write_text(json.dumps(original))
+
+        # Assembly time 1/2 maps to group time 3/2 in the first occurrence.
+        for clock, start, end in (("group", "3/2", "2"), ("assembly", "1/2", "1")):
+            calibrated = self.source.parent / f"calibration-{clock}.cut"
+            receipt = edit(("room-tone", "calibrate"), calibrated, "--clock", clock, "--from", start, "--to", end)
+            (threshold,) = receipt["thresholds"]
+            self.assertEqual(threshold["audio_stream_index"], 1)
+            self.assertEqual(threshold["threshold_db"], -117)
+            reopened = self.cli("--project", calibrated, *args)
+            self.assertEqual(reopened["thresholds"], receipt["thresholds"])
+            self.assertEqual(seconds(reopened["duration"]), 8)
+
+        replacement = recording.with_name("replacement.mov")
+        shutil.copy2(recording, replacement)
+        os.replace(replacement, recording)
+        replaced = self.cli("--project", project, *args)["pauses"][0]
+        self.assertEqual(replaced["group"], first["group"])
+        self.assertNotEqual(replaced["id"], first["id"])
+        self.assertEqual(edit(("pause", "protect"), invalid, "--protect-pause", first["id"], "--min-pause-seconds", "0.5",
+                              expected=2)["error"]["code"], "invalid_arguments")
+        self.assertFalse(invalid.exists())
+
+    def test_saved_reviews_are_used_without_caches_and_require_matching_content(self):
+        sequence = self.source.parent / "reviewed-takes.cut"
+        multicam = self.source.parent / "reviewed-assembly.cut"
+        args = ("--no-sidecar", "--min-pause-seconds", "0.5")
+        sequence.write_text(json.dumps({"format": "mpcut", "schema_version": 9, "kind": "sequence",
+                                        "clips": [{"id": id, "file": self.source.name, "from": "0", "to": "6"}
+                                                  for id in ("first", "second")]}))
+        self.project(multicam, audio={"mode": "fixed", "source_id": "a", "audio_stream_index": 1},
+                     switches=[{"group_time": "0", "angle_id": "a"}], assembly=[(0, 6), (0, 6)])
+        stat = self.source.stat()
+        digest = hashlib.sha256(self.source.read_bytes()).hexdigest()
+        for path in (sequence, multicam):
+            with self.subTest(project=path.name):
+                document = json.loads(path.read_bytes())
+                owner = "first"
+                source = {"file": self.source.name, "source_stamp": {"bytes": stat.st_size,
+                          "modified_seconds": stat.st_mtime_ns // 10**9, "modified_nanoseconds": stat.st_mtime_ns % 10**9},
+                          "evidence": {"method": "file", "stream": 1, "sha256": digest}}
+                marker_input = dict(source)
+                first, last = ({"numerator": v, "denominator": 1} for v in (1, 5))
+                if path == multicam:
+                    document["assembly"][0].update({"kind": "group", "id": "first"})
+                    owner = "group/first"
+                    offset = {"numerator": 0, "denominator": 1}
+                    source.update({"source_id": "a", "offset": offset, "group_range": {"from": "1", "to": "5"}})
+                    marker_input.update({"source_id": "a", "offset": offset})
+                duration = {"kind": "retain", "occurrence_id": owner, "from": first, "to": last,
+                            "retained_seconds": 1.25, "sources": [source]}
+                marker = {"kind": "marker", "occurrence_id": owner, "from": {"numerator": 1, "denominator": 2},
+                          "sources": [marker_input]}
+                document["analysis_annotations"] = {"scenes": [], "silence": [], "pause_reviews": [duration, marker]}
+                path.write_text(json.dumps(document))
+                report = self.cli("--project", path, *args)
+                self.assertFalse(report["pause_review_needs_attention"])
+                self.assertEqual(report["pauses"][0]["requested_retained_seconds"], 1.25)
+                self.assertNotIn("requested_retained_seconds", report["pauses"][1])
+                self.assertIn((0, Fraction(1, 2)), spans(report, "take_candidates"))
+                if path == sequence:
+                    boundary = {**marker, "occurrence_id": "second", "from": {"numerator": 0, "denominator": 1}}
+                    document["analysis_annotations"]["pause_reviews"].append(boundary)
+                    path.write_text(json.dumps(document))
+                    divided = spans(self.cli("--project", path, *args), "take_candidates")
+                    self.assertEqual(len(divided), len(spans(report, "take_candidates")) + 1)
+                    self.assertIn(Fraction(6), [start for start, _ in divided])
+                duration["sources"][0]["evidence"]["sha256"] = "0" * 64
+                path.write_text(json.dumps(document))
+                stale = self.cli("--project", path, *args)
+                self.assertTrue(stale["pause_review_needs_attention"])
+                self.assertNotIn("requested_retained_seconds", stale["pauses"][0])
+                self.assertNotIn((0, Fraction(1, 2)), spans(stale, "take_candidates"))
+
     def test_sequence_shortening_rejects_removal_of_the_whole_program(self):
         project = self.source.parent / "quiet-sequence.cut"
-        project.write_text(json.dumps({"format": "mpcut", "schema_version": 3, "kind": "sequence",
+        project.write_text(json.dumps({"format": "mpcut", "schema_version": 9, "kind": "sequence",
                                        "clips": [{"id": "quiet", "file": self.source.name, "from": "2", "to": "4"}]}))
         args = ("--project", project, "--threshold-db", "-40", "--padding-per-side-seconds", "0")
         scan = self.cli(*args)
@@ -208,7 +339,7 @@ class Silence(unittest.TestCase):
             source.hardlink_to(self.source)
             project = Path(folder) / "edit.cut"
             self.project(project, audio={"mode": "follow"}, switches=[{"group_time": "0", "angle_id": "a"}])
-            sidecar = source.with_suffix(".mov.cutdb")
+            sidecar = source.with_suffix(".mov.cutcache")
             failure = self.cli("--project", project, "--output", sidecar, "--dry-run", success=False)
             self.assertEqual(failure["error"]["code"], "unsupported_container")
             self.assertFalse(sidecar.exists())
@@ -244,7 +375,7 @@ class Silence(unittest.TestCase):
                 try:
                     deadline = time.monotonic() + 10
                     # Source z is indexed after source a. Its sidecar marks the end of the picture scan.
-                    sidecar = audio.with_suffix(".wav.cutdb")
+                    sidecar = audio.with_suffix(".wav.cutcache")
                     while not sidecar.exists() and process.poll() is None and time.monotonic() < deadline:
                         time.sleep(0.002)
                     self.assertTrue(sidecar.exists())
@@ -274,7 +405,7 @@ class Silence(unittest.TestCase):
                             "-map", "0:v", "-map", "1:a", "-map", "2:a", "-c:v", "libx264",
                             "-g", "25", "-bf", "0", "-c:a", "pcm_s16le", source], check=True, timeout=30)
             project.write_text(json.dumps({
-                "format": "mpcut", "schema_version": 3, "kind": "multicam", "reference_angle_id": "a",
+                "format": "mpcut", "schema_version": 9, "kind": "multicam", "reference_angle_id": "a",
                 "group_range": {"from": "0", "to": "6"},
                 "angles": [{"id": "a", "file": source.name, "audio_stream_index": 1}],
                 "audio": {"mode": "follow"},
@@ -288,7 +419,7 @@ class Silence(unittest.TestCase):
             self.assertEqual(self.intervals(report, "removals"), [(0, 1, 5, 1, 5)])
             lane, = report["preflight"]["mapping"]["audio_lanes"]
             self.assertEqual([span["stream"] for span in lane["spans"]], [1, 2])
-            self.assertFalse(source.with_suffix(".mov.cutdb").exists())
+            self.assertFalse(source.with_suffix(".mov.cutcache").exists())
             self.assertFalse(output.exists())
 
     def test_mix_silence_requires_all_lanes_in_each_assembly_occurrence(self):
@@ -303,7 +434,7 @@ class Silence(unittest.TestCase):
                             "-map", "0:v", "-map", "1:a", "-map", "2:a", "-c:v", "libx264",
                             "-g", "25", "-bf", "0", "-c:a", "pcm_s16le", source], check=True, timeout=30)
             project.write_text(json.dumps({
-                "format": "mpcut", "schema_version": 4, "kind": "multicam", "reference_angle_id": "a",
+                "format": "mpcut", "schema_version": 9, "kind": "multicam", "reference_angle_id": "a",
                 "group_range": {"from": "0", "to": "6"},
                 "angles": [{"id": "a", "file": source.name, "audio_stream_index": 1}],
                 "audio": {"mode": "mix"},
@@ -330,7 +461,7 @@ class Silence(unittest.TestCase):
                             "-f", "lavfi", "-i", f"aevalsrc='{signal}':s=48000:d=3",
                             "-c:v", "libx264", "-c:a", "pcm_s16le", source], check=True, timeout=30)
             project.write_text(json.dumps({
-                "format": "mpcut", "schema_version": 3, "kind": "multicam", "reference_angle_id": "a",
+                "format": "mpcut", "schema_version": 9, "kind": "multicam", "reference_angle_id": "a",
                 "group_range": {"from": "0", "to": "3"},
                 "angles": [{"id": "a", "file": source.name, "audio_stream_index": 1}],
                 "audio": {"mode": "follow"}, "switches": [{"group_time": "0", "angle_id": "a"}],
@@ -370,7 +501,7 @@ class Silence(unittest.TestCase):
                             "-c:v", "libx264", "-g", "25", "-bf", "0", "-c:a", "pcm_s16le", source],
                            check=True, timeout=30)
             document = {
-                "format": "mpcut", "schema_version": 3, "kind": "multicam", "reference_angle_id": "a",
+                "format": "mpcut", "schema_version": 9, "kind": "multicam", "reference_angle_id": "a",
                 "group_range": {"from": "0", "to": "3"},
                 "angles": [{"id": "a", "file": source.name, "audio_stream_index": 1}],
                 "audio": {"mode": "follow"},
@@ -422,7 +553,7 @@ class Silence(unittest.TestCase):
                             "-c:v", "libx264", "-g", "30", "-bf", "0", "-c:a", "pcm_s16le", source],
                            check=True, timeout=30)
             project.write_text(json.dumps({
-                "format": "mpcut", "schema_version": 3, "kind": "multicam", "reference_angle_id": "a",
+                "format": "mpcut", "schema_version": 9, "kind": "multicam", "reference_angle_id": "a",
                 "group_range": {"from": "0", "to": "6.006"},
                 "angles": [{"id": "a", "file": source.name, "audio_stream_index": 1}],
                 "audio": {"mode": "follow"}, "switches": [{"group_time": "0", "angle_id": "a"}],

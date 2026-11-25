@@ -9,25 +9,20 @@ final class MulticamPauseEdits: ObservableObject {
         let plan: MulticamPlan
         var project: CutProject? = nil
         var position: RationalTime? = nil
+        /// The seconds the review plays before and after the cut, as Settings gave them when it opened.
+        var before = 1.0
+        var after = 1.0
     }
 
     @Published var skip = false
-    @Published var protected: Set<AudioSpan> = []
     @Published var review: Review?
-    @Published var retainedSeconds: [MulticamPauseEdit.ID: Double] = [:]
-    @Published var takeBoundaries: [Int: Set<RationalTime>] = [:]
 
     func reset() {
         skip = false
-        protected = []
         review = nil
-        clearOccurrenceSettings()
     }
 
-    func clearOccurrenceSettings() {
-        if !retainedSeconds.isEmpty { retainedSeconds = [:] }
-        if !takeBoundaries.isEmpty { takeBoundaries = [:] }
-    }
+
 }
 
 enum MulticamExportProgram { case assembly, group, selection }
@@ -53,11 +48,11 @@ extension MulticamEditorModel {
         markOut = max(a, b)
     }
 
-    private func rangeEdge(_ time: RationalTime, within range: MulticamRange) -> RationalTime {
+    private func rangeEdge(_ time: RationalTime, within range: MulticamRange, pictureAngle: String? = nil) -> RationalTime {
         if time <= range.from { return range.from }
         if time >= range.to { return range.to }
-        let snapped = snappedAnalysisTime(time, within: range, includeEnd: true)
-            ?? snappedFrame(time, delta: 0) ?? time
+        let snapped = snappedAnalysisTime(time, within: range, includeEnd: true, pictureAngle: pictureAngle)
+            ?? snappedFrame(time, delta: 0, preferredAngle: pictureAngle) ?? time
         return min(range.to, max(range.from, snapped))
     }
 
@@ -106,7 +101,8 @@ extension MulticamEditorModel {
            let result = try? start.adding(min(still.duration, snapped)) { return result }
         guard let range = assemblyRange(at: index), offset != .zero,
               let group = try? range.from.adding(offset),
-              let snapped = try? rangeEdge(group, within: range).subtracting(range.from),
+              let snapped = try? rangeEdge(group, within: range, pictureAngle: assemblyItems[index].angleOverride)
+                .subtracting(range.from),
               let result = try? start.adding(snapped) else { return start }
         return result
     }
@@ -252,13 +248,15 @@ extension MulticamEditorModel {
         do {
             var used = Set<String>()
             var items: [StillAssemblyItem] = []
+            var pauseReviewsByItem: [[ProjectPauseReview]] = []
             for piece in pieces where piece.from < piece.to {
                 let slice = try project.assemblySelection(piece)
+                let reviews = Dictionary(grouping: slice.analysisAnnotations.pauseReviews, by: \.occurrenceID)
                 for item in slice.assemblyItems ?? [] {
+                    pauseReviewsByItem.append(ProjectPauseReview.occurrenceID(item).flatMap { reviews[$0] } ?? [])
                     if var insert = item.still, !used.insert(insert.id).inserted {
                         insert.id = ProjectIdentifier.make()
                         items.append(.still(insert))
-
                     } else {
                         items.append(item)
                     }
@@ -277,7 +275,17 @@ extension MulticamEditorModel {
                 }
             }
             preview.pause()
-            if edit(delete ? "Delete Selected Range" : "Split Selected Range", { $0.assemblyItems = items }) {
+            if edit(delete ? "Delete Selected Range" : "Split Selected Range", { project in
+                project.assemblyItems = items
+                project.analysisAnnotations.pauseReviews = project.analysisAnnotations.pauseReviews.filter { $0.occurrenceID == nil }
+                    + zip(items, pauseReviewsByItem).flatMap { item, reviews in
+                        reviews.map { original in
+                            var row = original
+                            row.occurrenceID = ProjectPauseReview.occurrenceID(item)
+                            return row
+                        }
+                    }
+            }) {
                 focusAssemblyEdit()
                 if delete {
                     seekAssembly(at: span.from, scrubbing: false)
@@ -433,14 +441,16 @@ extension MulticamEditorModel {
         let ranges = groupPlayback ? [project.range] : ranges
         let occurrenceScopes = groupPlayback ? nil : selectedPauseOccurrences
         guard analysis.hasSilenceResults(in: pauseAnalysisScope(ranges, occurrenceScopes: occurrenceScopes)) else { return [] }
-        let protected = pauseEdits.protected.union(transcriptProtectedGroupPauses())
+        let saved = pauseReviewSettings(project, ranges: ranges, groupPlayback: groupPlayback)
+        let protected = Set(transcriptProtectedGroupPauses())
         let result = MulticamSilencePlanner.plan(project: project, media: media,
             ranges: ranges,
             silences: analysis.silenceResults, scope: markedGroupSpan,
             minimum: analysis.pauseMinimum, padding: preferences.padding, protected: protected,
             maxBlip: preferences.maxBlip, keyframesOnly: analysis.snapTarget == .keyframes, occurrenceScopes: occurrenceScopes,
             assemblyIndices: groupPlayback ? nil : assemblyGroupIndices,
-            retainedSeconds: groupPlayback ? [:] : pauseEdits.retainedSeconds)
+            retainedSeconds: saved.choices.retained, reviewed: saved.choices.reviewed, protectedByOccurrence: saved.choices.protected,
+            mapping: saved.mapping, analysisRouting: saved.routing)
         guard !groupPlayback else { return result }
         let indices = assemblyGroupIndices
         return result.map { pause in
@@ -462,20 +472,92 @@ extension MulticamEditorModel {
     @discardableResult
     func setPauseRetainedDuration(_ seconds: Double?, for pause: MulticamPauseEdit) -> Bool {
         guard canApplyPauses, seconds.map({ $0.isFinite && $0 >= 0 }) ?? true else { return false }
-        objectWillChange.send()
-        pauseEdits.retainedSeconds[pause.id] = seconds
-        return true
-    }
-
-    func setPauseProtection(_ keep: Bool, for pause: MulticamPauseEdit) {
-        objectWillChange.send()
-        if keep {
-            pauseEdits.protected.insert(pause.id.span)
-        } else {
-            pauseEdits.protected = pauseEdits.protected.filter {
-                MulticamSilencePlanner.intersection($0, pause.id.span) == nil
+        guard let project else { return false }
+        let span = pause.id.span
+        guard let range = assemblyRange(at: pause.id.occurrence),
+              let routes = pauseRoutes(in: project, occurrence: pause.id.occurrence),
+              let evidence = ProjectPauseReview.sources(for: span, routes: routes, media: media) else { return false }
+        return edit("Set Retained Pause Duration") { project in
+            let id = Self.reviewID(in: &project, occurrence: pause.id.occurrence, creating: seconds != nil)
+            guard let id else { return }
+            project.analysisAnnotations.pauseReviews.removeAll {
+                $0.kind == .retain && $0.occurrenceID == id && $0.span == span && $0.matches(routes, media: media, within: range)
+            }
+            if let seconds {
+                project.analysisAnnotations.pauseReviews.append(.init(occurrenceID: id, kind: .retain, from: span.from, to: span.to,
+                                                                      retainedSeconds: seconds, sources: evidence))
             }
         }
+    }
+
+    @discardableResult
+    func setPauseProtection(_ keep: Bool, for pause: MulticamPauseEdit) -> Bool {
+        if pause.isProtected == keep { return true }
+        return setPauseProtection(keep, id: pause.id)
+    }
+
+    @discardableResult
+    func setPauseProtection(_ keep: Bool, id: MulticamPauseEdit.ID) -> Bool {
+        guard !isBusy, let project else { return false }
+        let span = id.span
+        guard let range = assemblyRange(at: id.occurrence), let routes = pauseRoutes(in: project, occurrence: id.occurrence),
+              let row = ProjectPauseReview.multicamProtection(for: span, routes: routes, media: media) else { return false }
+        let owner = project.assemblyItems.flatMap { ProjectPauseReview.occurrenceID($0[id.occurrence]) }
+            ?? (project.assemblyItems == nil ? "whole-group" : nil)
+        func matches(_ review: ProjectPauseReview) -> Bool {
+            review.kind == .protect && (review.occurrenceID == nil || review.occurrenceID == owner)
+                && review.span == span && review.matches(routes, media: media, within: range)
+        }
+        guard keep || project.analysisAnnotations.pauseReviews.contains(where: matches) else { return false }
+        return edit(keep ? "Protect Pause" : "Unprotect Pause") { project in
+            var reviews = project.analysisAnnotations.pauseReviews
+            if keep {
+                if !reviews.contains(row) { reviews.append(row) }
+            } else {
+                reviews.removeAll(where: matches)
+            }
+            project.analysisAnnotations.pauseReviews = reviews
+        }
+    }
+
+    private static func reviewID(in project: inout MulticamProject, occurrence: Int, creating: Bool) -> String? {
+        guard var items = project.assemblyItems else { return occurrence == 0 ? "whole-group" : nil }
+        guard items.indices.contains(occurrence) else { return nil }
+        let item = items[occurrence]
+        if let id = ProjectPauseReview.occurrenceID(item) { return id }
+        guard creating, let range = item.group else { return nil }
+        let id = ProjectIdentifier.make(avoiding: items.compactMap(\.occurrenceID))
+        items[occurrence] = .group(range, angle: item.angleOverride, id: id, layouts: item.tileLayouts)
+        project.assemblyItems = items
+        return "group/" + id
+    }
+
+    private func pauseRoutes(in project: MulticamProject, occurrence: Int) -> [MulticamSilenceRoute]? {
+        guard let routing = try? MulticamSilencePlanner.routing(plan: project.plan(), project: project, media: media,
+                                                                assumeUnindexedCoverage: true) else { return nil }
+        return routing[occurrence]?.routes
+    }
+
+    private func pauseReviewSettings(_ project: MulticamProject, ranges: [MulticamRange], groupPlayback: Bool)
+        -> (mapping: MulticamPlan?, routing: [Int: MulticamSilenceRouting]?, choices: MulticamPauseReviews) {
+        let hasReview = project.analysisAnnotations.pauseReviews.contains { $0.kind != .marker }
+        let mapping = hasReview ? try? project.plan(ranges: groupPlayback ? ranges : nil) : nil
+        let routing = mapping.flatMap { try? MulticamSilencePlanner.routing(plan: $0, project: project, media: media,
+                                                                           assumeUnindexedCoverage: true) }
+        let choices = MulticamPauseReviews(project: project, annotations: project.analysisAnnotations, routing: routing ?? [:],
+                                           media: media, silences: analysis.silenceResults, maxBlip: preferences.maxBlip,
+                                           groupPlayback: groupPlayback)
+        return (mapping, routing, choices)
+    }
+
+    var multicamPauseReviewMismatch: Bool {
+        guard let project, canApplyPauses else { return false }
+        let markers = Dictionary(grouping: project.analysisAnnotations.pauseReviews.filter { $0.kind == .marker }, by: \.occurrenceID)
+        for (index, item) in assemblyItems.enumerated() {
+            let id = project.assemblyItems == nil ? "whole-group" : ProjectPauseReview.occurrenceID(item)
+            if let id, markers[id]?.contains(where: { !$0.matchesMarker(in: project, media: media, mapping: mapping, occurrence: index) }) == true { return true }
+        }
+        return pauseReviewSettings(project, ranges: ranges, groupPlayback: false).choices.needsReview
     }
 
     func seekMulticamPause(_ pause: MulticamPauseEdit) {
@@ -516,7 +598,12 @@ extension MulticamEditorModel {
                 }
             }
             return output.flatMap { range in
-                let splits = (pauseEdits.takeBoundaries[index] ?? []).compactMap { try? start.adding($0) }
+                let id = project?.assemblyItems == nil ? "whole-group" : ProjectPauseReview.occurrenceID(assemblyItems[index])
+                let splits = (project?.analysisAnnotations.pauseReviews ?? []).compactMap { row -> RationalTime? in
+                    guard row.kind == .marker, row.occurrenceID == id,
+                          let project, row.matchesMarker(in: project, media: media, mapping: mapping, occurrence: index) else { return nil }
+                    return try? start.adding(row.from.subtracting(groupFrom))
+                }
                     .filter { range.from < $0 && $0 < range.to }.sorted()
                 let edges = [range.from] + splits + [range.to]
                 return zip(edges, edges.dropFirst()).map { from, to in
@@ -533,14 +620,30 @@ extension MulticamEditorModel {
         let start = assemblyStart(at: index)
         guard let offset = try? requested.subtracting(start), offset > .zero else { return false }
         if !add {
-            return pauseEdits.takeBoundaries[index]?.remove(offset) != nil
+            guard let time = try? (assemblyRange(at: index)?.from ?? .zero).adding(offset), var current = project,
+                  let id = Self.reviewID(in: &current, occurrence: index, creating: false),
+                  current.analysisAnnotations.pauseReviews.contains(where: { $0.kind == .marker && $0.occurrenceID == id && $0.from == time })
+            else { return false }
+            return edit("Remove Take Boundary") { next in
+                next.analysisAnnotations.pauseReviews.removeAll { $0.kind == .marker && $0.occurrenceID == id && $0.from == time }
+            }
         }
         let candidates = multicamTakeCandidates(plan: multicamPausePlan)
         guard let candidate = candidates.first(where: { $0.range.from < requested && requested < $0.range.to }),
               let snapped = try? assemblySelectionEdge(index: index, start: start, offset: offset).subtracting(start),
               snapped > .zero, let position = try? start.adding(snapped),
               candidate.range.from < position, position < candidate.range.to, position < assemblyRangeEnds[index] else { return false }
-        return pauseEdits.takeBoundaries[index, default: []].insert(snapped).inserted
+        guard let time = try? (assemblyRange(at: index)?.from ?? .zero).adding(snapped), let project else { return false }
+        var evidence: [ProjectPauseReview.Source] = []
+        if let interval = mapping?.intervals.first(where: { $0.assemblyIndex == index && $0.group.contains(time) }),
+           let source = interval.pictureSourceID, let input = media[source] {
+            guard let bound = ProjectPauseReview.Source(media: input, sourceID: source, offset: project.sources.first(where: { $0.id == source })?.offset) else { return false }
+            evidence.append(bound)
+        }
+        return edit("Add Take Boundary") { next in
+            guard let id = Self.reviewID(in: &next, occurrence: index, creating: true) else { return }
+            next.analysisAnnotations.pauseReviews.append(.init(occurrenceID: id, kind: .marker, from: time, sources: evidence))
+        }
     }
 
     @discardableResult
@@ -571,6 +674,10 @@ extension MulticamEditorModel {
     private func replaceRetainedRanges(_ pieces: [(occurrence: Int, span: AudioSpan)], action: String) -> Bool {
         let output = preview.currentTime()
         let playhead = assemblyPreview ? (occurrence: occurrenceIndex(at: output), group: groupTime(at: output)) : nil
+        let cardOffset: RationalTime? = playhead.flatMap { position in
+            assemblyStill(at: position.occurrence) == nil
+                ? nil : try? output.subtracting(assemblyStart(at: position.occurrence))
+        }
         let byOccurrence = Dictionary(grouping: pieces, by: \.occurrence)
         var revised: [StillAssemblyItem] = []
         var origin: [Int] = []
@@ -594,11 +701,14 @@ extension MulticamEditorModel {
             return false
         }
         preview.pause()
-        guard edit(action, { $0.assemblyItems = revised }) else { return false }
+        guard edit(action, { $0.replaceAssembly(revised, carryingPauseReviewsFrom: origin) }) else { return false }
         focusAssemblyEdit()
         guard assemblyPreview, let playhead, let mapping else { return true }
         let same = origin.indices.filter { origin[$0] == playhead.occurrence }
-        if let index = same.first(where: { assemblyRange(at: $0)?.contains(playhead.group) == true }) {
+        if let cardOffset, let index = same.first,
+           let restored = try? assemblyStart(at: index).adding(cardOffset) {
+            seekAssembly(at: restored, scrubbing: false)
+        } else if let index = same.first(where: { assemblyRange(at: $0)?.contains(playhead.group) == true }) {
             seekAssemblyOccurrence(index, group: playhead.group)
         } else if let index = same.first(where: { assemblyStill(at: $0) != nil || (assemblyRange(at: $0)?.from ?? .zero) >= playhead.group })
                     ?? origin.indices.first(where: { origin[$0] > playhead.occurrence }) {
@@ -636,7 +746,7 @@ extension MulticamEditorModel {
         guard !isBusy, pauseEdits.review == nil, let project, let duration = assemblyRangeEnds.last,
               assemblyItems.indices.contains(index), index > 0 else { return false }
         let position = assemblyStart(at: index)
-        let second = RationalTime(numerator: 1)
+        let context = cutPreviewContext
         func aligned(_ time: RationalTime) -> RationalTime {
             let index = assemblyRangeEnds.lowerBound { $0 > time }
             guard let still = assemblyStill(at: index), let elapsed = try? time.subtracting(assemblyStart(at: index)),
@@ -645,12 +755,13 @@ extension MulticamEditorModel {
             return output
         }
         do {
-            let from = aligned(try position.subtracting(min(second, position)))
-            let to = aligned(try position.adding(min(second, duration.subtracting(position))))
+            let from = aligned(try position.subtracting(min(context.before, position)))
+            let to = aligned(try position.adding(min(context.after, duration.subtracting(position))))
             let snapshot = try project.assemblySelection(.init(from: from, to: to))
             let plan = try snapshot.plan()
             preview.pause()
-            pauseEdits.review = .init(id: nil, plan: plan, project: .multicam(snapshot), position: position)
+            pauseEdits.review = .init(id: nil, plan: plan, project: .multicam(snapshot), position: position,
+                                      before: preferences.cutPreviewPreroll, after: preferences.cutPreviewPostroll)
             return true
         } catch { return false }
     }
@@ -659,24 +770,26 @@ extension MulticamEditorModel {
     func previewMulticamSwitch(at position: RationalTime) -> Bool {
         guard !isBusy, pauseEdits.review == nil, var project,
               position > project.range.from, project.switches.contains(where: { $0.at == position }) else { return false }
-        let second = RationalTime(numerator: 1)
+        let context = cutPreviewContext
         do {
-            let from = try position.subtracting(min(second, position.subtracting(project.range.from)))
-            let to = try position.adding(min(second, project.range.to.subtracting(position)))
+            let from = try position.subtracting(min(context.before, position.subtracting(project.range.from)))
+            let to = try position.adding(min(context.after, project.range.to.subtracting(position)))
             let range = MulticamRange(from: from, to: to)
             project.assemblyItems = [.group(range)]
             let plan = try project.plan()
             preview.pause()
-            pauseEdits.review = .init(id: nil, plan: plan, project: .multicam(project), position: position)
+            pauseEdits.review = .init(id: nil, plan: plan, project: .multicam(project), position: position,
+                                      before: preferences.cutPreviewPreroll, after: preferences.cutPreviewPostroll)
             return true
         } catch { return false }
     }
 
     func reviewMulticamPause(_ pause: MulticamPauseEdit) {
         guard !isBusy, var project, let cut = pause.removal, let original = assemblyRange(at: pause.id.occurrence) else { return }
-        let context = RationalTime(numerator: 3, denominator: 4)
-        guard let from = try? cut.from.subtracting(context),
-              let to = try? cut.to.adding(context),
+        // Plays the Settings seconds around the cut, as the join previews do.
+        let context = cutPreviewContext
+        guard let from = try? cut.from.subtracting(context.before),
+              let to = try? cut.to.adding(context.after),
               let window = MulticamSilencePlanner.intersection(.init(from: from, to: to),
                                                             MulticamSilencePlanner.span(original)) else { return }
         let kept = AudioAnalysis.retained(in: window, removing: [cut]).map(MulticamSilencePlanner.range)
@@ -687,6 +800,7 @@ extension MulticamEditorModel {
         }
         guard let plan = try? project.plan() else { return }
         preview.pause()
-        pauseEdits.review = .init(id: pause.id, plan: plan, project: .multicam(project))
+        pauseEdits.review = .init(id: pause.id, plan: plan, project: .multicam(project),
+                                  before: preferences.cutPreviewPreroll, after: preferences.cutPreviewPostroll)
     }
 }

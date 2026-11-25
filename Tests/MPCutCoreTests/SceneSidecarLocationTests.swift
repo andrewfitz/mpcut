@@ -246,7 +246,7 @@ final class SceneSidecarLocationTests: XCTestCase {
         }
         XCTAssertTrue(errors.isEmpty, "\(errors)")
         XCTAssertEqual(claims.count, 1)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: source.appendingPathExtension("cutdb").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: source.appendingPathExtension("cutcache").path))
         try SidecarLocations.$storageDirectory.withValue(config) {
             for project in projects {
                 try SidecarLocations.$projectURL.withValue(project) {

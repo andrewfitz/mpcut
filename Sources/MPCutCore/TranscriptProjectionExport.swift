@@ -9,14 +9,16 @@ extension ParticipantProject {
 
 extension TranscriptCodec {
     /// A single editable subtitle track. Clip-relative source times are used when available.
+    /// The CLI and agents use the standard limits. The desktop app passes the editor's caption settings.
     public static func encodeCaptions(_ indexes: [TranscriptIndex], space: TranscriptSpace,
-                                      filter: TranscriptFilter = .init()) throws -> Data {
-        try captionExport(indexes, space: space, filter: filter).data
+                                      filter: TranscriptFilter = .init(),
+                                      limits: TranscriptCaptionLimits = .standard) throws -> Data {
+        try captionExport(indexes, space: space, filter: filter, limits: limits).data
     }
 
-    package static func captionExport(_ indexes: [TranscriptIndex], space: TranscriptSpace,
-                                      filter: TranscriptFilter) throws -> (data: Data, wordCount: Int) {
-        try TranscriptSubtitles.captionExport(indexes, space: space, filter: filter)
+    package static func captionExport(_ indexes: [TranscriptIndex], space: TranscriptSpace, filter: TranscriptFilter,
+                                      limits: TranscriptCaptionLimits = .standard) throws -> (data: Data, wordCount: Int) {
+        try TranscriptSubtitles.captionExport(indexes, space: space, filter: filter, limits: limits)
     }
 
     public static func encode(_ index: TranscriptIndex, space: TranscriptSpace, format: TranscriptFormat,
@@ -97,9 +99,21 @@ extension TranscriptCodec {
                                   confidence: original == nil ? occurrence.observation?.confidence : original?.confidence,
                                   projection: projection)
         }
+        var referencedWords: [String: Set<String>] = [:]
+        for word in words {
+            for observation in word.observations {
+                if let id = observation.wordID {
+                    referencedWords[observation.trackID, default: []].insert(id)
+                }
+            }
+        }
         let tracks = index.document.tracks.map { original in
             var track = original
             track.id = scoped(track.id)
+            let referenced = referencedWords[track.id] ?? []
+            // Unreferenced local words become independent dialogue when the export is opened.
+            // Keep the rows needed to resolve the exported observations.
+            track.words = track.words?.filter { referenced.contains($0.id) }
             return track
         }
         let speakers = originalSpeakers.map { TranscriptSpeaker(id: scoped($0.id), name: $0.name) }

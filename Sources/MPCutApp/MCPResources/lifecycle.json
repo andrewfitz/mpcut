@@ -1,7 +1,7 @@
 [
   {
     "name": "preferences_read",
-    "description": "Read shared MPCut settings and inspect the local-control toggle.",
+    "description": "Read every shared MPCut setting in the key schedule, including the read-only local-control, agent permission, draft retention and cache limit values.",
     "inputSchema": {
       "type": "object",
       "properties": {},
@@ -11,7 +11,7 @@
   },
   {
     "name": "preferences_set",
-    "description": "Change a native preference. Lowering history_max_steps immediately trims retained history in open projects. Local MCP access is controlled in Settings.",
+    "description": "Change a native preference. Lowering history_max_steps immediately trims retained history in open projects. Refused while Settings → Automation → Let agents change settings is off. Local MCP control, the agent permissions, draft_retention_days and analysis_shared_cache_max_bytes are read-only to agents.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -24,21 +24,77 @@
         "key": {
           "type": "string",
           "enum": [
-            "history_max_steps",
-            "analysis_sidecar_reuse_enabled",
             "media_auto_refresh_enabled",
-            "export_tier_downgrade_warning_enabled",
-            "export_movie_default_mode",
+            "analysis_sidecar_reuse_enabled",
+            "history_max_steps",
+            "timeline_source_time_ticks_enabled",
             "timeline_snap_target",
             "timeline_large_previews_enabled",
-            "timeline_source_time_ticks_enabled",
-            "silence_min_pause_seconds",
-            "silence_max_blip_seconds",
-            "silence_padding_per_side_seconds",
             "playback_preview_volume_fraction",
             "playback_preview_muted",
             "playback_scrub_audio_enabled",
-            "export_jpeg_default_preset"
+            "export_movie_default_mode",
+            "export_jpeg_default_preset",
+            "export_tier_downgrade_warning_enabled",
+            "silence_min_pause_seconds",
+            "silence_max_blip_seconds",
+            "silence_padding_per_side_seconds",
+            "open_multiple_recordings_default_action",
+            "recent_files_max_count",
+            "draft_recovery_prompt_enabled",
+            "scene_rescan_confirmation_enabled",
+            "project_export_completion_message_enabled",
+            "timeline_cut_sections_default_enabled",
+            "workspace_full_height_sidebar_enabled",
+            "multicam_track_label_width_points",
+            "still_placement_default_duration_seconds",
+            "gap_default_duration_seconds",
+            "gap_default_color",
+            "still_timeline_default_width_pixels",
+            "still_timeline_default_height_pixels",
+            "still_timeline_default_frame_rate",
+            "still_timeline_default_codec",
+            "timeline_time_display",
+            "playback_default_speed",
+            "playback_cut_preview_preroll_seconds",
+            "playback_cut_preview_postroll_seconds",
+            "playback_viewer_force_sdr_enabled",
+            "playback_monitor_force_sdr_enabled",
+            "playback_monitor_clean_feed_enabled",
+            "playback_monitor_placement",
+            "analysis_scene_auto_scan_enabled",
+            "analysis_silence_auto_scan_enabled",
+            "tiles_scan_default_layout",
+            "tiles_scan_default_grid_columns",
+            "tiles_scan_default_grid_rows",
+            "tiles_scan_default_detail",
+            "tiles_dialogue_default_min_hold_seconds",
+            "tiles_dialogue_default_overlap_policy",
+            "tiles_dialogue_default_offscreen_policy",
+            "transcript_default_engine",
+            "transcript_default_speaker_identification_enabled",
+            "transcript_default_model_download_enabled",
+            "transcript_follow_playback_default_enabled",
+            "transcript_reader_text_size_points",
+            "transcript_edit_default_boundary_policy",
+            "transcript_tighten_default_retained_pause_seconds",
+            "transcript_default_filler_terms",
+            "transcript_export_default_format",
+            "transcript_caption_max_line_characters",
+            "transcript_caption_max_lines",
+            "transcript_caption_max_cue_seconds",
+            "transcript_caption_speaker_labels_enabled",
+            "export_reencode_default_codec",
+            "export_reencode_default_quality",
+            "export_prores_default_quality",
+            "export_reencode_default_container",
+            "export_multicam_default_audio_layout",
+            "export_result_json_default_enabled",
+            "resolve_send_open_timeline_default_enabled",
+            "export_start_folder_mode",
+            "export_finished_reveal_enabled",
+            "export_finished_notification_enabled",
+            "export_finished_sound_enabled"
           ]
         },
         "value": {
@@ -53,7 +109,7 @@
               "type": "number"
             }
           ],
-          "description": "history_max_steps 0–500, playback_preview_volume_fraction 0–1, silence_max_blip_seconds 0–1 second, pause durations in seconds. Enum values match preferences_read."
+          "description": "The type, unit, range and special values of each key are in its conditional schema. Enum values match preferences_read."
         }
       },
       "required": [
@@ -62,6 +118,40 @@
         "value"
       ],
       "allOf": [
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "media_auto_refresh_enabled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean",
+                "description": "Watch recordings for changes while editing. Factory false."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "analysis_sidecar_reuse_enabled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean",
+                "description": "Save and reuse analysis in cutcaches. Factory true."
+              }
+            }
+          }
+        },
         {
           "if": {
             "properties": {
@@ -75,7 +165,8 @@
               "value": {
                 "type": "integer",
                 "minimum": 0,
-                "maximum": 500
+                "maximum": 500,
+                "description": "Undo and redo steps, 0–500; 0 turns history off. Lowering it trims open projects. Factory 50."
               }
             }
           }
@@ -84,97 +175,15 @@
           "if": {
             "properties": {
               "key": {
-                "enum": [
-                  "playback_preview_volume_fraction",
-                  "silence_max_blip_seconds"
-                ]
+                "const": "timeline_source_time_ticks_enabled"
               }
             }
           },
           "then": {
             "properties": {
               "value": {
-                "type": "number",
-                "minimum": 0,
-                "maximum": 1
-              }
-            }
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "key": {
-                "const": "silence_min_pause_seconds"
-              }
-            }
-          },
-          "then": {
-            "properties": {
-              "value": {
-                "type": "number",
-                "minimum": 0.02
-              }
-            }
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "key": {
-                "const": "silence_padding_per_side_seconds"
-              }
-            }
-          },
-          "then": {
-            "properties": {
-              "value": {
-                "type": "number",
-                "minimum": 0
-              }
-            }
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "key": {
-                "enum": [
-                  "media_auto_refresh_enabled",
-                  "export_tier_downgrade_warning_enabled",
-                  "analysis_sidecar_reuse_enabled",
-                  "timeline_large_previews_enabled",
-                  "timeline_source_time_ticks_enabled",
-                  "playback_preview_muted",
-                  "playback_scrub_audio_enabled"
-                ]
-              }
-            }
-          },
-          "then": {
-            "properties": {
-              "value": {
-                "type": "boolean"
-              }
-            }
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "key": {
-                "const": "export_movie_default_mode"
-              }
-            }
-          },
-          "then": {
-            "properties": {
-              "value": {
-                "enum": [
-                  "copy",
-                  "smart",
-                  "encode"
-                ]
+                "type": "boolean",
+                "description": "Show source time ticks inside clips. Factory false."
               }
             }
           }
@@ -195,7 +204,99 @@
                   "keyframes",
                   "scenes",
                   "silence"
-                ]
+                ],
+                "description": "Snap target. Factory off."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "timeline_large_previews_enabled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean",
+                "description": "Enlarge thumbnails and waveforms. Factory false."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "playback_preview_volume_fraction"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "Preview volume as a fraction, 0–1. Factory 1."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "playback_preview_muted"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean",
+                "description": "Mute preview audio. Factory false."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "playback_scrub_audio_enabled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean",
+                "description": "Play audio while scrubbing. Factory true."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "export_movie_default_mode"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "enum": [
+                  "copy",
+                  "smart",
+                  "encode"
+                ],
+                "description": "Default movie export mode. Factory smart."
               }
             }
           }
@@ -214,7 +315,1145 @@
                 "enum": [
                   "review",
                   "full"
-                ]
+                ],
+                "description": "Default JPEG preset. Factory review."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "export_tier_downgrade_warning_enabled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean",
+                "description": "Warn when an edit lowers the export tier. Factory true."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "silence_min_pause_seconds"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "number",
+                "minimum": 0.02,
+                "description": "Minimum pause in seconds, at least 0.02. Factory 1.5."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "silence_max_blip_seconds"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "Ignore sounds up to this many seconds, 0–1; 0 keeps every interruption. Factory 0.06."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "silence_padding_per_side_seconds"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Silence kept on each side of a cut in seconds, at least 0. Factory 0.2."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "open_multiple_recordings_default_action"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "enum": [
+                  "ask",
+                  "join",
+                  "multicam"
+                ],
+                "description": "Opening several recordings from Finder: ask, join clips or open as multicam. Factory ask."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "recent_files_max_count"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 30,
+                "description": "Recent items, 1–30. Factory 10."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "draft_recovery_prompt_enabled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean",
+                "description": "Offer to recover untitled projects at launch. Factory false."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "scene_rescan_confirmation_enabled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean",
+                "description": "Confirm before scanning scenes again. Factory true."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "project_export_completion_message_enabled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean",
+                "description": "Show the exported message after a project export with no warnings. Factory true."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "timeline_cut_sections_default_enabled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean",
+                "description": "Show cut sections in new windows. Starting value. Factory true."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "workspace_full_height_sidebar_enabled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean",
+                "description": "Full-height panel beside the timeline in every window. Factory false."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "multicam_track_label_width_points"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "number",
+                "minimum": 106,
+                "maximum": 360,
+                "description": "Multicam track label width in points, 106–360. Each window clamps it to its own space. Factory 172."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "still_placement_default_duration_seconds"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "number",
+                "minimum": 0.04,
+                "maximum": 600,
+                "description": "Inserted still duration in seconds, 0.04–600. Starting value. Factory 2."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "gap_default_duration_seconds"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "number",
+                "minimum": 0.04,
+                "maximum": 600,
+                "description": "Color gap and Space Clips duration in seconds, 0.04–600. Starting value. Factory 2."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "gap_default_color"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "string",
+                "pattern": "^#[0-9A-Fa-f]{6}$",
+                "description": "Gap color as #RRGGBB. Starting value. Factory #000000."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "still_timeline_default_width_pixels"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "integer",
+                "minimum": 16,
+                "maximum": 8192,
+                "description": "New stills timeline width in pixels, an even number from 16 to 8192. Factory 1920."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "still_timeline_default_height_pixels"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "integer",
+                "minimum": 16,
+                "maximum": 8192,
+                "description": "New stills timeline height in pixels, an even number from 16 to 8192. Factory 1080."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "still_timeline_default_frame_rate"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "number",
+                "minimum": 1,
+                "maximum": 240,
+                "description": "New stills timeline frame rate in frames per second, 1–240. Factory 30."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "still_timeline_default_codec"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "enum": [
+                  "h264",
+                  "hevc",
+                  "prores"
+                ],
+                "description": "New stills timeline codec. Factory h264."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "timeline_time_display"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "enum": [
+                  "milliseconds",
+                  "frames"
+                ],
+                "description": "Time display. Factory milliseconds."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "playback_default_speed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "number",
+                "enum": [
+                  0.125,
+                  0.25,
+                  0.5,
+                  0.75,
+                  1,
+                  1.25,
+                  1.5,
+                  2,
+                  4,
+                  8
+                ],
+                "description": "Starting playback speed as a rate. Factory 1."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "playback_cut_preview_preroll_seconds"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "number",
+                "minimum": 0.25,
+                "maximum": 10,
+                "description": "Seconds played before a cut, 0.25–10. Factory 1."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "playback_cut_preview_postroll_seconds"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "number",
+                "minimum": 0.25,
+                "maximum": 10,
+                "description": "Seconds played after a cut, 0.25–10. Factory 1."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "playback_viewer_force_sdr_enabled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean",
+                "description": "Force SDR on every picture surface except the Video Monitor. Factory false."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "playback_monitor_force_sdr_enabled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean",
+                "description": "Force SDR on the Video Monitor. Factory false."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "playback_monitor_clean_feed_enabled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean",
+                "description": "Clean feed on the Video Monitor. Factory false."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "playback_monitor_placement"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "enum": [
+                  "other_display",
+                  "last_position"
+                ],
+                "description": "Where the Video Monitor opens. Factory other_display."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "analysis_scene_auto_scan_enabled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean",
+                "description": "Scan for scenes when a recording is added. Factory false."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "analysis_silence_auto_scan_enabled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean",
+                "description": "Scan for pauses when a recording is added. Factory false."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "tiles_scan_default_layout"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "enum": [
+                  "video_call",
+                  "camera_multiview",
+                  "even_grid"
+                ],
+                "description": "Find Tiles layout for a recording with no saved layout. A build without TileTrail uses even_grid. Factory video_call."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "tiles_scan_default_grid_columns"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 12,
+                "description": "Find Tiles grid columns, 1–12. Factory 2."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "tiles_scan_default_grid_rows"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 12,
+                "description": "Find Tiles grid rows, 1–12. Factory 2."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "tiles_scan_default_detail"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "enum": [
+                  "adaptive",
+                  "every_frame",
+                  "sparse"
+                ],
+                "description": "Find Tiles scan detail. Factory adaptive."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "tiles_dialogue_default_min_hold_seconds"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "number",
+                "minimum": 0.04,
+                "maximum": 60,
+                "description": "Dialogue switches minimum hold in seconds, 0.04–60. Factory 1."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "tiles_dialogue_default_overlap_policy"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "enum": [
+                  "hold",
+                  "visible_speaker"
+                ],
+                "description": "Dialogue switches during overlapping speech. Factory hold."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "tiles_dialogue_default_offscreen_policy"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "enum": [
+                  "hold",
+                  "original",
+                  "reaction"
+                ],
+                "description": "Dialogue switches for an offscreen speaker. Factory hold."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "transcript_default_engine"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "string",
+                "maxLength": 128,
+                "description": "Preferred transcription engine name; empty is Automatic (Qwen3, then the first available). Factory empty."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "transcript_default_speaker_identification_enabled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean",
+                "description": "Identify speakers in mixed audio. Factory false."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "transcript_default_model_download_enabled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean",
+                "description": "Download missing models. Factory false."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "transcript_follow_playback_default_enabled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean",
+                "description": "Follow playback in new windows. Starting value. Factory true."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "transcript_reader_text_size_points"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "number",
+                "minimum": 11,
+                "maximum": 24,
+                "description": "Transcript reader text size in points, 11–24. Factory 14."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "transcript_edit_default_boundary_policy"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "enum": [
+                  "nearest_frame",
+                  "copy_safe",
+                  "exact"
+                ],
+                "description": "Transcript edit boundary. Factory nearest_frame."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "transcript_tighten_default_retained_pause_seconds"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 10,
+                "description": "Pause to keep when tightening, in seconds, 0–10. Factory 0.2."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "transcript_default_filler_terms"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "string",
+                "maxLength": 4096,
+                "description": "Filler terms as one string, terms separated by commas. Factory empty."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "transcript_export_default_format"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "enum": [
+                  "json",
+                  "text",
+                  "srt",
+                  "vtt"
+                ],
+                "description": "Export Transcript format. Factory json."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "transcript_caption_max_line_characters"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "integer",
+                "minimum": 20,
+                "maximum": 80,
+                "description": "Caption characters per line, 20–80. Factory 42."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "transcript_caption_max_lines"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 3,
+                "description": "Caption lines per cue, 1–3. Factory 2."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "transcript_caption_max_cue_seconds"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "number",
+                "minimum": 1,
+                "maximum": 20,
+                "description": "Longest caption cue in seconds, 1–20. Factory 6."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "transcript_caption_speaker_labels_enabled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean",
+                "description": "Speaker labels in captions. Factory true."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "export_reencode_default_codec"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "enum": [
+                  "h264",
+                  "hevc",
+                  "prores"
+                ],
+                "description": "Default re-encode video codec. Factory h264."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "export_reencode_default_quality"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "enum": [
+                  "smaller",
+                  "balanced",
+                  "high"
+                ],
+                "description": "Default H.264 and HEVC quality. Factory balanced."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "export_prores_default_quality"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "enum": [
+                  "422-lt",
+                  "422",
+                  "422-hq"
+                ],
+                "description": "Default ProRes quality. Factory 422."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "export_reencode_default_container"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "enum": [
+                  "automatic",
+                  "mp4",
+                  "mov",
+                  "mkv"
+                ],
+                "description": "H.264 and HEVC container; automatic is MP4 in the sequence editor and MOV in multicam. ProRes stays MOV. Factory automatic."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "export_multicam_default_audio_layout"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "enum": [
+                  "separate_tracks",
+                  "downmix_mono",
+                  "downmix_stereo"
+                ],
+                "description": "Default multicam audio layout. Factory separate_tracks."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "export_result_json_default_enabled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean",
+                "description": "Save Export Result JSON. Factory false."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "resolve_send_open_timeline_default_enabled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean",
+                "description": "Open the timeline in Resolve after sending. Factory true."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "export_start_folder_mode"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "enum": [
+                  "automatic",
+                  "project",
+                  "source",
+                  "chosen"
+                ],
+                "description": "Where export panels start. Factory automatic."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "export_finished_reveal_enabled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean",
+                "description": "Show in Finder when an export finishes. Factory false."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "export_finished_notification_enabled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean",
+                "description": "Notify when an export finishes. Setting it never asks for notification permission. Factory false."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "export_finished_sound_enabled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean",
+                "description": "Play a sound when an export finishes. Factory false."
               }
             }
           }
@@ -513,6 +1752,24 @@
     }
   },
   {
+    "name": "history_panel_close",
+    "description": "Dismiss the target project’s history sheet and wait for the native sheet to close.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Live handle returned by project_windows_list."
+        }
+      },
+      "required": [
+        "project_handle"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
     "name": "multicam_setup_read",
     "description": "Inspect the pending setup after a multicam import. Returns source IDs, picture/stream availability, and whether the project already exists.",
     "inputSchema": {
@@ -711,6 +1968,32 @@
         "project_handle"
       ],
       "additionalProperties": false
+    }
+  },
+  {
+    "name": "recent_files_list",
+    "description": "List the absolute local paths shown in Open Recent, newest first.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "recent_files_clear",
+    "description": "Clear the application’s Open Recent menu. Returns the remaining paths.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "openWorldHint": false
     }
   }
 ]

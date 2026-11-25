@@ -4,6 +4,7 @@ import argparse
 from fractions import Fraction
 import hashlib
 import json
+import os
 import plistlib
 import sqlite3
 from pathlib import Path
@@ -32,12 +33,13 @@ class CopyEdges(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name)
+        self.env = dict(os.environ, MPCUT_SIDECAR_HOME=str(self.root / "preferences"))
         self.wave = self.root / "source.wav"
         ffmpeg("-f", "lavfi", "-i", "aevalsrc=0.4*sin(2*PI*(227*t+201*t*t)):s=44100:d=3.33",
                "-c:a", "pcm_s16le", self.wave)
 
     def run_cli(self, *args, success=True):
-        proc = subprocess.run([CLI, *args, "--json"], capture_output=True, text=True, timeout=30)
+        proc = subprocess.run([CLI, *args, "--json"], env=self.env, capture_output=True, text=True, timeout=30)
         self.assertEqual(proc.returncode == 0, success, proc.stdout + proc.stderr)
         return json.loads(proc.stdout)
 
@@ -165,11 +167,12 @@ class CopyEdges(unittest.TestCase):
             ffmpeg("-i", self.wave, "-c:a", "libmp3lame", "-reservoir", "0", *options, source)
             start, end = 103123, 129057
             expected = ffmpeg("-i", source, "-f", "f32le", "-")[4 * start:4 * end]
-            self.run_cli("analysis", "sidecar", "build", "--only", "index", source)
+            report = self.run_cli("analysis", "sidecar", "build", "--only", "index", source)
+            cache = Path(report["write_location"]).as_uri() + "?mode=rw"
             for mode in ["indexed", "bad_checksum", "legacy"]:
                 with self.subTest(name=name, mode=mode):
                     if mode != "indexed":
-                        with sqlite3.connect(str(source) + ".cutdb") as db:
+                        with sqlite3.connect(cache, uri=True) as db:
                             value = section_bytes(db, "media_index.v1")
                             stamp, = db.execute("SELECT stamp FROM source").fetchone()
                             header = plistlib.loads(value)

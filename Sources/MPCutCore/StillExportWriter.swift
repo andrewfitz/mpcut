@@ -95,7 +95,7 @@ extension StillExportPlanner {
             throw CutError(code: "write_failed", message: String(cString: strerror(errno)))
         }
         try engine.checkCancellation()
-        let failure = publishExclusively(from: partial, to: destination)
+        let failure = try MediaExportPublication.publish(from: partial, to: destination)
         if failure == EEXIST {
             throw CutError(code: "output_exists", message: "A file already exists at the destination.")
         }

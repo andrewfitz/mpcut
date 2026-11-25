@@ -22,7 +22,7 @@ func checkTranscriptMCP(t *testing.T, call func(string, object, string) object, 
 	}
 	asset := filepath.Join(dir, "Transcript room.wav")
 	writeAudioFixture(t, asset, audioPlateau{4 * fixtureSampleRate, 512})
-	path := fixture("Transcript fixture.cut", `{"format":"mpcut","schema_version":3,"kind":"sequence","clips":[{"id":"first","file":"Transcript room.wav","from":"0","to":"4"},{"id":"again","file":"Transcript room.wav","from":"0","to":"4"}]}`)
+	path := fixture("Transcript fixture.cut", `{"format":"mpcut","schema_version":9,"kind":"sequence","clips":[{"id":"first","file":"Transcript room.wav","from":"0","to":"4"},{"id":"again","file":"Transcript room.wav","from":"0","to":"4"}]}`)
 	var cues strings.Builder
 	for second := 0; second < 4; second++ {
 		fmt.Fprintf(&cues, "%d\n00:00:%02d,250 --> 00:00:%02d,750\nThe same quote.\n\n", second+1, second, second)
@@ -77,6 +77,14 @@ func checkTranscriptMCP(t *testing.T, call func(string, object, string) object, 
 	firstShot, repeatShot := row(search), row(repeat)
 	if firstShot["word_id"] != repeatShot["word_id"] || firstShot["id"] == repeatShot["id"] {
 		t.Fatalf("repeat should preserve the word ID and have its own occurrence ID: %v %v", firstShot, repeatShot)
+	}
+	expanded := call("transcript_editor_selection_resolve", object{"project_handle": project,
+		"result_id": imported["result_id"], "expansion": "speaker_turn",
+		"selection": object{"space": "current_cut", "first_word_id": repeatShot["word_id"], "first_occurrence_id": repeatShot["id"]}}, "")
+	phrase := expanded["selection"].(object)
+	if phrase["first"].(object)["id"] != repeatShot["id"] || phrase["last"].(object)["clip_id"] != repeatShot["clip_id"] ||
+		phrase["last"].(object)["id"] == repeatShot["id"] {
+		t.Fatalf("editor expansion should keep the repeated turn on its own clip: %v", expanded)
 	}
 	evidence := call("transcript_editor_word_evidence_read", object{"project_handle": project, "word_id": firstShot["word_id"], "limit": 1}, "")
 	if evidence["total"] != float64(0) {
@@ -159,7 +167,7 @@ func checkTranscriptProvider(t *testing.T, call func(string, object, string) obj
 	writeAudioFixture(t, media, audioPlateau{fixtureSampleRate, 8192})
 	writeAudioFixture(t, filepath.Join(dir, "Provider source B.wav"), audioPlateau{fixtureSampleRate, 4096})
 	saved := filepath.Join(dir, "Provider source.cut")
-	if err := os.WriteFile(saved, []byte(`{"format":"mpcut","schema_version":3,"kind":"sequence","clips":[{"id":"source","file":"Provider source.wav","from":"0","to":"1"},{"id":"source-b","file":"Provider source B.wav","from":"0","to":"1"}]}`), 0600); err != nil {
+	if err := os.WriteFile(saved, []byte(`{"format":"mpcut","schema_version":9,"kind":"sequence","clips":[{"id":"source","file":"Provider source.wav","from":"0","to":"1"},{"id":"source-b","file":"Provider source B.wav","from":"0","to":"1"}]}`), 0600); err != nil {
 		t.Fatal(err)
 	}
 	project := call("project_open", object{"project_path": saved, "operation_id": "open-provider-fixture"}, "")["project_handle"]
@@ -315,7 +323,7 @@ func checkTranscriptProjectMCP(t *testing.T, call func(string, object, string) o
 		}
 		return path
 	}
-	path := write("Transcript project-wide.cut", `{"format":"mpcut","schema_version":3,"kind":"sequence","clips":[{"id":"z","file":"Z interview.wav","from":"0","to":"2"},{"id":"a","file":"A interview.wav","from":"0","to":"2"}]}`)
+	path := write("Transcript project-wide.cut", `{"format":"mpcut","schema_version":9,"kind":"sequence","clips":[{"id":"z","file":"Z interview.wav","from":"0","to":"2"},{"id":"a","file":"A interview.wav","from":"0","to":"2"}]}`)
 	type media struct{ file, subtitle string }
 	var inputs []media
 	// Attach in the opposite order from the cut. Each JSON transcript emits the same word IDs and

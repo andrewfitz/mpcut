@@ -66,7 +66,8 @@ private struct TranscriptTimeSelection {
 @MainActor
 struct TranscriptPane: View {
     let session: ProjectSession
-    @AppStorage("transcript_suggested_angles") private var suggestedAnglesData = Data()
+    @State private var suggestedAnglesData: Data
+    @ObservedObject private var readerPresentation: TranscriptReaderPresentation
     @ObservedObject private var basket: TranscriptPaneBasket
     @ObservedObject private var controller: LiveTranscriptController
     @StateObject private var modelObservation: TranscriptPaneObservation
@@ -101,7 +102,7 @@ struct TranscriptPane: View {
     @State private var selectionStart: TranscriptOccurrence?
     @State private var selectionEnd: TranscriptOccurrence?
     @State private var activePositions: [Int] = []
-    @State private var followPlayback = true
+    private var followPlayback: Bool { readerPresentation.followsPlayback }
     @State private var alert: String?
     @State private var sheet: TranscriptPaneSheet?
     @State private var detail: String?
@@ -121,10 +122,15 @@ struct TranscriptPane: View {
     @State private var contextPlayback: AnyCancellable?
     @FocusState private var searchFocused: Bool
     @FocusState private var dialogueFocused: Bool
+    /// Settings → Transcripts → Reader text size, read when the pane is made.
+    @State private var readerTextSize: CGFloat
 
     init(session: ProjectSession) {
         TranscriptPaneProbe.initializations += 1
         self.session = session
+        _suggestedAnglesData = State(initialValue: session.editor.preferences.transcriptSuggestedAngles)
+        _readerTextSize = State(initialValue: CGFloat(session.editor.preferences.readerTextSize))
+        _readerPresentation = ObservedObject(wrappedValue: session.presentation.transcriptReader)
         _basket = ObservedObject(wrappedValue: session.transcriptBasket)
         _controller = ObservedObject(wrappedValue: session.transcript)
         _modelObservation = StateObject(wrappedValue: TranscriptPaneObservation(session: session))
@@ -142,7 +148,6 @@ struct TranscriptPane: View {
             _includeInferred = State(initialValue: place.scope.inferred)
             _searchText = State(initialValue: place.searchText)
             _query = State(initialValue: place.query)
-            _followPlayback = State(initialValue: place.followPlayback)
             _restoring = State(initialValue: place)
         }
     }
@@ -222,6 +227,7 @@ struct TranscriptPane: View {
         let _ = TranscriptPaneProbe.status = resultsLabel
         VStack(spacing: 0) {
             header
+                .onReceive(session.editor.preferences.$transcriptSuggestedAngles.dropFirst()) { suggestedAnglesData = $0 }
             if let detail {
                 Label(detail, systemImage: "exclamationmark.triangle")
                     .font(.caption)
@@ -295,6 +301,10 @@ struct TranscriptPane: View {
             // A click that waits for an edit to be indexed chose a word of the clock it was made in.
             if previous.space != next.space { queuedChoice = nil }
             showScope(next)
+        }
+        .onChange(of: followPlayback) { _, follows in
+            if follows { followPlayhead(scrolling: true) }
+            else { activePositions = [] }
         }
         .onReceive(editor.$playhead) { seconds in
             if !isMulticam, let time = timelineRationalTime(seconds) { follow(time) }
@@ -376,7 +386,7 @@ struct TranscriptPane: View {
                 .frame(maxWidth: 140)
                 .accessibilityIdentifier("transcript.attachment")
             }
-            if !isMulticam { PanelDockToggle() }
+            if !isMulticam { PanelDockToggle(preferences: session.editor.preferences) }
             if selectedAttachment != nil || controller.activeJobID != nil {
                 PaneIconButton(title: "Import Transcript…", symbol: "square.and.arrow.down",
                                help: "Import Transcriberrr JSON, SubRip, or WebVTT", action: chooseImport)
@@ -393,8 +403,6 @@ struct TranscriptPane: View {
                     if document != nil {
                         Button("Inspect Attachment…", action: showAttachment)
                         Button("Rebind Transcript…", action: showRebind)
-                    } else {
-                        Button("Recover Transcript Store…", action: locateTranscriptStore)
                     }
                     Button("Export Captions…") { showExport(captions: true) }
                         .disabled(document == nil || loadedRevision != revision)
@@ -422,7 +430,7 @@ struct TranscriptPane: View {
                   systemImage: selectedAttachment == nil ? "text.quote" : "exclamationmark.triangle")
         } description: {
             Text(selectedAttachment == nil ? "Transcribe the project audio or import an existing transcript."
-                 : "The transcript store for this attachment could not be read.")
+                 : "This attachment’s transcript could not be read.")
         } actions: {
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 10) { emptyStateActions }
@@ -438,10 +446,6 @@ struct TranscriptPane: View {
             Button("Transcribe Audio…", action: showSetup)
                 .buttonStyle(.borderedProminent)
                 .accessibilityIdentifier("transcript.transcribe")
-        } else {
-            Button("Recover Transcript Store…", action: locateTranscriptStore)
-                .buttonStyle(.borderedProminent)
-                .accessibilityIdentifier("transcript.recoverStore")
         }
         Button("Import Transcript…", action: chooseImport)
             .accessibilityIdentifier(selectedAttachment == nil ? "transcript.import" : "transcript.import.empty")
@@ -614,7 +618,7 @@ struct TranscriptPane: View {
                                      choose: { word, extending, seek in
                     dialogueFocused = true
                     choose(word, extending: extending, seek: seek)
-                }, inspect: showEvidence, describe: wordDescription)
+                }, inspect: showEvidence, describe: wordDescription, textSize: readerTextSize)
                 .frame(width: geometry.size.width, height: geometry.size.height)
                 .focused($dialogueFocused)
             }
@@ -688,9 +692,7 @@ struct TranscriptPane: View {
                 }
                 PaneIconButton(title: "Follow Playback", symbol: followPlayback ? "scope" : "location.slash",
                                active: followPlayback, help: "Follow the active word as the playhead moves") {
-                    followPlayback.toggle()
-                    if followPlayback { followPlayhead(scrolling: true) }
-                    else { activePositions = [] }
+                    readerPresentation.followsPlayback.toggle()
                 }
                 .accessibilityValue(followPlayback ? "On" : "Off")
             }
@@ -876,7 +878,7 @@ struct TranscriptPane: View {
         let top = viewport.view?.topWord ?? viewport.lastTopWord ?? 0
         return TranscriptReaderPlace(owner: loadedRevision?.owner ?? session.mcpHandle, attachmentID: loadedRevision?.attachment,
                               resultID: loadedRevision?.resultID, selectedAttachmentID: attachmentID, scope: browseScope,
-                              searchText: searchText, query: query, followPlayback: followPlayback,
+                              searchText: searchText, query: query,
                               anchor: words.indices.contains(top) ? words[top] : nil, anchorIndex: top, selectionStart: selectionStart,
                               selectionEnd: selectionEnd, matchNumber: matchNumber,
                               matchWord: matchNumber.flatMap { number in
@@ -1275,8 +1277,8 @@ extension TranscriptPane {
                     Button("One Word Earlier") { expand(.earlier) }
                     Button("One Word Later") { expand(.later) }
                     Button("Sentence") { expand(.sentence) }
-                    Button("Speaker Turn") { expand(.turn) }
-                    Button("Include Preceding Question") { expand(.question) }
+                    Button("Speaker Turn") { expand(.speakerTurn) }
+                    Button("Include Preceding Question") { expand(.precedingQuestion) }
                 }
                 Divider()
                 Button("Split at Word Edge…") { showEdit(.split) }
@@ -1370,24 +1372,44 @@ extension TranscriptPane {
         }
     }
 
-    private func anglePreferenceKey(for speaker: String?) -> String? {
-        guard let speaker, let attachment = selectedAttachment else { return nil }
-        return attachment.id + ":" + speaker
-    }
-
-    private var suggestedAngles: [String: String] {
-        (try? JSONDecoder().decode([String: String].self, from: suggestedAnglesData)) ?? [:]
-    }
-
     private func suggestedAngle(for speaker: String?) -> String? {
-        anglePreferenceKey(for: speaker).flatMap { suggestedAngles[$0] }
+        guard let speaker, let attachment = selectedAttachment else { return nil }
+        return TranscriptSuggestedCameras.forAttachments(controller.state.attachments.map(\.id),
+                                                         data: suggestedAnglesData)[attachment.id]?[speaker]
     }
 
     private func rememberAngle(_ angle: String?, for speaker: String) {
-        guard let key = anglePreferenceKey(for: speaker) else { return }
-        var angles = suggestedAngles
-        angles[key] = angle
-        if let encoded = try? JSONEncoder().encode(angles) { suggestedAnglesData = encoded }
+        guard let attachment = selectedAttachment else { return }
+        TranscriptSuggestedCameras.set(angle, attachment: attachment.id, speaker: speaker, in: session.editor.preferences)
+    }
+
+    /// Read from Settings when a sheet is made. Nothing a sheet changes is written back.
+    private var sheetDefaults: TranscriptSheetDefaults { TranscriptSheetDefaults(preferences: session.editor.preferences) }
+
+    /// Where the transcript and caption save panels start. Automatic keeps the rule they always had;
+    /// another Settings choice starts this window's session, and a folder chosen in a panel wins after that.
+    private var transcriptExportDirectory: URL? {
+        let preferences = session.editor.preferences
+        let mode = preferences.exportStartFolder
+        guard mode != .automatic else { return transcriptPanelDirectory }
+        let projectURL = isMulticam ? multicam.projectURL : editor.projectURL
+        return ExportStartFolder.resolve(
+            mode: mode, chosenFolder: preferences.exportStartFolderPath.isEmpty ? nil : URL(fileURLWithPath: preferences.exportStartFolderPath),
+            projectFile: projectURL.flatMap { ProjectDraft.isManaged($0) ? nil : $0.resolvingSymlinksInPath() },
+            sourceRecording: transcriptSourceRecording, sessionFolder: session.transcriptPaneMemory.exportFolder,
+            automatic: transcriptPanelDirectory
+        ).directory
+    }
+
+    private var transcriptSourceRecording: URL? {
+        if isMulticam, let project = multicam.project {
+            let groupTime = multicam.groupTime(at: multicam.preview.currentTime())
+            let source = project.selection(at: groupTime).flatMap { project.pictureSource(for: $0.angle, at: groupTime) }
+                ?? project.sources.first
+            return source.map { URL(fileURLWithPath: $0.file) }
+        }
+        if let sourceID = editor.analysisPlayheadSourceID, let media = editor.analysisSourceMedia[sourceID] { return media.url }
+        return editor.sequenceClips.first.map { URL(fileURLWithPath: $0.file) }
     }
 
     private var transcriptPanelDirectory: URL? {
@@ -1456,31 +1478,6 @@ extension TranscriptPane {
         }
         if let window = session.window { panel.beginSheetModal(for: window, completionHandler: receive) }
         else { panel.begin(completionHandler: receive) }
-    }
-
-    private func locateTranscriptStore() {
-        guard let attachment = selectedAttachment else { return }
-        perform {
-            let context = try controller.assetContext()
-            let requested = revision
-            let panel = NSOpenPanel()
-            panel.canChooseFiles = false
-            panel.canChooseDirectories = true
-            panel.allowsMultipleSelection = false
-            panel.directoryURL = context.deletingLastPathComponent()
-            panel.prompt = "Recover"
-            panel.message = "Choose the transcript store beside this project."
-            let finish: (NSApplication.ModalResponse) -> Void = { result in
-                guard result == .OK, let directory = panel.url, requested == revision else { return }
-                perform {
-                    try controller.recoverAttachment(id: attachment.id, from: directory)
-                    status = "Recovered the transcript."
-                    reload()
-                }
-            }
-            if let window = session.window { panel.beginSheetModal(for: window, completionHandler: finish) }
-            else { panel.begin(completionHandler: finish) }
-        }
     }
 
     private var bindingChoices: [TranscriptBindingChoice] {
@@ -1596,18 +1593,23 @@ extension TranscriptPane {
     private func showExport(captions: Bool = false) {
         let requested = revision
         guard let attachmentID = selectedAttachment?.id else { return }
+        let defaults = sheetDefaults
         sheet = TranscriptPaneSheet(captions ? "Export Captions" : "Export Transcript") {
             TranscriptExportForm(space: captions ? .currentCut : space, isMulticam: isMulticam,
                                  captions: captions, tracks: document?.tracks ?? [],
-                                 privacyWarning: controller.project.participants.transcriptExportWarning) { format, clock, trackID in
+                                 privacyWarning: controller.project.participants.transcriptExportWarning,
+                                 defaultFormat: defaults.exportFormat) { format, clock, trackID in
                 let panel = NSSavePanel()
-                panel.directoryURL = transcriptPanelDirectory
+                panel.directoryURL = transcriptExportDirectory
                 let fileExtension = format == .text ? "txt" : format.rawValue
                 if let type = UTType(filenameExtension: fileExtension) { panel.allowedContentTypes = [type] }
                 let basename = captions ? "Captions" : "Transcript"
                 panel.nameFieldStringValue = "\(basename)-\(clock.rawValue).\(fileExtension)"
                 let save: (NSApplication.ModalResponse) -> Void = { result in
                     guard result == .OK, let url = panel.url else { return }
+                    if session.editor.preferences.exportStartFolder != .automatic {
+                        session.transcriptPaneMemory.exportFolder = url.deletingLastPathComponent()
+                    }
                     guard requested == revision else {
                         alert = "The transcript changed. Choose the export options again."
                         return
@@ -1618,7 +1620,8 @@ extension TranscriptPane {
                             let index = try await controller.indexedTranscript(attachmentID: attachmentID, clocks: [clock])
                             try await Task.detached(priority: .userInitiated) {
                                 let data = try captions
-                                    ? TranscriptCodec.encodeCaptions([index], space: clock, filter: .init(trackID: trackID))
+                                    ? TranscriptCodec.encodeCaptions([index], space: clock, filter: .init(trackID: trackID),
+                                                                     limits: defaults.captionLimits)
                                     : TranscriptCodec.encode(index, space: clock, format: format)
                                 try data.write(to: url, options: .atomic)
                             }.value
@@ -1780,10 +1783,12 @@ extension TranscriptPane {
         if let index {
             Task { @MainActor in try? await controller.extend(index, with: Set(TranscriptSpace.allCases)) }
         }
+        let defaults = sheetDefaults
         sheet = TranscriptPaneSheet(editTitle(action)) {
             TranscriptEditOptionsForm(action: action, queueName: defaultName,
                                       startAngles: action == .switchAngle ? angleChoices(selection.first, edge: .start) : [],
-                                      endAngles: action == .switchAngle ? angleChoices(selection.last, edge: .end) : []) {
+                                      endAngles: action == .switchAngle ? angleChoices(selection.last, edge: .end) : [],
+                                      defaults: defaults) {
                 name, leading, trailing, retained, startNudge, endNudge, policy, edge, kind, angleID in
                 let words = address(selection, in: chosenSpace, kind: kind, leading: leading, trailing: trailing)
                 let request = TranscriptEditRequest(action: action, selections: [words], retainedDuration: retained,
@@ -2078,36 +2083,10 @@ extension TranscriptPane {
         }
     }
 
-    private enum Expansion { case earlier, later, sentence, turn, question }
-
-    private func expand(_ type: Expansion) {
-        guard let selection, let index else { return }
-        let words = index.readAll(space: space, filter: space == .source ? .init(
-            trackID: selection.first.trackID, includeInferred: true
-        ) : .init())
-        guard let first = words.firstIndex(where: { $0.id == selection.first.id }),
-              let last = words.firstIndex(where: { $0.id == selection.last.id }) else { return }
-        let firstWord = words[first]
-        func sameTurn(_ item: TranscriptOccurrence) -> Bool {
-            item.speakerID == firstWord.speakerID && item.trackID == firstWord.trackID
-                && item.clipID == firstWord.clipID && item.assemblyIndex == firstWord.assemblyIndex
-        }
-        func punctuation(_ item: TranscriptOccurrence) -> Bool { item.text.last.map { ".?!".contains($0) } == true }
-        var from = first
-        var to = last
-        if type == .earlier { from = max(0, first - 1) }
-        if type == .later { to = min(words.count - 1, last + 1) }
-        if type == .sentence || type == .turn {
-            while from > 0 && sameTurn(words[from - 1]) && (type == .turn || !punctuation(words[from - 1])) { from -= 1 }
-            while to + 1 < words.count && sameTurn(words[to + 1]) && (type == .turn || !punctuation(words[to])) { to += 1 }
-        }
-        if type == .question, first > 0 {
-            if let question = words[..<first].lastIndex(where: { $0.text.hasSuffix("?") }) {
-                from = question
-                while from > 0 && words[from - 1].speakerID == words[question].speakerID && !punctuation(words[from - 1]) { from -= 1 }
-            }
-        }
-        let pair = TranscriptTimeSelection(first: words[from], last: words[to])
+    private func expand(_ type: TranscriptSelectionExpansion) {
+        guard let selection, let index,
+              let expanded = type.endpoints(from: selection.first, to: selection.last, in: index, space: space) else { return }
+        let pair = TranscriptTimeSelection(first: expanded.first, last: expanded.last)
         if let position = readerPosition(pair.first) {
             scrollRequest = .init(word: position)
             selectionStart = pair.first
@@ -2217,8 +2196,9 @@ extension TranscriptPane {
     private func showSetup() { showSetup(targets: []) }
 
     private func showSetup(targets: Set<TranscriptSetupTarget>) {
+        let defaults = sheetDefaults
         sheet = TranscriptPaneSheet("Transcribe Audio", contentHasActions: true) {
-            TranscriptJobSetup(controller: controller, targets: targets) { options, download in
+            TranscriptJobSetup(controller: controller, targets: targets, defaults: defaults) { options, download in
                 _ = try controller.start(options: options, download: download)
                 sheet = nil
             }
@@ -2226,8 +2206,9 @@ extension TranscriptPane {
     }
 
     private func showRetry(_ job: TranscriptJobRecord) {
+        let downloads = sheetDefaults.downloadsModels
         sheet = TranscriptPaneSheet("Retry Transcription", contentHasActions: true) {
-            TranscriptRetryForm(message: job.message ?? controller.jobError) { download in
+            TranscriptRetryForm(message: job.message ?? controller.jobError, downloadsModels: downloads) { download in
                 try controller.retry(job.id, download: download)
                 sheet = nil
             }
@@ -2328,6 +2309,7 @@ extension TranscriptPane {
             let current = selection.map { address($0, in: clock) }
             let playhead = cutPlayhead
             let startingText = query.isEmpty ? selectedText() : query
+            let defaults = sheetDefaults
             sheet = TranscriptPaneSheet(mode.title) {
                 TranscriptProjectIndexes(jobs: jobs) { indexes in
                     TranscriptEditorialForm(mode: mode, indexes: indexes, attachmentLabels: labels, space: clock,
@@ -2347,7 +2329,7 @@ extension TranscriptPane {
                         guard let pair = passage(take),
                               let index = indexes.first(where: { $0.attachment?.id == pair.first.attachmentID }) else { return }
                         appendOrdered(pair, in: clock, index: index)
-                    }, review: { action, takes, policy in
+                    }, defaults: defaults, review: { action, takes, policy in
                         let selections = try takes.map { take in
                             guard let pair = passage(take) else { throw unresolvedSelect() }
                             return address(pair, in: clock)
@@ -2377,6 +2359,7 @@ extension TranscriptPane {
             let saved = controller.state.authoring
             let target = selection.map { address($0, in: space) }
             let playhead = cutPlayhead
+            let defaults = sheetDefaults
             sheet = TranscriptPaneSheet("Named Selects and Corrections") {
                 TranscriptProjectIndexes(jobs: jobs) { indexes in
                     let reviews = indexes.flatMap(\.authoredReview)
@@ -2385,7 +2368,7 @@ extension TranscriptPane {
                         if let reviewed = byID[record.id] { return [reviewed] }
                         return TranscriptEditorial.review(records: [record], sourceWords: [], attachmentID: record.attachmentID)
                     }
-                    TranscriptAuthoredForm(records: records, attachmentLabels: labels) { action, records, policy in
+                    TranscriptAuthoredForm(records: records, attachmentLabels: labels, defaults: defaults) { action, records, policy in
                         let selections = try records.flatMap { record in
                             try record.anchors.map { anchor in
                                 guard anchor.status == .resolved, let first = anchor.words.first, let last = anchor.words.last else {
@@ -2458,8 +2441,10 @@ extension TranscriptPane {
     private func showOrderedSelects() {
         let target = selection.map { address($0, in: space) }
         let playhead = cutPlayhead
+        let defaults = sheetDefaults
         sheet = TranscriptPaneSheet("Ordered Selects") {
-            TranscriptOrderedForm(selects: $basket.items, hasTarget: target != nil, hasPlayhead: playhead != nil, copy: { items in
+            TranscriptOrderedForm(selects: $basket.items, hasTarget: target != nil, hasPlayhead: playhead != nil, defaults: defaults,
+                                  copy: { items in
                 let entries = try await resolveOrdered(items)
                 let quotes = try entries.map { item, index, location in
                     guard let firstID = location.firstOccurrenceID, let lastID = location.lastOccurrenceID,

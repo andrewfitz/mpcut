@@ -1,7 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")"
-IFS= read -r helper < helper-path.txt
+helper=""
+IFS= read -r helper < helper-path.txt || true
+if [[ -z "$helper" ]]; then
+    echo "Set the absolute path to MPCut.app/Contents/Helpers/mpcut-mcp in helper-path.txt." >&2
+    exit 1
+fi
 
 umask 077
 key_dir="${MPCUT_GROK_KEY_DIR:-$HOME/Library/Application Support/MPCut/Grok Connector}"

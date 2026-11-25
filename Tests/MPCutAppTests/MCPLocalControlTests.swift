@@ -92,6 +92,27 @@ final class MCPLocalControlTests: XCTestCase {
         XCTAssertEqual((inline["project_data"] as? [String: Any])?["history"] as? [Int], [9_007_199_254_740_993])
     }
 
+    func testInlineProjectsAllowFractionalAssetAndAnnotationFields() async throws {
+        func request(_ fields: String) -> Data {
+            Data(#"{"version":2,"tool":"project_file_inspect","arguments":{"project_data":{"schema_version":9,"format":"mpcut","kind":"sequence","clips":[],\#(fields)}}}"#.utf8)
+        }
+        let fields = #""embedded_assets":{"transcripts":{"asset":{"words":[{"c":0.93}]}}},"analysis_annotations":{"silence":[{"threshold_db":-37.5}]}"#
+        let (_, arguments, _) = try await MCPLocalControl.decode(request(fields))
+        let project = try XCTUnwrap(arguments["project_data"] as? [String: Any])
+        let annotations = try XCTUnwrap(project["analysis_annotations"] as? [String: Any])
+        XCTAssertEqual((annotations["silence"] as? [[String: Double]])?.first?["threshold_db"], -37.5)
+
+        let history = #""history":{"undo":[{"analysis_annotations":{"silence":[{"~":"value"}]}}]}"#
+        _ = try await MCPLocalControl.decode(request(history + #","refs":{"value":{"threshold_db":-42.25}}"#))
+        let bad = #""history":{"undo":[{"clips":[{"~":"value"}]}]},"refs":{"value":{"track_ordinal":1.000000000000000001}}"#
+        do {
+            _ = try await MCPLocalControl.decode(request(bad))
+            XCTFail("Accepted a fractional track ordinal in retained history")
+        } catch let failure as MCPFailure {
+            XCTAssertEqual(failure.code, "invalid_arguments")
+        }
+    }
+
     @MainActor
     func testToggleAndDocumentGenerations() async throws {
         _ = NSApplication.shared
@@ -131,7 +152,7 @@ final class MCPLocalControlTests: XCTestCase {
         XCTAssertEqual(orderError["code"], "invalid_arguments")
         XCTAssertTrue(orderError["message"]?.contains("edit.order[1]") == true)
         let fractionalProject = try await socketReply(
-            #"{"version":2,"tool":"project_file_inspect","arguments":{"operation_id":"42970FFD-0FF6-42C1-BF05-0ECFAD579C1E","project_data":{"format":"mpcut","schema_version":3.0000000000000001,"kind":"sequence","clips":[]}}}"#,
+            #"{"version":2,"tool":"project_file_inspect","arguments":{"operation_id":"42970FFD-0FF6-42C1-BF05-0ECFAD579C1E","project_data":{"format":"mpcut","schema_version":9.0000000000000001,"kind":"sequence","clips":[]}}}"#,
             directory: directory)
         let projectError = try XCTUnwrap(fractionalProject["error"] as? [String: String])
         XCTAssertEqual(projectError["code"], "invalid_arguments")

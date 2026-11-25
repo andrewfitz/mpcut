@@ -172,7 +172,7 @@ class SpaceClips(unittest.TestCase):
     def test_export_spacing_leaves_the_saved_project_intact(self):
         project = self.output.with_name("original.cut")
         project.write_text(json.dumps({
-            "format": "mpcut", "schema_version": 3, "kind": "sequence",
+            "format": "mpcut", "schema_version": 9, "kind": "sequence",
             "clips": [{"id": f"clip-{index}", "file": str(self.source), "from": str(Fraction(start, FRAME_RATE)),
                        "to": str(Fraction(end, FRAME_RATE))} for index, (start, end) in enumerate(CLIPS)],
         }))
@@ -195,7 +195,7 @@ class SpaceClips(unittest.TestCase):
         clips[1]["file"] = alias.name
         project = self.output.with_name("original.cut")
         project.write_text(json.dumps({
-            "format": "mpcut", "schema_version": 3, "kind": "sequence",
+            "format": "mpcut", "schema_version": 9, "kind": "sequence",
             "clips": [dict(clip, id=f"clip-{index}") for index, clip in enumerate(clips)],
         }))
         original = project.read_bytes()

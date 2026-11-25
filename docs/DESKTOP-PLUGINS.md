@@ -12,6 +12,8 @@ Install a helper-enabled build of **MPCut.app** in **/Applications** on your App
 
 **Grok and Grok Bot** use the **MPCut-Grok.zip** download. Expand it on the editing Mac. It includes a Finder launcher, the HTTPS connector setup for each host, and a self-contained copy of the shared skill to attach in Grok or save as a private skill in Grok Bot. The bridge binds to loopback and requires a bearer key. Connect your own HTTPS route for remote access. [Grok setup](../packaging/grok/Setup.md)
 
+For a checkout build, the packaged application is `dist/MPCut.app` and the desktop downloads are in `dist/desktop-plugins/`. The default desktop configuration launches the helper in Applications. To identify the build that connection actually uses, collect the result of `cli_version_read` and compare its `build_id` with `dist/MPCut.app/Contents/Helpers/mpcut --version --json`. A result containing only `version` comes from an older CLI. [Build and installation](../README.md#build-from-source)
+
 ## Try it
 
 Start with “List my open MPCut timelines and tell me which have unsaved edits.” An empty list is a successful connection to an editor with no windows. Seeing a skill in the menu only confirms its instructions loaded. If the host shows the skill but offers no MPCut tools, check the local session, plugin or extension listed above. If the tools report the app is unavailable, check the running app and its Automation setting.

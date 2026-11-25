@@ -6,8 +6,10 @@ import sys
 import time
 import wave
 
+extra_words = int(os.environ.get("MPCUT_FIXTURE_EXTRA_WORDS", "0"))
+
 if sys.argv[1:] == ["capabilities"]:
-    print(json.dumps({"version": "lifecycle-fixture", "session_schema_version": 1, "engines": [{
+    print(json.dumps({"version": f"lifecycle-fixture-{extra_words}", "session_schema_version": 1, "engines": [{
         "name": "lifecycle-fixture", "aliases": [], "included": True, "default_model": "fixture",
         "diarization": False, "minimum_macos": "14.0", "model_source": "macos"
     }]}))
@@ -64,7 +66,7 @@ for ordinal, track in enumerate(manifest["tracks"]):
             local_words += [{"id": f"local-{extra}", "text": "again", "precision": "word",
                              "start_sample": 8000 + 2 * extra, "end_sample": 8002 + 2 * extra,
                              "speaker_id": "person", "utterance_id": "fixture-utterance"}
-                            for extra in range(int(os.environ.get("MPCUT_FIXTURE_EXTRA_WORDS", "0")) if ordinal == 0 else 0)]
+                            for extra in range(extra_words if ordinal == 0 else 0)]
             activity = [{"start_sample": start, "end_sample": min(start + 320, duration), "level": 0.25}
                         for start in range(0, duration, 320)]
             evidence = {"version": 1, "sample_rate": 16000, "stream_evidence": track["stream_evidence"],

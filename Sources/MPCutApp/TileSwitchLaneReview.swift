@@ -116,6 +116,7 @@ struct TileSwitchLaneReview: View {
         let document = model.projectURL ?? model.draft.url ?? LiveProjectMediaArchive.untitledURL
         let useSidecar = model.useAnalysisSidecars
         let sidecarWork = model.sidecarWork
+        let minimumHold = TilesDialogueDefaults.switchLaneHold(model.preferences)
         working = true
         message = nil
         Task {
@@ -124,7 +125,7 @@ struct TileSwitchLaneReview: View {
                 let currentIndexes = try await readIndexes()
                 let proposed = try await sidecarWork.detached(priority: .userInitiated) {
                     try TileSwitches.propose(in: project, document: document, indexes: currentIndexes,
-                                             useSidecar: useSidecar, cancelled: { Task.isCancelled })
+                                             minimumHold: minimumHold, useSidecar: useSidecar, cancelled: { Task.isCancelled })
                 }.value
                 guard model.mcpGeneration == generation, model.mcpRevision == revision,
                       model.transcriptMediaRevision == mediaRevision, model.project == project else { return }

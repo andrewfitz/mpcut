@@ -364,6 +364,10 @@ MPPreviewDecoder *mp_preview_open(const char *path, enum MPPreviewTracks tracks,
     preview->cancelled = cancelled;
     preview->cancel_context = context;
     preview->format->interrupt_callback = (AVIOInterruptCB){preview_cancelled, preview};
+    if (preview_cancelled(preview)) {
+        *error = "Preview opening was cancelled.";
+        goto failure;
+    }
     *error = "FFmpeg could not open this media for preview.";
     if (avformat_open_input(&preview->format, path, NULL, NULL) < 0)
         goto failure;
@@ -445,6 +449,10 @@ MPPreviewDecoder *mp_preview_open(const char *path, enum MPPreviewTracks tracks,
     preview->origin = CMTimeConvertScale(preview->timeline_origin, AV_TIME_BASE,
                                          kCMTimeRoundingMethod_RoundHalfAwayFromZero).value;
     preview->awaiting_keyframe = true;
+    if (preview_cancelled(preview)) {
+        *error = "Preview opening was cancelled.";
+        goto failure;
+    }
     *error = NULL;
     return preview;
 

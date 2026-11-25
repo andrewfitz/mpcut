@@ -87,7 +87,7 @@ enum TranscriptJobArtifact {
         let packed = packedURL(url)
         guard let bytes = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
         guard bytes.count >= minimumSize,
-              let payload = try? SidecarPayload.encode(bytes, key: kind.payloadKey, cancelled: { false }),
+              let payload = try? SidecarPayload.encode(bytes, key: kind.payloadKey, providerActivity: kind == .levels, cancelled: { false }),
               payload.logicalSize == bytes.count, payload.bytes.count + headerSize < bytes.count else {
             // A packed form from an earlier swap no longer describes this file.
             try? FileManager.default.removeItem(at: packed)

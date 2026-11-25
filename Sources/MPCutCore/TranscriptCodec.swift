@@ -31,13 +31,13 @@ public enum TranscriptCodec {
         case .json:
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-            return try encoder.encode(document.withoutActivity())
+            return try encoder.encode(document)
         case .srt, .vtt, .text:
             return try Data(TranscriptSubtitles.encode(document, format: format).utf8)
         }
     }
 
-    /// The form a project keeps beside it. `decode` reads it back as the same document.
+    /// The canonical UTF-8 JSON bytes of the project's immutable transcript asset.
     public static func encodeStored(_ document: TranscriptDocument) throws -> Data {
         try TranscriptStoredForm.encode(document)
     }
@@ -59,8 +59,8 @@ public enum TranscriptCodec {
                 switch version {
                 case TranscriptDocument.currentSchemaVersion:
                     self = .document(try TranscriptDocument(from: decoder))
-                case TranscriptStoredForm.schemaVersion:
-                    self = .document(try TranscriptStoredForm.Document(from: decoder).document())
+                case 3, TranscriptStoredForm.schemaVersion:
+                    self = .document(try TranscriptStoredForm.Document(from: decoder).document(storedVersion: version))
                 default:
                     throw CutError(code: "unsupported_transcript_version", message: "Unsupported transcript schema version \(version)")
                 }

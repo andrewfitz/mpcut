@@ -33,7 +33,7 @@ final class ProjectMediaPresentationTests: XCTestCase {
         let document = URL(fileURLWithPath: "/Edit/Sequence.cut")
         let original = TranscriptBinding(trackID: "voice", file: "old.mov", streamIndex: 1, channel: 1)
         let unrelated = TranscriptBinding(trackID: "room", file: "studio.mov", streamIndex: 4)
-        let asset = TranscriptAsset(file: "transcript.json", sha256: String(repeating: "0", count: 64))
+        let asset = TranscriptAsset(sha256: String(repeating: "0", count: 64))
         let attachment = TranscriptAttachment(id: "transcript", asset: asset, bindings: [original, unrelated])
         let previous = ProjectTranscripts(attachments: [attachment])
         var changed = original

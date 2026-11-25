@@ -1,6 +1,6 @@
 {
   "format": "mpcut",
-  "schema_version": 3,
+  "schema_version": 9,
   "kind": "multicam",
   "reference_angle_id": "A",
   "group_range": {"from": "0", "to": "10"},

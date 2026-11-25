@@ -40,23 +40,19 @@ final class MulticamAnalysisAuditTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(report.viewCount, 2)
         let first = report.scenes[0].view
         let other = try XCTUnwrap(report.scenes.map(\.view).first { $0 != first })
-        let sidecar = AnalysisSidecar(media: source)
-        var sections = try AnalysisSidecar.sceneSections(for: report)
-        sections[AnalysisSidecar.viewNameSectionKey] = try AnalysisSidecar.viewNameData(
-            [first: "Room", other: "Stage"], for: report)
-        try sidecar.save(sections)
-
-        let project = MulticamProject(referenceAngle: "camera", range: .init(from: .zero, to: source.duration),
+        var reviewed = report
+        reviewed.setViewName("Room", for: first)
+        reviewed.setViewName("Stage", for: other)
+        var project = MulticamProject(referenceAngle: "camera", range: .init(from: .zero, to: source.duration),
                                       angles: [.init(id: "camera", file: url.path)],
                                       audio: .none, switches: [.init(at: .zero, angle: "camera")])
-        let sessions = ProjectSessions(preferences: EditorPreferences(), openWindow: { _ in })
-        XCTAssertTrue(sessions.reopen())
-        let session = try XCTUnwrap(sessions.sessions.values.first)
-        session.isMulticam = true
-        let analysis = session.multicam.analysis
-        analysis.update(project: project, media: ["camera": source], ordinary: ["camera": source], useSidecars: true)
-        analysis.scan(.scenes)
-        try await waitUntil { !analysis.sourceScenes("camera").isEmpty && !analysis.isScanning(.scenes) }
+        XCTAssertTrue(project.analysisAnnotations.setScene(reviewed, for: source))
+        let analysis = MulticamAnalysisStore()
+        analysis.saveAnnotations = { next, _ in
+            project.analysisAnnotations = next
+            return true
+        }
+        analysis.update(project: project, media: ["camera": source], ordinary: ["camera": source], useSidecars: false)
         let scene = try XCTUnwrap(analysis.currentScene(at: .zero, project: project))
         XCTAssertEqual(scene.view, first)
         XCTAssertEqual(scene.name, "Room")
@@ -65,24 +61,12 @@ final class MulticamAnalysisAuditTests: XCTestCase {
         XCTAssertEqual(analysis.currentScene(at: next.start, angle: "camera", exclusiveEnd: false)?.index, 1)
         analysis.rename(scene, to: "Desk")
 
-        func saved() -> [Int: String] {
-            let views = sidecar.sceneReport(for: source)?.views ?? []
-            return Dictionary(uniqueKeysWithValues: views.compactMap { view in view.name.map { (view.view, $0) } })
-        }
-        // Read only after the write. A reader in this process can make a concurrent sidecar write fail.
-        sessions.windowClosed(session)
-        var quitAllowed = false
-        XCTAssertEqual(sessions.prepareToQuit(stopExports: { true }, reply: { quitAllowed = $0 }), .later)
-        try await waitUntil { quitAllowed }
-        XCTAssertEqual(sessions.prepareToQuit(stopExports: { true }, reply: { _ in }), .now)
-
-        XCTAssertEqual(saved(), [first: "Desk", other: "Stage"])
-    }
-
-    @MainActor
-    private func waitUntil(_ ready: () -> Bool) async throws {
-        let deadline = ContinuousClock.now + .seconds(30)
-        while !ready(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
-        XCTAssertTrue(ready())
+        let file = directory.appendingPathComponent("review.cut")
+        try CutProject.multicam(project).save(to: file)
+        let reopened = try CutProject.load(from: file)
+        let saved = try XCTUnwrap(reopened.analysisAnnotations.scene(for: source))
+        XCTAssertEqual(saved.views.first(where: { $0.view == first })?.name, "Desk")
+        XCTAssertEqual(saved.views.first(where: { $0.view == other })?.name, "Stage")
+        XCTAssertEqual(saved.scenes, report.scenes)
     }
 }

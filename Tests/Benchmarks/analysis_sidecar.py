@@ -4,57 +4,67 @@
 import argparse
 from fractions import Fraction
 import json
+import os
 from pathlib import Path
 import shutil
+import sqlite3
 import statistics
-import subprocess
 import tempfile
-import time
+
+from scene_detection import measured_run
 
 
 def report(cli, source, *arguments):
-    started = time.perf_counter()
-    output = subprocess.check_output([cli, *arguments, "--json", source], timeout=3600)
-    elapsed = time.perf_counter() - started
-    return json.loads(output), elapsed
+    output, _, (elapsed, rss_mib, _) = measured_run([cli, *arguments, "--json", source])
+    return json.loads(output), elapsed, round(rss_mib, 2)
 
 
 def compare(cli, source, arguments, runs):
     timings = {"fresh": [], "cached": []}
+    peaks = {"fresh": [], "cached": []}
     expected = None
     for run in range(runs + 1):
         order = ("fresh", "cached") if run % 2 == 0 else ("cached", "fresh")
         for mode in order:
             flags = ["--no-sidecar", *arguments] if mode == "fresh" else arguments
-            result, seconds = report(cli, source, *flags)
+            result, seconds, peak = report(cli, source, *flags)
             if expected is None:
                 expected = result
             elif result != expected:
                 raise RuntimeError(f"Cached and fresh reports differ for {arguments}")
             if run:
                 timings[mode].append(seconds)
+                peaks[mode].append(peak)
     return {f"{mode}Seconds": round(statistics.median(samples), 4)
-            for mode, samples in timings.items()}
+            for mode, samples in timings.items()} | {f"{mode}PeakMiB": max(values) for mode, values in peaks.items()}
 
 
 def benchmark(cli, file, directory, runs):
     source = directory / file.name
     shutil.copy2(file, source)
-    first, build = report(cli, source, "analysis", "sidecar", "build")
+    first, build, peak = report(cli, source, "analysis", "sidecar", "build")
     cache = Path(first["sidecar"])
+    if cache.parent != directory:
+        raise RuntimeError(f"Expected the benchmark cache in {directory}, got {cache}")
     initial_size = cache.stat().st_size
+    with sqlite3.connect(cache.as_uri() + "?mode=ro", uri=True) as database:
+        section_sizes = dict(database.execute("SELECT name, length(value) FROM sections ORDER BY name"))
+        attempts_size = 0
+        if database.execute("SELECT 1 FROM sqlite_schema WHERE name = 'scene_attempts'").fetchone():
+            attempts_size = database.execute("SELECT coalesce(sum(length(checkpoint)), 0) FROM scene_attempts").fetchone()[0]
+            attempts_size += database.execute("SELECT coalesce(sum(length(value)), 0) FROM scene_markers").fetchone()[0]
     save_times = []
     inspect_times = []
     for _ in range(runs):
-        saved, elapsed = report(cli, source, "analysis", "sidecar", "build")
+        saved, elapsed, _ = report(cli, source, "analysis", "sidecar", "build")
         if saved["sections"] != first["sections"] or saved["status"] != "current":
             raise RuntimeError("Repeating a sidecar save changed the inventory")
         save_times.append(elapsed)
-        inspected, elapsed = report(cli, source, "analysis", "sidecar", "inspect")
+        inspected, elapsed, _ = report(cli, source, "analysis", "sidecar", "inspect")
         if inspected["sections"] != saved["sections"] or inspected["status"] != "current":
             raise RuntimeError("Sidecar inspection and save disagree")
         inspect_times.append(elapsed)
-    info, _ = report(cli, source, "media", "inspect")
+    info, _, _ = report(cli, source, "media", "inspect")
     duration = info["media"]["duration"]
     end = min(1, Fraction(duration["numerator"], duration["denominator"]))
     operations = {"inspection": ["media", "inspect"]}
@@ -77,7 +87,9 @@ def benchmark(cli, file, directory, runs):
         "sidecarBytes": initial_size, "afterQueriesBytes": cache.stat().st_size,
         "repeatBuildSeconds": round(statistics.median(save_times), 4),
         "inventorySeconds": round(statistics.median(inspect_times), 4),
-        "buildSeconds": round(build, 4), "measuredRuns": runs,
+        "sectionBytes": section_sizes, "sceneAttemptPayloadBytes": attempts_size,
+        "databaseBytesOutsidePayloads": initial_size - sum(section_sizes.values()) - attempts_size,
+        "coldBuildPeakMiB": peak, "buildSeconds": round(build, 4), "measuredRuns": runs,
         "reports": reports,
     }
 
@@ -91,6 +103,7 @@ if __name__ == "__main__":
     if options.runs < 1:
         parser.error("--runs must be positive")
     with tempfile.TemporaryDirectory(prefix="mpcut-sidecar-benchmark-") as scratch:
+        os.environ["MPCUT_SIDECAR_HOME"] = str(Path(scratch) / "settings")
         result = benchmark(options.mpcut.resolve(strict=True), options.file.resolve(strict=True),
                            Path(scratch), options.runs)
     print(json.dumps(result, indent=2))

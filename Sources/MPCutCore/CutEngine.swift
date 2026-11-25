@@ -811,7 +811,7 @@ public struct CutEngine: Sendable {
             try verifyIdentity(source, identity: identity)
         }
         try checkCancellation()
-        let failure = publishExclusively(from: partial, to: destination)
+        let failure = try MediaExportPublication.publish(from: partial, to: destination)
         guard failure == 0 else {
             if failure == EEXIST { throw destinationExists }
             throw CutError(code: "write_failed", message: String(cString: strerror(failure)))

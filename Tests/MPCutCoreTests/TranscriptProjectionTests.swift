@@ -20,7 +20,7 @@ final class TranscriptProjectionTests: XCTestCase {
 
     private func attachment(_ bindings: [TranscriptBinding]) -> TranscriptAttachment {
         let digest = String(repeating: "a", count: 64)
-        return .init(id: "interview", asset: .init(file: "project.cut.transcripts/\(digest).json", sha256: digest),
+        return .init(id: "interview", asset: .init(sha256: digest),
                      bindings: bindings)
     }
 

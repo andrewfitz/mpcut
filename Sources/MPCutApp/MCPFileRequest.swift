@@ -41,22 +41,35 @@ struct MCPFileRequest {
         "project_file_edit": ("author", ["project", "edit"]),
         "timeline_file_range_map": ("review_project", ["timeline", "range", "map"]),
         "history_file_compare": ("review_project", ["history", "compare"]),
+        "history_file_restore_copy": ("review_project", ["history", "restore-copy"]),
+        "project_file_document_print": ("review_project", ["project", "document", "print"]),
         "multicam_file_sync_suggest": ("review_project", ["multicam", "sync", "suggest"]),
         "multicam_file_switch_coverage_read": ("review_project", ["multicam", "switch", "coverage"]),
+        "silence_file_pause_protect": ("analysis_edit", ["silence", "pause", "protect"]),
+        "silence_file_room_tone_calibrate": ("analysis_edit", ["silence", "room-tone", "calibrate"]),
+        "scenes_file_view_rename": ("analysis_edit", ["scenes", "view", "rename"]),
         "silence_file_shorten": ("silence", ["silence", "shorten"]),
         "silence_file_scan": ("silence", ["silence", "scan"]),
         "silence_file_plan": ("silence", ["silence", "plan"]),
         "silence_file_export": ("silence", ["silence", "export"]),
         "scenes_file_scan": ("scenes", ["scenes", "scan"]),
         "scenes_file_export": ("scenes", ["scenes", "export"]),
+        "project_file_output_read": ("project_output", ["project", "output", "read"]),
+        "project_file_output_set": ("project_output", ["project", "output", "set"]),
         "project_file_media_refresh": ("refresh", ["project", "media", "refresh"]),
         "project_file_media_list": ("project_media", ["project", "media", "list"]),
         "project_file_media_locate": ("project_media", ["project", "media", "locate"]),
         "project_file_media_relink": ("project_media", ["project", "media", "relink"]),
         "project_file_media_replace": ("project_media", ["project", "media", "replace"]),
+        "project_file_media_leave_offline": ("project_media", ["project", "media", "leave-offline"]),
+        "project_file_media_revert": ("project_media", ["project", "media", "revert"]),
         "review_file_frames_export": ("frames", ["review", "frames", "export"]),
         "analysis_file_sidecar_inspect": ("sidecar", ["analysis", "sidecar", "inspect"]),
         "analysis_file_sidecar_build": ("sidecar", ["analysis", "sidecar", "build"]),
+        "analysis_file_cache_settings_read": ("cache", ["analysis", "cache", "settings"]),
+        "analysis_file_cache_settings_set": ("cache", ["analysis", "cache", "configure"]),
+        "analysis_file_cache_preview": ("cache", ["analysis", "cache", "preview"]),
+        "analysis_file_cache_clear": ("cache", ["analysis", "cache", "clear"]),
         "export_file_project_render": ("export", ["export", "project", "render"]),
         "export_file_clips_join": ("export", ["export", "clips", "join"]),
         "export_file_soundtrack_replace": ("export", ["export", "soundtrack", "replace"]),
@@ -74,6 +87,9 @@ struct MCPFileRequest {
         "tiles_file_inspect": ["tiles", "inspect"],
         "tiles_file_preview": ["tiles", "preview"],
         "tiles_file_accept": ["tiles", "accept"],
+        "tiles_file_pending_read": ["tiles", "pending", "read"],
+        "tiles_file_pending_stage": ["tiles", "pending", "stage"],
+        "tiles_file_pending_discard": ["tiles", "pending", "discard"],
         "tiles_file_link": ["tiles", "link"],
         "tiles_file_feeds_list": ["tiles", "feeds", "list"],
         "tiles_file_feeds_inspect": ["tiles", "feeds", "inspect"],
@@ -103,11 +119,11 @@ struct MCPFileRequest {
     ]
 
     static func supports(_ tool: String) -> Bool {
-        routes[tool] != nil || transcriptCommand(for: tool) != nil || tilesRoutes[tool] != nil
+        tool == MCPFileReview.requestTool || routes[tool] != nil || transcriptCommand(for: tool) != nil || tilesRoutes[tool] != nil
     }
 
     static func isFileTool(_ tool: String) -> Bool {
-        supports(tool) || ["file_job_status_read", "file_job_result_read", "file_job_cancel"].contains(tool)
+        supports(tool) || [MCPFileReview.resultTool, "file_job_status_read", "file_job_result_read", "file_job_cancel", "file_job_release"].contains(tool)
     }
 
     init(tool: String, fields: [String: Any]) throws {
@@ -115,7 +131,13 @@ struct MCPFileRequest {
         try self.init(tool: tool, validatedFields: validated)
     }
 
-    init(tool: String, validatedFields fields: [String: Any]) throws {
+    init(tool: String, validatedFields fields: [String: Any], cacheProtection: Set<URL> = []) throws {
+        if tool == MCPFileReview.requestTool {
+            directory = FileManager.default.homeDirectoryForCurrentUser
+            input = nil
+            arguments = try MCPFileReview.arguments(Fields(values: fields))
+            return
+        }
         let transcript = Self.transcriptCommand(for: tool)
         let tiles = Self.tilesRoutes[tool]
         guard let route = Self.routes[tool] ?? transcript.map({ ("transcript", $0) }) ?? tiles.map({ ("tiles", $0) }) else {
@@ -125,6 +147,35 @@ struct MCPFileRequest {
         let a = Fields(values: fields)
         directory = try a.path("working_directory").map { URL(fileURLWithPath: $0, isDirectory: true) }
             ?? FileManager.default.homeDirectoryForCurrentUser
+        if route.family == "analysis_edit" {
+            guard let project = try a.path("project_path"), let output = try a.path("out_project") else {
+                throw a.invalid("Supply project_path and a new out_project.")
+            }
+            arguments = route.path + ["--project", project, "--out-project", output, "--json"]
+            if try a.bool("no_sidecar") { arguments.append("--no-sidecar") }
+            switch tool {
+            case "silence_file_pause_protect":
+                for id in try a.strings("protect_pauses") { arguments += ["--protect-pause", id] }
+                for (key, flag) in [("silence_threshold_db", "--threshold-db"),
+                                    ("silence_min_pause_seconds", "--min-pause-seconds"),
+                                    ("silence_max_blip_seconds", "--max-blip-seconds")] {
+                    if let number = fields[key] as? NSNumber { arguments += [flag, number.stringValue] }
+                }
+            case "silence_file_room_tone_calibrate":
+                guard let clock = try a.string("clock"), let from = try a.string("from"),
+                      let to = try a.string("to") else { throw a.invalid("Supply clock, from and to.") }
+                arguments += ["--clock", clock, "--from", from, "--to", to]
+            case "scenes_file_view_rename":
+                guard let source = try a.path("file"), let view = fields["view"] as? Int,
+                      let reportID = try a.string("report_id"),
+                      let name = fields["name"] as? String else { throw a.invalid("Supply file, report_id, view and name.") }
+                arguments += ["--source", source, "--report-id", reportID, "--view", String(view), "--name=" + name]
+            default:
+                throw a.invalid("Unknown analysis edit.")
+            }
+            input = nil
+            return
+        }
         if let command = tiles {
             for key in ["file", "project_path", "analysis_file", "resume_file", "out_project", "output", "plan"] {
                 _ = try a.path(key)
@@ -158,14 +209,65 @@ struct MCPFileRequest {
             if tool == "transcript_file_job_prepare", request["operation_id"] == nil {
                 request["operation_id"] = fields["operation_id"]
             }
-            if ["transcript_file_job_prepare", "transcript_file_job_retry", "transcript_file_job_run"].contains(tool), request["progress"] == nil {
+            if ["transcript_file_job_prepare", "transcript_file_job_retry", "transcript_file_job_reconcile", "transcript_file_job_run"].contains(tool), request["progress"] == nil {
                 request["progress"] = "jsonl"
             }
             arguments = command + ["--stdin", "--json"]
             input = try a.jsonObject(request)
             return
         }
-        arguments = route.path + ["--json"]
+        let inlineJoin = command == "rearrange" && fields["ranges"] != nil
+        arguments = (inlineJoin ? ["export", "clips", "join"] : route.path) + ["--json"]
+        if command == "cache" {
+            for (key, option) in [("folder", "--folder"), ("project_path", "--project")] {
+                if let path = try a.path(key) { arguments += [option, path] }
+            }
+            for key in ["mode", "location"] {
+                if let value = try a.string(key) { arguments += [a.flag(key), value] }
+            }
+            if tool == "analysis_file_cache_clear" {
+                guard try a.bool("confirm"), let tokens = fields["clear_tokens"] as? [String],
+                      !tokens.isEmpty, Set(tokens).count == tokens.count else {
+                    throw a.invalid("Confirm the clear and supply distinct tokens from the preview.")
+                }
+                arguments += ["--confirm"]
+                for token in tokens { arguments += ["--select", token] }
+            }
+            if !cacheProtection.isEmpty {
+                arguments.append("--stdin")
+                input = try JSONEncoder().encode(cacheProtection.map(\.path).sorted())
+            }
+            return
+        }
+        if command == "project_output" {
+            guard let project = try a.path("project_path") else { throw a.invalid("Supply an absolute project_path.") }
+            arguments.append(project)
+            guard tool == "project_file_output_set" else { return }
+            let output = try a.path("out_project")
+            let inPlace = try fields["in_place"].map { _ in try a.bool("in_place") } ?? false
+            let integers = ["width", "height", "background"]
+            let strings = ["frame_rate", "audio_mode", "unresolved_privacy"]
+            guard (output != nil) != inPlace, (integers + strings).contains(where: { fields[$0] != nil }) else {
+                throw a.invalid("Supply an export setting and choose out_project or in_place.")
+            }
+            if let output { arguments += ["--out-project", output] }
+            if inPlace { arguments.append("--in-place") }
+            for key in integers where fields[key] != nil {
+                arguments += [a.flag(key), try a.number(key, integer: true)]
+            }
+            for key in strings {
+                if let value = try a.string(key) { arguments += [a.flag(key), value] }
+            }
+            if fields["audio_ids"] != nil {
+                guard fields["audio_mode"] != nil else { throw a.invalid("Supply audio_mode with audio_ids.") }
+                guard let ids = fields["audio_ids"] as? [String], !ids.isEmpty,
+                      ids.allSatisfy({ !$0.isEmpty && !$0.utf8.contains(0) }) else {
+                    throw a.invalid("Supply nonempty audio_ids.")
+                }
+                arguments += ids.map { "--audio-id=" + $0 }
+            }
+            return
+        }
         if command == "project_media" {
             guard let project = try a.path("project_path") else { throw a.invalid("Supply an absolute project_path.") }
             arguments.append(project)
@@ -191,7 +293,7 @@ struct MCPFileRequest {
                 let to = try mapping.number("to", integer: true)
                 arguments += ["--stream-map", from + "=" + to]
             }
-            for key in ["in_place", "allow_loss", "reset_crop", "shared_time_of_day"] where fields[key] != nil {
+            for key in ["in_place", "allow_loss", "reset_crop", "shared_time_of_day", "include_history", "apply_matches"] where fields[key] != nil {
                 if try a.bool(key) { arguments.append(a.flag(key)) }
             }
             return
@@ -210,6 +312,10 @@ struct MCPFileRequest {
         }
         if command == "review_project" {
             guard let project = try a.path("project_path") else { throw a.invalid("Supply an absolute project_path.") }
+            if tool == "project_file_document_print" {
+                arguments.append(project)
+                return
+            }
             if tool == "multicam_file_switch_coverage_read" {
                 guard let angle = try a.string("angle_id"), let groupTime = try a.string("group_time") else {
                     throw a.invalid("Supply angle_id and group_time.")
@@ -219,7 +325,7 @@ struct MCPFileRequest {
                 return
             }
             arguments += ["--project", project]
-            for (key, flag) in [("before_project_path", "--before-project"), ("file", "--file")] {
+            for (key, flag) in [("before_project_path", "--before-project"), ("file", "--file"), ("out_project", "--out-project")] {
                 if let value = try a.path(key) { arguments += [flag, value] }
             }
             for key in ["space", "from", "to", "source_id", "reference_source_id"] {
@@ -227,6 +333,9 @@ struct MCPFileRequest {
             }
             if fields["occurrence_index"] != nil {
                 arguments += ["--occurrence-index", try a.number("occurrence_index", integer: true)]
+            }
+            if fields["history_index"] != nil {
+                arguments += ["--history-index", try a.number("history_index", integer: true)]
             }
             if let path = try a.path("replacement") {
                 arguments += ["--replacement", path]
@@ -327,7 +436,7 @@ struct MCPFileRequest {
         if let selection = try a.string("select") {
             arguments += ["--select", selection == "non_silent" ? "non-silent" : selection]
         }
-        for name in ["sample", "preset", "group_by", "audio", "audio_output", "mode", "video", "quality", "tracks", "snap", "still_timing"] {
+        for name in ["plan_token", "format", "sample", "preset", "group_by", "audio", "audio_output", "mode", "video", "quality", "tracks", "snap", "still_timing"] {
             if let value = try a.string(name) { arguments += [a.flag(name), value] }
         }
         if command == "scenes" {
@@ -376,7 +485,8 @@ struct MCPFileRequest {
             arguments.append(a.flag(detail))
         }
         if let path = try a.path("export_to") { arguments += ["--export-to", path] }
-        if let path = try a.path("output") { arguments += ["--output", path] }
+        let output = try a.path("output")
+        if let output, !inlineJoin { arguments += ["--output", output] }
         if let topic = try a.string("topic") { arguments += topic.split(separator: " ").map(String.init) }
         if fields["only"] != nil { arguments += ["--only", try a.strings("only").joined(separator: ",")] }
         if fields["at"] != nil {
@@ -489,8 +599,15 @@ struct MCPFileRequest {
                     request["container"] = try a.string("container")
                     arguments.append("--stdin")
                     input = try a.jsonObject(request)
-                } else {
-                    arguments += ["--", file, ranges.map { $0.from + "-" + $0.to }.joined(separator: ",")]
+                } else if let output {
+                    // Stdin avoids the process argument limit. Keep each range as its own
+                    // input clip so the cut map retains the native range-join numbering.
+                    let mode = ExportRules.defaultMode(for: ExportEntryPoint.cliRearrange.source)
+                    arguments += ["--mode", mode.rawValue]
+                    if fields["snap"] == nil { arguments += ["--snap", "nearest"] }
+                    arguments.append("--stdin")
+                    input = try a.jsonObject(["file": file, "output": output,
+                                              "clips": ranges.map { ["from": $0.from, "to": $0.to] }])
                 }
             }
         } else if let file = try a.path("file") {
@@ -595,6 +712,8 @@ extension MCPFileRequest {
         case "transcript_file_job_prepare": ["transcript", "job", "prepare"]
         case "transcript_file_job_status_read": ["transcript", "job", "status"]
         case "transcript_file_job_cancel": ["transcript", "job", "cancel"]
+        case "transcript_file_jobs_list": ["transcript", "job", "list"]
+        case "transcript_file_job_reconcile": ["transcript", "job", "reconcile"]
         case "transcript_file_job_retry": ["transcript", "job", "retry"]
         case "transcript_file_attachment_import": ["transcript", "attachment", "import"]
         case "transcript_file_attachment_inspect": ["transcript", "attachment", "inspect"]

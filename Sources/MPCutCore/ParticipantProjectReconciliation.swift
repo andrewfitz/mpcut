@@ -64,8 +64,15 @@ extension CutProject {
     public mutating func reconcileParticipantAnalysis(_ scan: ParticipantScanResult, sourceID: String,
                                                       relativeTo projectURL: URL,
                                                       reviewed: ParticipantReconciliation, cancelled: @escaping () -> Bool = { false }) throws {
+        try reconcileParticipantAnalysis(scan, sourceID: sourceID, relativeTo: projectURL, reviewed: reviewed,
+                                         applying: nil, cancelled: cancelled)
+    }
+
+    package mutating func reconcileParticipantAnalysis(_ scan: ParticipantScanResult, sourceID: String,
+                                                       relativeTo projectURL: URL, reviewed: ParticipantReconciliation,
+                                                       applying choices: TilesReviewChoices?, cancelled: @escaping () -> Bool) throws {
         let validated = try validateParticipantScanSource(scan, sourceID: sourceID, relativeTo: projectURL, cancelled: cancelled)
-        try participants.reconcileAnalysis(validated, sourceID: sourceID, reviewed: reviewed)
+        try participants.reconcileAnalysis(validated, sourceID: sourceID, reviewed: reviewed, applying: choices)
     }
 }
 
@@ -76,7 +83,12 @@ extension ParticipantProject {
 
     public mutating func reconcileAnalysis(_ scan: ParticipantScanResult, sourceID: String,
                                            reviewed: ParticipantReconciliation) throws {
-        let prepared = try prepareReconciliation(scan, sourceID: sourceID)
+        try reconcileAnalysis(scan, sourceID: sourceID, reviewed: reviewed, applying: nil)
+    }
+
+    mutating func reconcileAnalysis(_ scan: ParticipantScanResult, sourceID: String,
+                                    reviewed: ParticipantReconciliation, applying choices: TilesReviewChoices?) throws {
+        let prepared = try prepareReconciliation(scan, sourceID: sourceID, collectChoiceIDs: choices != nil)
         guard prepared.review == reviewed else {
             throw invalidParticipantProject("The accepted geometry or affected decisions changed after review. Review the replacement again.")
         }
@@ -85,6 +97,10 @@ extension ParticipantProject {
         revised.people.append(contentsOf: prepared.newPeople)
         revised.appearanceOverrides.removeAll { override in
             override.sourceID == sourceID && prepared.removedIDs.contains(override.appearanceID)
+        }
+        if let choices, !reviewed.retainedCopiedGeometry {
+            try choices.apply(to: &revised, sourceID: sourceID, analysisIdentity: scan.analysisIdentity,
+                              reconciledFeedIDs: prepared.choiceIDs)
         }
         try revised.validate()
         self = revised
@@ -105,9 +121,11 @@ extension ParticipantProject {
         let geometry: ParticipantSourceGeometry
         let newPeople: [ParticipantPerson]
         let removedIDs: Set<String>
+        let choiceIDs: [String: String]
     }
 
-    private func prepareReconciliation(_ scan: ParticipantScanResult, sourceID: String) throws -> PreparedReconciliation {
+    private func prepareReconciliation(_ scan: ParticipantScanResult, sourceID: String,
+                                       collectChoiceIDs: Bool = false) throws -> PreparedReconciliation {
         guard let index = sources.firstIndex(where: { $0.sourceID == sourceID }) else {
             throw invalidParticipantProject("This source has no accepted geometry to reconcile.")
         }
@@ -138,7 +156,7 @@ extension ParticipantProject {
                 removedAppearanceIDs: [], affectedParticipantIDs: [], affectedRedactionIDs: [], affectedBindingIDs: [],
                 affectedPresentationIDs: [], removedOverrideCount: 0, previous: previous, previousOverrides: overrides,
                 analysisIdentity: scan.analysisIdentity)
-            return .init(review: review, index: index, geometry: geometry, newPeople: [], removedIDs: [])
+            return .init(review: review, index: index, geometry: geometry, newPeople: [], removedIDs: [], choiceIDs: [:])
         }
 
         let oldTracks = Dictionary(grouping: previous.appearances, by: \.id)
@@ -161,6 +179,7 @@ extension ParticipantProject {
         let feedMatches = feedCandidates.compactMapValues { $0.count == 1 ? $0.first : nil }
         let feedMatchCounts = Dictionary(grouping: feedMatches.values, by: { $0 }).mapValues(\.count)
         let retainedFeeds = feedMatches.filter { feedMatchCounts[$0.value] == 1 }
+        let freshChoiceIDs = collectChoiceIDs ? TilesReviewChoices.feedIDs(in: geometry.appearances) : [:]
         var uncertainFeeds = Set<String>()
         geometry.appearances = newTracks.keys.sorted().flatMap { id -> [ParticipantAppearance] in
             guard let fresh = newTracks[id] else { return [] }
@@ -214,9 +233,12 @@ extension ParticipantProject {
         let eventFeeds = geometry.scanEvents.flatMap { event in
             (event.feedID.map { [$0] } ?? []) + (event.candidates ?? []).map(\.feedID)
         }
-        let referencedPeople = Set(geometry.appearances.compactMap(\.participantID) + eventFeeds)
+        let assignedPeople = Set(geometry.appearances.compactMap(\.participantID))
+        let referencedPeople = assignedPeople.union(eventFeeds)
         let newPeople = replacement.people.filter { referencedPeople.contains($0.id) }
-        return .init(review: review, index: index, geometry: geometry, newPeople: newPeople, removedIDs: removedIDs)
+        let choiceIDs = freshChoiceIDs.mapValues { retainedFeeds[$0] ?? $0 }.filter { assignedPeople.contains($0.value) }
+        return .init(review: review, index: index, geometry: geometry, newPeople: newPeople, removedIDs: removedIDs,
+                     choiceIDs: choiceIDs)
     }
 
     /// A split or range-specific link may give a detector tile several edited

@@ -1054,7 +1054,7 @@ class AudioConversionTests(unittest.TestCase):
     def index_header(self, source, change=None):
         """The saved index header of a source. `change` edits it in place, as an earlier build's index."""
         key = "media_index.v1"
-        with sqlite3.connect(str(source) + ".cutdb") as db:
+        with sqlite3.connect(str(source) + ".cutcache") as db:
             value = section_bytes(db, key)
             header = plistlib.loads(value)
             if change is not None:
@@ -1085,7 +1085,7 @@ class AudioConversionTests(unittest.TestCase):
 
         for source, audio, known in [(surround, "opus", None), (aac, "aac", 96_000), (opus, "opus", 80_000)]:
             with self.subTest(source=source.name):
-                saved = Path(str(source) + ".cutdb")
+                saved = Path(str(source) + ".cutcache")
                 fresh = (self.layout(source, "--no-sidecar"), rate(source, audio, "--no-sidecar"))
                 self.assertFalse(saved.exists())
                 if known is None:

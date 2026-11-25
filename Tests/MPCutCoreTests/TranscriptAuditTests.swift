@@ -18,7 +18,7 @@ final class TranscriptAuditTests: XCTestCase {
         }
         var project = CutProject.multicam(multicam)
         let hash = String(repeating: "a", count: 64)
-        let attachment = TranscriptAttachment(id: "words", asset: .init(file: "edit.cut.transcripts/\(hash).json", sha256: hash),
+        let attachment = TranscriptAttachment(id: "words", asset: .init(sha256: hash),
                                               bindings: [camera, lav])
         project.transcripts = ProjectTranscripts(attachments: [attachment])
         let document = TranscriptDocument(clock: .presentation, tracks: [camera, lav].map {
@@ -57,7 +57,7 @@ final class TranscriptAuditTests: XCTestCase {
         }
         var project = CutProject.sequence(clips)
         let hash = String(repeating: "c", count: 64)
-        let attachment = TranscriptAttachment(id: "words", asset: .init(file: "edit.cut.transcripts/\(hash).json", sha256: hash),
+        let attachment = TranscriptAttachment(id: "words", asset: .init(sha256: hash),
                                               bindings: [binding])
         project.transcripts = ProjectTranscripts(attachments: [attachment])
         let document = TranscriptDocument(clock: .presentation, tracks: [.init(id: "mic", name: "mic", streamIndex: 0)],
@@ -87,7 +87,7 @@ final class TranscriptAuditTests: XCTestCase {
         let lav = TranscriptBinding(trackID: "mic", sourceID: "mic", streamIndex: 1)
         var project = CutProject.multicam(multicam)
         let hash = String(repeating: "d", count: 64)
-        let attachment = TranscriptAttachment(id: "words", asset: .init(file: "edit.cut.transcripts/\(hash).json", sha256: hash),
+        let attachment = TranscriptAttachment(id: "words", asset: .init(sha256: hash),
                                               bindings: [camera, lav])
         project.transcripts = ProjectTranscripts(attachments: [attachment])
         let heard = TranscriptWord(id: "w", text: "teh", start: time(1), end: time(2), observations: ["cam", "mic"].map {
@@ -181,7 +181,7 @@ final class TranscriptAuditTests: XCTestCase {
         }
         var project = CutProject.multicam(multicam)
         let hash = String(repeating: "b", count: 64)
-        let attachment = TranscriptAttachment(id: "words", asset: .init(file: "edit.cut.transcripts/\(hash).json", sha256: hash),
+        let attachment = TranscriptAttachment(id: "words", asset: .init(sha256: hash),
                                               bindings: [camera, lav])
         project.transcripts = ProjectTranscripts(attachments: [attachment])
         let document = TranscriptDocument(clock: .presentation, tracks: [camera, lav].map {
@@ -238,83 +238,6 @@ final class TranscriptAuditTests: XCTestCase {
         XCTAssertEqual(observation?.range, .init(from: .init(numerator: 684, denominator: 25), to: .init(numerator: 686, denominator: 25)))
     }
 
-    func testDecodedStoreEntryIsReusedUntilTheFileChanges() throws {
-        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("mpcut-decoded-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: folder) }
-        let project = folder.appendingPathComponent("talk.cut")
-        let track = TranscriptTrack(id: "mic", name: "mic")
-        let document = TranscriptDocument(clock: .presentation, tracks: [track], words: [
-            .init(id: "w0", text: "hello", start: time(0), end: time(1), candidateTrackIDs: ["mic"])
-        ])
-        let asset = try TranscriptStore.put(TranscriptCodec.encode(document, format: .json), relativeTo: project)
-        let first = try TranscriptStore.decoded(asset, relativeTo: project)
-        XCTAssertEqual(first.words.map(\.text), ["hello"])
-        XCTAssertEqual(try TranscriptStore.decoded(asset, relativeTo: project).words.map(\.id), ["w0"])
-
-        // Different bytes under the same name fail the digest exactly as an uncached read does.
-        let file = try XCTUnwrap(TranscriptStore.assetLocation(asset, relativeTo: project))
-        try FileManager.default.removeItem(at: file)
-        try Data("{}".utf8).write(to: file)
-        XCTAssertThrowsError(try TranscriptStore.decoded(asset, relativeTo: project)) {
-            XCTAssertEqual(($0 as? CutError)?.code, "damaged_transcript")
-        }
-        try FileManager.default.removeItem(at: file)
-        XCTAssertThrowsError(try TranscriptStore.decoded(asset, relativeTo: project)) {
-            XCTAssertEqual(($0 as? CutError)?.code, "missing_transcript")
-        }
-    }
-
-    func testSavingARenamedProjectLeavesTheStoreACopyStillReads() throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("mpcut-rename-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let original = root.appendingPathComponent("Original.cut")
-        let copy = root.appendingPathComponent("Copy.cut")
-        let renamed = root.appendingPathComponent("Renamed.cut")
-        let data = Data("dialogue".utf8)
-        let asset = try TranscriptStore.put(data, relativeTo: original)
-        var project = CutProject.sequence([])
-        project.transcripts.attachments = [.init(id: "dialogue", asset: asset, bindings: [])]
-        try project.save(to: original)
-        try FileManager.default.copyItem(at: original, to: copy)
-        try FileManager.default.moveItem(at: original, to: renamed)
-        XCTAssertEqual(try TranscriptStore.read(asset, relativeTo: copy), data)
-
-        project.transcripts = try TranscriptStore.copy(in: project.transcripts, from: renamed, to: renamed)
-        try project.save(to: renamed)
-        let saved = try XCTUnwrap(CutProject.load(from: renamed).transcripts.attachments.first?.asset)
-        XCTAssertEqual(try TranscriptStore.read(saved, relativeTo: renamed), data)
-        // The duplicate still names the former store, and nothing else holds its transcript.
-        XCTAssertEqual(try TranscriptStore.read(asset, relativeTo: copy), data)
-    }
-
-    func testProjectRenamedOnlyInLetterCaseKeepsItsTranscripts() throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("mpcut-case-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let probe = root.appendingPathComponent("Probe")
-        try Data().write(to: probe)
-        guard FileManager.default.fileExists(atPath: root.appendingPathComponent("probe").path) else {
-            throw XCTSkip("This volume distinguishes letter case.")
-        }
-        let original = root.appendingPathComponent("Talk.cut")
-        let data = Data("dialogue".utf8)
-        let asset = try TranscriptStore.put(data, relativeTo: original)
-        var project = CutProject.sequence([])
-        project.transcripts.attachments = [.init(id: "dialogue", asset: asset, bindings: [])]
-        try project.save(to: original)
-        XCTAssertEqual(rename(original.path, root.path + "/talk.cut"), 0)
-        let renamed = root.appendingPathComponent("talk.cut")
-        XCTAssertEqual(try TranscriptStore.read(asset, relativeTo: renamed), data)
-        XCTAssertNoThrow(try TranscriptStore.put(Data("new result".utf8), relativeTo: renamed))
-        project.transcripts = try TranscriptStore.copy(in: project.transcripts, from: renamed, to: renamed)
-        XCTAssertNil(project.transcripts.attachments.first?.asset.unavailable)
-        try project.save(to: renamed)
-        let saved = try XCTUnwrap(CutProject.load(from: renamed).transcripts.attachments.first?.asset)
-        XCTAssertEqual(try TranscriptStore.read(saved, relativeTo: renamed), data)
-    }
-
     func testListFileErrorCodesAreSingleTokens() throws {
         let missing = URL(fileURLWithPath: "/nonexistent/mpcut-\(UUID().uuidString).json")
         XCTAssertThrowsError(try ClipEditCSV.readListData(missing, kind: "Transcript plan")) {
@@ -332,7 +255,7 @@ final class TranscriptAuditTests: XCTestCase {
         ])
         let hash = String(repeating: "a", count: 64)
         let binding = TranscriptBinding(trackID: track.id, file: "mic.wav", streamIndex: 1, sequenceStreamOrdinal: 0)
-        let attachment = TranscriptAttachment(id: "words", asset: .init(file: "edit.cut.transcripts/\(hash).json", sha256: hash),
+        let attachment = TranscriptAttachment(id: "words", asset: .init(sha256: hash),
                                               bindings: [binding])
         // The blade lands inside "hello" and removes nothing.
         let bladed = CutProject.sequence([

@@ -244,7 +244,14 @@ extension ParticipantProject {
     }
 
     public func mapSourcePaths(_ map: (String) -> String) -> Self {
+        var result = mapSourceIDs(map)
+        for index in pendingReviews.indices { result.pendingReviews[index].file = map(pendingReviews[index].file) }
+        return result
+    }
+
+    func mapSourceIDs(_ map: (String) -> String) -> Self {
         var result = self
+        for index in pendingReviews.indices { result.pendingReviews[index].sourceID = map(pendingReviews[index].sourceID) }
         for index in sources.indices { result.sources[index].sourceID = map(sources[index].sourceID) }
         for index in appearanceOverrides.indices { result.appearanceOverrides[index].sourceID = map(appearanceOverrides[index].sourceID) }
         for index in people.indices {
@@ -260,14 +267,30 @@ extension ParticipantProject {
         return result
     }
 
+    var pendingMediaPaths: [(id: String, path: String)] {
+        pendingReviews.map { ($0.sourceID, $0.file) }
+    }
+
     package var protectedMediaPaths: [(id: String, path: String)] {
         let picture = sources.map { ($0.sourceID, $0.sourceID) }
         let audio = people.compactMap { person in person.audio?.selection.map { (person.id, $0.source) } }
         let slots = render?.shots.flatMap(\.slots).filter { $0.target == .camera }.map { ($0.id, $0.id) } ?? []
-        return picture + audio + slots
+        return picture + audio + slots + pendingMediaPaths
     }
 
     public func validate() throws {
+        let reviews = pendingReviews
+        guard Set(reviews.map(\.sourceID)).count == reviews.count, Set(reviews.map(\.id)).count == reviews.count,
+              reviews.allSatisfy({ review in
+                  validStillID(review.id) && validStillID(review.sourceID) && ProjectFile.validMediaPath(review.file)
+                  && review.choices.analysisIdentity == review.asset.scan.analysisIdentity
+                  && TilesReviewChoices.validMerges(review.choices.merged)
+                  && review.choices.grids.allSatisfy { grid in
+                      grid.isValid && grid.range.from >= .zero && grid.range.from < grid.range.to
+                          && grid.range.to <= review.asset.scan.source.duration
+                  } }) else {
+            throw invalidParticipantProject("Invalid pending tile review.")
+        }
         let roster = Set(people.map(\.id))
         guard roster.count == people.count,
               people.allSatisfy({ validStillID($0.id) && validStillID($0.name) && ($0.treatment?.color ?? 0) <= 0xFFFFFF }) else {

@@ -1,6 +1,7 @@
+import CryptoKit
 import Foundation
 
-public struct DetectedScene: Codable, Sendable {
+public struct DetectedScene: Codable, Equatable, Sendable {
     public let number: Int
     public let startPTS: Int64
     public let start: RationalTime
@@ -17,7 +18,7 @@ public struct DetectedScene: Codable, Sendable {
     }
 }
 
-public struct SceneView: Codable, Sendable {
+public struct SceneView: Codable, Equatable, Sendable {
     public let view: Int
     public let label: String
     public let sceneNumbers: [Int]
@@ -77,14 +78,15 @@ public struct SceneSourceStamp: Codable, Hashable, Sendable {
     }
 }
 
-public struct SceneReport: Codable, Sendable {
+public struct SceneReport: Codable, Equatable, Sendable {
     public var ok: Bool { true }
-    public let file: String
+    public internal(set) var file: String
     public let sourceStamp: SceneSourceStamp
     public let timeBase: RationalTime
     public let origin: RationalTime
     public let duration: RationalTime
     public let scenes: [DetectedScene]
+    public internal(set) var sourceEvidence: AnalysisSourceEvidence? = nil
     public let viewCount: Int
     public private(set) var views: [SceneView]
     package var syntheticLeading: Bool = false
@@ -93,6 +95,7 @@ public struct SceneReport: Codable, Sendable {
         case ok, file, origin, duration, scenes, views
         case sourceStamp = "source_stamp"
         case timeBase = "time_base"
+        case sourceEvidence = "source_evidence"
         case viewCount = "view_count"
     }
 
@@ -100,17 +103,30 @@ public struct SceneReport: Codable, Sendable {
         let path = url.standardizedFileURL.path
         guard file != path else { return self }
         return SceneReport(file: path, sourceStamp: sourceStamp, timeBase: timeBase, origin: origin,
-                           duration: duration, scenes: scenes, viewCount: viewCount, views: views,
+                           duration: duration, scenes: scenes, sourceEvidence: sourceEvidence, viewCount: viewCount, views: views,
                            syntheticLeading: syntheticLeading)
     }
 
-    mutating func restoreViewNames(_ names: [Int: String]) {
-        for index in views.indices {
-            let view = views[index]
-            guard view.name != names[view.view] else { continue }
-            views[index] = SceneView(view: view.view, label: view.label, sceneNumbers: view.sceneNumbers,
-                                     name: names[view.view])
+    package var coversFullSource: Bool {
+        scenes.first?.start == .zero && scenes.last?.end == duration
+    }
+
+    package func reviewID(scope: SceneScanScope = .fullSource) -> String? {
+        struct Binding: Encodable {
+            let file: String
+            let sourceStamp: SceneSourceStamp
+            let timeBase: RationalTime
+            let origin: RationalTime
+            let duration: RationalTime
+            let scenes: [DetectedScene]
+            let scope: SceneScanScope
         }
+        let value = Binding(file: file, sourceStamp: sourceStamp, timeBase: timeBase, origin: origin,
+                            duration: duration, scenes: scenes, scope: scope)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let encoded = try? encoder.encode(value) else { return nil }
+        return SHA256.hash(data: encoded).map { String(format: "%02x", $0) }.joined()
     }
 
     public mutating func setViewName(_ name: String?, for view: Int) {
@@ -123,26 +139,36 @@ public struct SceneReport: Codable, Sendable {
 
 extension SceneReport {
     public init(from decoder: Decoder) throws {
+        try self.init(from: decoder, embedded: false)
+    }
+
+    init(from decoder: Decoder, embedded: Bool) throws {
         let fields = try decoder.container(keyedBy: CodingKeys.self)
-        self.init(file: try fields.decode(String.self, forKey: .file),
+        self.init(file: embedded ? "" : try fields.decode(String.self, forKey: .file),
                   sourceStamp: try fields.decode(SceneSourceStamp.self, forKey: .sourceStamp),
                   timeBase: try fields.decode(RationalTime.self, forKey: .timeBase),
                   origin: try fields.decode(RationalTime.self, forKey: .origin),
                   duration: try fields.decode(RationalTime.self, forKey: .duration),
                   scenes: try fields.decode([DetectedScene].self, forKey: .scenes),
+                  sourceEvidence: try fields.decodeIfPresent(AnalysisSourceEvidence.self, forKey: .sourceEvidence),
                   viewCount: try fields.decode(Int.self, forKey: .viewCount),
                   views: try fields.decode([SceneView].self, forKey: .views))
     }
 
     public func encode(to encoder: Encoder) throws {
+        try encode(to: encoder, embedded: false)
+    }
+
+    func encode(to encoder: Encoder, embedded: Bool) throws {
         var fields = encoder.container(keyedBy: CodingKeys.self)
         try fields.encode(ok, forKey: .ok)
-        try fields.encode(file, forKey: .file)
+        if !embedded { try fields.encode(file, forKey: .file) }
         try fields.encode(sourceStamp, forKey: .sourceStamp)
         try fields.encode(timeBase, forKey: .timeBase)
         try fields.encode(origin, forKey: .origin)
         try fields.encode(duration, forKey: .duration)
         try fields.encode(scenes, forKey: .scenes)
+        try fields.encodeIfPresent(sourceEvidence, forKey: .sourceEvidence)
         try fields.encode(viewCount, forKey: .viewCount)
         try fields.encode(views, forKey: .views)
     }

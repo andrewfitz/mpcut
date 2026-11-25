@@ -16,14 +16,17 @@ public struct TimelineComparison: Codable, Equatable, Sendable {
     public let afterDuration: RationalTime
     public let projectFields: [String]
     public private(set) var changes: [Change]
+    public private(set) var participantChanges: [ParticipantChange]
     public private(set) var nextOffset: Int?
 
     package func page(offset: Int, limit: Int) -> Self {
         var result = self
-        let start = min(changes.count, offset)
-        let end = start + min(changes.count - start, limit)
-        result.changes = Array(changes[start..<end])
-        result.nextOffset = end < changes.count ? end : nil
+        let count = changes.count + participantChanges.count
+        let start = min(count, offset)
+        let end = start + min(count - start, limit)
+        result.changes = Array(changes[min(changes.count, start)..<min(changes.count, end)])
+        result.participantChanges = Array(participantChanges[max(0, start - changes.count)..<max(0, end - changes.count)])
+        result.nextOffset = end < count ? end : nil
         return result
     }
 
@@ -31,6 +34,7 @@ public struct TimelineComparison: Codable, Equatable, Sendable {
         case beforeClock = "before_clock", afterClock = "after_clock"
         case beforeDuration = "before_duration", afterDuration = "after_duration"
         case projectFields = "project_fields", changes, nextOffset = "next_offset"
+        case participantChanges = "participant_changes"
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -41,6 +45,7 @@ public struct TimelineComparison: Codable, Equatable, Sendable {
         try fields.encode(afterDuration.description, forKey: .afterDuration)
         try fields.encode(projectFields, forKey: .projectFields)
         try fields.encode(changes, forKey: .changes)
+        try fields.encode(participantChanges, forKey: .participantChanges)
         try fields.encodeIfPresent(nextOffset, forKey: .nextOffset)
     }
 
@@ -51,24 +56,29 @@ public struct TimelineComparison: Codable, Equatable, Sendable {
                       beforeDuration: ProjectField.time(fields, .beforeDuration),
                       afterDuration: ProjectField.time(fields, .afterDuration),
                       projectFields: fields.decode([String].self, forKey: .projectFields),
-                      changes: fields.decode([Change].self, forKey: .changes))
+                      changes: fields.decode([Change].self, forKey: .changes),
+                      participantChanges: fields.decodeIfPresent([ParticipantChange].self, forKey: .participantChanges) ?? [])
         nextOffset = try fields.decodeIfPresent(Int.self, forKey: .nextOffset)
     }
 
     private init(beforeClock: TimelineClock, afterClock: TimelineClock, beforeDuration: RationalTime,
-                 afterDuration: RationalTime, projectFields: [String], changes: [Change]) {
+                 afterDuration: RationalTime, projectFields: [String], changes: [Change],
+                 participantChanges: [ParticipantChange]) {
         self.beforeClock = beforeClock
         self.afterClock = afterClock
         self.beforeDuration = beforeDuration
         self.afterDuration = afterDuration
         self.projectFields = projectFields
         self.changes = changes
+        self.participantChanges = participantChanges
     }
 
     public static func compare(from before: CutProject, to after: CutProject) throws -> Self {
         let previous = try before.timelineOccurrences()
         let current = try after.timelineOccurrences()
         let oldContents = Contents(before), newContents = Contents(after)
+        let participant = try TimelineParticipantComparison(before.participants, after.participants)
+        let participantFields = Set(participant.rows.map(\.category))
         let sameClock = before.timelineOutputClock == after.timelineOutputClock
         var projectFields: [String] = []
         if !sameClock { projectFields.append("clock") }
@@ -84,6 +94,7 @@ public struct TimelineComparison: Codable, Equatable, Sendable {
         if before.stillSoundtrack != after.stillSoundtrack { projectFields.append("still_soundtrack") }
         let treatmentChanged = before.participants.effectiveRedactions != after.participants.effectiveRedactions
         if treatmentChanged { projectFields.append("feed_treatments") }
+        projectFields += participantFields.map(\.rawValue).sorted()
         if before.participants.tileOutput != after.participants.tileOutput { projectFields.append("tile_output") }
         let groupLayoutsChanged = oldContents.groupLayouts != newContents.groupLayouts
         if groupLayoutsChanged { projectFields.append("group_tile_layouts") }
@@ -145,6 +156,11 @@ public struct TimelineComparison: Codable, Equatable, Sendable {
             }
             if oldContents.tileLayouts(for: old) != newContents.tileLayouts(for: item) { fields.append("tile_layouts") }
             if treatmentChanged, item.input != nil { fields.append("feed_treatments") }
+            if !participantFields.isEmpty {
+                let oldCategories = try oldContents.participantCategories(for: old, comparison: participant, after: false)
+                let newCategories = try newContents.participantCategories(for: item, comparison: participant, after: true)
+                fields += oldCategories.union(newCategories).map(\.rawValue).sorted()
+            }
             if oldContents.asset(old.assetID) != newContents.asset(item.assetID) { fields.append("still_asset") }
             if oldContents.replacementContents(for: old) != newContents.replacementContents(for: item) {
                 fields.append("picture_replacement")
@@ -171,7 +187,7 @@ public struct TimelineComparison: Codable, Equatable, Sendable {
         try Task.checkCancellation()
         return Self(beforeClock: before.timelineOutputClock, afterClock: after.timelineOutputClock,
                     beforeDuration: previous.last?.output.to ?? .zero, afterDuration: current.last?.output.to ?? .zero,
-                    projectFields: projectFields, changes: changes)
+                    projectFields: projectFields, changes: changes, participantChanges: participant.rows)
     }
 
     private enum Identity: Hashable {
@@ -220,28 +236,48 @@ public struct TimelineComparison: Codable, Equatable, Sendable {
         let groupLayouts: [TileLayoutSpan]
         private let assembly: [StillAssemblyItem]
         private let clipLayouts: [String: [TileLayoutSpan]]
+        private let recordingsByID: [String: MulticamSource]
+        private let recordingsByAngle: [String: [MulticamSource]]
+        private let usesLegacyRender: Bool
+        private let legacyShots: [ParticipantTimedShot.Scope: [ParticipantTimedShot]]
+        private let defaultShot: ParticipantShot
+        private let omittedFeeds: Set<String>
 
         init(_ project: CutProject) {
             let sourceClips: [CutSequenceClip]
             let stillCards: [StillInsert]
+            let participants = project.participants
+            let render = participants.tileOutput == nil ? participants.render : nil
+            usesLegacyRender = render != nil
+            legacyShots = ParticipantTimedShot.index(render?.shots ?? [])
+            defaultShot = render?.shots.first { $0.range == nil } ?? .init(layout: .original)
+            omittedFeeds = Set(participants.effectiveRedactions.filter { $0.treatment == .omit }.map(\.participantID))
             switch project {
             case .sequence(let clips):
                 sourceClips = clips
                 stillCards = []
                 switches = []
                 groupLayouts = []
+                recordingsByID = [:]
+                recordingsByAngle = [:]
                 assembly = []
             case .stillSequence(let sequence):
                 sourceClips = sequence.items.compactMap(\.source)
                 stillCards = sequence.items.compactMap(\.still)
                 switches = []
                 groupLayouts = []
+                recordingsByID = [:]
+                recordingsByAngle = [:]
                 assembly = []
             case .multicam(let multicam):
                 sourceClips = []
                 stillCards = multicam.assemblyItems?.compactMap(\.still) ?? []
                 switches = multicam.switches
                 groupLayouts = multicam.groupTileLayouts
+                recordingsByID = Dictionary(multicam.pictureSources.map { ($0.id, $0) },
+                                            uniquingKeysWith: { first, _ in first })
+                recordingsByAngle = Dictionary(multicam.angles.map { ($0.id, $0.recordings) },
+                                               uniquingKeysWith: { first, _ in first })
                 assembly = multicam.assemblyItems ?? []
             }
             sources = Dictionary(sourceClips.map { ($0.id, Source($0)) }, uniquingKeysWith: { first, _ in first })
@@ -282,6 +318,90 @@ public struct TimelineComparison: Codable, Equatable, Sendable {
                 []
             }
             return layouts.compactMap { $0.limited(from: input.from, to: input.to) }
+        }
+
+        func participantCategories(for item: TimelineOccurrence, comparison: TimelineParticipantComparison,
+                                   after: Bool) throws -> Set<ParticipantChange.Category> {
+            guard let input = item.input else { return [] }
+            if let file = item.file { return comparison.categories(in: input, source: file, after: after) }
+
+            var fields: Set<ParticipantChange.Category> = []
+            func add(_ sources: [MulticamSource], in interval: MulticamRange) throws {
+                for source in sources {
+                    let extent = source.coverage ?? MulticamRange(from: source.offset, to: interval.to)
+                    guard let overlap = interval.participantIntersection(extent) else { continue }
+                    let physical = source.feedAngle.flatMap { recordingsByID[$0.sourceID] } ?? source
+                    let range = try MulticamRange(from: overlap.from.subtracting(physical.offset),
+                                                  to: overlap.to.subtracting(physical.offset))
+                    fields.formUnion(comparison.categories(in: range, source: physical.id, after: after))
+                }
+            }
+
+            func addBase(in range: MulticamRange) throws {
+                if let angle = item.angleOverride {
+                    try add(recordingsByAngle[angle] ?? [], in: range)
+                    return
+                }
+                let start = max(0, switches.lowerBound { $0.at > range.from } - 1)
+                for index in switches.indices.dropFirst(start) {
+                    guard switches[index].at < range.to else { break }
+                    let next = index + 1 < switches.count ? switches[index + 1].at : range.to
+                    let interval = MulticamRange(from: max(switches[index].at, range.from), to: min(next, range.to))
+                    try add(recordingsByAngle[switches[index].angle] ?? [], in: interval)
+                    if next >= range.to { break }
+                }
+            }
+
+            let groupShots = Array((legacyShots[.init(clock: .group)] ?? []).overlapping(input))
+            let outputShots = Array((legacyShots[.init(clock: .output)] ?? []).overlapping(item.output))
+            let occurrenceShots = Array((legacyShots[.init(clock: .output, occurrence: item.index)] ?? []).overlapping(item.output))
+            let clipLayouts = usesLegacyRender ? [] : tileLayouts(for: item).sorted { $0.range.from < $1.range.from }
+            let sharedLayouts = usesLegacyRender ? [] : groupLayouts(in: input).sorted { $0.range.from < $1.range.from }
+            let hasLayoutOverrides = !clipLayouts.isEmpty || !sharedLayouts.isEmpty || !groupShots.isEmpty
+                || !outputShots.isEmpty || !occurrenceShots.isEmpty || defaultShot.layout != .original
+            guard hasLayoutOverrides else {
+                try addBase(in: input)
+                return fields
+            }
+
+            let displacement = try input.from.subtracting(item.output.from)
+            var points = Set([input.from, input.to])
+            let groupRanges = clipLayouts.map(\.range) + sharedLayouts.map(\.range) + groupShots.map(\.range)
+            for range in groupRanges {
+                if let overlap = range.participantIntersection(input) { points.formUnion([overlap.from, overlap.to]) }
+            }
+            for shot in outputShots + occurrenceShots {
+                if let overlap = shot.range.participantIntersection(item.output) {
+                    let range = try overlap.participantShifted(by: displacement)
+                    points.formUnion([range.from, range.to])
+                }
+            }
+            let boundaries = points.sorted()
+            for (from, to) in zip(boundaries, boundaries.dropFirst()) {
+                try Task.checkCancellation()
+                let range = MulticamRange(from: from, to: to)
+                let outputTime = try from.subtracting(displacement)
+                func activeLayout(_ layouts: [TileLayoutSpan]) -> TileLayoutSpan? {
+                    let index = layouts.lowerBound { $0.range.to > from }
+                    guard layouts.indices.contains(index), layouts[index].range.contains(from) else { return nil }
+                    return layouts[index]
+                }
+                let nativeLayout = activeLayout(clipLayouts) ?? activeLayout(sharedLayouts)
+                let shot = nativeLayout?.shot(range: range)
+                    ?? occurrenceShots.shot(at: outputTime)
+                    ?? outputShots.shot(at: outputTime)
+                    ?? groupShots.shot(at: from)
+                    ?? defaultShot
+                let slots = shot.slots.filter { $0.target != .participant || !omittedFeeds.contains($0.id) }
+                if shot.layout == .original || shot.layout == .arranged
+                    || slots.contains(where: { $0.target == .participant || $0.target == .presentation }) {
+                    try addBase(in: range)
+                }
+                for id in Set(slots.filter { $0.target == .camera }.map(\.id)) {
+                    try add(recordingsByAngle[id] ?? [], in: range)
+                }
+            }
+            return fields
         }
 
         func sourceChanged(_ id: String, comparedWith other: Self) -> Bool { sources[id] != other.sources[id] }

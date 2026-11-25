@@ -239,7 +239,7 @@ class SelectedTrackIssue(unittest.TestCase):
     def test_saved_index_keeps_each_track_issue(self):
         result = run([CLI, "analysis", "sidecar", "build", "--json", "--only", "index", self.both], check=False)
         self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertTrue(Path(str(self.both) + ".cutdb").exists())
+        self.assertTrue(Path(str(self.both) + ".cutcache").exists())
         for stream in [1, 2]:
             code, report = self.export(self.both, stream)
             self.assertEqual(code, 1, report)

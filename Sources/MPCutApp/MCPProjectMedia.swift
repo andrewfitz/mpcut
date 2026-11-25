@@ -62,7 +62,8 @@ extension ProjectSessions {
     func mcpProjectMedia(tool: String, arguments: [String: Any], session: ProjectSession,
                          checkAccess: @escaping @MainActor () throws -> Void) async throws -> [String: Any]? {
         guard ["project_editor_media_list", "project_editor_media_locate", "project_editor_media_relink",
-               "project_editor_media_replace", "still_editor_asset_relink"].contains(tool) else { return nil }
+               "project_editor_media_replace", "project_editor_media_leave_offline",
+               "project_editor_media_revert", "still_editor_asset_relink"].contains(tool) else { return nil }
         guard let archive = session.mcpMediaArchive else {
             throw MCPCommandError("invalid_target", "Open a project with media references.")
         }
@@ -85,22 +86,45 @@ extension ProjectSessions {
 
         switch tool {
         case "project_editor_media_list":
-            let rows = await Task.detached(priority: .userInitiated) {
+            let includeHistory = arguments["include_history"] as? Bool == true
+            let current = await Task.detached(priority: .userInitiated) {
                 ProjectMedia.inventory(project: archive.project, undo: archive.undo, redo: archive.redo,
                                        relativeTo: archive.documentURL, snapshot: archive.snapshot, checkFile: false)
             }.value
             try checkRevision()
+            let rows: [ProjectMediaRow]
+            if includeHistory {
+                // Keep live presentation for current paths and probe history-only paths off the main actor.
+                let statuses = Dictionary(uniqueKeysWithValues: current.map { ($0.url, session.mcpMediaStatus($0)) })
+                rows = await Task.detached(priority: .userInitiated) {
+                    ProjectMediaVolume.$checking.withValue(archive.checkingVolumes) {
+                        ProjectMedia.inventory(project: archive.project, undo: archive.undo, redo: archive.redo,
+                                               relativeTo: archive.documentURL, snapshot: archive.snapshot,
+                                               includeHistory: true, statuses: statuses)
+                    }
+                }.value
+                try checkRevision()
+            } else {
+                rows = current
+            }
             let start = min(rows.count, arguments["offset"] as? Int ?? 0)
             let end = start + min(rows.count - start, arguments["limit"] as? Int ?? 50)
             let page = rows[start..<end].map { row in
                 var current = row
-                current.status = session.mcpMediaStatus(row)
+                if !includeHistory {
+                    current.status = session.mcpMediaStatus(row)
+                }
                 return current
             }
             return ["items": try mediaJSON(page), "total": rows.count, "offset": start]
 
         case "project_editor_media_locate":
             let folder = try path("folder", directory: true)
+            let includeHistory = arguments["include_history"] as? Bool == true
+            let applyMatches = arguments["apply_matches"] as? Bool == true
+            if applyMatches, !session.mcpCanEditProjectMedia {
+                throw MCPCommandError("editor_busy", "Finish the current project operation before relinking media.")
+            }
             let checking = session.mcpMediaCheckingVolumes
             let receipt = try mcpAnalysisJobs.reserve(session: session, kind: "media_locate")
             let endWork = receipt.cleanup.begin()
@@ -109,7 +133,7 @@ extension ProjectSessions {
                 let candidates = try ProjectMediaVolume.$checking.withValue(checking) {
                     try ProjectMedia.locate(project: archive.project, undo: archive.undo, redo: archive.redo,
                                             snapshot: archive.snapshot, relativeTo: archive.documentURL,
-                                            folder: folder)
+                                            folder: folder, includeHistory: includeHistory)
                 }
                 try Task.checkCancellation()
                 return (candidates, try MCPSchemas.encodeResult(candidates))
@@ -122,7 +146,29 @@ extension ProjectSessions {
                     guard !receipt.cancellationRequested else { throw CancellationError() }
                     try checkRevision()
                     receipt.mediaLocateRows = candidates
-                    receipt.finish("succeeded", detail: ["candidates": try JSONSerialization.jsonObject(with: data)])
+                    var detail: [String: Any] = ["candidates": try JSONSerialization.jsonObject(with: data)]
+                    if applyMatches {
+                        guard session.mcpCanEditProjectMedia else {
+                            throw MCPCommandError("editor_busy", "Finish the current project operation before relinking media.")
+                        }
+                        let mappings = candidates.compactMap(\.eligibleMapping)
+                        if mappings.isEmpty {
+                            detail["changed"] = false
+                            detail["applied"] = [String]()
+                            detail["failures"] = [String: String]()
+                        } else {
+                            let result = try await session.mcpRelinkMedia(mappings) {
+                                guard !receipt.cancellationRequested else { throw CancellationError() }
+                                try checkRevision()
+                            }
+                            detail["changed"] = result.changed
+                            detail["applied"] = result.applied
+                            detail["failures"] = result.failures
+                        }
+                        detail["revision"] = session.mcpRevision
+                        detail["history_retained"] = false
+                    }
+                    receipt.finish("succeeded", detail: detail)
                 } catch {
                     if receipt.cancellationRequested || error is CancellationError {
                         receipt.finish("cancelled")
@@ -132,6 +178,28 @@ extension ProjectSessions {
                 }
             }
             return receipt.snapshot
+
+        case "project_editor_media_leave_offline", "project_editor_media_revert":
+            guard session.mcpCanEditProjectMedia else {
+                throw MCPCommandError("editor_busy", "Finish the current project operation before changing media.")
+            }
+            let source = try text("source")
+            try checkRevision()
+            let changed: Bool
+            if tool == "project_editor_media_revert" {
+                if session.isMulticam {
+                    changed = try await session.multicam.revertProjectMedia(source, validateCommit: checkRevision)
+                } else {
+                    changed = try await session.editor.revertProjectMedia(source, validateCommit: checkRevision)
+                }
+            } else if session.isMulticam {
+                try session.multicam.ignoreProjectMedia(source)
+                changed = session.mcpRevision != revision
+            } else {
+                try session.editor.ignoreProjectMedia(source)
+                changed = session.mcpRevision != revision
+            }
+            return ["changed": changed, "history_retained": false]
 
         case "project_editor_media_relink", "still_editor_asset_relink":
             guard session.mcpCanEditProjectMedia else {

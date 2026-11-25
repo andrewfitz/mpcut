@@ -25,7 +25,7 @@ class PremiereBridgeTests(unittest.TestCase):
                          re.search(r"const protocolVersion = (\d+)", panel)[1])
 
     @unittest.skipUnless(shutil.which("node"), "Node.js is required to run the Premiere panel")
-    def test_invalid_request_does_not_block_the_next_conversion(self):
+    def test_mailbox_failures_do_not_block_the_next_conversion(self):
         script = r"""
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -40,12 +40,23 @@ const directory = {
             { name: "job-2.json", async read() { return "{"; }, async delete() { deleted.push(2); } },
             {
                 name: "job-3.json",
-                async read() { return JSON.stringify({ protocol_version: 3, operation: "read" }); },
+                async read() { return "{}"; },
                 async delete() { deleted.push(3); },
+            },
+            {
+                name: "job-4.json",
+                async read() {
+                    return JSON.stringify({
+                        protocol_version: 3, operation: "read", project_path: "/tmp/copy.prproj",
+                        timeline_xml_path: "/tmp/copy.xml", allow_loss: true, expected_angle_numbers: [],
+                    });
+                },
+                async delete() { deleted.push(4); },
             },
         ];
     },
     async createFile(name) {
+        if (name === "result-3.json") throw Error("Response file is unavailable");
         return { async write(value) { responses.set(name, value); } };
     },
 };
@@ -59,8 +70,14 @@ const context = {
     require(name) {
         if (name === "uxp") return { storage: { localFileSystem: { async getDataFolder() { return directory; } } } };
         return {
-            Project: { async open() { return project; } },
-            ProjectConverter: { async exportAsFinalCutProXML() { return true; } },
+            Project: { async open(path) { assert.equal(path, "/tmp/copy.prproj"); return project; } },
+            ProjectConverter: {
+                async exportAsFinalCutProXML(target, path) {
+                    assert.equal(target, sequence);
+                    assert.equal(path, "/tmp/copy.xml");
+                    return true;
+                },
+            },
             OpenProjectOptions: class { setShowLocateFileDialog() {} setShowWarningDialog() {} setAddToMRUList() {} },
             CloseProjectOptions: class { setPromptIfDirty() { return this; } },
         };
@@ -69,9 +86,9 @@ const context = {
     setInterval() {},
 };
 vm.runInNewContext(fs.readFileSync(process.argv[1], "utf8"), context).then(() => {
-    assert.deepEqual(deleted, [2, 3]);
+    assert.deepEqual(deleted, [2, 3, 4]);
     assert.match(JSON.parse(responses.get("result-2.json")).error, /SyntaxError/);
-    assert.deepEqual(JSON.parse(responses.get("result-3.json")), { warnings: [] });
+    assert.deepEqual(JSON.parse(responses.get("result-4.json")), { warnings: [] });
 }).catch(error => { console.error(error); process.exitCode = 1; });
 """
         subprocess.run(["node", "-e", script, ROOT / "packaging/premiere/index.js"], check=True)

@@ -69,6 +69,9 @@ final class MCPLiveOutputJobs {
         let job = Job(owner: owner, revision: revision, nativeCancellation: nativeCancellation)
         let progress = job.progress
         let task = ProjectSidecarWork(project: project).detached(priority: .userInitiated) { () -> Outcome in
+            // An agent's export keeps the Mac awake like one the editor starts, until it finishes, fails or is cancelled.
+            let awake = SleepPrevention(reason: "Exporting from MPCut")
+            defer { awake.end() }
             do {
                 try Task.checkCancellation()
                 return .success(try work(progress))

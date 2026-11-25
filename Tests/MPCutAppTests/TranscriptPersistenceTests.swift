@@ -5,6 +5,72 @@ import XCTest
 
 final class TranscriptPersistenceTests: XCTestCase {
     @MainActor
+    func testTranscriptAndAuthoringHistorySurviveDraftRecoveryAndIndependentSaveAs() throws {
+        _ = NSApplication.shared
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let preferences = EditorPreferences()
+        preferences.historyLimit = 10
+        let original = ProjectSession(id: UUID(), preferences: preferences)
+        let payload = TranscriptDocument(clock: .presentation, speakers: [.init(id: "a", name: "Speaker")],
+                                         words: [.init(id: "hello", text: "Hello", start: .zero,
+                                                        end: .init(numerator: 1))])
+        let importURL = folder.appendingPathComponent("Transcript.json")
+        try TranscriptCodec.encodeStored(payload).write(to: importURL)
+        let attachment = try original.transcript.importTranscript(importURL, format: .json)
+        let asset = attachment.asset
+        let rename = try original.transcript.correct(.renameSpeaker(speakerID: "a", name: "Host"),
+                                                     attachmentID: attachment.id)
+        try FileManager.default.removeItem(at: importURL)
+        let draft = try XCTUnwrap(original.editor.draft.url)
+        func checkArchive(at url: URL, file: StaticString = #filePath, line: UInt = #line) throws {
+            let archive = try CutProject.loadDocument(from: url, limit: 10)
+            let current = try XCTUnwrap(archive.project.transcripts.attachments.first?.asset, file: file, line: line)
+            XCTAssertEqual(current, asset, file: file, line: line)
+            XCTAssertEqual(try TranscriptStore.decoded(current, relativeTo: url), payload, file: file, line: line)
+            XCTAssertEqual(archive.project.transcripts.authoring, [rename], file: file, line: line)
+            XCTAssertEqual(archive.undo.count, 1, file: file, line: line)
+            XCTAssertEqual(archive.undo.first?.project.transcripts.attachments.map(\.asset), [asset], file: file, line: line)
+            XCTAssertEqual(archive.undo.first?.project.transcripts.authoring, [], file: file, line: line)
+        }
+        defer { try? FileManager.default.removeItem(at: draft.deletingLastPathComponent()) }
+        try checkArchive(at: draft)
+        original.preserveAfterUnconfirmedClose()
+        original.end()
+        try checkArchive(at: draft)
+
+        let recovered = ProjectSession(id: UUID(), preferences: preferences)
+        defer { recovered.end() }
+        try recovered.editor.openProject([], at: draft)
+        XCTAssertNil(recovered.editor.projectURL)
+        XCTAssertEqual(recovered.editor.draft.url, draft)
+        XCTAssertEqual(try recovered.transcript.document(), payload)
+
+        let first = folder.appendingPathComponent("First.cut")
+        let second = folder.appendingPathComponent("Second.cut")
+        try recovered.editor.writeProject(to: first)
+        try checkArchive(at: first)
+        try recovered.editor.writeProject(to: second)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: draft.path))
+        try FileManager.default.removeItem(at: first)
+        try checkArchive(at: second)
+
+        let reopened = ProjectSession(id: UUID(), preferences: preferences)
+        defer { reopened.end() }
+        try reopened.editor.openProject([], at: second)
+        XCTAssertTrue(reopened.editor.canUndo)
+        reopened.editor.undo()
+        XCTAssertTrue(reopened.editor.transcriptState.authoring.isEmpty)
+        XCTAssertEqual(try reopened.transcript.document(), payload)
+        XCTAssertEqual(try reopened.transcript.index().speakers.map(\.name), ["Speaker"])
+        reopened.editor.redo()
+        XCTAssertEqual(reopened.editor.transcriptState.authoring, [rename])
+        XCTAssertEqual(try reopened.transcript.document(), payload)
+        XCTAssertEqual(try reopened.transcript.index().speakers.map(\.name), ["Host"])
+    }
+
+    @MainActor
     func testParticipantMediaRemainsProtectedThroughSaveAndHistory() throws {
         _ = NSApplication.shared
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -44,7 +110,7 @@ final class TranscriptPersistenceTests: XCTestCase {
         let recording = TranscriptTrack(id: "mic", name: "Mic", sourceID: "wide", streamIndex: 1)
         let binding = TranscriptBinding(trackID: recording.id, sourceID: "wide", streamIndex: 1)
         let attachment = TranscriptAttachment(id: "dialogue",
-            asset: .init(file: "dialogue.json", sha256: String(repeating: "a", count: 64)), bindings: [binding])
+            asset: .init(sha256: String(repeating: "a", count: 64)), bindings: [binding])
         let transcript = TranscriptDocument(clock: .session, tracks: [recording],
             words: [.init(id: "opening", text: "hello", start: t(1), end: t(2))])
         var project = MulticamProject(referenceAngle: "wide", range: range,
@@ -88,8 +154,7 @@ final class TranscriptPersistenceTests: XCTestCase {
         let editor = session.editor
         defer { editor.endSession() }
         let draft = try editor.transcriptAssetContext()
-        let draftStore = TranscriptStore.folder(relativeTo: draft, draft: true)
-        let data = Data("{\"version\":1}".utf8)
+        let data = try TranscriptCodec.encodeStored(TranscriptDocument(clock: .presentation))
         let asset = try TranscriptStore.put(data, relativeTo: draft, draft: true)
         let timeline = session.transcript.timelineRevision
         let attachment = TranscriptAttachment(id: "dialogue", asset: asset, bindings: [])
@@ -123,13 +188,13 @@ final class TranscriptPersistenceTests: XCTestCase {
             XCTAssertEqual((error as? CutError)?.code, "destination_exists")
         }
         XCTAssertEqual(try CutProject.load(from: occupied), occupiedProject)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: TranscriptStore.folder(relativeTo: occupied).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: occupied.appendingPathExtension("transcripts").path))
         XCTAssertEqual(editor.draft.url, draft)
         XCTAssertEqual(try TranscriptStore.read(asset, relativeTo: draft), data)
 
         let saved = directory.appendingPathComponent("Interview.cut")
         try editor.writeProject(to: saved)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: draftStore.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: saved.appendingPathExtension("transcripts").path))
         let document = try CutProject.loadDocument(from: saved, limit: 10)
         let savedAsset = try XCTUnwrap(document.project.transcripts.attachments.first?.asset)
         XCTAssertEqual(try TranscriptStore.read(savedAsset, relativeTo: saved), data)

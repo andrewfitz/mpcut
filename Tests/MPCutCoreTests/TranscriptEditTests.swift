@@ -14,6 +14,32 @@ final class TranscriptEditTests: XCTestCase {
         XCTAssertEqual(resolved.range, .init(from: time(1), to: time(7)))
     }
 
+    func testReaderExpansionUsesOccurrenceAndRespectsSentenceAndTurnBoundaries() throws {
+        let clips = ["a", "b"].map { CutSequenceClip(id: $0, file: "take.mov", from: .zero, to: time(10)) }
+        let (_, index, _) = try fixture(.sequence(clips), tracks: [binding("mic", file: "take.mov")], words: [
+            word("Before.", 0, 1, track: "mic"), word("What", 1, 2, track: "mic"), word("happened?", 2, 3, track: "mic"),
+            word("It", 3, 4, track: "mic"), word("worked.", 4, 5, track: "mic"), word("After.", 5, 6, track: "mic")
+        ])
+        let hit = try XCTUnwrap(index.locate(wordID: "worked.", space: .currentCut).last)
+        let request = TranscriptWordSelection(firstWordID: hit.wordID, firstOccurrenceID: hit.id,
+                                              trailingPadding: time(1))
+        let sentence = try TranscriptEditPlanner.select(request, expansion: .sentence, in: index)
+        XCTAssertEqual(sentence.first.wordID, "It")
+        XCTAssertEqual(sentence.first.clipID, "b")
+        XCTAssertEqual(sentence.last.id, hit.id)
+        XCTAssertEqual(sentence.range, .init(from: time(13), to: time(16)))
+
+        let turn = try TranscriptEditPlanner.select(request, expansion: .speakerTurn, in: index)
+        XCTAssertEqual(turn.first.wordID, "Before.")
+        XCTAssertEqual(turn.first.clipID, "b")
+        XCTAssertEqual(turn.last.wordID, "After.")
+
+        let answer = try TranscriptEditPlanner.select(request, expansion: .precedingQuestion, in: index)
+        XCTAssertEqual(answer.first.wordID, "What")
+        XCTAssertEqual(answer.first.clipID, "b")
+        XCTAssertEqual(answer.last.id, hit.id)
+    }
+
     func testRepeatedWordRequiresOccurrenceAndDeleteIsAtomic() throws {
         let clips = ["a", "b"].map { CutSequenceClip(id: $0, file: "take.mov", from: time(0), to: time(10)) }
         let (project, index, revision) = try fixture(.sequence(clips), tracks: [binding("mic", file: "take.mov")],
@@ -179,7 +205,7 @@ final class TranscriptEditTests: XCTestCase {
         let bindings = [binding("first-mic", file: "a.mov"), binding("second-mic", file: "b.mov")]
         let attachments = zip(["first", "second"], bindings).map { id, binding in
             let hash = String(repeating: id == "first" ? "a" : "b", count: 64)
-            return TranscriptAttachment(id: id, asset: .init(file: "edit.cut.transcripts/\(hash).json", sha256: hash),
+            return TranscriptAttachment(id: id, asset: .init(sha256: hash),
                                         bindings: [binding])
         }
         project.transcripts = .init(attachments: attachments)
@@ -219,7 +245,7 @@ final class TranscriptEditTests: XCTestCase {
         var project = CutProject.sequence([clip])
         func attachment(_ id: String, file: String) -> TranscriptAttachment {
             let hash = String(repeating: id, count: 64)
-            return .init(id: id, asset: .init(file: "edit.cut.transcripts/\(hash).json", sha256: hash),
+            return .init(id: id, asset: .init(sha256: hash),
                          bindings: [binding(id, file: file)])
         }
         let main = attachment("a", file: clip.file)
@@ -388,7 +414,7 @@ final class TranscriptEditTests: XCTestCase {
         func check(_ timeline: CutProject, _ binding: TranscriptBinding, sequence: [String: MediaInfo] = [:],
                    multicam: [String: MediaInfo] = [:], line: UInt = #line) throws {
             var project = timeline
-            let attachment = TranscriptAttachment(id: "words", asset: .init(file: "edit.cut.transcripts/\(hash).json", sha256: hash),
+            let attachment = TranscriptAttachment(id: "words", asset: .init(sha256: hash),
                                                   bindings: [binding])
             project.transcripts = ProjectTranscripts(attachments: [attachment])
             let document = TranscriptDocument(clock: .presentation, tracks: [
@@ -474,7 +500,7 @@ final class TranscriptEditTests: XCTestCase {
         throws -> (CutProject, TranscriptIndex, TranscriptEditRevision) {
         var project = timeline
         let hash = String(repeating: "a", count: 64)
-        let attachment = TranscriptAttachment(id: "words", asset: .init(file: "edit.cut.transcripts/\(hash).json", sha256: hash),
+        let attachment = TranscriptAttachment(id: "words", asset: .init(sha256: hash),
                                               bindings: tracks)
         project.transcripts = ProjectTranscripts(attachments: [attachment])
         let document = TranscriptDocument(clock: .presentation, tracks: tracks.map {

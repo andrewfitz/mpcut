@@ -6,6 +6,7 @@ import MPCutCore
 struct TranscriptCLI {
     enum Operation: String, CaseIterable {
         case capabilities, tracks, prepareSession = "prepare-session", status, cancel, retry, runJob = "run-job"
+        case listJobs, reconcile
         case `import`, inspect, bind, detach, read, search, locate, export
         case compare, alignScript = "align-script", suggest, correct, select, plan, apply, queue
 
@@ -26,6 +27,8 @@ struct TranscriptCLI {
             case .runJob: return job.union(["progress", "download"])
             case .status, .cancel: return job
             case .retry: return job.union(["progress", "project_path"])
+            case .listJobs: return ["project_path", "job_directory", "offset", "limit"]
+            case .reconcile: return attachment.union(["job_directory", "progress"])
             case .import:
                 return target.union(attachment).union(destination).union(job).union(
                     ["transcript", "format", "origin", "bindings", "source_id", "audio_stream_index", "channel", "track_id", "output"])
@@ -44,7 +47,7 @@ struct TranscriptCLI {
                 ["record", "record_id", "change", "selection", "space", "first_word_id", "last_word_id", "first_occurrence_id",
                  "last_occurrence_id", "kind", "leading_padding", "trailing_padding", "selections", "revision"])
             case .select: return attachment.union(
-                ["selection", "space", "first_word_id", "last_word_id", "first_occurrence_id", "last_occurrence_id", "kind", "leading_padding", "trailing_padding"])
+                ["expansion", "selection", "space", "first_word_id", "last_word_id", "first_occurrence_id", "last_occurrence_id", "kind", "leading_padding", "trailing_padding"])
             case .plan, .apply, .queue:
                 return attachment.union(self == .plan ? [] : destination).union(
                     ["request", "plan", "selection", "space", "first_word_id", "last_word_id", "first_occurrence_id",
@@ -316,7 +319,7 @@ private struct TranscriptCLIProject {
     }
 
     func document(_ attachment: TranscriptAttachment) throws -> TranscriptDocument {
-        try TranscriptCodec.decode(TranscriptStore.read(attachment.asset, relativeTo: url), format: .json)
+        try TranscriptStore.decoded(attachment.asset, relativeTo: url)
     }
 
     func revision(_ attachment: TranscriptAttachment) throws -> TranscriptEditRevision {
@@ -353,10 +356,9 @@ private struct TranscriptCLIProject {
     }
 
     func save(_ updated: CutProject, to destination: (url: URL, inPlace: Bool), change: CutHistoryState? = nil,
-              snapshot: Bool = false, assetData: [TranscriptAsset: Data] = [:], interruption: Interruption,
+              snapshot: Bool = false, interruption: Interruption,
               beforePublish: () throws -> Void = {}) throws {
-        if destination.inPlace, updated == project,
-           assetData.keys.allSatisfy({ (try? TranscriptStore.read($0, relativeTo: url)) != nil }) { return }
+        if destination.inPlace, updated == project { return }
         try interruption.check()
         var paths: [String: String] = [:]
         func rebase(_ state: CutHistoryState) throws -> CutHistoryState {
@@ -366,10 +368,10 @@ private struct TranscriptCLIProject {
         if snapshot { saved.transcripts.documentID = nil }
         let past = snapshot ? [] : try (undo + (change.map { [$0] } ?? [])).map(rebase)
         let future = snapshot || change != nil ? [] : try redo.map(rebase)
-        try saved.saveCopy(to: destination.url, copyingTranscriptsFrom: url, undo: past, redo: future,
+        try saved.saveCopy(to: destination.url, undo: past, redo: future,
                            mediaSnapshot: mediaSnapshot.rebased(from: url, to: destination.url),
                            replacingExisting: destination.inPlace, expected: destination.inPlace ? media.diskRevision : nil,
-                           assetData: assetData, beforePublish: beforePublish, check: interruption.check)
+                           beforePublish: beforePublish, check: interruption.check)
     }
 
     struct IndexMedia {
@@ -820,7 +822,7 @@ extension TranscriptCLI {
         }
         try interruption.check()
         switch operation {
-        case .capabilities, .tracks, .prepareSession, .status, .cancel, .retry, .runJob:
+        case .capabilities, .tracks, .prepareSession, .status, .cancel, .retry, .runJob, .listJobs, .reconcile:
             try runJob(request, json: json, interruption: interruption)
             return
         case .import:
@@ -880,15 +882,19 @@ extension TranscriptCLI {
             return
         }
 
+        let attachmentIDs = loaded.project.transcripts.attachments.map(\.id)
         let primaryID: String?
         if let requestedID {
             primaryID = requestedID
         } else if let reviewed {
             primaryID = reviewed.attachmentID
         } else if let edit = try request.optional("request", TranscriptEditRequest.self) {
-            primaryID = edit.selections.first?.attachmentID ?? edit.target?.attachmentID
+            primaryID = try (edit.selections + [edit.target].compactMap { $0 })
+                .compactMap { try $0.attachmentOwner(in: attachmentIDs) }.first
+        } else if operation == .select || (operation == .plan || operation == .queue) && request.values["first_word_id"] != nil {
+            primaryID = try request.wordSelection().attachmentOwner(in: attachmentIDs)
         } else if let selection = try request.optional("selection", TranscriptWordSelection.self) {
-            primaryID = selection.attachmentID
+            primaryID = try selection.attachmentOwner(in: attachmentIDs)
         } else if let record = try request.optional("record", TranscriptAuthoredRecord.self) {
             primaryID = record.attachmentID
         } else {
@@ -939,7 +945,7 @@ extension TranscriptCLI {
         let index = try loaded.index(document: document, attachment: attachment, media: media, spaces: indexSpaces(request))
         switch operation {
         case .select:
-            try reply(TranscriptEditPlanner.select(request.wordSelection(), in: index))
+            try reply(TranscriptEditPlanner.select(request.wordSelection(), expansion: request.optional("expansion"), in: index))
         case .plan, .apply, .queue, .correct:
             try runEdit(request, loaded: loaded, attachment: attachment, index: index, media: media, reviewed: reviewed,
                         json: json, interruption: interruption)
@@ -1147,7 +1153,10 @@ extension TranscriptCLI {
         guard operation != .queue || (edit.action == .queue && !(edit.name ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) else {
             throw CLIError("invalid_arguments", "Provide a queue request and a name for the excerpt.")
         }
-        let selectedAttachments = Set((edit.selections + [edit.target].compactMap { $0 }).compactMap(\.attachmentID))
+        let attachmentIDs = loaded.project.transcripts.attachments.map(\.id)
+        let selectedAttachments = try Set((edit.selections + [edit.target].compactMap { $0 }).compactMap {
+            try $0.attachmentOwner(in: attachmentIDs)
+        })
         var additionalIndexes = try selectedAttachments.subtracting([attachment.id]).sorted().map { id in
             let extra = try loaded.attachment(id)
             let document = try loaded.document(extra)
@@ -1241,6 +1250,26 @@ private extension TranscriptCLI {
             }
         }
         switch operation {
+        case .listJobs:
+            let loaded = try loadProject(request)
+            let page = try request.page()
+            let linked = try linkedJobs(in: loaded, interruption: interruption)
+            let records = try store.list(document: loaded.url, identity: loaded.project.transcripts.documentID,
+                                         linkedJobs: Set(linked.keys))
+            let summaries = records.map { TranscriptCLIJobSummary($0, fingerprints: linked[$0.id, default: []]) }
+            try writeJSON(TranscriptCLIPage(summaries, page: page), pretty: !json)
+        case .reconcile:
+            let loaded = try loadProject(request)
+            let attachment = try loaded.attachment(request.optional("attachment_id"))
+            guard let id = attachment.asset.recognitionJobID,
+                  let record = try? store.status(id),
+                  record.belongs(to: loaded.url.resolvingSymlinksInPath().standardizedFileURL.path,
+                                 identity: loaded.project.transcripts.documentID, linkedJobs: [id]) else {
+                throw CutError(code: "transcript_reconcile_unavailable",
+                               message: "The attached transcript has no recognition job in this project’s job directory.")
+            }
+            let result = try retry(record, in: loaded, store: store, interruption: interruption, progress: progress)
+            try writeJSON(TranscriptPreparation(result), pretty: !json)
         case .runJob, .status, .cancel, .retry:
             let id = try request.required("job_id", UUID.self)
             switch operation {
@@ -1278,16 +1307,12 @@ private extension TranscriptCLI {
                 if let project = try request.url("project_path") {
                     let loaded = try TranscriptCLIProject(url: project)
                     let job = try store.status(id)
-                    let sameOwner = job.documentIdentity != nil && job.documentIdentity == loaded.project.transcripts.documentID
-                    guard sameOwner || (job.documentIdentity == nil && job.documentID == project.resolvingSymlinksInPath().path) else {
+                    let linked = try linkedJobs(in: loaded, interruption: interruption)
+                    guard job.belongs(to: project.resolvingSymlinksInPath().standardizedFileURL.path,
+                                      identity: loaded.project.transcripts.documentID, linkedJobs: Set(linked.keys)) else {
                         throw CutError(code: "transcript_operation_conflict", message: "This job belongs to another project.")
                     }
-                    record = try AnalysisSidecar.$excludedSources.withValue(
-                        AnalysisSidecar.excludedSources.union(loaded.media.sidecarExclusions(relativeTo: project))
-                    ) {
-                        try store.retry(id, project: loaded.project, relativeTo: project,
-                                        cancelled: { !interruption.isActive }, progress: progress)
-                    }
+                    record = try retry(job, in: loaded, store: store, interruption: interruption, progress: progress)
                 } else {
                     record = try store.retry(id, cancelled: { !interruption.isActive }, progress: progress)
                 }
@@ -1333,6 +1358,30 @@ private extension TranscriptCLI {
                 }
             }
         default: preconditionFailure()
+        }
+    }
+
+    func linkedJobs(in loaded: TranscriptCLIProject, interruption: Interruption) throws -> [UUID: Set<String>] {
+        var linked: [UUID: Set<String>] = [:]
+        for attachment in loaded.project.transcripts.attachments {
+            try interruption.check()
+            guard let id = attachment.asset.recognitionJobID else { continue }
+            if let fingerprint = attachment.fingerprint {
+                linked[id, default: []].insert(fingerprint)
+            } else if linked[id] == nil {
+                linked[id] = []
+            }
+        }
+        return linked
+    }
+
+    func retry(_ record: TranscriptJobRecord, in loaded: TranscriptCLIProject, store: TranscriptJobStore,
+               interruption: Interruption, progress: (TranscriptJobRecord) -> Void) throws -> TranscriptJobRecord {
+        try AnalysisSidecar.$excludedSources.withValue(
+            AnalysisSidecar.excludedSources.union(loaded.media.sidecarExclusions(relativeTo: loaded.url))
+        ) {
+            try store.retry(record.id, project: loaded.project, relativeTo: loaded.url,
+                            cancelled: { !interruption.isActive }, progress: progress)
         }
     }
 
@@ -1436,7 +1485,6 @@ private extension TranscriptCLI {
             }
             var updated = loaded.project
             var attachmentIDs: [String] = []
-            var newAssets: [TranscriptAsset: Data] = [:]
             for (document, session) in results {
                 let id = requestedID ?? session?.id ?? ProjectIdentifier.make(avoiding: updated.transcripts.attachments.map(\.id))
                 let previous = updated.transcripts.attachments.first { $0.id == id }
@@ -1446,10 +1494,8 @@ private extension TranscriptCLI {
                 let verified = session?.bindings
                 let bindings = try loaded.bindings(bindingRequest, document: document, original: verified ?? previous?.bindings ?? [],
                                                    interruption: interruption)
-                let bytes = try TranscriptCodec.encodeStored(document)
-                let file = TranscriptStore.reference(for: bytes, relativeTo: target.url)
-                newAssets[file] = bytes
-                let attachment = TranscriptAttachment(id: id, asset: file, bindings: bindings,
+                let asset = try TranscriptStore.put(document)
+                let attachment = TranscriptAttachment(id: id, asset: asset, bindings: bindings,
                                                       importOrigin: request.values.keys.contains("origin") ? origin : previous?.importOrigin,
                                                       fingerprint: document.fingerprint)
                 if let index = updated.transcripts.attachments.firstIndex(where: { $0.id == id }) {
@@ -1460,7 +1506,7 @@ private extension TranscriptCLI {
                 attachmentIDs.append(id)
             }
             if updated != loaded.project { try updated.transcripts.advanceRevision() }
-            try loaded.save(updated, to: target, assetData: newAssets, interruption: interruption) {
+            try loaded.save(updated, to: target, interruption: interruption) {
                 guard let acknowledgement else { return }
                 let job = try acknowledgement.store.status(acknowledgement.id)
                 guard job.preparationID == acknowledgement.preparation, [.completed, .partial].contains(job.state),
@@ -1582,6 +1628,29 @@ private struct TranscriptProgress: Encodable {
     let state: TranscriptJobState
     let tracks: Int
     let staged: Int
+}
+
+private struct TranscriptCLIJobSummary: Encodable {
+    private enum CodingKeys: String, CodingKey {
+        case id, state, attached, options, message
+        case updatedAt = "updated_at"
+    }
+
+    let id: UUID
+    let state: TranscriptJobState
+    let attached: Bool
+    let options: TranscriptJobOptions
+    let message: String?
+    let updatedAt: Date
+
+    init(_ job: TranscriptJobRecord, fingerprints: Set<String>) {
+        id = job.id
+        state = job.state
+        attached = job.attached && job.sessions.contains { fingerprints.contains($0.fingerprint) }
+        options = job.options
+        message = job.message
+        updatedAt = job.updatedAt
+    }
 }
 
 private struct TranscriptPreparation: Encodable {

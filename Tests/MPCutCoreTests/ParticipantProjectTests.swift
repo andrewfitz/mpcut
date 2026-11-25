@@ -89,7 +89,7 @@ final class ParticipantProjectTests: XCTestCase {
         var edited = previous
         edited.participants = project
         let (data, _) = try edited.encodedArchive(undo: [.init(action: "Link Tile", project: previous)], redo: [],
-                                                  mediaSnapshot: .empty, byteLimit: MulticamProject.maximumFileSize)
+                                                  mediaSnapshot: .empty)
         let restored = try CutProject.decodeEditorDocument(data, limit: 1)
         XCTAssertEqual(restored.project, edited)
         XCTAssertEqual(restored.undo.first?.project, previous)
@@ -315,6 +315,29 @@ final class ParticipantProjectTests: XCTestCase {
         XCTAssertEqual(project.participants, accepted)
     }
 
+    func testEmbeddedTileScanIntegerFieldsCannotRoundToMatchDigest() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let media = directory.appendingPathComponent("gallery.mov")
+        try Data([1, 2, 3]).write(to: media)
+        let scan = try fixtureScan(media, analysisIdentity: "initial", verification: true)
+        var project = CutProject.sequence([.init(id: "source", file: "gallery.mov", from: .zero, to: time(1))])
+        let pending = try PendingTileReview(scan: scan, sourceID: "gallery.mov", file: "gallery.mov")
+        project.participants.setPendingReview(pending)
+        let url = directory.appendingPathComponent("gallery.cut")
+        try project.save(to: url)
+        let valid = String(decoding: try CutProject.documentJSON(at: url), as: UTF8.self)
+        let malformed = valid.replacingOccurrences(of: #""pixel_aspect_num":1"#,
+                                                   with: #""pixel_aspect_num":1.00000000000000000001"#)
+        XCTAssertNotEqual(malformed, valid)
+        XCTAssertThrowsError(try CutProject.decode(Data(malformed.utf8))) {
+            XCTAssertEqual(($0 as? CutError)?.code, "invalid_cut_project")
+            XCTAssertTrue(($0 as? CutError)?.message.contains("non-integer JSON number") == true)
+        }
+        XCTAssertEqual(try CutProject.decode(Data(valid.utf8)).participants.pendingReviews, [pending])
+    }
+
     func testReconcileCopyRetainsReviewWhileChangedMediaRequiresNewIdentityReview() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -501,6 +524,30 @@ final class ParticipantProjectTests: XCTestCase {
         XCTAssertFalse(project.sources[0].appearances.contains { $0.participantID == feedID })
     }
 
+    func testPendingReconciliationAppliesChoicesToRetainedFeedIDs() throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try Data([1]).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let original = try fixtureScan(file, analysisIdentity: "original")
+        let replacement = try fixtureScan(file, analysisIdentity: "replacement", participantID: 9)
+        var project = ParticipantProject()
+        try project.acceptAnalysis(original, sourceID: "gallery")
+        let retained = try XCTUnwrap(project.people.first?.id)
+        let review = try project.reconciliation(for: replacement, sourceID: "gallery")
+        var choices = TilesReviewChoices(scan: replacement)
+        choices.names = ["feed-9": "Renamed"]
+        choices.unchecked = ["feed-1"]
+        try project.reconcileAnalysis(replacement, sourceID: "gallery", reviewed: review, applying: choices)
+        XCTAssertEqual(project.people.first?.id, retained)
+        XCTAssertEqual(project.people.first?.name, "Renamed")
+        XCTAssertEqual(project.sources.first?.appearances.first?.participantID, retained)
+
+        let rerun = try project.reconciliation(for: replacement, sourceID: "gallery")
+        choices.unchecked = ["feed-9"]
+        try project.reconcileAnalysis(replacement, sourceID: "gallery", reviewed: rerun, applying: choices)
+        XCTAssertNil(project.sources.first?.appearances.first?.participantID)
+    }
+
     func testVerificationKeepsRangeSpecificLinkAndFreshCameraState() throws {
         let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try Data([1]).write(to: file)
@@ -528,21 +575,21 @@ final class ParticipantProjectTests: XCTestCase {
 
     private func fixtureScan(_ media: URL, analysisIdentity: String, feedLayout: String? = nil,
                              sampling: String = "sparse", verification: Bool = false,
-                             competingTile: Bool = false, cameraOff: Bool = false) throws -> ParticipantScanResult {
+                             competingTile: Bool = false, cameraOff: Bool = false, participantID: Int = 1) throws -> ParticipantScanResult {
         let stamp = try JSONEncoder().encode(SceneSourceStamp(identity: SourceIdentity(media)))
         let stampObject = try JSONSerialization.jsonObject(with: stamp)
         let zero = ["numerator": 0, "denominator": 1]
         let one = ["numerator": 1, "denominator": 1]
         let transform: [String: Any] = ["rotation": "R0", "pixel_aspect_num": 1, "pixel_aspect_den": 1]
         let region: [String: Any] = [
-            "appearance_id": 2, "participant_id": 1, "rect": ["x": 0, "y": 0, "width": 1, "height": 1],
+            "appearance_id": 2, "participant_id": participantID, "rect": ["x": 0, "y": 0, "width": 1, "height": 1],
             "kind": "video", "role": "primary", "confidence": 1, "identity_uncertain": false, "possible_matches": []
         ]
         var analysis: [String: Any] = [
             "schema_version": 1, "start": zero, "end": one, "sampling": "sparse",
             "observations": [["timestamp": zero, "display": transform, "confidence": 1, "regions": [region]]],
-            "tracks": [["id": 1, "appearance_ids": [2]]],
-            "appearances": [["id": 2, "participant_id": 1, "start": zero, "end": one]],
+            "tracks": [["id": participantID, "appearance_ids": [2]]],
+            "appearances": [["id": 2, "participant_id": participantID, "start": zero, "end": one]],
             "events": [], "coverage": [["start": zero, "end": one, "status": "observed"]],
             "diagnostics": [], "resume_at": NSNull()
         ]

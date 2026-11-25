@@ -3,6 +3,19 @@ import XCTest
 @testable import MPCutCore
 
 final class ProjectConverterTests: XCTestCase {
+    func testSavedAnalysisOmissionRequiresLossApproval() throws {
+        let timeline = CutProject.sequence([.init(id: "clip", file: "camera.mov", from: .zero, to: .init(numerator: 1))])
+        var project = timeline
+        project.analysisAnnotations.pauseReviews = [.init(occurrenceID: "clip", kind: .marker, from: .zero, sources: [])]
+
+        XCTAssertThrowsError(try ProjectConverter.prepareForInterchange(project, for: "FCPXML", allowLoss: false)) {
+            XCTAssertEqual(($0 as? CutError)?.code, "conversion_loss")
+        }
+        let prepared = try ProjectConverter.prepareForInterchange(project, for: "FCPXML", allowLoss: true)
+        XCTAssertEqual(prepared.project, timeline)
+        XCTAssertEqual(prepared.warnings.count, 1)
+    }
+
     func testInterchangeRefusesFeedTreatmentEvenWhenOmissionsAreAllowed() throws {
         var project = CutProject.sequence([.init(id: "clip", file: "call.mov", from: .zero, to: .init(numerator: 1))])
         project.participants = .init(people: [.init(id: "guest", name: "Guest", treatment: .init(mode: .cover))])
@@ -12,14 +25,14 @@ final class ProjectConverterTests: XCTestCase {
         XCTAssertNotNil(project.participants.transcriptExportWarning)
     }
 
-    func testTranscriptInterchangeReportsLossAndNativeCopyOwnsItsStore() throws {
+    func testTranscriptInterchangeReportsLossAndNativeCopyEmbedsItsAsset() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let input = root.appendingPathComponent("Interview.cut")
         let output = root.appendingPathComponent("Selects.cut")
         let timeline = CutProject.sequence([.init(id: "one", file: "recording.mov", from: .zero, to: .init(numerator: 1))])
-        let data = Data("transcript asset".utf8)
+        let data = try TranscriptCodec.encodeStored(TranscriptDocument(clock: .presentation))
         let asset = try TranscriptStore.put(data, relativeTo: input)
         var project = timeline
         project.transcripts = .init(attachments: [.init(id: "interview", asset: asset, bindings: [])])
@@ -34,9 +47,9 @@ final class ProjectConverterTests: XCTestCase {
         XCTAssertEqual(prepared.warnings.count, 1)
 
         XCTAssertEqual(try ProjectConverter.convert(input: input, output: output), [])
+        try FileManager.default.removeItem(at: input)
         let copied = try XCTUnwrap(CutProject.load(from: output).transcripts.attachments.first)
-        XCTAssertNotEqual(copied.asset.file, asset.file)
-        try FileManager.default.removeItem(at: TranscriptStore.folder(relativeTo: input))
+        XCTAssertEqual(copied.asset.sha256, asset.sha256)
         XCTAssertEqual(try TranscriptStore.read(copied.asset, relativeTo: output), data)
     }
 

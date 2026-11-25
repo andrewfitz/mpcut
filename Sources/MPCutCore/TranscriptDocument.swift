@@ -471,16 +471,6 @@ public struct TranscriptDocument: Codable, Equatable, Sendable {
     static func invalid(_ message: String) -> CutError {
         CutError(code: "invalid_transcript", message: message)
     }
-
-    /// The document as MPCut writes it. Audio levels are measured into the recording's analysis
-    /// sidecar. A transcript made before that carried a level frame for every 20 ms of every
-    /// track, which came to most of its size.
-    func withoutActivity() -> TranscriptDocument {
-        guard tracks.contains(where: { !$0.activity.isEmpty }) else { return self }
-        var document = self
-        for index in document.tracks.indices { document.tracks[index].activity = [] }
-        return document
-    }
 }
 
 extension TranscriptDocument {

@@ -64,6 +64,9 @@ struct PauseControls: View {
                 .help("Measure marked room tone")
             Divider().padding(.vertical, 2)
             SectionHeading("Pauses")
+            if editor.pauseReviewMismatch {
+                IssueLabel("The recording or detected boundaries changed. Review the saved pause ranges before shortening.")
+            }
             if let progress = editor.silenceProgress {
                 ProgressView(value: progress) {
                     Text("Finding silence… \(progressPercent(progress))").font(.callout).monospacedDigit()
@@ -102,8 +105,9 @@ struct PauseControls: View {
                     .disabled(!editor.canPreviewCurrentCut)
                     .help("Preview shortened pause")
                 Spacer(minLength: 0)
-                Button(editor.currentPause?.isProtected == true ? "Shorten This Pause" : "Keep This Pause",
-                       action: editor.protectCurrentPause)
+                Button(editor.currentPause?.isProtected == true ? "Shorten This Pause" : "Keep This Pause") {
+                    _ = editor.protectCurrentPause()
+                }
                     .disabled(editor.currentPause == nil)
                     .help(editor.currentPause?.isProtected == true ? "Shorten selected pause" : "Protect selected pause")
             }.disabled(!editor.pauseAnalysisReady || editor.pausePlan.isEmpty)
@@ -309,14 +313,15 @@ struct CutPreviewSheet: View {
     var body: some View {
         let isPause = editor.cutPreview?.pauseKey != nil
         EditorSheet(title: isPause ? "Preview Cut" : "Preview Join",
-                    message: isPause ? "Listen to the cut with the shorter pause." : "Review up to one second on each side of the join.") {
+                    message: isPause ? "Listen to the cut with the shorter pause."
+                        : editor.cutPreview?.joinMessage ?? CutPreview.joinMessage(preroll: 1, postroll: 1)) {
             Group {
                 if let cut = editor.cutPreview, cut.project == nil, !cut.ranges.isEmpty, cut.ranges.allSatisfy(\.isAudioOnly) {
                     CutWaveformPreview(editor: editor, ranges: cut.ranges, playhead: preview.time)
                         .frame(width: 480, height: 150)
                         .accessibilityLabel("Audio cut preview")
                 } else {
-                    PreviewView(preview: preview).frame(width: 480, height: 270).background(.black)
+                    PreviewView(preview: preview, preferences: editor.preferences).frame(width: 480, height: 270).background(.black)
                 }
             }
             .modifier(InsetPanel())

@@ -4,7 +4,9 @@
 
 **[Download MPCut](https://github.com/andrewfitz/mpcut/releases/latest)** · [Make your first cut](docs/USAGE.md#make-your-first-cut) · [User manual](docs/USAGE.md) · [CLI guide](docs/CLI.md) · [Agent guide](docs/MCP-AGENT-GUIDE.md) · [Headless editing](docs/HEADLESS.md) · [Release notes](CHANGELOG.md)
 
-> This README describes the **2.0.0 source build**. Check **MPCut → About MPCut** or run `mpcut --version` to identify your installed build. The downloads page lists the published versions. [Build from source](#build-from-source) · [Downloads](https://github.com/andrewfitz/mpcut/releases)
+> This README describes the **2.0.0 source build**. Run `mpcut --version --json` on the CLI inside the app you intend to use. This build reports the executable build ID, supported project schemas and available detectors. A response containing only `version` identifies an older CLI. Different builds can display the same release number in **About MPCut**. The downloads page lists the published versions. [Build from source](#build-from-source) · [Downloads](https://github.com/andrewfitz/mpcut/releases)
+
+This source build opens and saves schema 9 projects. To reopen an earlier `.cut`, use the MPCut version that created it. Schema 9 keeps transcripts, unfinished Tiles reviews and undo history in the project file. Recording caches use the disposable `.cutcache` extension. [Project format](docs/CUT-FORMAT.md)
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/timeline-dark.jpg">
@@ -37,6 +39,8 @@ Edit from Claude Desktop, ChatGPT Desktop (Work and Codex), Grok or Grok Bot usi
 
 Open **Settings → General → Automation** and enable local MCP control. Configure your agent’s stdio server to launch `/Applications/MPCut.app/Contents/Helpers/mpcut-mcp` or the helper from the app bundle you have open. Ask the agent to list open projects, inspect the timeline and split a specific clip. Edits use the GUI’s native history, including its retention limit. Turn off the setting to end access. **Help → MPCut Agent Guide** opens the instructions offline. [Setup and use cases](docs/MCP-AGENT-GUIDE.md) · [Tool reference](docs/MCP-REFERENCE.md)
 
+For a saved project, start the same helper with `--files-only`. You can review a frame, compare mask or tile changes against saved history, or preflight a movie and pass the returned approval token to the render. Keep the operation UUID so you can recover a file job after reconnecting. [Headless workflows](docs/HEADLESS.md)
+
 ## Edit on the timeline
 
 1. Choose **File → Add Clips…** (⌘O) and select a recording.
@@ -65,7 +69,7 @@ mpcut project convert Interview.cut --to fcp --output Interview.fcpxml
 | `.fcpxml`, `.fcpxmld` | Final Cut Pro and compatible editors | MPCut reads and writes timeline interchange XML directly. |
 | `.fcpbundle` | Final Cut Pro | Native library conversion requires Final Cut Pro and an interactive host step. |
 
-Conversion handles one edit at a time and requires every referenced recording to be online. Relink missing media in **File → Project Media…** or with `mpcut project media` first. Resolve can retain editable multicam angles. Premiere can retain switchable angles for two to four aligned cameras at a common frame rate that cover the full group. To bring that edit back through Premiere’s sequence XML, flatten a copy in Premiere or choose `--flatten-multicam --allow-loss` when exporting from MPCut. The flattened sequence retains the assembled picture cuts and selected microphone tracks. Reading a Resolve archive requires loss approval because its timeline exchange can omit host-specific effects, grades and project settings. Final Cut library import asks you to export the chosen project as XML in Final Cut. Review reported limitations before retrying a conversion with `--allow-loss`. Keep referenced recordings and generated audio files alongside your projects. For an editable XML handoff to an existing Resolve project, see the workflow below.
+Conversion handles one edit at a time and requires every referenced recording to be online. Relink missing media in **File → Project Media…** or with `mpcut project media relink` first. Resolve can retain editable multicam angles. Premiere can retain switchable angles for two to four aligned cameras at a common frame rate that cover the full group. To bring that edit back through Premiere’s sequence XML, flatten a copy in Premiere or choose `--flatten-multicam --allow-loss` when exporting from MPCut. The flattened sequence retains the assembled picture cuts and selected microphone tracks. Reading a Resolve archive requires loss approval because its timeline exchange can omit host-specific effects, grades and project settings. Final Cut library import asks you to export the chosen project as XML in Final Cut. Review reported limitations before retrying a conversion with `--allow-loss`. Keep referenced recordings and generated audio files alongside your projects. For an editable XML handoff to an existing Resolve project, see the workflow below.
 
 ## Export a project to DaVinci Resolve
 
@@ -142,6 +146,8 @@ On an Apple Silicon Mac with the Xcode command-line tools, CMake, pkg-config and
 ./scripts/build-app.sh
 open dist/MPCut.app
 ```
+
+The checkout’s packaged app is `dist/MPCut.app`. To check it before installation, run `dist/MPCut.app/Contents/Helpers/mpcut --version --json`. Building in `dist` leaves the installed copy in Applications at its existing version. Use `python3 scripts/package-desktop-plugins.py` to refresh the packages in `dist/desktop-plugins/`. [Desktop plugin setup](docs/DESKTOP-PLUGINS.md)
 
 Use `./scripts/build-app.sh /Applications` to install the source build there for the CLI examples above.
 

@@ -10,12 +10,29 @@ struct ParticipantDialogueReview: View {
     let preview: (ParticipantDialogueProposal) -> Void
     let commit: (CutProject, CutProject, ParticipantDialogueProposal) throws -> Void
 
-    @State private var minimum = "1"
-    @State private var overlap = ParticipantDialogueOptions.Overlap.hold
-    @State private var offscreen = ParticipantDialogueOptions.Offscreen.hold
+    @State private var minimum: String
+    @State private var overlap: ParticipantDialogueOptions.Overlap
+    @State private var offscreen: ParticipantDialogueOptions.Offscreen
     @State private var proposals: [ParticipantDialogueProposal] = []
     @State private var task: Task<Void, Never>?
     @State private var status: String?
+
+    /// Minimum Hold, Overlapping Speech and Offscreen Speaker start from Settings → Media & Analysis,
+    /// read when the review is made. Changing them here never writes the Settings values.
+    init(session: ProjectSession, project: CutProject, document: URL, angles: [ParticipantVirtualAngle],
+         preview: @escaping (ParticipantDialogueProposal) -> Void,
+         commit: @escaping (CutProject, CutProject, ParticipantDialogueProposal) throws -> Void) {
+        self.session = session
+        self.project = project
+        self.document = document
+        self.angles = angles
+        self.preview = preview
+        self.commit = commit
+        let defaults = TilesDialogueDefaults(preferences: session.editor.preferences)
+        _minimum = State(initialValue: defaults.minimumHold)
+        _overlap = State(initialValue: defaults.overlap)
+        _offscreen = State(initialValue: defaults.offscreen)
+    }
 
     var body: some View {
         DisclosureGroup("Dialogue Switch Suggestions") {

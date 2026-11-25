@@ -58,7 +58,7 @@ struct SequenceFindSceneCommands: View {
                           restart: { editor.confirmSceneRestart(clipID: clip, paused: $0) })
         SceneScopeCommand(title: "All Sources", enabled: editor.canScanScenes(clipID: nil),
                           state: editor.sceneDisposition(clipID: nil),
-                          scan: { editor.scanForScenes(policy: $0 == .resume ? .reuse : $0) },
+                          scan: { editor.scanForScenes(policy: $0) },
                           restart: { editor.confirmSceneRestart(paused: $0) })
 
         if editor.scenePaused {
@@ -88,7 +88,7 @@ struct MulticamFindSceneCommands: View {
                           restart: { model.confirmSceneRestart(camera: camera, paused: $0) })
         SceneScopeCommand(title: "All Cameras", enabled: !model.isBusy && model.analysis.canScanScenes(camera: nil),
                           state: model.analysis.sceneDisposition(camera: nil),
-                          scan: { model.analysis.scanScenes(policy: $0 == .resume ? .reuse : $0) },
+                          scan: { model.analysis.scanScenes(policy: $0) },
                           restart: { model.confirmSceneRestart(paused: $0) })
 
         if model.analysis.scenePaused {

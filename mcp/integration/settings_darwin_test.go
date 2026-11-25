@@ -64,18 +64,12 @@ func TestControlSetting(t *testing.T) {
 	if pid, err := socketPeer(socket); err == nil {
 		t.Fatalf("existing MPCut listener pid %d; leaving it untouched", pid)
 	}
-	start := func() *exec.Cmd {
+	start := func() (int, func()) {
 		t.Helper()
-		app := exec.CommandContext(ctx, filepath.Join(copyPath, "Contents/MacOS/MPCut"), "-ApplePersistenceIgnoreState", "YES", "-NSQuitAlwaysKeepsWindows", "NO")
-		app.Env = append(os.Environ(), "CFFIXED_USER_HOME="+dir, isolatedEndpoint)
-		app.Stderr = os.Stderr
-		if err := app.Start(); err != nil {
-			t.Fatal(err)
-		}
-		return app
+		return launchBackstage(t, ctx, filepath.Base(socketDirectory), copyPath, []string{"CFFIXED_USER_HOME=" + dir, isolatedEndpoint},
+			"-ApplePersistenceIgnoreState", "YES", "-NSQuitAlwaysKeepsWindows", "NO")
 	}
-	app := start()
-	defer func() { _ = app.Process.Kill(); _ = app.Wait() }()
+	appPID, quit := start()
 	helper := exec.Command(filepath.Join(copyPath, "Contents/Helpers/mpcut-mcp"))
 	helper.Env = append(os.Environ(), isolatedEndpoint)
 	client := mcp.NewClient(&mcp.Implementation{Name: "mpcut-settings-smoke", Version: "1"}, nil)
@@ -101,7 +95,7 @@ func TestControlSetting(t *testing.T) {
 	_, sourceFile, _, _ := runtime.Caller(0)
 	toggle := func() {
 		t.Helper()
-		cmd := exec.CommandContext(ctx, "xcrun", "swift", filepath.Join(filepath.Dir(sourceFile), "testdata/press_menu.swift"), strconv.Itoa(app.Process.Pid), "toggle-control")
+		cmd := exec.CommandContext(ctx, "xcrun", "swift", filepath.Join(filepath.Dir(sourceFile), "testdata/press_menu.swift"), strconv.Itoa(appPID), "toggle-control")
 		data, err := cmd.CombinedOutput()
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 77 {
@@ -115,7 +109,7 @@ func TestControlSetting(t *testing.T) {
 		t.Helper()
 		eventually(t, "Settings enabling test app listener", func() bool {
 			pid, err := socketPeer(socket)
-			if err == nil && pid != app.Process.Pid {
+			if err == nil && pid != appPID {
 				t.Fatalf("unexpected listener owned by pid %d", pid)
 			}
 			return err == nil
@@ -128,9 +122,8 @@ func TestControlSetting(t *testing.T) {
 		out, err := exec.Command("/usr/bin/defaults", "read", preferencesDomain, "automation_local_mcp_enabled").Output()
 		return err == nil && strings.TrimSpace(string(out)) == "1"
 	})
-	_ = app.Process.Kill()
-	_ = app.Wait()
-	app = start()
+	quit()
+	appPID, _ = start()
 	waitForListener()
 	checkAccess(true)
 	toggle()

@@ -34,6 +34,8 @@ struct MulticamTimeline: View {
     var scrubEnded: () -> Void = {}
     var zoom: Binding<Double> = .constant(0)
     var largeThumbnails: Binding<Bool> = .constant(false)
+    /// The shared label width before this window clamps it to its own space.
+    var trackLabelWidth: Binding<Double> = .constant(172)
     var showsSourceRuler = false
     private var sourceRulerHeight: CGFloat { showsSourceRuler ? TimelineSourceRuler.height : 0 }
     var timeEntryRequest = 0
@@ -51,8 +53,6 @@ struct MulticamTimeline: View {
     var assembly: MulticamAssemblyTimeline? = nil
 
     @Environment(\.displayScale) private var displayScale
-    static let trackWidthPreference = "multicam_track_label_width_points"
-    @AppStorage(MulticamTimeline.trackWidthPreference) private var savedTrackWidth = 172.0
     @State private var scroll = MulticamScrollPosition()
     @GestureState private var trackResizeDelta: CGFloat = 0
     @State private var hoveringTrackDivider = false
@@ -160,7 +160,7 @@ struct MulticamTimeline: View {
             Divider()
 
             GeometryReader { panel in
-                let storedWidth = Self.trackWidth(savedTrackWidth, available: panel.size.width)
+                let storedWidth = Self.trackWidth(trackLabelWidth.wrappedValue, available: panel.size.width)
                 let labelWidth = Self.trackWidth(storedWidth + trackResizeDelta, available: panel.size.width)
                 ScrollView(.vertical) {
                     VStack(spacing: 0) {
@@ -269,16 +269,16 @@ struct MulticamTimeline: View {
             .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global)
                 .updating($trackResizeDelta) { value, delta, _ in delta = value.translation.width }
                 .onEnded { value in
-                    let start = Self.trackWidth(savedTrackWidth, available: available)
-                    savedTrackWidth = Self.trackWidth(start + value.translation.width, available: available)
+                    let start = Self.trackWidth(trackLabelWidth.wrappedValue, available: available)
+                    trackLabelWidth.wrappedValue = Self.trackWidth(start + value.translation.width, available: available)
                 })
             .help("Resize track labels")
             .accessibilityLabel("Track label width")
             .accessibilityValue("\(Int(width.rounded())) points")
             .accessibilityAdjustableAction { direction in
                 switch direction {
-                case .increment: savedTrackWidth = Self.trackWidth(width + 16, available: available)
-                case .decrement: savedTrackWidth = Self.trackWidth(width - 16, available: available)
+                case .increment: trackLabelWidth.wrappedValue = Self.trackWidth(width + 16, available: available)
+                case .decrement: trackLabelWidth.wrappedValue = Self.trackWidth(width - 16, available: available)
                 @unknown default: break
                 }
             }

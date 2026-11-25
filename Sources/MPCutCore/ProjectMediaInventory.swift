@@ -8,6 +8,9 @@ public struct ProjectMediaUse: Hashable, Encodable, Sendable {
     public enum Kind: String, Codable, Sendable {
         case clip, original, still, stillAudioReference, stillSoundtrack, stillFragment, select, camera, microphone
         case multicamSpan, multicamSelection, transcript, transcriptAnchor, participant, participantAudio
+        case analysisAnnotation, pendingTileReview
+
+        package var canReplaceDirectly: Bool { self != .analysisAnnotation && self != .pendingTileReview }
     }
 
     public let path: String
@@ -64,6 +67,25 @@ public struct ProjectMediaRow: Encodable, Sendable {
 }
 
 public enum ProjectMedia {
+    package static func leaveOffline(_ path: String, project: CutProject, relativeTo document: URL,
+                                     snapshot: inout ProjectMediaSnapshot) throws {
+        func location(_ path: String) -> URL {
+            let watched = ProjectMediaVolume.watchURL(path, relativeTo: document)
+            return ProjectMediaVolume.isChecking(watched) ? watched : CutProject.mediaURL(path, relativeTo: document)
+        }
+        let source = location(path)
+        guard let reference = references(in: project).first(where: { location($0.path) == source }) else {
+            throw CutError(code: "missing_source", message: "This path does not reference project media.")
+        }
+        if let index = snapshot.entries.firstIndex(where: { location($0.path) == source }) {
+            snapshot.entries[index].ignored = true
+        } else {
+            var entry = ProjectMediaSnapshot.Entry(path: reference.path)
+            entry.ignored = true
+            snapshot.entries.append(entry)
+        }
+    }
+
     public static func inventory(project: CutProject, undo: [CutHistoryState] = [], redo: [CutHistoryState] = [],
                                  relativeTo document: URL, snapshot: ProjectMediaSnapshot = .init(),
                                  includeHistory: Bool = false, statuses: [URL: ProjectMediaStatus] = [:], checkFile: Bool = true) -> [ProjectMediaRow] {
@@ -284,6 +306,30 @@ public enum ProjectMedia {
                 guard let path = participantPath(slot.id) else { continue }
                 uses.append(.init(path: path, id: slot.id, kind: .participant, picture: true,
                                   provenanceID: "shot/\(shotIndex)/slot/\(slotIndex)"))
+            }
+        }
+        let annotations = project.analysisAnnotations
+        for scene in annotations.scenes {
+            guard let evidence = scene.sourceEvidence else { continue }
+            uses.append(.init(path: scene.file, id: "scene review", kind: .analysisAnnotation,
+                              provenanceID: "scenes/\(evidence.stream)/\(evidence.sha256)"))
+        }
+        for threshold in annotations.silence {
+            uses.append(.init(path: threshold.file, id: "silence threshold", kind: .analysisAnnotation,
+                              provenanceID: "silence/\(threshold.stream)/\(threshold.sourceEvidence.sha256)"))
+        }
+        for review in annotations.pauseReviews {
+            for source in review.sources {
+                let span = "\(review.from)-\(review.to.map(\.description) ?? "")"
+                uses.append(.init(path: source.file, id: "pause review", kind: .analysisAnnotation,
+                                  sourceID: source.sourceID,
+                                  provenanceID: "pause/\(review.kind.rawValue)/\(span)/\(source.stream)/\(source.evidence.sha256)/\(review.occurrenceID ?? "")"))
+            }
+        }
+        for review in project.participants.pendingReviews {
+            uses.append(.init(path: review.file, id: review.id, kind: .pendingTileReview))
+            if project.sequenceItems != nil, review.sourceID != review.file {
+                uses.append(.init(path: review.sourceID, id: review.id, kind: .pendingTileReview))
             }
         }
         return uses

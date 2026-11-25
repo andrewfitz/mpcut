@@ -1,8 +1,8 @@
 import Foundation
 
 /// A time and detector finding retained when a scan becomes editable geometry.
-public struct ParticipantTileScanEvent: Codable, Equatable, Sendable {
-    public struct Candidate: Codable, Equatable, Sendable {
+public struct ParticipantTileScanEvent: Codable, Hashable, Sendable {
+    public struct Candidate: Codable, Hashable, Sendable {
         public let feedID: String
         public let confidence: Double
         public let precedingTileID: String?

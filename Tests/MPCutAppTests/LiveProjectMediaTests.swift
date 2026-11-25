@@ -5,6 +5,50 @@ import XCTest
 
 final class LiveProjectMediaTests: XCTestCase {
     @MainActor
+    func testMediaMCPAppliesLocatedMatchThenRevertsAndLeavesItOffline() async throws {
+        let (directory, source) = try recording()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let preferences = preferences()
+        let sessions = ProjectSessions(preferences: preferences)
+        let session = sessions.session(for: nil)
+        defer { session.editor.endSession() }
+        session.editor.importFiles([source])
+        try await wait { !session.editor.isBusy }
+        XCTAssertEqual(session.editor.sequenceClips.map(\.file), [source.path])
+        let cursor = session.editor.historyCursor
+        let archive = directory.appendingPathComponent("Archive", isDirectory: true)
+        try FileManager.default.createDirectory(at: archive, withIntermediateDirectories: true)
+        let moved = archive.appendingPathComponent(source.lastPathComponent)
+        try FileManager.default.moveItem(at: source, to: moved)
+
+        func media(_ action: String, _ arguments: [String: Any]) async throws -> [String: Any] {
+            let result = try await sessions.mcpProjectMedia(tool: "project_editor_media_" + action,
+                                                            arguments: arguments, session: session, checkAccess: {})
+            return try XCTUnwrap(result)
+        }
+        let started = try await media("locate", ["folder": archive.path, "apply_matches": true, "include_history": true])
+        let id = try XCTUnwrap(started["job_id"] as? String)
+        let receipt = try sessions.mcpAnalysisJobs.lookup(id, session: session)
+        try await wait { receipt.state != "running" }
+        XCTAssertEqual(receipt.state, "succeeded", String(describing: receipt.snapshot))
+        XCTAssertEqual(receipt.snapshot["changed"] as? Bool, true)
+        XCTAssertEqual(session.editor.sequenceClips.map(\.file), [moved.path])
+        XCTAssertEqual(session.editor.historyCursor, cursor)
+
+        let reverted = try await media("revert", ["source": moved.path])
+        XCTAssertEqual(reverted["changed"] as? Bool, true)
+        XCTAssertEqual(session.editor.sequenceClips.map(\.file), [source.path])
+        XCTAssertEqual(session.editor.historyCursor, cursor)
+        let ignored = try await media("leave_offline", ["source": source.path])
+        XCTAssertEqual(ignored["changed"] as? Bool, true)
+        let repeated = try await media("leave_offline", ["source": source.path])
+        XCTAssertEqual(repeated["changed"] as? Bool, false)
+        let list = try await media("list", ["include_history": true])
+        let rows = try XCTUnwrap(list["items"] as? [[String: Any]])
+        XCTAssertEqual(rows.first?["status"] as? String, "ignored")
+    }
+
+    @MainActor
     func testSequenceRelinkPreservesHistoryOnBothSidesOfCursorAndSurvivesSave() async throws {
         let (directory, source) = try recording()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -94,8 +138,7 @@ final class LiveProjectMediaTests: XCTestCase {
         defer { model.endSession() }
         model.importFiles([source])
         try await wait { !model.isBusy }
-        let digest = String(repeating: "0", count: 64)
-        let asset = TranscriptAsset(file: "edit.transcripts/\(digest).json", sha256: digest, unavailable: .missing)
+        let asset = try TranscriptStore.put(TranscriptDocument(clock: .presentation))
         let old = TranscriptBinding(trackID: "target", file: source.path, streamIndex: 0)
         let other = TranscriptBinding(trackID: "other", file: directory.appendingPathComponent("Other.mov").path, streamIndex: 0)
         try model.setTranscriptState(.init(attachments: [.init(id: "speech", asset: asset, bindings: [old, other])]))
@@ -163,8 +206,7 @@ final class LiveProjectMediaTests: XCTestCase {
         try await wait { !model.isBusy }
         let media = try XCTUnwrap(model.analysisSourceMedia.values.first)
         let stream = try XCTUnwrap(media.audio.first?.stream.index)
-        let assetContext = try model.transcriptAssetContext()
-        let asset = try TranscriptStore.put(Data("{\"version\":1}".utf8), relativeTo: assetContext, draft: true)
+        let asset = try TranscriptStore.put(TranscriptDocument(clock: .presentation))
         let original = TranscriptAttachment(id: "original", asset: asset, bindings: [
             TranscriptBinding(trackID: "track", file: source.path, streamIndex: stream)
         ])
