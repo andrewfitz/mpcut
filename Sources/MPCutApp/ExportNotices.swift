@@ -56,6 +56,15 @@ enum ExportNotices {
         return copied == .zero ? durations + "\nSmart Trim needs to re-encode every frame in this selection." : durations
     }
 
+    /// "Encoded audio: 0.075 s of AAC frames at 2 joins." for the AAC frames Smart Trim encodes where ranges meet in a
+    /// Matroska output, from the plan's `encoded_audio_edges`. Nil when it encodes none.
+    static func encodedAudio(_ edit: ResolvedEdit) -> String? {
+        let joins = edit.segments.reduce(0) { $0 + ($1.encodedAudioEdges?.count ?? 0) }
+        guard joins > 0 else { return nil }
+        return "Encoded audio: \(ExportRules.seconds(edit.encodedAudioDuration.seconds)) of AAC frames at "
+            + (joins == 1 ? "1 join." : "\(joins) joins.")
+    }
+
     /// "Smart Trim re-encodes 1.500 s of 42.000 s." for the details of a Lossless tier. Nil when nothing is encoded.
     static func smartTrimShare(encoded: RationalTime, of duration: RationalTime) -> String? {
         guard encoded > .zero else { return nil }

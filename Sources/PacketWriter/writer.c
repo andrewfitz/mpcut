@@ -2,6 +2,7 @@
 #include "MediaProbe.h"
 #include "timecode.h"
 #include "aac_edits.h"
+#include "aac_bridge.h"
 #include "avc_reorder.h"
 #include "hevc_sets.h"
 #include "mp3_crop.h"
@@ -136,6 +137,15 @@ typedef struct {
     int smart_dirty;       /* Smart Trim: the output's decoder may hold sets that the source description does not. */
     uint8_t *tail_sets;    /* Smart Trim: the sets at the tail edge's keyframe, for its decoder. */
     int tail_sets_size;
+    /* Smart Trim AAC bridges into Matroska. Per input stream of the range being written: the frame starts its copy
+     * keeps, [aac_copy_from, aac_copy_to), on the clock of aac_grid and aac_origin. INT64_MIN and INT64_MAX when open. */
+    int64_t *aac_copy_from, *aac_copy_to, *aac_grid;
+    MPCutTime *aac_origin;
+    int64_t *aac_head_cut, *aac_head_padding, *aac_tail_cut; /* Per input stream, INT64_MIN when the copy has no trim. */
+    int aac_trim_packet;                /* The packet being copied is trimmed by a codec delay or DiscardPadding. */
+    const MPCutAACBridge *head_bridges; /* Bridges written before this range's packets. */
+    size_t head_bridge_count;
+    MPCutTime previous_shift;           /* Output minus source time in the previous range. */
 } Writer;
 
 enum { HEVC_ENTRY_KEEP, HEVC_ENTRY_HVC1, HEVC_ENTRY_HEV1 };
@@ -282,6 +292,25 @@ static int input_open(Writer *writer, AVFormatContext **input, const char *path)
         return ff_error(writer, result, "Cannot read stream information from", path);
     }
     return 0;
+}
+
+/* MOV and Matroska sources are opened without decoding, so an AAC track does not know its frame size. Matroska writes
+ * the track's DefaultDuration from it, and without that its blocks carry no duration when read again. State it from
+ * the AudioSpecificConfig of an AAC Low Complexity track: 1024 samples, or 960 when frameLengthFlag is set. A track
+ * that could use SBR is left as it is, since its frames run at another rate than the one the container states. */
+static void state_aac_frame_size(AVCodecParameters *codec) {
+    if (codec->codec_id != AV_CODEC_ID_AAC || codec->frame_size > 0 || !codec->extradata || codec->extradata_size < 2)
+        return;
+    const uint8_t *bytes = codec->extradata;
+    int object = bytes[0] >> 3, rate_index = ((bytes[0] & 7) << 1) | (bytes[1] >> 7), channels = (bytes[1] >> 3) & 15;
+    if (object != 2 || rate_index == 15 || channels == 0)
+        return;
+    if (codec->extradata_size >= 5) {
+        unsigned bits = (unsigned)bytes[2] << 16 | (unsigned)bytes[3] << 8 | bytes[4];
+        if (bits >> 13 == 0x2b7 && ((bits >> 8) & 31) == 5 && ((bits >> 7) & 1))
+            return;
+    }
+    codec->frame_size = (bytes[1] >> 2) & 1 ? 960 : 1024;
 }
 
 static int is_mov(const AVOutputFormat *format) {
@@ -1399,6 +1428,13 @@ static int configure_output(Writer *writer, AVFormatContext *input, int whole_fi
         }
         if (is_mov(output->oformat) && (result = fill_vp_format(writer, input, index, destination->codecpar)))
             return result;
+        if (is_matroska(output->oformat))
+            state_aac_frame_size(destination->codecpar);
+        if (writer->aac_head_padding && writer->aac_head_padding[index] != INT64_MIN) {
+            if (!is_matroska(output->oformat) || writer->aac_head_padding[index] > INT_MAX)
+                return fail(writer, "An AAC start trim needs Matroska output");
+            destination->codecpar->initial_padding = (int)writer->aac_head_padding[index];
+        }
         if (writer->avc_reorder > 0 && primary_video(source) && source->codecpar->codec_id == AV_CODEC_ID_H264) {
             uint8_t *config = NULL;
             int size = 0;
@@ -1879,7 +1915,8 @@ static int remux_packet(Writer *writer, const AVStream *input_track, const Range
     if (!range->whole_file && (video || (!range->keep_audio_start || !range->keep_audio_end))) {
         int before = time_compare(pts, range->source_start) < 0;
         int after = time_compare(pts, range->source_end) >= 0;
-        if ((before && (video || !range->keep_audio_start)) || (after && (video || !range->keep_audio_end))) {
+        if (!writer->aac_trim_packet
+            && ((before && (video || !range->keep_audio_start)) || (after && (video || !range->keep_audio_end)))) {
             packet->size = 0;
             return 0;
         }
@@ -1906,10 +1943,10 @@ static int remux_packet(Writer *writer, const AVStream *input_track, const Range
         if (packet->duration <= 0 || !packet_end.denominator) {
             return fail(writer, "Missing duration on %s track %d", track_type, packet->stream_index);
         }
-        if ((video || !range->keep_audio_end) && time_compare(packet_end, range->source_end) > 0) {
+        if ((video || !range->keep_audio_end) && !writer->aac_trim_packet && time_compare(packet_end, range->source_end) > 0) {
             return fail(writer, "Requested end crosses a packet on %s track %d", track_type, packet->stream_index);
         }
-        if (!video) {
+        if (!video && !writer->aac_trim_packet) {
             size_t size = 0;
             const uint8_t *skip = av_packet_get_side_data(packet, AV_PKT_DATA_SKIP_SAMPLES, &size);
             if (skip && size >= 8
@@ -3333,6 +3370,59 @@ static int splice_video(Writer *writer, const AVFormatContext *input, const AVSt
     return 0;
 }
 
+/* Write the encoded frames of one AAC bridge, which end where this range's copied frames of the track begin. */
+static int write_aac_bridge(Writer *writer, const AVFormatContext *input, const Range *range, const MPCutAACBridge *bridge) {
+    if (!is_matroska(writer->output->oformat))
+        return fail(writer, "Encoded AAC frames at a join need Matroska output");
+    if (bridge->stream < 0 || (unsigned)bridge->stream >= input->nb_streams || writer->stream_map[bridge->stream] < 0)
+        return fail(writer, "The encoded AAC frames at a join belong to no selected track");
+    const AVStream *source = input->streams[bridge->stream];
+    int rate = source->codecpar->sample_rate;
+    if (rate <= 0 || !writer->previous_shift.denominator)
+        return fail(writer, "The encoded AAC frames at a join have no clock");
+    MPCutAACBridgeFrames frames;
+    char reason[512] = {0};
+    if (mpcut_build_aac_bridge(bridge, &frames, reason, sizeof(reason)))
+        return fail(writer, "%s", reason);
+    AVStream *track = writer->output->streams[writer->stream_map[bridge->stream]];
+    // The earlier range's last copied frame ends at x on the output clock.
+    MPCutTime x = time_add(time_add(bridge->previous_origin, (MPCutTime){bridge->previous_copy_end, rate}, 1),
+                           writer->previous_shift, 1);
+    MPCutTime resume = time_add(time_add(bridge->origin, (MPCutTime){bridge->copy_start, rate}, 1), range->shift, 1);
+    int64_t span = (int64_t)frames.count * MPCUT_AAC_FRAME - frames.trim;
+    MPCutTime end = time_add(x, (MPCutTime){span, rate}, 1);
+    int64_t gap = time_round(time_add(resume, end, -1), (AVRational){1, rate});
+    int result = 0;
+    if (!x.denominator || !end.denominator || gap < -1 || gap > 1) {
+        result = fail(writer, "The encoded AAC frames at a join do not meet the copied frames after it");
+        goto done;
+    }
+    for (int i = 0; i < frames.count; i++) {
+        int64_t offset = (int64_t)i * MPCUT_AAC_FRAME - (i > frames.trimmed ? frames.trim : 0);
+        MPCutTime start = time_add(x, (MPCutTime){offset, rate}, 1);
+        MPCutTime stop = time_add(start, (MPCutTime){MPCUT_AAC_FRAME - (i == frames.trimmed ? frames.trim : 0), rate}, 1);
+        av_packet_unref(writer->packet);
+        av_packet_move_ref(writer->packet, frames.packets[i]);
+        AVPacket *packet = writer->packet;
+        packet->stream_index = writer->stream_map[bridge->stream];
+        packet->pts = packet->dts = time_round(start, track->time_base);
+        int64_t stop_tick = time_round(stop, track->time_base);
+        if (packet->pts == AV_NOPTS_VALUE || stop_tick == AV_NOPTS_VALUE) {
+            result = fail(writer, "The output clock cannot represent encoded AAC frames at a join");
+            goto done;
+        }
+        packet->duration = stop_tick > packet->pts ? stop_tick - packet->pts : 1;
+        packet->flags |= AV_PKT_FLAG_KEY;
+        result = write_packet(writer, input->url);
+        av_packet_unref(writer->packet);
+        if (result)
+            goto done;
+    }
+done:
+    mpcut_aac_bridge_frames_free(&frames);
+    return result;
+}
+
 static int write_range(Writer *writer, AVFormatContext *input, const Range *range, double total_duration) {
     if (input->nb_streams != writer->range_track_count) {
         return fail(writer, "Track layout changed while reopening %s", input->url);
@@ -3364,6 +3454,11 @@ static int write_range(Writer *writer, AVFormatContext *input, const Range *rang
         if (result) {
             return result;
         }
+    }
+    for (size_t i = 0; i < writer->head_bridge_count; i++) {
+        result = write_aac_bridge(writer, input, range, &writer->head_bridges[i]);
+        if (result)
+            return result;
     }
 
     if (range->opus_trim) {
@@ -3449,7 +3544,33 @@ static int write_range(Writer *writer, AVFormatContext *input, const Range *rang
                 return result;
         }
 
-        if (writer->aac_edits && !range->whole_file && input_track->codecpar->codec_id == AV_CODEC_ID_AAC) {
+        if (writer->aac_grid && writer->aac_grid[input_index] != INT64_MIN) {
+            int64_t position = mpcut_aac_bridge_position(source_pts, input_track->time_base, writer->aac_origin[input_index],
+                                                         input_track->codecpar->sample_rate, writer->aac_grid[input_index]);
+            if (position == INT64_MIN)
+                return fail(writer, "An AAC frame next to an encoded join has no presentation time");
+            if (position < writer->aac_copy_from[input_index] || position >= writer->aac_copy_to[input_index]) {
+                packet->size = 0;
+                result = 0;
+                goto bridged;
+            }
+            int64_t head = writer->aac_head_cut[input_index], tail = writer->aac_tail_cut[input_index];
+            writer->aac_trim_packet = (head != INT64_MIN && position < head)
+                || (tail != INT64_MIN && position + MPCUT_AAC_FRAME > tail);
+            if (writer->aac_trim_packet) {
+                // The codec delay hides the start; the frame that holds the end discards what follows it.
+                av_packet_side_data_remove(packet->side_data, &packet->side_data_elems, AV_PKT_DATA_SKIP_SAMPLES);
+                if (tail != INT64_MIN && position + MPCUT_AAC_FRAME > tail) {
+                    uint8_t *side = av_packet_new_side_data(packet, AV_PKT_DATA_SKIP_SAMPLES, 10);
+                    if (!side)
+                        return fail(writer, "Cannot allocate an AAC end trim");
+                    memset(side, 0, 10);
+                    AV_WL32(side + 4, (uint32_t)(position + MPCUT_AAC_FRAME - tail));
+                }
+            }
+            result = remux_packet(writer, input_track, range, 0, 0);
+            writer->aac_trim_packet = 0;
+        } else if (writer->aac_edits && !range->whole_file && input_track->codecpar->codec_id == AV_CODEC_ID_AAC) {
             AVRational output_base = writer->output->streams[packet->stream_index]->time_base;
             result = mpcut_aac_packet(writer->aac_edits, packet, input_track->time_base,
                                      output_base, 0, writer->error, writer->error_capacity);
@@ -3469,6 +3590,7 @@ static int write_range(Writer *writer, AVFormatContext *input, const Range *rang
             result = frame_size ? slice_pcm(writer, input_track, range, frame_size)
                                 : remux_packet(writer, input_track, range, video, video && mov_video_timing);
         }
+    bridged:
         if (result) {
             return result;
         }
@@ -3727,6 +3849,78 @@ static int plan_avc_reorder(Writer *writer, const MPCutSegment *segments, size_t
     return 0;
 }
 
+/* The copy windows of AAC tracks that meet a bridge at either end of this range. */
+static int set_aac_windows(Writer *writer, const AVFormatContext *input, const MPCutSegment *segment,
+                           const MPCutSegment *next) {
+    av_freep(&writer->aac_copy_from);
+    av_freep(&writer->aac_copy_to);
+    av_freep(&writer->aac_grid);
+    av_freep(&writer->aac_origin);
+    av_freep(&writer->aac_head_cut);
+    av_freep(&writer->aac_head_padding);
+    av_freep(&writer->aac_tail_cut);
+    writer->head_bridges = segment->aac_bridges;
+    writer->head_bridge_count = segment->aac_bridge_count;
+    if (!segment->aac_bridge_count && (!next || !next->aac_bridge_count) && !segment->aac_head_count && !segment->aac_tail_count)
+        return 0;
+    unsigned streams = input->nb_streams;
+    writer->aac_copy_from = av_malloc_array(streams, sizeof(int64_t));
+    writer->aac_copy_to = av_malloc_array(streams, sizeof(int64_t));
+    writer->aac_grid = av_malloc_array(streams, sizeof(int64_t));
+    writer->aac_origin = av_calloc(streams, sizeof(MPCutTime));
+    writer->aac_head_cut = av_malloc_array(streams, sizeof(int64_t));
+    writer->aac_head_padding = av_malloc_array(streams, sizeof(int64_t));
+    writer->aac_tail_cut = av_malloc_array(streams, sizeof(int64_t));
+    if (!writer->aac_copy_from || !writer->aac_copy_to || !writer->aac_grid || !writer->aac_origin
+        || !writer->aac_head_cut || !writer->aac_head_padding || !writer->aac_tail_cut)
+        return fail(writer, "Cannot allocate AAC join state");
+    for (unsigned i = 0; i < streams; i++) {
+        writer->aac_copy_from[i] = INT64_MIN;
+        writer->aac_copy_to[i] = INT64_MAX;
+        writer->aac_grid[i] = INT64_MIN;
+        writer->aac_head_cut[i] = writer->aac_head_padding[i] = writer->aac_tail_cut[i] = INT64_MIN;
+    }
+    for (size_t i = 0; i < segment->aac_head_count + segment->aac_tail_count; i++) {
+        int head = i < segment->aac_head_count;
+        const MPCutAACTrim *trim = head ? &segment->aac_heads[i] : &segment->aac_tails[i - segment->aac_head_count];
+        if (trim->stream < 0 || (unsigned)trim->stream >= streams || trim->padding < 0
+            || (head ? trim->copy > trim->cut : trim->copy < trim->cut))
+            return fail(writer, "An AAC trim names a missing track or no frame");
+        if (writer->aac_grid[trim->stream] != INT64_MIN && writer->aac_grid[trim->stream] != trim->grid)
+            return fail(writer, "The AAC trims of a range disagree on its frames");
+        writer->aac_grid[trim->stream] = trim->grid;
+        writer->aac_origin[trim->stream] = trim->origin;
+        if (head) {
+            writer->aac_copy_from[trim->stream] = trim->copy;
+            writer->aac_head_cut[trim->stream] = trim->cut;
+            writer->aac_head_padding[trim->stream] = trim->padding;
+        } else {
+            writer->aac_copy_to[trim->stream] = trim->copy;
+            writer->aac_tail_cut[trim->stream] = trim->cut;
+        }
+    }
+    for (size_t i = 0; i < segment->aac_bridge_count; i++) {
+        const MPCutAACBridge *bridge = &segment->aac_bridges[i];
+        if (bridge->stream < 0 || (unsigned)bridge->stream >= streams)
+            return fail(writer, "An encoded AAC join names a missing track");
+        writer->aac_copy_from[bridge->stream] = bridge->copy_start;
+        writer->aac_grid[bridge->stream] = bridge->grid;
+        writer->aac_origin[bridge->stream] = bridge->origin;
+    }
+    for (size_t i = 0; next && i < next->aac_bridge_count; i++) {
+        const MPCutAACBridge *bridge = &next->aac_bridges[i];
+        if (bridge->previous_stream < 0 || (unsigned)bridge->previous_stream >= streams)
+            return fail(writer, "An encoded AAC join names a missing track");
+        if (writer->aac_grid[bridge->previous_stream] != INT64_MIN
+            && writer->aac_grid[bridge->previous_stream] != bridge->previous_grid)
+            return fail(writer, "The encoded AAC joins of a range disagree on its frames");
+        writer->aac_copy_to[bridge->previous_stream] = bridge->previous_copy_end;
+        writer->aac_grid[bridge->previous_stream] = bridge->previous_grid;
+        writer->aac_origin[bridge->previous_stream] = bridge->previous_origin;
+    }
+    return 0;
+}
+
 int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_path, int tracks, int audio_stream,
                 const uint32_t *still_mastering_display,
                 MPCutProgress progress, void *context, char *error, size_t error_capacity) {
@@ -3928,6 +4122,9 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
             result = fail(&writer, "Cannot allocate track read state");
             goto cleanup;
         }
+        result = set_aac_windows(&writer, input, segment, index + 1 < count ? &segments[index + 1] : NULL);
+        if (result)
+            goto cleanup;
         /* A MOV description change can occur on a packet preceding the selected
          * range. Scan multi-description sources from their initial state so the
          * first retained picture gets the active configuration even after a trim. */
@@ -3994,6 +4191,7 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
 
         avformat_close_input(&input);
         cursor = range.output_end;
+        writer.previous_shift = range.shift;
     }
 
     {
@@ -4072,6 +4270,13 @@ cleanup:
     av_free(writer.tail_sets);
     av_free(writer.hvc1);
     av_free(writer.range_tracks);
+    av_free(writer.aac_copy_from);
+    av_free(writer.aac_copy_to);
+    av_free(writer.aac_grid);
+    av_free(writer.aac_origin);
+    av_free(writer.aac_head_cut);
+    av_free(writer.aac_head_padding);
+    av_free(writer.aac_tail_cut);
     av_free(writer.stream_map);
     av_free(writer.art);
     free_chapters(&chapters);

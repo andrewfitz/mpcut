@@ -341,7 +341,11 @@ extension CutEngine {
                 // cannot make a discontinuous MP3, Vorbis or Opus splice independently audible.
                 if ["opus", "vorbis", "mp3", "aac"].contains(stream.codec),
                    (start && !originalEdge || !start && !last || !sound.presentationEdits.isEmpty) {
-                    throw CutError(code: "unsafe_boundary", message: "\(stream.codec.uppercased()) track \(stream.index) requires its original decoder history at this join.",
+                    // Smart Trim is a movie export, so a sound-only AAC join into Matroska stays refused here.
+                    let message = stream.codec == "aac" && ["mkv", "mka"].contains(container)
+                        ? "AAC track \(stream.index) requires its original decoder history at this join. Smart Trim encodes AAC frames at joins only in a movie export; converting the audio makes the join exact."
+                        : "\(stream.codec.uppercased()) track \(stream.index) requires its original decoder history at this join."
+                    throw CutError(code: "unsafe_boundary", message: message,
                                    segment: segment, boundary: field, track: stream.index).because(.joinDecoderHistory)
                 }
                 if !originalEdge { packets.append(sound) }

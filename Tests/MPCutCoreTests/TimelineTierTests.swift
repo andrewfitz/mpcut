@@ -135,7 +135,8 @@ final class TimelineTierTests: XCTestCase {
         .sourceTimeline: "Not reached by a planner: a source with a timeline issue, such as two video tracks, is refused as source_unsupported_tracks (see the fixture test). The code `unsupported_timeline` is raised at import and maps to it below.",
         .outputContainer: "Only reached when no container carries the clips, or with a named container; covered by the code mapping below.",
         .selectionTracks: "The timeline tier always asks for every track; covered by the code mapping below.",
-        .writerOther: "The fallback for failures that are not about the timeline."
+        .writerOther: "The fallback for failures that are not about the timeline.",
+        .joinAACFrames: "Only reached with a named Matroska container: a timeline whose AAC join a Matroska copy refuses copies losslessly into MOV, which places the join with an edit list. AACBridgeTests reaches it on a named MKV output."
     ]
 
     func testEveryFactorGivesItsTierAndIsReported() throws {

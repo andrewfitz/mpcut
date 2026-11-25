@@ -27,6 +27,62 @@ typedef struct {
     uint32_t checksum;
 } MPCutMP3Anchor;
 
+/* Smart Trim's encoded AAC frames where two ranges meet inside a Matroska output. Sample positions count on each
+ * source's own sample clock, relative to its origin (`MPCutSegment.source_origin`): sample s is presented at
+ * origin + s / sample_rate. `grid` is any frame start of the track; its AAC frames are 1024 samples apart.
+ * The earlier range copies its frames up to previous_copy_end, a frame start at least one frame before its cut.
+ * This range copies its frames from copy_start, a frame start at or after its cut. The frames between are encoded
+ * again from the decoded sound, and the trim that brings the two frame grids together is written as Matroska
+ * DiscardPadding on one of them. previous_floor and ceiling bound how far planning may move the copy points. */
+typedef struct {
+    const char *previous_path;
+    int previous_stream;     /* Absolute stream index in the earlier range's source. */
+    MPCutTime previous_origin;
+    int64_t previous_grid;
+    int64_t previous_cut;    /* The sample after the earlier range's last. */
+    int64_t previous_copy_end;
+    int64_t previous_floor;  /* The earlier range's copy cannot end before this frame start. */
+    const char *path;
+    int stream;
+    MPCutTime origin;
+    int64_t grid;
+    int64_t cut;             /* This range's first sample. */
+    int64_t copy_start;
+    int64_t ceiling;         /* This range's copy cannot start after this frame start. */
+    int64_t bit_rate;
+    int encoder;             /* MPCUT_AAC_BRIDGE_FFMPEG or MPCUT_AAC_BRIDGE_APPLE, chosen by planning. */
+} MPCutAACBridge;
+
+/* The bridge encoders. They differ in the long-window shape they code (FFmpeg's Kaiser-Bessel-derived, Apple's sine),
+ * and a splice decodes cleanly only with the shape of the copied frames on either side. */
+enum { MPCUT_AAC_BRIDGE_FFMPEG = 0, MPCUT_AAC_BRIDGE_APPLE = 1 };
+
+/* What planning found for one bridge: the encoded frames, the samples one of them discards, and their size. */
+typedef struct {
+    int frames;
+    int trim;
+    uint64_t bytes;
+} MPCutAACBridgeReport;
+
+/* Encode a bridge and check, by decoding the copied frames around it, that the join decodes as the two ranges do
+ * within the codec's own error. Moves the copy points by a frame at a time, within their bounds, when a splice
+ * does not meet that test. Returns 0 with the report, 1 with a sentence in error, or 2 when cancelled. */
+int mpcut_plan_aac_bridge(MPCutAACBridge *bridge, MPCutAACBridgeReport *report, char *error, size_t capacity);
+
+/* A Smart Trim AAC copy into Matroska that starts or ends inside a frame, on the track's sample clock (see
+ * MPCutAACBridge). A start copies from `copy`, one frame before the frame that holds `cut` where there is one, and
+ * the output track's codec delay hides the `padding` samples before the cut: the decoder still runs through the
+ * frame before. An end copies up to `copy`, the end of the frame that holds `cut`, and that frame discards the
+ * samples after the cut as Matroska DiscardPadding. */
+typedef struct {
+    int stream;
+    MPCutTime origin;
+    int64_t grid;
+    int64_t cut;
+    int64_t copy;
+    int64_t padding;
+} MPCutAACTrim;
+
 typedef struct {
     const char *path;
     MPCutTime start;
@@ -45,6 +101,12 @@ typedef struct {
     MPCutTime output_start; /* Planned movie time of the range start. Positive in a whole MOV copy whose linked audio leads. */
     unsigned audio_stream_override; /* Absolute audio stream index + 1, or 0 to use the export-wide selector. */
     MPCutMP3Anchor mp3_anchor;
+    const MPCutAACBridge *aac_bridges; /* Bridges written where this range meets the previous one, one per track. */
+    size_t aac_bridge_count;
+    const MPCutAACTrim *aac_heads; /* The first range only. */
+    size_t aac_head_count;
+    const MPCutAACTrim *aac_tails; /* The last range only. */
+    size_t aac_tail_count;
 } MPCutSegment;
 
 /* AAC presentation edits in their track's native sample clock. */

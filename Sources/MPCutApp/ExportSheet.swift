@@ -231,6 +231,7 @@ extension ExportPlan {
                 return "MPCut couldn’t calculate how much video needs encoding."
             }
             let durations = "Copied video: \(Self.seconds(copied.seconds)) · Encoded video: \(Self.seconds(encoded.seconds))"
+                + (ExportNotices.encodedAudio(edit).map { "\n" + $0 } ?? "")
             return copied == .zero && encoded > .zero ? durations + "\nSmart Trim needs to re-encode every frame in this selection." : durations
         case .packets(let edit, _, let tracks):
             let contents: String

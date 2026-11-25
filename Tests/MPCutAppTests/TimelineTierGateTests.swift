@@ -458,12 +458,20 @@ final class TimelineTierGateTests: XCTestCase {
     func testBadgeAndSheetOpenOnTheSameContainer() async throws {
         let (model, _) = try await editor("Shuttle-Chirp", "mov")
         defer { model.endSession() }
-        // Remove the head: the clip now starts on a keyframe that is not on an AAC packet, which Matroska refuses.
-        model.seek(0.6)
-        model.split()
+        // Keep 0–0.6 s and one picture at 1.2 s. The join of two keyframes that are not on AAC packets copies into
+        // MOV, whose edit lists place it. Matroska refuses it: a copy cannot join the AAC frames there, and the
+        // one-picture range is too short for the frames Smart Trim would encode.
+        for time in [0.6, 1.2, 1.24] {
+            model.seek(time)
+            model.split()
+            try await settle(model)
+        }
+        XCTAssertEqual(model.timelineClips.count, 4)
+        model.deleteClip(model.timelineClips[3].id)
         try await settle(model)
-        model.deleteClip(try XCTUnwrap(model.timelineClips.first?.id))
+        model.deleteClip(model.timelineClips[1].id)
         try await settle(model)
+        XCTAssertEqual(model.timelineClips.count, 2)
         XCTAssertEqual(model.settledTier, .trueLossless)
 
         func badgeContainer() -> String? {

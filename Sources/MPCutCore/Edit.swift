@@ -123,9 +123,14 @@ public struct ResolvedSegment: Codable, Sendable {
     package var sourceClipIndex: Int? = nil
     var sourceClipSeams: [RationalTime] = []
     public internal(set) var encodedEdges: [EncodedEdge]? = nil
+    /// Smart Trim's encoded AAC frames where this range meets the previous one (Matroska output).
+    public internal(set) var encodedAudioEdges: [EncodedAudioEdge]? = nil
+    var aacBridges: [AACBridgePlan]? = nil
+    var aacHeads: [AACEdgeTrim]? = nil
+    var aacTails: [AACEdgeTrim]? = nil
 
     enum CodingKeys: String, CodingKey {
-        case file, from, to, outputStart, tracks, reachesEnd, encodedEdges
+        case file, from, to, outputStart, tracks, reachesEnd, encodedEdges, encodedAudioEdges
     }
 
     public var duration: RationalTime { to - from }

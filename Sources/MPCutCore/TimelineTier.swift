@@ -45,6 +45,7 @@ public enum TierFactorID: String, CaseIterable, Codable, Sendable {
     case cutOpusWindow = "cut_opus_window"
     case cutMP3Crop = "cut_mp3_crop"
     case joinDecoderHistory = "join_decoder_history"
+    case joinAACFrames = "join_aac_frames"
     case joinVideoDTSOverlap = "join_video_dts_overlap"
     case joinSmartOpenGOP = "join_smart_open_gop"
     case joinStreamMismatch = "join_stream_mismatch"
@@ -69,7 +70,8 @@ public enum TierFactorID: String, CaseIterable, Codable, Sendable {
 
     public var effect: TierFactorEffect {
         switch self {
-        case .cutVideoStart, .cutVideoEnd, .joinVideoDTSOverlap, .cutAudioSample, .placementPicture, .placementSilence: return .lossless
+        case .cutVideoStart, .cutVideoEnd, .joinVideoDTSOverlap, .cutAudioSample, .placementPicture, .placementSilence, .joinAACFrames:
+            return .lossless
         case .cutAudioPacket, .cutAudioPriming, .cutAACCoverage, .cutPCMSampleClock, .cutOpusWindow, .cutMP3Crop,
              .joinDecoderHistory, .joinSmartOpenGOP, .joinTimecode, .sourceUnsupportedTracks, .sourceSmartIneligible, .sourceStartUnsafe,
              .joinStreamMismatch:
@@ -102,6 +104,7 @@ public enum TierFactorID: String, CaseIterable, Codable, Sendable {
         case .cutOpusWindow: return "An Opus track cannot keep the requested start or end within its trim window."
         case .cutMP3Crop: return "An MP3 track cannot be cropped to the range with gapless timing."
         case .joinDecoderHistory: return "The audio decoder needs samples from before the join. It can copy one continuous range."
+        case .joinAACFrames: return "AAC frames after a join decode only with their own history. Smart Trim encodes the few AAC frames around a join into Matroska."
         case .joinVideoDTSOverlap: return "The two ranges overlap in video decode time at the join."
         case .joinSmartOpenGOP: return "Frames in this open GOP depend on frames from an earlier group of pictures. Smart Trim has no verified keyframe where it can resume copying."
         case .joinStreamMismatch: return "These clips use different codecs, frame formats, timing or audio formats. Use Re-encode to export them together."

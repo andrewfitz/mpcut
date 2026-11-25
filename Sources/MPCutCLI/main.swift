@@ -312,6 +312,7 @@ private struct ExportResult: Encodable {
         let duration: RationalTime
         let tracks: [ResolvedTrack]
         let encodedEdges: [EncodedEdge]?
+        let encodedAudioEdges: [EncodedAudioEdge]?
         let trackActions: [TrackAction]
 
         init(_ segment: ResolvedSegment, mode: ExportMode, audioAction: ReencodeAudio? = nil, original: URL? = nil) {
@@ -322,6 +323,7 @@ private struct ExportResult: Encodable {
             duration = segment.duration
             tracks = segment.tracks
             encodedEdges = segment.encodedEdges
+            encodedAudioEdges = segment.encodedAudioEdges
             let edges = segment.encodedEdges ?? []
             let videoAction: String
             if mode == .encode || (edges.count == 1 && edges[0].from == segment.from && edges[0].to == segment.to) {
@@ -339,13 +341,15 @@ private struct ExportResult: Encodable {
                 }
                 // The encode plan lists output audio actions separately.
                 guard mode != .encode else { return nil }
-                return TrackAction(index: track.index, kind: track.kind, action: "copy")
+                // Smart Trim encodes a few AAC frames where this range meets the previous one.
+                let bridged = segment.encodedAudioEdges?.contains { $0.track == track.index } == true
+                return TrackAction(index: track.index, kind: track.kind, action: bridged ? "copy_and_encode" : "copy")
             }
         }
     }
 
     private enum CodingKeys: String, CodingKey {
-        case ok, dryRun, output, segments, duration, container, mode, copiedDuration, encodedDuration, order, cutMap
+        case ok, dryRun, output, segments, duration, container, mode, copiedDuration, encodedDuration, encodedAudioDuration, order, cutMap
         case video, quality, audio, audioActions, width, height, warnings, silence, tracks, audioStream, applied, tier, canvas
         case encodedEdgeResults, writtenWarnings
     }
@@ -367,6 +371,8 @@ private struct ExportResult: Encodable {
         try fields.encodeIfPresent(edit.audioStream, forKey: .audioStream)
         try fields.encode(encodedDuration, forKey: .encodedDuration)
         try fields.encode(copiedDuration, forKey: .copiedDuration)
+        // The output time Smart Trim encodes in AAC frames at joins, present only when it encodes some.
+        if edit.encodedAudioDuration > .zero { try fields.encode(edit.encodedAudioDuration, forKey: .encodedAudioDuration) }
         try fields.encodeIfPresent(order, forKey: .order)
         if !encodedEdgeResults.isEmpty { try fields.encode(encodedEdgeResults, forKey: .encodedEdgeResults) }
         if !writtenWarnings.isEmpty { try fields.encode(writtenWarnings, forKey: .writtenWarnings) }

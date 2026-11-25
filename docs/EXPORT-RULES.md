@@ -249,6 +249,7 @@ Each factor explains why a higher-quality mode is unavailable. Errors include th
 | `cut_opus_window` | cut | Re-encode | — | An Opus track cannot keep the requested start or end within its trim window. |
 | `cut_mp3_crop` | cut | Re-encode | — | An MP3 track cannot be cropped to the range with gapless timing. |
 | `join_decoder_history` | join | Re-encode | — | The audio decoder needs samples from before the join. It can copy one continuous range. |
+| `join_aac_frames` | join | Lossless | — | AAC frames after a join decode only with their own history. Smart Trim encodes the few AAC frames around a join into Matroska. |
 | `join_video_dts_overlap` | join | Lossless | verified times in `nearest` | The two ranges overlap in video decode time at the join. |
 | `join_smart_open_gop` | join | Re-encode | — | Frames in this open GOP depend on frames from an earlier group of pictures. Smart Trim has no verified keyframe where it can resume copying. |
 | `join_stream_mismatch` | join | Re-encode | — | These clips use different codecs, frame formats, timing or audio formats. Use Re-encode to export them together. |

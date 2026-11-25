@@ -5,7 +5,7 @@ import PacketWriter
 public struct CutEngine: Sendable {
     private let cancelled: (@Sendable () -> Bool)?
 
-    private let smartTrim: Bool
+    let smartTrim: Bool
     private let useSidecar: Bool
     let tracks: ExportTracks
     let audioStream: Int?
@@ -735,6 +735,7 @@ public struct CutEngine: Sendable {
         if let track = sequence[0].streams.first(where: { $0.kind == "data" && $0.codecTag == "tmcd" }) {
             try checkTimecode(segments, duration: duration, container: container, track: track.index)
         }
+        try planAACBridges(&segments, media: effective.map(\.info), container: container)
         var smartTrimNotes: [String] = []
         if segments.contains(where: { $0.encodedEdges != nil }) {
             smartTrimNotes = try checkSmartTrim(segments, clips: effective.map(\.startIndex))
@@ -940,10 +941,38 @@ public struct CutEngine: Sendable {
         }
 
         let schedule = segments.flatMap { $0.videoDecodeTimes.map(nativeTime) }
-        return schedule.withUnsafeBufferPointer { ticks in
+        // Each range's bridges in one buffer, read through the segments that name them.
+        var bridges: [MPCutAACBridge] = []
+        var bridgeRanges: [Range<Int>] = []
+        var trims: [MPCutAACTrim] = []
+        var headRanges: [Range<Int>] = []
+        var tailRanges: [Range<Int>] = []
+        for segment in segments {
+            for (list, isHead) in [(segment.aacHeads ?? [], true), (segment.aacTails ?? [], false)] {
+                let start = trims.count
+                trims += list.map { MPCutAACTrim(stream: Int32($0.stream), origin: nativeTime($0.origin), grid: $0.grid,
+                                                 cut: $0.cut, copy: $0.copy, padding: $0.padding) }
+                if isHead { headRanges.append(start..<trims.count) } else { tailRanges.append(start..<trims.count) }
+            }
+        }
+        for (index, segment) in segments.enumerated() {
+            let start = bridges.count
+            for plan in segment.aacBridges ?? [] where index > 0 {
+                bridges.append(MPCutAACBridge(previous_path: UnsafePointer(paths[index - 1]), previous_stream: Int32(plan.previousStream),
+                                              previous_origin: nativeTime(plan.previousOrigin), previous_grid: plan.previousGrid,
+                                              previous_cut: plan.previousCut, previous_copy_end: plan.previousCopyEnd,
+                                              previous_floor: plan.previousFloor, path: UnsafePointer(paths[index]),
+                                              stream: Int32(plan.stream), origin: nativeTime(plan.origin), grid: plan.grid,
+                                              cut: plan.cut, copy_start: plan.copyStart, ceiling: plan.ceiling,
+                                              bit_rate: plan.bitRate, encoder: plan.encoder))
+            }
+            bridgeRanges.append(start..<bridges.count)
+        }
+        return try trims.withUnsafeBufferPointer { trimBuffer in try bridges.withUnsafeBufferPointer { bridgeBuffer in try schedule.withUnsafeBufferPointer { ticks in
             preSkips.withUnsafeBufferPointer { skips in
                 var cursor = 0
-                let native = zip(segments, paths).map { segment, path in
+                let native = zip(segments, paths).enumerated().map { index, pair in
+                    let (segment, path) = pair
                     let count = segment.videoDecodeTimes.count
                     let start = count == 0 ? nil : ticks.baseAddress?.advanced(by: cursor)
                     cursor += count
@@ -961,11 +990,17 @@ public struct CutEngine: Sendable {
                                         output_start: nativeTime(segment.outputStart),
                                         audio_stream_override: useAudioStreamOverride && segment.tracks.count == 1 && segment.tracks[0].kind == "audio"
                                             ? UInt32(segment.tracks[0].index) + 1 : 0,
-                                        mp3_anchor: segment.tracks.first?.mp3Anchor?.native ?? MPCutMP3Anchor())
+                                        mp3_anchor: segment.tracks.first?.mp3Anchor?.native ?? MPCutMP3Anchor(),
+                                        aac_bridges: bridgeRanges[index].isEmpty ? nil : bridgeBuffer.baseAddress?.advanced(by: bridgeRanges[index].lowerBound),
+                                        aac_bridge_count: bridgeRanges[index].count,
+                                        aac_heads: headRanges[index].isEmpty ? nil : trimBuffer.baseAddress?.advanced(by: headRanges[index].lowerBound),
+                                        aac_head_count: headRanges[index].count,
+                                        aac_tails: tailRanges[index].isEmpty ? nil : trimBuffer.baseAddress?.advanced(by: tailRanges[index].lowerBound),
+                                        aac_tail_count: tailRanges[index].count)
                 }
                 return native.withUnsafeBufferPointer(body)
             }
-        }
+        } } }
     }
 
     func verifyIdentity(_ source: URL, identity: SourceIdentity) throws {
@@ -1166,7 +1201,7 @@ extension CutEngine {
 
     fileprivate struct Boundaries {
         var times: [RationalTime]
-        var rejected: [RationalTime: (track: Int, reason: String?)]
+        var rejected: [RationalTime: (track: Int, reason: String?, factor: TierFactorID?)]
         /// True when Smart Trim accepts every frame, so a refused time is off the frame grid.
         var frameAccurate = false
         /// The first frame time, when the source cannot be copied from its beginning.
@@ -1215,16 +1250,26 @@ private extension CutEngine {
             }
         }
         if !start && media.duration > .zero { candidates.append(media.duration) }
-        var rejected: [RationalTime: (track: Int, reason: String?)] = [:]
+        var rejected: [RationalTime: (track: Int, reason: String?, factor: TierFactorID?)] = [:]
         for audio in media.audio {
             let track = audio.stream
             var reason: String?
+            var factor: TierFactorID?
             let accepts: (RationalTime) -> Bool
             let matroskaCodec = matroskaAudioCodec(audio, media: media)
-            if let codec = matroskaCodec, start ? !first : !last {
+            let interior = start ? !first : !last
+            if let codec = matroskaCodec, interior {
                 accepts = { _ in false }
                 reason = "\(codec) track \(track.index) requires continuous decoder state across this join. "
                     + "Keep a single continuous range from the source beginning."
+            } else if interior ? bridgesAAC(audio, container: container) : trimsAAC(audio, container: container) {
+                // Smart Trim encodes the frames around a join, and a copy trims the outer edges with a codec delay or
+                // DiscardPadding, so a cut can fall on any sample the track covers.
+                let lower = max(.zero, audio.start)
+                accepts = { candidate in
+                    if start { return candidate >= lower && candidate < audio.end }
+                    return candidate > lower && (candidate <= audio.end || (last && candidate == media.duration))
+                }
             } else if track.isPCM || supportsAACEdits(track, container: container) {
                 accepts = { candidate in
                     if first && last && candidate == (start ? .zero : media.duration) { return true }
@@ -1250,6 +1295,9 @@ private extension CutEngine {
                 accepts = { first && $0 == .zero }
                 if let codec = matroskaCodec {
                     reason = "\(codec) track \(track.index) requires its original decoder start. Keep the source beginning."
+                } else if interior, let joinReason = aacJoinReason(audio, container: container) {
+                    reason = joinReason
+                    factor = aacBridgeIssue(audio) == nil ? .joinAACFrames : .joinDecoderHistory
                 }
             } else {
                 var packetEdges = Set<RationalTime>()
@@ -1259,13 +1307,17 @@ private extension CutEngine {
                     packetEdges.insert(packet.time)
                 }
                 accepts = { (last && $0 == media.duration) || packetEdges.contains($0) }
+                if interior, let joinReason = aacJoinReason(audio, container: container) {
+                    reason = joinReason
+                    factor = aacBridgeIssue(audio) == nil ? .joinAACFrames : .joinDecoderHistory
+                }
             }
             var index = 0
             try candidates.removeAll { candidate in
                 if index.isMultiple(of: 1_024) { try checkCancellation() }
                 index += 1
                 if accepts(candidate) { return false }
-                if recordRejections { rejected[candidate] = (track.index, reason) }
+                if recordRejections { rejected[candidate] = (track.index, reason, factor) }
                 return true
             }
         }
@@ -1308,7 +1360,7 @@ private extension CutEngine {
         }
         let factor: TierFactorID
         if let rejection {
-            factor = rejection.reason == nil ? .cutAudioPacket : .joinDecoderHistory
+            factor = rejection.factor ?? (rejection.reason == nil ? .cutAudioPacket : .joinDecoderHistory)
         } else if let first = boundaries.unsafeStart, requested <= first {
             factor = .sourceStartUnsafe
         } else if boundaries.frameAccurate {
@@ -1405,6 +1457,21 @@ extension CutEngine {
                 }
                 sourceStart = try RationalTime(numerator: startSample, denominator: 48_000).subtracting(media.origin)
                 sourceEnd = try RationalTime(numerator: endSample, denominator: 48_000).subtracting(media.origin)
+                trackOutputStart = try outputStart.adding(sourceStart.subtracting(from))
+                trackOutputEnd = try outputStart.adding(sourceEnd.subtracting(from))
+            } else if trimsAAC(audio, container: container) {
+                // The copy keeps whole frames inside these windows, and Smart Trim encodes the frames at each join.
+                let rate = Int64(track.sampleRate)
+                func sample(_ time: RationalTime) throws -> RationalTime {
+                    RationalTime(numerator: try time.roundedToSamples(track.sampleRate), denominator: rate)
+                }
+                sourceStart = first && from == .zero ? max(.zero, audio.start) : try sample(from)
+                sourceEnd = last ? (reachesAudioEnd ? audio.end : to) : try sample(to)
+                guard sourceStart < sourceEnd, sourceStart >= audio.start, sourceEnd <= audio.end else {
+                    throw CutError(code: "unsafe_boundary", message: "AAC track \(track.index) does not cover the requested interval.",
+                                   segment: segment, boundary: sourceStart < audio.start ? "from" : "to",
+                                   track: track.index).because(.cutAACCoverage)
+                }
                 trackOutputStart = try outputStart.adding(sourceStart.subtracting(from))
                 trackOutputEnd = try outputStart.adding(sourceEnd.subtracting(from))
             } else if track.isPCM || supportsAACEdits(track, container: container) {

@@ -17,11 +17,13 @@ final class TimelineTierContainerTests: XCTestCase {
     }
 
     func testTierAndOpeningContainerPreferTheUsersContainerOnlyWhenItVerifies() throws {
-        // H.264 with AAC in MOV. A cut on a keyframe that is not on an AAC packet copies into MOV and MP4, whose
-        // edit lists trim the sound, and is refused by Matroska. All three are listed for the source.
+        // H.264 with AAC in MOV. Two ranges joined on keyframes that are not on AAC packets copy into MOV and MP4,
+        // whose edit lists place the join. Matroska refuses them: a copy cannot join AAC frames there, and the second
+        // range, one picture long, is too short for the AAC frames Smart Trim would encode. All three are listed.
         let movie = fixture("Shuttle-Chirp.mov")
         let media = try CutEngine(useSidecar: false).inspect(movie, keyframes: true)
-        let cut = [ClipRequest(file: movie, from: RationalTime(numerator: 3, denominator: 5), to: nil)]
+        let cut = [ClipRequest(file: movie, from: .zero, to: RationalTime(numerator: 3, denominator: 5)),
+                   ClipRequest(file: movie, from: RationalTime(numerator: 6, denominator: 5), to: RationalTime(numerator: 31, denominator: 25))]
         let whole = [ClipRequest(file: movie)]
         let engine = CutEngine(useSidecar: false)
         XCTAssertEqual(engine.suggestedContainers(for: media, clips: cut), ["mov", "mkv", "mp4"])
@@ -32,6 +34,11 @@ final class TimelineTierContainerTests: XCTestCase {
         }
         XCTAssertTrue(plans("mov") && plans("mp4"))
         XCTAssertFalse(plans("mkv"), "The scenario needs a listed container that fails for these cuts.")
+        // A single cut inside an AAC frame copies into Matroska too: a codec delay hides the start, packets unchanged.
+        let head = [ClipRequest(file: movie, from: RationalTime(numerator: 3, denominator: 5), to: nil)]
+        if case .unavailable(let issue, _) = planner.resolve(ExportRequest(clips: head, mode: .copy, container: "mkv"), media: [movie: media]) {
+            XCTFail("A Matroska copy refuses a start inside an AAC frame: \(issue.message)")
+        }
 
         // preferred → the container of the tier and of the sheet's opening state.
         let cases: [(preferred: String?, clips: [ClipRequest], expected: String)] = [

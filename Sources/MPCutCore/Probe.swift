@@ -588,10 +588,11 @@ private extension Probe {
                 let raw = try timestamp(packet.pts, base: base)
                 let skip = Swift.max(Int64(packet.skip), Int64(track.initial_padding))
                 var start = try raw.adding(RationalTime(numerator: skip, denominator: Int64(track.sample_rate)))
-                if string(track.codec) == "opus", format.split(separator: ",").contains("matroska"),
-                   base == RationalTime(numerator: 1, denominator: 1000), track.sample_rate == 48_000 {
-                    // Matroska stores the leading codec delay rounded to milliseconds.
-                    start = try raw.adding(RationalTime(numerator: (skip + 24) / 48, denominator: 1000))
+                if format.split(separator: ",").contains("matroska"), base == RationalTime(numerator: 1, denominator: 1000),
+                   skip > 0, track.initial_padding > 0 {
+                    // FFmpeg moves Matroska timestamps back by the codec delay rounded to milliseconds, so the first
+                    // audible sample is where that rounded delay, not the exact one, brings the first packet.
+                    start = try raw.adding(matroskaDelay(skip, sampleRate: Int64(track.sample_rate)))
                 }
                 var editCount = 0
                 var editRate: Int32 = 0
@@ -750,6 +751,11 @@ private extension Probe {
         return presentation
     }
 
+    /// The codec delay as FFmpeg subtracts it from Matroska timestamps: whole milliseconds, rounded to nearest.
+    static func matroskaDelay(_ samples: Int64, sampleRate: Int64) -> RationalTime {
+        RationalTime(numerator: (samples * 1000 + sampleRate / 2) / max(1, sampleRate), denominator: 1000)
+    }
+
     static func buildAudio(_ stream: StreamInfo, packets: UnsafeBufferPointer<MPProbePacket>,
                            origin: RationalTime, standalone: Bool, progress: (Int) -> Void, cancelled: (() -> Bool)?) throws -> AudioIndex {
         let sampleRate = Int64(max(1, stream.sampleRate))
@@ -812,7 +818,13 @@ private extension Probe {
                abs(rawStart.seconds - priorSampleEnd.seconds) <= stream.timeBase.seconds + 0.5 / Double(sampleRate) {
                 sampleStart = priorSampleEnd
             }
-            let audibleStart = skip == 0 ? sampleStart : try sampleStart.adding(RationalTime(numerator: Int64(skip), denominator: sampleRate))
+            // A Matroska codec delay moves timestamps back by whole milliseconds (see makeMedia), so the first packet's
+            // audible start is that many milliseconds on, which is the sample the decoder delivers first.
+            let matroskaStart = index == 0 && skip > 0 && stream.initialPadding > 0 && stream.codec != "opus"
+                && stream.timeBase == RationalTime(numerator: 1, denominator: 1000)
+            let audibleStart = skip == 0 ? sampleStart
+                : matroskaStart ? try sampleStart.adding(matroskaDelay(Int64(skip), sampleRate: sampleRate))
+                : try sampleStart.adding(RationalTime(numerator: Int64(skip), denominator: sampleRate))
             let decodedEnd = decodedSamples > 0
                 ? try sampleStart.adding(RationalTime(numerator: Int64(decodedSamples), denominator: sampleRate))
                 : rawEnd

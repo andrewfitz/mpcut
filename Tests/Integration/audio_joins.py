@@ -3,15 +3,19 @@
 
 An AAC copy into MOV, MP4 or M4A places each range with its own edit-list entry. AVFoundation applies it to the
 sample. FFmpeg applies an interior entry only at whole AAC frames: it plays the whole last frame before a join and
-leaves out the partial first frame after it. AC-3 and E-AC-3 joins are on frame boundaries, but the first block
-after a join decodes with another frame's overlap. Each test decodes the outputs and compares them with the source.
+leaves out the partial first frame after it. Into Matroska, which has no edit list, Smart Trim encodes the few AAC
+frames around each join and trims one of them with DiscardPadding, so FFmpeg decodes the join to the sample. AC-3 and
+E-AC-3 joins are on frame boundaries, but the first block after a join decodes with another frame's overlap. Each test
+decodes the outputs and compares them with the source.
 """
 import argparse
 from array import array
+from fractions import Fraction
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -153,16 +157,126 @@ class AudioJoins(unittest.TestCase):
             with self.subTest(mode=mode):
                 self.check_aac_joins(self.root / f"sound-{mode}.m4a", ranges, mode, tracks="audio")
 
-    def test_matroska_refuses_an_interior_aac_start_in_copy_and_smart(self):
-        for mode in ["copy", "smart"]:
-            with self.subTest(mode=mode):
-                output = self.root / f"refused-{mode}.mkv"
-                error = self.export(output, [(48000, 96000), (144000, 192000)], mode, dry=True, ok=False)["error"]
-                self.assertEqual((error["code"], error["reason"], error["track"]), ("unsafe_boundary", "cut_audio_packet", 1))
-                output = self.root / f"refused-{mode}.mka"
-                error = self.export(output, [(48623, 96000), (144011, 192000)], mode, ok=False, tracks="audio")["error"]
-                self.assertEqual((error["code"], error["reason"]), ("unsafe_boundary", "join_decoder_history"))
-                self.assertFalse(output.exists())
+    def test_matroska_copy_refuses_an_aac_join_and_names_smart_trim(self):
+        output = self.root / "refused.mkv"
+        error = self.export(output, [(0, 115200), (153600, 288000)], "copy", dry=True, ok=False)["error"]
+        self.assertEqual((error["code"], error["reason"], error["track"]), ("unsafe_boundary", "join_aac_frames", 1))
+        self.assertIn("Smart Trim makes the join exact", error["message"])
+        self.assertIn("smart_trim", [alternative["id"] for alternative in error["alternatives"]])
+        # A single range can start and end inside AAC frames: the copy keeps every frame byte for byte, a codec delay
+        # hides the start with the frame before it, and DiscardPadding the end. FFmpeg decodes exactly that range.
+        trimmed = self.root / "trimmed.mkv"
+        report = self.export(trimmed, [(48000, 278400)], "copy")
+        self.assertNotIn("encoded_audio_edges", report["segments"][0])
+        self.assertNotIn("encoded_audio_duration", report)
+        decoded, wanted = decode_ffmpeg(trimmed), frames(self.source_ffmpeg, 48000, 278400)
+        self.assertEqual(len(decoded), len(wanted))
+        self.assertLessEqual(max(abs(a - b) for a, b in zip(decoded, wanted)), 1)
+        # A sound-only export has no Smart Trim, so its refusal points to a conversion.
+        output = self.root / "refused.mka"
+        error = self.export(output, [(48623, 96000), (144011, 192000)], "copy", ok=False, tracks="audio")["error"]
+        self.assertEqual((error["code"], error["reason"]), ("unsafe_boundary", "join_decoder_history"))
+        self.assertIn("converting the audio makes the join exact", error["message"])
+        self.assertFalse(output.exists())
+
+    def bridged_movie(self, name, audio):
+        """A six-second H.264 movie with keyframes every 0.2 s and the given AAC file as its sound."""
+        path = self.root / name
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=320x240:r=25", "-i", audio, "-t", "6", "-map", "0:v", "-map", "1:a",
+               "-c:v", "libx264", "-g", "5", "-bf", "0", "-c:a", "copy", path)
+        return path
+
+    def check_matroska_bridges(self, source, encoder, ranges, rate=RATE):
+        """`ranges` are in 1/48000 s; `rate` is the sample rate of the source."""
+        output = self.root / f"bridged-{source.name}-{ranges[0][0]}.mkv"
+        dry = self.export(output, ranges, "smart", dry=True, source=source)
+        report = self.export(output, ranges, "smart", source=source)
+        self.assertEqual(dry["segments"], report["segments"], "the dry run and the export plan different frames")
+        self.assertEqual(dry.get("encoded_audio_duration"), report.get("encoded_audio_duration"))
+        self.assertEqual(dry.get("warnings"), report.get("warnings"))
+        segments = report["segments"]
+        self.assertNotIn("encoded_audio_edges", segments[0])
+        edges = []
+        for segment in segments[1:]:
+            self.assertEqual(len(segment["encoded_audio_edges"]), 1, segment)
+            edge = segment["encoded_audio_edges"][0]
+            self.assertEqual((edge["track"], edge["encoder"]), (1, encoder))
+            audio = [action for action in segment["track_actions"] if action["kind"] == "audio"]
+            self.assertEqual([action["action"] for action in audio], ["copy_and_encode"])
+            start, end = (round(time(edge[key]) * rate) for key in ("from", "to"))
+            self.assertEqual(edge["frame_count"], (end - start + 1023) // 1024)
+            edges.append((start, end))
+        self.assertEqual(time(report["encoded_audio_duration"]), sum(Fraction(end - start, rate) for start, end in edges))
+
+        # AVFoundation cannot read Matroska, so FFmpeg is the reader here. It applies DiscardPadding to the sample.
+        original = decode_ffmpeg(source)
+        expected = array("h")
+        for segment in segments:
+            track = [track for track in segment["tracks"] if track["kind"] == "audio"][0]
+            expected += frames(original, round(time(track["source_start"]) * rate), round(time(track["source_end"]) * rate))
+        decoded = decode_ffmpeg(output)
+        self.assertEqual(len(decoded), len(expected), "the bridges or the trims at the outer edges change the length")
+        inside = set()
+        for start, end in edges:
+            inside.update(range(2 * start, 2 * (end + 1024)))
+            region = range(2 * start, 2 * (end + 1024))
+            error = (sum((decoded[i] - expected[i]) ** 2 for i in region) / len(region)) ** 0.5
+            self.assertLess(error, 0.02 * 32768, f"the encoded frames at {start} differ beyond codec error")
+            steps = max(abs(decoded[i] - decoded[i - 2]) for i in region)
+            wanted = max(abs(expected[i] - expected[i - 2]) for i in region)
+            self.assertLess(steps, wanted + 0.1 * 32768, f"the encoded frames at {start} click")
+        outside = max(abs(decoded[i] - expected[i]) for i in range(len(expected)) if i not in inside)
+        self.assertLessEqual(outside, 1, "a copied frame decodes differently")
+
+        # The output reopens with its planned duration, and a copy of it keeps the trims.
+        info = json.loads(subprocess.run([CLI, "media", "inspect", "--json", output], env=self.env, capture_output=True,
+                                         text=True, check=True).stdout)
+        self.assertEqual(time(info["media"]["duration"]), time(report["duration"]))
+        copy = self.root / f"recopied-{source.name}-{ranges[0][0]}.mkv"
+        subprocess.run([CLI, "export", "clips", "join", "--json", "--mode", "copy", "--clip", output, "--output", copy],
+                       env=self.env, capture_output=True, check=True)
+        self.assertTrue(decode_ffmpeg(copy) == decode_ffmpeg(output), "a copy of the output decodes differently")
+
+    def test_smart_trim_encodes_exact_aac_joins_into_matroska(self):
+        # Joins from the source's start to its end, then a start and an end inside frames, trimmed by a codec delay
+        # and DiscardPadding.
+        whole = [(0, 115200), (153600, 192000), (19200, 48000), (249600, 288000)]
+        inner = [(48000, 115200), (153600, 192000), (19200, 48000), (249600, 278400)]
+        sources = [(self.movie, "ffmpeg")]
+        matroska = self.root / "source.mkv"
+        ffmpeg("-i", self.movie, "-c", "copy", matroska)
+        sources.append((matroska, "ffmpeg"))
+        # Noise with FFmpeg's default perceptual noise substitution, which the bridge encoder leaves off.
+        noisy = self.root / "noisy.m4a"
+        ffmpeg("-f", "lavfi", "-i", "anoisesrc=c=pink:s=48000:a=0.3", "-f", "lavfi", "-i", CHIRP,
+               "-filter_complex", "[0][1]amix=inputs=2", "-t", "6", "-ac", "2", "-c:a", "aac", "-b:a", "128k", noisy)
+        sources.append((self.bridged_movie("noisy.mov", noisy), "ffmpeg"))
+        if shutil.which("afconvert"):
+            wave = self.root / "chirp.wav"
+            ffmpeg("-f", "lavfi", "-i", CHIRP, "-t", "6", "-c:a", "pcm_s16le", wave)
+            apple = self.root / "apple.m4a"
+            subprocess.run(["afconvert", "-f", "m4af", "-d", "aac", "-b", "160000", wave, apple], check=True)
+            sources.append((self.bridged_movie("apple.mov", apple), "apple"))
+        cd = self.root / "cd.m4a"
+        ffmpeg("-f", "lavfi", "-i", CHIRP.replace("s=48000", "s=44100"), "-t", "6", "-c:a", "aac", "-b:a", "128k", cd)
+        rated = [(self.bridged_movie("cd.mov", cd), "ffmpeg", 44100)]
+        for (source, encoder), (name, ranges) in [(pair, choice) for pair in sources for choice in [("whole", whole), ("inner", inner)]]:
+            with self.subTest(source=source.name, ranges=name):
+                self.check_matroska_bridges(source, encoder, ranges)
+        for source, encoder, rate in rated:
+            with self.subTest(source=source.name, ranges="inner"):
+                self.check_matroska_bridges(source, encoder, inner, rate)
+
+    @unittest.skipUnless(shutil.which("afconvert"), "needs afconvert for an HE-AAC source")
+    def test_smart_trim_refuses_an_he_aac_join_into_matroska_with_its_reason(self):
+        wave = self.root / "he.wav"
+        ffmpeg("-f", "lavfi", "-i", CHIRP, "-t", "6", "-c:a", "pcm_s16le", wave)
+        he = self.root / "he.m4a"
+        subprocess.run(["afconvert", "-f", "m4af", "-d", "aach", "-b", "64000", wave, he], check=True)
+        source = self.bridged_movie("he.mov", he)
+        error = self.export(self.root / "he.mkv", [(0, 115200), (153600, 288000)], "smart", ok=False, source=source)["error"]
+        self.assertEqual((error["code"], error["reason"]), ("unsafe_boundary", "join_decoder_history"))
+        self.assertIn("HE-AAC", error["message"])
 
     def test_converted_sound_places_every_join_for_ffmpeg(self):
         ranges = [(48623, 115541), (153611, 192007), (19201, 48000)]

@@ -93,7 +93,7 @@ private struct IndexHeader: Codable {
     // layers, which Smart Trim and Re-encode would drop, and lets MV-HEVC start at keyframes
     // whose second view begins with CRA. Every earlier H.264 index, and every index of HEVC
     // with additional layers (whose copy containers changed too), is rebuilt.
-    private static let currentProbeRevision = 13
+    private static let currentProbeRevision = 14
     let probeRevision: Int
     let identity: SourceIdentity
     let sourceExtension: String
@@ -184,13 +184,19 @@ private struct IndexHeader: Codable {
     var isUsable: Bool {
         let descriptions = streams.map(\.value)
         let needsNewIndex = descriptions.contains { ["mjpeg", "alac", "flac"].contains($0.codec) }
-        let needsRevision13 = descriptions.contains { $0.codec == "h264" || ($0.codec == "hevc" && $0.hasAdditionalVideoLayers) }
+        // Revision 14 places the first audible sample of a Matroska track with a codec delay where FFmpeg's
+        // millisecond-rounded timestamps put it.
+        let needsRevision14 = format.split(separator: ",").contains("matroska")
+            && descriptions.contains { $0.kind == "audio" && $0.initialPadding > 0 && $0.codec != "opus" }
+        let needsRevision13 = needsRevision14
+            || descriptions.contains { $0.codec == "h264" || ($0.codec == "hevc" && $0.hasAdditionalVideoLayers) }
         let needsRevision12 = needsRevision13 || format.split(separator: ",").contains("matroska")
             && descriptions.contains { ["h264", "hevc"].contains($0.codec) }
         let needsRevision11 = needsRevision12 || descriptions.contains { $0.kind != "audio" }
         let needsRevision10 = needsRevision11 || descriptions.contains { ["h264", "hevc"].contains($0.codec) }
         let needsRevision9 = format.split(separator: ",").contains("mov") || needsRevision10
-        guard probeRevision == Self.currentProbeRevision || (probeRevision == 12 && !needsRevision13)
+        guard probeRevision == Self.currentProbeRevision || (probeRevision == 13 && !needsRevision14)
+                || (probeRevision == 12 && !needsRevision13)
                 || (probeRevision == 11 && !needsRevision12)
                 || (probeRevision == 10 && !needsRevision11)
                 || (probeRevision == 9 && !needsRevision10)
