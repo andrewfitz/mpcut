@@ -93,8 +93,7 @@ extension EditorModel {
                     case .still(let plan): return "\(item.output.lastPathComponent)\n\(plan.inspectorSummary)"
                     case .picture(let plan):
                         let mode = ExportRules.displayName(mode: options.mode, soundOnly: options.tracks == .audio)
-                        return [item.output.lastPathComponent, mode, plan.report.picturePrivacyNotice, plan.report.audioPrivacyNotice]
-                            .compactMap { $0 }.joined(separator: "\n")
+                        return ([item.output.lastPathComponent, mode] + plan.notices).joined(separator: "\n")
                     }
                 }
                 return .success(batch.review(interleaving: summaries))

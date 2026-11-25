@@ -17,7 +17,8 @@ static bool h26x_random_access(const AVPacket *packet, const AVCodecParameters *
         length_size = (params->extradata[21] & 3) + 1;
     const uint8_t *bytes = packet->data;
     int size = packet->size;
-    bool random_access = false;
+    bool random_access = false, layer_cra = false;
+    int base = -1;
     for (int i = 0; i < size;) {
         int unit_end = size;
         if (length_size) {
@@ -47,12 +48,19 @@ static bool h26x_random_access(const AVPacket *packet, const AVCodecParameters *
         int type = hevc ? (bytes[i] >> 1) & 63 : bytes[i] & 31;
         if (hevc && mp_hevc_multilayer_unit(bytes + i, unit_end - i))
             *multilayer = 1;
-        if (hevc && type <= 31) {
+        if (hevc && type <= 31 && (((bytes[i] & 1) << 5) | (bytes[i + 1] >> 3))) {
+            // The picture of a higher layer in the same access unit (a second MV-HEVC view, an alpha layer) has to
+            // start its layer too. Apple's encoder starts a second view with CRA, predicted from the base picture.
+            if (require_no_leading || type < 16 || type > 21)
+                return false;
+            layer_cra |= type == 21;
+        } else if (hevc && type <= 31) {
             // BLA_N_LP and IDR_N_LP exclude pictures that decode later but present earlier.
             if (require_no_leading && type != 18 && type != 20)
                 return false;
             if (type < 16 || type > (source_start ? 21 : 20))
                 return false;
+            base = type;
             random_access = true;
         } else if (!hevc && type >= 1 && type <= 5) {
             if (type != 5)
@@ -61,6 +69,10 @@ static bool h26x_random_access(const AVPacket *packet, const AVCodecParameters *
         }
         i = unit_end;
     }
+    // Every layer of an access unit is presented at once, so a higher layer's CRA picture has no leading pictures
+    // when the base picture has none (IDR_N_LP, BLA_N_LP): no later picture of any layer is presented before it.
+    if (layer_cra && !source_start && base != 18 && base != 20)
+        return false;
     return random_access;
 }
 
@@ -210,6 +222,88 @@ static size_t unescape_rbsp(uint8_t *rbsp, const uint8_t *data, size_t length)
         zeros = data[i] == 0 ? zeros + 1 : 0;
     }
     return size;
+}
+
+bool mp_h264_layer_unit(const uint8_t *unit, size_t size)
+{
+    if (size < 1)
+        return false;
+    unsigned type = unit[0] & 31;
+    if (type == 14 || type == 15 || type == 19 || type == 20 || type == 21)
+        return true;
+    if (type != 13 || size < 2)
+        return false;
+    uint8_t rbsp[16];
+    BitReader bits = {.data = rbsp, .size = unescape_rbsp(rbsp, unit + 1, size - 1 < sizeof(rbsp) ? size - 1 : sizeof(rbsp))};
+    ue(&bits); // seq_parameter_set_id
+    unsigned aux_format_idc = ue(&bits);
+    return !bits.invalid && aux_format_idc != 0;
+}
+
+bool mp_h264_layered(const AVPacket *packet, const AVCodecParameters *params)
+{
+    int length_size = params->extradata_size >= 5 && params->extradata[0] == 1 ? (params->extradata[4] & 3) + 1 : 0;
+    const uint8_t *bytes = packet->data;
+    int size = packet->size;
+    for (int i = 0; i < size;) {
+        int unit_end = size;
+        if (length_size) {
+            if (size - i < length_size)
+                return false;
+            uint32_t length = 0;
+            for (int end = i + length_size; i < end; i++)
+                length = (length << 8) | bytes[i];
+            if (!length || length > (uint32_t)(size - i))
+                return false;
+            unit_end = i + (int)length;
+        } else {
+            while (i <= size - 3 && (bytes[i] || bytes[i + 1] || bytes[i + 2] != 1))
+                i++;
+            if (i > size - 4)
+                break;
+            i += 3;
+            for (int next = i; next <= size - 3; next++) {
+                if (!bytes[next] && !bytes[next + 1] && bytes[next + 2] == 1) {
+                    unit_end = next;
+                    break;
+                }
+            }
+        }
+        if (mp_h264_layer_unit(bytes + i, (size_t)(unit_end - i)))
+            return true;
+        i = unit_end;
+    }
+    return false;
+}
+
+/* Whether an avcC record lists a sequence parameter set extension that declares an auxiliary picture. */
+static bool avcc_auxiliary(const AVCodecParameters *params)
+{
+    const uint8_t *p = params->extradata, *end = p + params->extradata_size;
+    if (params->extradata_size < 7 || p[0] != 1 || p[1] == 66 || p[1] == 77 || p[1] == 88)
+        return false;
+    p += 5;
+    for (int kind = 0; kind < 2; kind++) {
+        if (end - p < 1)
+            return false;
+        unsigned count = kind ? p[0] : p[0] & 31;
+        p++;
+        for (unsigned i = 0; i < count; i++) {
+            if (end - p < 2 || end - p - 2 < AV_RB16(p))
+                return false;
+            p += 2 + AV_RB16(p);
+        }
+    }
+    if (end - p < 4)
+        return false;
+    unsigned count = p[3];
+    p += 4;
+    for (unsigned i = 0; i < count && end - p >= 2 && end - p - 2 >= AV_RB16(p); i++) {
+        if (mp_h264_layer_unit(p + 2, AV_RB16(p)))
+            return true;
+        p += 2 + AV_RB16(p);
+    }
+    return false;
 }
 
 static bool read_avc_sps(AVCodecParameters *params, bool *may_interlace)
@@ -556,6 +650,8 @@ bool mp_read_video_header(AVCodecParameters *params, const AVPacket *packet, boo
 {
     switch (params->codec_id) {
     case AV_CODEC_ID_H264:
+        if (avcc_auxiliary(params))
+            *multilayer = 1;
         if (read_avc_sps(params, may_interlace)) {
             if (*may_interlace && params->field_order == AV_FIELD_UNKNOWN)
                 read_with_parser(params, packet);

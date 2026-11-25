@@ -132,9 +132,18 @@ enum ParticipantPictureColor {
         }
     }
 
+    /// The space Core Video gives a picture tagged BT.709, the same on every system. Rendering into it keeps
+    /// a BT.709 recording's code values; `CGColorSpace.itur_709` uses another curve and shifts midtones.
+    static let bt709: CGColorSpace = CVImageBufferCreateColorSpaceFromAttachments([
+        kCVImageBufferColorPrimariesKey: kCVImageBufferColorPrimaries_ITU_R_709_2,
+        kCVImageBufferTransferFunctionKey: kCVImageBufferTransferFunction_ITU_R_709_2,
+        kCVImageBufferYCbCrMatrixKey: kCVImageBufferYCbCrMatrix_ITU_R_709_2
+    ] as CFDictionary)?.takeRetainedValue() ?? CGColorSpace(name: CGColorSpace.itur_709)!
+
+    /// SDR output is BT.709 on every system, in both its pixels and its tags, like MPCut's other video output.
     var colorSpace: CGColorSpace {
         switch self {
-        case .sdr: ParticipantCompositor.colorSpace
+        case .sdr: Self.bt709
         case .pq: CGColorSpace(name: CGColorSpace.itur_2100_PQ)!
         case .hlg: CGColorSpace(name: CGColorSpace.itur_2100_HLG)!
         }
@@ -150,17 +159,21 @@ enum ParticipantPictureColor {
 
     var encoderTransfer: String {
         switch self {
-        case .sdr:
-            if #available(macOS 15, *) { return AVVideoTransferFunction_IEC_sRGB }
-            return AVVideoTransferFunction_ITU_R_709_2
-        case .pq: return AVVideoTransferFunction_SMPTE_ST_2084_PQ
-        case .hlg: return AVVideoTransferFunction_ITU_R_2100_HLG
+        case .sdr: AVVideoTransferFunction_ITU_R_709_2
+        case .pq: AVVideoTransferFunction_SMPTE_ST_2084_PQ
+        case .hlg: AVVideoTransferFunction_ITU_R_2100_HLG
         }
+    }
+
+    /// The space canvas, gap and cover colors are given in. SDR colors are written with their own code
+    /// values; HDR output keeps reading them as sRGB.
+    var canvasSpace: CGColorSpace {
+        self == .sdr ? colorSpace : ParticipantCompositor.colorSpace
     }
 
     var bufferTransfer: CFString {
         switch self {
-        case .sdr: kCVImageBufferTransferFunction_sRGB
+        case .sdr: kCVImageBufferTransferFunction_ITU_R_709_2
         case .pq: kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ
         case .hlg: kCVImageBufferTransferFunction_ITU_R_2100_HLG
         }

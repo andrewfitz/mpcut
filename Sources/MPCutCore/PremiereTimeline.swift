@@ -133,6 +133,8 @@ enum PremiereTimeline {
         for file in Set(edits.map(\.file)) { _ = try inspect(file) }
         let video = edits.lazy.filter(\.video).compactMap { media[$0.file]?.videoStream }.first ?? referenceVideo
         let fps = video?.frameRate ?? RationalTime(numerator: 30)
+        // A Premiere sequence needs a picture format. With no picture to follow, say which one it was given.
+        if video == nil { warnings.insert("No clip has picture, so the sequence uses 30 fps and 1920 × 1080.") }
         func frame(_ time: RationalTime, at rate: RationalTime) throws -> Int64 {
             let exact = try time.multiplied(by: rate)
             if exact.denominator != 1 { try loss("Premiere rounds subframe edits to the nearest frame.") }

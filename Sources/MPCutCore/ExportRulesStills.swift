@@ -183,7 +183,7 @@ extension StillTimelinePlan {
 extension StillExportReport {
     /// Fidelity of this selected plan. A full-program tier may plan a different mode or container.
     public var fidelityTier: FidelityTier {
-        if (mode == .encode && tracks != .audio) || soundActions.contains(where: { $0.audio == .aac }) ||
+        if (mode == .encode && tracks != .audio) || soundActions.contains(where: { [.aac, .mp3, .opus].contains($0.audio) }) ||
             (audioOutput != .separateTracks && !soundActions.isEmpty) {
             return .reencode
         }

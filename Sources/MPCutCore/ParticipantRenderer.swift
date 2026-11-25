@@ -31,6 +31,7 @@ public struct ParticipantRenderer: Sendable {
         if let output { try project.validateDestination(output, relativeTo: document) }
         let resolved = try prepare(project, document: document, plan: plan, cancelled: cancelled, range: range,
                                    silenceAudio: settings.audio == .removeAudio, sharedInputs: sharedInputs)
+        resolved.noteEncoding(settings)
         let sound = try ParticipantRenderSound.resolve(project.participantSound(in: range), document: document, timeline: resolved.timeline.timeline,
                                                        audio: resolved.plan.audio, cancelled: cancelled, action: settings.audio,
                                                        container: output?.pathExtension.lowercased() ?? "mov", audioOutput: audioOutput)
@@ -54,6 +55,7 @@ public struct ParticipantRenderer: Sendable {
         _ = update(0)
         try project.validateDestination(output, relativeTo: document)
         let resolved = try prepare(project, document: document, plan: plan, cancelled: isCancelled, range: range, silenceAudio: settings.audio == .removeAudio)
+        resolved.noteEncoding(settings)
         let sound = try ParticipantRenderSound.resolve(project.participantSound(in: range), document: document, timeline: resolved.timeline.timeline,
                                                        audio: resolved.plan.audio, cancelled: isCancelled, action: settings.audio,
                                                        container: output.pathExtension.lowercased(), audioOutput: audioOutput)
@@ -116,22 +118,34 @@ public struct ParticipantRenderer: Sendable {
             }
         }
         if !legacyWholeFramePrivacy, project.stillFormat != nil { plan.canvas = project.projectOutputSettings.canvas }
-        if usesSourceCanvas, let source = try Self.sourceCanvas(project, document: document, cancelled: cancelled) {
-            plan.canvas = source
+        // A canvas without a chosen frame rate follows the reference recording, so its pictures are not
+        // dropped or repeated. Saved compositions always store their rate and render as before.
+        let followsRecordingRate = plan.canvas.requestedFrameRate == nil
+        var canvasWarnings: [String] = []
+        if usesSourceCanvas || followsRecordingRate,
+           let source = try Self.sourceCanvas(project, document: document, cancelled: cancelled) {
+            if usesSourceCanvas { plan.canvas = source.canvas } else { plan.canvas.frameRate = source.canvas.frameRate }
+            if let rate = source.rateWarning { canvasWarnings.append(rate) }
+            if usesSourceCanvas, let size = source.sizeWarning { canvasWarnings.append(size) }
         }
+        if plan.canvas.requestedFrameRate == nil { plan.canvas.frameRate = ParticipantCanvas.fallbackFrameRate }
         if silenceAudio { plan.audio = .init() }
         let legacyTreatments = project.participants.render?.redactions ?? []
         let usesLegacyTreatment = plan.redactions.contains(where: legacyTreatments.contains)
         let legacyPrivacy = legacyWholeFramePrivacy || usesLegacyTreatment
         let legacyFormat = legacyWholeFramePrivacy || (project.participants.tileOutput == nil && usesLegacyTreatment)
         try plan.validate(allowNativeLayouts: !legacyFormat)
-        return try .init(project: project, document: document, plan: plan, cancelled: cancelled, auditPrivacy: auditPrivacy,
-                         forceSDR: forceSDR || legacyWholeFramePrivacy, range: range, sharedInputs: sharedInputs,
-                         legacyWholeFramePrivacy: legacyPrivacy)
+        let session = try ParticipantRenderSession(project: project, document: document, plan: plan, cancelled: cancelled,
+                                                   auditPrivacy: auditPrivacy, forceSDR: forceSDR || legacyWholeFramePrivacy,
+                                                   range: range, sharedInputs: sharedInputs, legacyWholeFramePrivacy: legacyPrivacy)
+        session.warnings = canvasWarnings
+        return session
     }
 
-    private static func sourceCanvas(_ project: CutProject, document: URL,
-                                     cancelled: (@Sendable () -> Bool)?) throws -> ParticipantCanvas? {
+    /// The canvas a composition without its own takes from the first readable reference recording, with what it
+    /// could not follow: a rate that is neither regular nor near a standard one, or a picture wider than 8192 pixels.
+    private static func sourceCanvas(_ project: CutProject, document: URL, cancelled: (@Sendable () -> Bool)?) throws
+        -> (canvas: ParticipantCanvas, rateWarning: String?, sizeWarning: String?)? {
         let candidates: [String]
         if case .multicam(let multicam) = project {
             candidates = multicam.recordings(for: multicam.referenceAngle).map(\.file)
@@ -147,13 +161,42 @@ public struct ParticipantRenderer: Sendable {
                   video.displayWidth > 0, video.displayHeight > 0 else { continue }
             let scale = min(1, 8192 / Double(max(video.displayWidth, video.displayHeight)))
             func even(_ dimension: Int) -> Int { max(2, Int((Double(dimension) * scale / 2).rounded()) * 2) }
-            let rate = video.frameRate
-            let supported = rate > .zero && rate.seconds <= 120 && rate.numerator <= Int64(Int32.max)
-            return .init(width: even(video.displayWidth), height: even(video.displayHeight),
-                         frameRate: supported ? rate : .init(numerator: 30))
+            let rate = canvasRate(video.frameRate)
+            let canvas = ParticipantCanvas(width: even(video.displayWidth), height: even(video.displayHeight),
+                                           frameRate: rate ?? ParticipantCanvas.fallbackFrameRate)
+            let name = file.lastPathComponent
+            return (canvas,
+                    rate == nil ? Self.irregularRateWarning(name, rate: video.frameRate) : nil,
+                    scale < 1 ? "\(name) is larger than 8192 pixels, so the canvas is scaled to "
+                        + "\(canvas.width) × \(canvas.height)." : nil)
         }
         try engine.checkCancellation()
         return nil
+    }
+
+    /// The warning for a recording whose rate `canvasRate` refuses, so the canvas takes 30 fps and repeats or drops pictures.
+    package static func irregularRateWarning(_ name: String, rate: RationalTime) -> String {
+        let fallback = ParticipantCanvas.fallbackFrameRate.description
+        guard rate > .zero else {
+            return "The frame rate of \(name) could not be read, so the canvas uses \(fallback) fps. Choose a frame rate to change it."
+        }
+        return "\(name) averages \(String(format: "%.3f", rate.seconds)) fps, which is not a regular rate, so the canvas uses "
+            + "\(fallback) fps and pictures may repeat or drop. Choose a frame rate to change it."
+    }
+
+    /// A recording's rate as a canvas cadence. A variable-rate recording's average snaps to the nearest
+    /// standard rate within 0.05%, and an irregular rate is refused, so the movie clock stays small.
+    package static func canvasRate(_ rate: RationalTime) -> RationalTime? {
+        guard rate > .zero, rate.seconds <= 120, rate.numerator <= Int64(Int32.max) else { return nil }
+        let standard: [RationalTime] = [
+            .init(numerator: 24000, denominator: 1001), .init(numerator: 24), .init(numerator: 25),
+            .init(numerator: 30000, denominator: 1001), .init(numerator: 30), .init(numerator: 48), .init(numerator: 50),
+            .init(numerator: 60000, denominator: 1001), .init(numerator: 60), .init(numerator: 100),
+            .init(numerator: 120000, denominator: 1001), .init(numerator: 120)
+        ]
+        if let near = standard.min(by: { abs($0.seconds - rate.seconds) < abs($1.seconds - rate.seconds) }),
+           abs(near.seconds - rate.seconds) <= near.seconds * 0.0005 { return near }
+        return rate.denominator <= 1001 ? rate : nil
     }
 
     @discardableResult
@@ -187,6 +230,8 @@ final class ParticipantRenderSession {
     let engine: CutEngine
     let extent: CGRect
     let color: ParticipantPictureColor
+    /// True when a recording has more than eight bits per sample, so a ten-bit encoder keeps them.
+    let deepSource: Bool
     let frameCount: Int64
     let cadence: RationalTime
     let timescale: Int32
@@ -206,8 +251,13 @@ final class ParticipantRenderSession {
     private let treatmentIndex: Int
     private let unscannedSourceIDs: [String]
     private let pictureInputs: ParticipantSharedPictureInputs
-    private lazy var background = ParticipantCompositor.color(plan.canvas.background, in: extent)
+    private lazy var background = ParticipantCompositor.color(plan.canvas.background, in: extent, space: color.canvasSpace)
     var blankSourceRanges: [MulticamRange] = []
+    /// What the planned picture gives up, reported as `warnings`: the canvas notes of `prepare`, then those of the
+    /// encoding settings from `noteEncoding`.
+    var warnings: [String] = []
+    /// What writing the picture changed, reported as `written_warnings`. Each picture writer replaces it.
+    var writtenWarning: String?
     private var privacyIssues: [ParticipantPrivacyIssue] = []
     private let reportsPrivacyInRenderSummary: Bool
 
@@ -374,6 +424,7 @@ final class ParticipantRenderSession {
                                        transfer: canvasColor.stillTransfer, primaries: canvasColor == .sdr ? "bt709" : "bt2020",
                                        diffuseWhiteNits: project.programColorPolicy?.diffuseWhiteNits ?? 203)
         self.media = media
+        deepSource = media.values.contains { $0.video.bitDepth > 8 }
         self.geometry = geometry
         self.stale = stale.union(conflictingAliases)
         self.pendingIdentities = acceptedRoutes.mapValues { Set($0.unresolvedParticipantIDs) }
@@ -402,7 +453,22 @@ final class ParticipantRenderSession {
               publishable: privacyIssues.isEmpty || plan.unresolvedPrivacy == .cover,
               staleSourceIDs: stale.sorted(), unscannedSourceIDs: unscannedSourceIDs.isEmpty ? nil : unscannedSourceIDs, output: output,
               audioPrivacyNotice: treatments.isEmpty || plan.audio.mode == .iso || sound.actions.isEmpty
-                ? nil : "Shared audio can still contain speech from treated feeds.")
+                ? nil : "Shared audio can still contain speech from treated feeds.",
+              warnings: warnings.isEmpty ? nil : warnings, writtenWarnings: writtenWarning.map { [$0] })
+    }
+
+    /// Adds what `settings` gives up to `warnings`: a recording deeper than eight bits written by an eight-bit codec.
+    func noteEncoding(_ settings: ReencodeSettings) {
+        guard let note = Self.depthWarning(deepSource: deepSource, color: color, codec: settings.codec),
+              !warnings.contains(note) else { return }
+        warnings.append(note)
+    }
+
+    /// Nil when the picture keeps the recordings' depth: HDR and deep SDR stay ten-bit through HEVC and ProRes.
+    static func depthWarning(deepSource: Bool, color: ParticipantPictureColor, codec: ReencodeCodec) -> String? {
+        guard deepSource, color == .sdr, codec == .h264 || codec == .jpeg else { return nil }
+        let name = codec == .h264 ? "H.264" : "JPEG"
+        return "A recording has more than 8 bits per sample. \(name) writes the picture with 8 bits; choose HEVC or ProRes to keep 10."
     }
 
     func verifySources() throws {
@@ -665,7 +731,8 @@ final class ParticipantRenderSession {
                 guard !treatments.isEmpty else { return original }
                 // Legacy delivery retains the exact Core Image blur used by saved compositions.
                 return ParticipantCompositor.redact(original, appearances: sourceGeometry.at(source.frames[index].time)
-                    .appearances, treatments: treatments, allowMetal: !legacyWholeFramePrivacy)
+                    .appearances, treatments: treatments, allowMetal: !legacyWholeFramePrivacy,
+                    space: color.canvasSpace)
             }
             let result: CIImage
             if let frameInputs, decoded == nil, !treatments.isEmpty {
@@ -730,9 +797,9 @@ final class ParticipantRenderSession {
                     let area = ParticipantCompositor.rect(tile.bounds, in: source.extent)
                     if let label = tile.labelBounds {
                         let region = ParticipantCompositor.rect(label, in: source.extent)
-                        picture = ParticipantCompositor.color(color, in: region).composited(over: picture)
+                        picture = ParticipantCompositor.color(color, in: region, space: self.color.canvasSpace).composited(over: picture)
                     }
-                    picture = ParticipantCompositor.color(color, in: area).composited(over: picture)
+                    picture = ParticipantCompositor.color(color, in: area, space: self.color.canvasSpace).composited(over: picture)
                     return area
                 }
                 // Consume every native appearance of each moved feed before writing any destination.
@@ -804,7 +871,7 @@ final class ParticipantRenderSession {
         let slots = ParticipantCompositor.slots(window.shot.layout, count: layers.count, extent: extent)
         for (layer, rect) in zip(layers, slots) {
             cells?(layer.slot, rect)
-            if let rgb = layer.slot.background { result = ParticipantCompositor.color(rgb, in: rect).composited(over: result) }
+            if let rgb = layer.slot.background { result = ParticipantCompositor.color(rgb, in: rect, space: color.canvasSpace).composited(over: result) }
             guard let route = layer.route, let index = layer.index else { continue }
             var picture = try image(route, index)
             if let bounds = layer.bounds {

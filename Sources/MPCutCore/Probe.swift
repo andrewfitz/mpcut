@@ -176,7 +176,7 @@ public struct MediaInfo: Encodable, Sendable {
     public let streams: [StreamInfo]
     public let frames: [FrameInfo]
     public let audio: [AudioIndex]
-    static let auxiliaryTrackIssue = "The file contains an unsupported auxiliary, subtitle, or data track."
+    static let auxiliaryTrackIssue = "The file contains a track of unknown kind, a second timecode track, or a chapter list that cannot be read."
     public let copyIssue: String?
     /// The first issue found on each audio track, by stream index. `copyIssue` reports
     /// only one issue for the file, which can belong to a track the caller excluded.

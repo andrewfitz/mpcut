@@ -26,9 +26,18 @@ public struct ParticipantRenderReport: Codable, Sendable {
     public var unscannedSourceIDs: [String]? = nil
     public let output: String?
     public var audioPrivacyNotice: String? = nil
+    /// What the planned picture gives up: bit depth the chosen codec cannot hold, or a canvas rate or size that
+    /// could not follow the recording. A dry run and the render report the same warnings.
+    public var warnings: [String]? = nil
+    /// What only writing can show, such as constant quality the encoder could not take. Nil in a plan.
+    public var writtenWarnings: [String]? = nil
+
+    /// The plan's warnings, then those of the written picture.
+    public var allWarnings: [String] { (warnings ?? []) + (writtenWarnings ?? []) }
 
     private enum CodingKeys: String, CodingKey {
-        case canvas, duration, audio, publishable, output
+        case canvas, duration, audio, publishable, output, warnings
+        case writtenWarnings = "written_warnings"
         case audioPrivacyNotice = "audio_privacy_notice"
         case staleSourceIDs = "stale_source_ids"
         case unscannedSourceIDs = "unscanned_source_ids"

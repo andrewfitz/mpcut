@@ -550,6 +550,7 @@ public struct CutEngine: Sendable {
         var segments: [ResolvedSegment] = []
         var silentAACSegments: [Int: Int] = [:]
         var audibleAACTracks: Set<Int> = []
+        var layerNotes: [String] = []
         var lastVideoDTS: RationalTime?
         let needsMatroskaDTS = uniqueMedia.contains { $0.video.reconstructedDTS }
         let canScheduleVideo = needsMatroskaDTS || (smartTrim && ["mov", "mp4", "m4v"].contains(container)
@@ -589,6 +590,11 @@ public struct CutEngine: Sendable {
                                   field: "from", includeSuggestions: includeSuggestions, eligible: { $0 < requestedTo })
             let to = try select(requestedTo, from: endCandidates, snap: snap, segment: endIndex,
                                 field: "to", includeSuggestions: includeSuggestions, eligible: { $0 > from })
+            // Smart Trim would have encoded these edges for a picture of one layer. Say why the cut moved instead.
+            if from != requestedFrom || to != requestedTo, let note = startCandidates.layerNote ?? endCandidates.layerNote,
+               !layerNotes.contains(note) {
+                layerNotes.append(note)
+            }
             let end = try duration.adding(to.subtracting(from))
             let sourceStart = try info.origin.adding(from)
             _ = try info.origin.adding(to)
@@ -729,11 +735,18 @@ public struct CutEngine: Sendable {
         if let track = sequence[0].streams.first(where: { $0.kind == "data" && $0.codecTag == "tmcd" }) {
             try checkTimecode(segments, duration: duration, container: container, track: track.index)
         }
+        var smartTrimNotes: [String] = []
+        if segments.contains(where: { $0.encodedEdges != nil }) {
+            smartTrimNotes = try checkSmartTrim(segments, clips: effective.map(\.startIndex))
+        }
+        smartTrimNotes += layerNotes
         for info in uniqueMedia {
             try verifyIdentity(info.url, identity: info.identity)
         }
-        return ResolvedEdit(segments: segments, duration: duration, container: container,
-                            identities: Dictionary(uniqueKeysWithValues: uniqueMedia.map { ($0.url, $0.identity) }), tracks: tracks)
+        var edit = ResolvedEdit(segments: segments, duration: duration, container: container,
+                                identities: Dictionary(uniqueKeysWithValues: uniqueMedia.map { ($0.url, $0.identity) }), tracks: tracks)
+        edit.smartTrimNotes = smartTrimNotes
+        return edit
     }
 
     public func export(_ edit: ResolvedEdit, to output: URL,
@@ -812,15 +825,20 @@ public struct CutEngine: Sendable {
         return Int32(edit.keepsTimecode ? MPCUT_TRACKS_DELIVERED_VIDEO_TIMECODE : MPCUT_TRACKS_DELIVERED_VIDEO)
     }
 
-    /// What a packet copy of this edit leaves behind, one sentence each: cover art or chapters that the container
-    /// cannot store, chapters that have no place on the output timeline, and timecode a picture-only copy cannot keep.
-    /// Only file headers are read. A source that cannot be opened reports nothing here; the export itself reports it.
+    /// What a packet copy of this edit leaves behind, one sentence each: what its Smart Trim edges lose, found when
+    /// the edit was planned, cover art or chapters that the container cannot store, chapters that have no place on the
+    /// output timeline, timecode a picture-only copy cannot keep, and HEVC that has to keep an 'hev1' description.
+    /// Only file headers are read, except, for HEVC from a source without MOV sample entries copied into MOV or MP4,
+    /// the video packets from the start of each source to its latest range start and those of the copied ranges. A
+    /// staged picture (a multicam program's lane) reports only the 'hev1' description. A source that cannot be opened
+    /// reports nothing here; the export itself reports it.
     public func copyOmissions(_ edit: ResolvedEdit) -> [String] {
-        var omissions: [String] = []
+        var omissions = edit.smartTrimNotes
         if let issue = edit.timecodeIssue {
             omissions.append("The timecode track is not copied. \(issue)")
         }
-        var notes = [CChar](repeating: 0, count: 2048)
+        // Room for every note: the writer stops adding notes once the buffer is full.
+        var notes = [CChar](repeating: 0, count: 65_536)
         let capacity = notes.count
         let selection = nativeSelection(edit)
         let status = try? withNativeSegments(edit.segments, useAudioStreamOverride: edit.usesPerSourceAudioStream) { buffer in
@@ -829,6 +847,44 @@ public struct CutEngine: Sendable {
         }
         guard status == 0 else { return omissions }
         return omissions + String(cString: notes).split(separator: "\n").map(String.init)
+    }
+
+    /// The refusals a Smart Trim export would otherwise meet only while writing: copied samples whose in-band
+    /// parameter sets the rewritten sample entry cannot keep, and edge pictures carrying metadata a re-encode drops.
+    /// `clips` gives the first clip number of each segment. Returns what the edges lose without a refusal, one
+    /// sentence each: the film grain a player would synthesize on the pictures they replace.
+    private func checkSmartTrim(_ segments: [ResolvedSegment], clips: [Int]) throws -> [String] {
+        let bridge = ExportProgress { _ in self.cancelled?() != true }
+        var failedSegment = 0
+        var diagnostic = [CChar](repeating: 0, count: 2048)
+        let capacity = diagnostic.count
+        // Room for a note on every edge: the writer stops adding notes once the buffer is full.
+        var notes = [CChar](repeating: 0, count: 65_536)
+        let notesCapacity = notes.count
+        let result = try withNativeSegments(segments) { buffer in
+            withExtendedLifetime(bridge) {
+                mpcut_check_smart_trim(buffer.baseAddress, buffer.count, &failedSegment, ExportProgress.callback,
+                                       Unmanaged.passUnretained(bridge).toOpaque(), &diagnostic, capacity,
+                                       &notes, notesCapacity)
+            }
+        }
+        if result == 2 { throw cancellationError }
+        guard result == 0 else {
+            throw CutError(code: "unsupported_format", message: String(cString: diagnostic),
+                           segment: clips.indices.contains(failedSegment - 1) ? clips[failedSegment - 1] : nil)
+                .because(.sourceSmartIneligible)
+        }
+        return String(cString: notes).split(separator: "\n").map(String.init)
+    }
+
+    /// The same check for camera footage whose Smart Trim edges a still program plans itself, so its dry run refuses
+    /// what its export would. `segment` is the one-based camera span reported in a refusal.
+    func checkSmartTrim(_ media: MediaInfo, from: RationalTime, to: RationalTime, edges: [EncodedEdge],
+                        segment: Int) throws -> [String] {
+        guard !edges.isEmpty else { return [] }
+        let range = ResolvedSegment(file: media.url, from: from, to: to, outputStart: .zero, tracks: [],
+                                    sourceOrigin: media.origin, reachesEnd: to == media.duration, encodedEdges: edges)
+        return try checkSmartTrim([range], clips: [segment])
     }
 
     private func checkTimecode(_ segments: [ResolvedSegment], duration: RationalTime,
@@ -949,7 +1005,7 @@ public struct CutEngine: Sendable {
     }
 
     private func supportedMuxContainers(_ containers: [String], for media: MediaInfo) -> [String] {
-        let eligible = containers.filter { singlePacketOpusMuxIssue(media, container: $0) == nil }
+        let eligible = containers.filter { singlePacketOpusMuxIssue(media, container: $0) == nil && audioCodecContainerIssue(media, container: $0) == nil }
         if let reported = media.reportedContainers { return eligible.filter { reported.contains($0) } }
         let candidates = media.hasVideo ? eligible : eligible.filter { audioContainerIssue(media, container: $0) == nil }
         guard !candidates.isEmpty else { return [] }
@@ -966,6 +1022,7 @@ public struct CutEngine: Sendable {
 
     func muxIssue(_ media: MediaInfo, container: String) -> String? {
         if let issue = singlePacketOpusMuxIssue(media, container: container) { return issue }
+        if let issue = audioCodecContainerIssue(media, container: container) { return issue }
         if !media.hasVideo, let issue = audioContainerIssue(media, container: container) { return issue }
         let selection = muxSelection(media)
         var diagnostic = [CChar](repeating: 0, count: 2048)
@@ -1113,6 +1170,8 @@ extension CutEngine {
         var frameAccurate = false
         /// The first frame time, when the source cannot be copied from its beginning.
         var unsafeStart: RationalTime?
+        /// Why Smart Trim cuts this source only where every picture layer starts (`smartTrimLayerNote`).
+        var layerNote: String?
     }
 }
 
@@ -1210,7 +1269,8 @@ private extension CutEngine {
             }
         }
         return Boundaries(times: candidates, rejected: rejected, frameAccurate: frameAccurate,
-                          unsafeStart: start && !media.sourceStartSafe ? media.frames.first?.time ?? .zero : nil)
+                          unsafeStart: start && !media.sourceStartSafe ? media.frames.first?.time ?? .zero : nil,
+                          layerNote: smartTrim ? smartTrimLayerNote(in: media) : nil)
     }
 
     func select(_ requested: RationalTime, from boundaries: Boundaries, snap: SnapMode,
@@ -1240,6 +1300,8 @@ private extension CutEngine {
         if let rejection {
             reason = rejection.reason
                 ?? "The picture and audio track \(rejection.track) do not share a verified \(edge) boundary at \(requested)."
+        } else if let note = boundaries.layerNote, !boundaries.frameAccurate {
+            reason = "There is no verified video \(edge) boundary at \(requested). " + note
         } else {
             reason = "There is no verified video \(edge) boundary at \(requested)."
         }

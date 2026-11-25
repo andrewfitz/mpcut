@@ -4037,7 +4037,7 @@ Returns `state`, `progress`, `input_revision` and published `outputs`. After can
 
 ### `export_editor_project_plan`
 
-Plan the open project export and report eligible ranges, review findings and the occurrence-level cut map when available. An ordinary plan lists under warnings what the output does not keep: reductions made by an encode, and cover art, chapters or timecode that a copy leaves behind. A plain copy that keeps everything has no warnings field. A re-encode lists each audio track under audio_actions with its codec, bit_rate or bit_depth and reason. Multicam and still plans carry their warnings inside plan.
+Plan the open project export and report eligible ranges, review findings and the occurrence-level cut map when available. An ordinary plan lists under warnings what the output does not keep: reductions made by an encode, and cover art, attached files, chapters, timecode, or subtitle and data tracks that a copy leaves behind. A plain copy that keeps everything has no warnings field. A re-encode lists each audio track under audio_actions with its codec, bit_rate or bit_depth and reason. A multicam plan also lists under warnings, after the plan's own, what its program leaves out of its sources, such as the chapters of a camera other than the reference angle; plan.warnings keeps the plan's own. Still plans carry their warnings inside plan. When audio auto cannot copy a sound-only selection, applied names the conversion the export rules chose and warnings begin with what it gives up.
 
 Starts a live job. Poll `export_editor_job_status_read` for its result. A successful dry run can report `eligible: false` with `reason` and any available structured `issue`, `proposed_ranges`, `alternatives` or `fallback`. An eligible plan or render can include `cut_map.occurrences[]` in playback order, with individual requested, resolved and output ranges and render segment references. Still plans report copied and encoded camera duration, generated still duration and sample count, placement ranges, effective output codec and sound actions. Confirm published paths in the job’s `outputs`. `warnings` lists what a copy cannot carry in the chosen container and the notes of a re-encode, and is absent for a plain copy that keeps everything. A re-encode also reports `audio_actions` with each track’s codec, bit rate or bit depth, and reason.
 
@@ -4062,7 +4062,7 @@ Starts a live job. Poll `export_editor_job_status_read` for its result. A succes
 
 ### `export_editor_project_render`
 
-Render the open project to the output path and report its occurrence-level cut map when available. The result reports warnings and audio_actions as export_editor_project_plan does.
+Render the open project to the output path and report its occurrence-level cut map when available. The result reports warnings and audio_actions as export_editor_project_plan does. A written Smart Trim export of a sequence adds encoded_edge_results, one row for each encoded edge with its segment, from, to, encoded_bytes, target_bytes and retried, and for an AV1 edge max_qp, with first_attempt_bytes when it was retried. A written export adds written_warnings when writing changed something no plan could know, such as constant quality the encoder could not take or pictures decoded in software after the hardware decoder failed; the warnings of a plan and its render stay the same.
 
 Starts a live job. Poll `export_editor_job_status_read` for its result. A successful dry run can report `eligible: false` with `reason` and any available structured `issue`, `proposed_ranges`, `alternatives` or `fallback`. An eligible plan or render can include `cut_map.occurrences[]` in playback order, with individual requested, resolved and output ranges and render segment references. Still plans report copied and encoded camera duration, generated still duration and sample count, placement ranges, effective output codec and sound actions. Confirm published paths in the job’s `outputs`. `warnings` lists what a copy cannot carry in the chosen container and the notes of a re-encode, and is absent for a plain copy that keeps everything. A re-encode also reports `audio_actions` with each track’s codec, bit rate or bit depth, and reason.
 
@@ -4138,7 +4138,7 @@ Returns the default `coordinate_space` and current `ranges[]` with IDs, names wh
 
 ### `export_queue_plan`
 
-Plan exports of queued entries using their captured ranges. range_plans has one row for each ordinary sequence entry: destination, mode, tracks, container, duration, copied_video_duration and encoded_video_duration for picture, audio_actions for converted sound, a summary, and warnings for what the output does not keep, such as cover art, chapters or timecode that a copy leaves behind. Still and multicam entries report under still_plans and multicam_plans.
+Plan exports of queued entries using their captured ranges. range_plans has one row for each ordinary sequence entry: destination, mode, tracks, container, duration, copied_video_duration and encoded_video_duration for picture, audio_actions for converted sound, a summary, and warnings for what the output does not keep, such as cover art, attached files, chapters, timecode, or subtitle and data tracks that a copy leaves behind. Still and multicam entries report under still_plans and multicam_plans. A multicam_plans row adds warnings, after its plan's own, with what its program leaves out of its sources, such as chapters.
 
 Returns a live job receipt with `job_id`, `input_revision`, `state`, `progress` and published `outputs`. Poll `export_editor_job_status_read` with the same project. The terminal result reports planned `destinations` and still plans for applicable queue entries. Affected entries are skipped and their IDs appear in `skipped_needs_replan`. `range_plans[]` gives each ordinary range’s destination, mode, container, copied and encoded video durations, audio actions and `warnings`.
 
@@ -4175,7 +4175,7 @@ Returns the default `coordinate_space` and current `ranges[]` with IDs, names wh
 
 ### `export_queue_render`
 
-Render the queued entries to the output directory. The result reports range_plans as export_queue_plan does.
+Render the queued entries to the output directory. The result reports range_plans as export_queue_plan does. A written ordinary range whose Smart Trim encoded edges adds encoded_edge_results to its row, as export_editor_project_render reports them. written_warnings lists, under each file name, what writing changed that no plan could know.
 
 Returns a live job receipt with `job_id`, `input_revision`, `state`, `progress` and published `outputs`. Poll `export_editor_job_status_read` with the same project. The terminal result reports planned `destinations` and still plans for applicable queue entries. Affected entries are skipped and their IDs appear in `skipped_needs_replan`. `range_plans[]` gives each ordinary range’s destination, mode, container, copied and encoded video durations, audio actions and `warnings`.
 
@@ -4215,7 +4215,7 @@ Returns a live job receipt for `export_editor_job_status_read`. Published `outpu
 
 ### `project_editor_resolve_export`
 
-Write an interchange timeline from the current project for Resolve.
+Write an interchange timeline from the current project for Resolve. The result lists warnings for what the timeline could not keep exactly, such as cuts rounded to the frame grid.
 
 Returns a live job receipt for `export_editor_job_status_read`. Published `outputs` can include both the interchange file and the linked WAV directory. The terminal result reports conversion warnings or whether Resolve opened the timeline, as applicable.
 
@@ -4228,7 +4228,7 @@ Returns a live job receipt for `export_editor_job_status_read`. Published `outpu
 
 ### `project_editor_resolve_import`
 
-Write an interchange timeline and import it into Resolve.
+Write an interchange timeline and import it into Resolve. The result lists warnings for what the timeline could not keep exactly, such as cuts rounded to the frame grid.
 
 Returns a live job receipt for `export_editor_job_status_read`. Published `outputs` can include both the interchange file and the linked WAV directory. The terminal result reports conversion warnings or whether Resolve opened the timeline, as applicable.
 
@@ -4798,7 +4798,7 @@ Returns the window’s actual presentation state, including zoom, available scro
 
 Read a live project's revision, editor state and a page of sequence clips or multicam occurrences. Pass the first page's revision on subsequent pages to detect concurrent edits.
 
-State includes `busy`, `modal`, selection, playhead, snapping and `history_max_steps`. Use `offset` and `total` to page `clips[]` or `occurrences[]` at a pinned revision. A sequence row identifies an occurrence by `id` and provides `sequence_from`, `sequence_to`, `source_from` and `source_to`. A multicam row identifies it by zero-based `index` and provides assembly bounds and group bounds for group rows. Insert rows identify the still placement and asset. Still placements are also paged under `stills` when present. `tier` reports the export tier of the timeline: its `id` (`true_lossless`, `lossless`, `reencode`, `checking` or `unavailable`), `name`, the best `mode` and `container`, `warnings`, and the `factors` that lower it, each with an `id`, a `message` and any `nearest` times. `current` is false while a newer timeline is being checked.
+State includes `busy`, `modal`, selection, playhead, snapping and `history_max_steps`. Use `offset` and `total` to page `clips[]` or `occurrences[]` at a pinned revision. A sequence row identifies an occurrence by `id` and provides `sequence_from`, `sequence_to`, `source_from` and `source_to`. A multicam row identifies it by zero-based `index` and provides assembly bounds and group bounds for group rows. Insert rows identify the still placement and asset. Still placements are also paged under `stills` when present. `tier` reports the export tier of the timeline: its `id` (`true_lossless`, `lossless`, `reencode`, `checking` or `unavailable`), `name`, the best `mode` and `container`, `warnings`, and the `factors` that lower it, each with an `id`, a `message` and any `nearest` times. `current` is false while a newer timeline is being checked. A sequence's `preview` names the playback `decoder` (`avfoundation`, or `ffmpeg` with the `fallback_reason` that moved playback to it), gives `picture_decoder_note` when FFmpeg decoded the picture on screen in place of AVFoundation, and repeats what the viewer shows: a blocking or retryable `issue`, an `audio_warning`, a `picture_notice` when playback skipped pictures to the next keyframe, and a `picture_issue`.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |

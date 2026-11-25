@@ -118,11 +118,19 @@ extension StillExportPlanner {
         if let cameraReference { reference = cameraReference.video }
         let effectiveFormat = format ?? project.stillFormat
         let exactStandaloneClock = held || project.stillSoundtrack != nil
+        // A still-only Smart Trim program has no camera to match: its HEVC keeps deep images in
+        // Main 10 and --quality selects the ProRes profile. Re-encode chooses these itself.
+        func generatedDepth(_ codec: ReencodeCodec) throws -> Bool {
+            guard mode != .encode, codec == .hevc else { return false }
+            return try placedStillsAreDeep(project, windows: windows, document: document, engine: engine)
+        }
+        let generatedQuality = mode != .encode ? settings.requestedQuality : nil
         if reference == nil, let format = effectiveFormat {
             let pictureClock = exactStandaloneClock ? try StillSampleSchedule.pictureClock(
                 [format.cadence.denominator] + written.flatMap { [$0.from.denominator, $0.to.denominator] }) : nil
             reference = try format.targetStream(color: project.programColorPolicy ?? StillTimelineFormat.sdrColorPolicy,
-                                                duration: timeline.duration, pictureClock: pictureClock)
+                                                duration: timeline.duration, pictureClock: pictureClock,
+                                                deep: try generatedDepth(format.codec), quality: generatedQuality)
         }
         if reference == nil, case .multicam(let multicam) = project,
            let angle = multicam.angles.first(where: { $0.id == multicam.referenceAngle }) {
@@ -148,7 +156,8 @@ extension StillExportPlanner {
                                              cadence: cadence, codec: videoCodec, container: container)
             let scale = held ? try StillSampleSchedule.pictureClock(
                 [cadence.denominator] + written.flatMap { [$0.from.denominator, $0.to.denominator] }) : nil
-            reference = try target.targetStream(color: policy, duration: timeline.duration, pictureClock: scale)
+            reference = try target.targetStream(color: policy, duration: timeline.duration, pictureClock: scale,
+                                                deep: try generatedDepth(videoCodec), quality: generatedQuality)
         }
         if mode != .encode && (!cameraSpans.isEmpty || (effectiveFormat == nil && videoCodec == nil)) && windows.contains(where: { $0.placementID != nil }) {
             try policy.validateSourceCompatibility(reference)
@@ -179,7 +188,8 @@ extension StillExportPlanner {
                            message: "The output must use PQ to retain the camera mastering-display metadata.")
         }
 
-        let generator = StillVideoGenerator(cancelled: cancelled, colorPolicy: policy, standalone: indexed.isEmpty || (cameraSpans.isEmpty && videoCodec != nil))
+        let generator = StillVideoGenerator(cancelled: cancelled, colorPolicy: policy, standalone: indexed.isEmpty || (cameraSpans.isEmpty && videoCodec != nil),
+                                            quality: settings.requestedQuality)
         let assets = Dictionary(uniqueKeysWithValues: project.stillAssets.map { ($0.id, $0) })
         let inserts = Dictionary(uniqueKeysWithValues: project.stillInserts.map { ($0.id, $0) })
         let replacements = Dictionary(uniqueKeysWithValues: project.stillReplacements.map { ($0.id, $0) })
@@ -191,6 +201,7 @@ extension StillExportPlanner {
             return file
         }
         var pictures: [StillExportPicture] = []
+        var smartTrimNotes: [String] = []
         var allConversionInputs: [ClipRequest] = []
         let timescale = mode != .encode ? Int(exactly: reference.timeBase.denominator) : nil
 
@@ -295,6 +306,14 @@ extension StillExportPlanner {
                 let edges = try cameraEdges(media, input: camera.input, frames: frames, index: index, windows: windows,
                                             mode: mode, requireCameraCopy: requireCameraCopy,
                                             container: stagingContainer, engine: engine)
+                if mode == .smart {
+                    // The refusals the export meets while writing these edges, and what they lose without one.
+                    for note in try engine.checkSmartTrim(media, from: camera.input.from, to: camera.input.to,
+                                                          edges: edges, segment: index + 1)
+                    where !smartTrimNotes.contains(note) {
+                        smartTrimNotes.append(note)
+                    }
+                }
                 if matroska && mode == .encode {
                     let shift = try window.output.from.subtracting(camera.input.from)
                     var previous = renderOutput.from
@@ -332,7 +351,13 @@ extension StillExportPlanner {
                                   writtenOutput: renderOutput == window.output ? nil : renderOutput))
         }
 
-        var warnings: [String] = []
+        var warnings = smartTrimNotes
+        // The program is assembled from staged pictures, so no camera's movie metadata reaches it.
+        let cameraFiles = pictures.compactMap { picture -> URL? in
+            if case .camera(let media, _, _, _) = picture.content { return media.url }
+            return nil
+        }
+        warnings += ReencodeChapter.droppedMetadata(of: cameraFiles, by: "The still program")
         if hdr.contains(where: { $0.hasContentLight || $0.hasInBandContentLight }) {
             warnings.append("Content-light statistics will be omitted because the still-bearing program has different content.")
         }
@@ -599,6 +624,27 @@ extension StillExportPlanner {
                                            adjustedTime: try adjacent.output.from.adding(shift), durationChange: .zero)
         }
         throw StillUnsafeJoin(issue: issue, proposals: proposals)
+    }
+
+    /// Whether any image placed in these windows has more than 8 bits per component. One answer
+    /// holds for the whole program, so every generated segment shares one HEVC profile. An image
+    /// that cannot be read here counts as 8-bit; opening it later reports the problem.
+    private func placedStillsAreDeep(_ project: CutProject, windows: [PictureWindow], document: URL,
+                                     engine: CutEngine) throws -> Bool {
+        let assets = Dictionary(uniqueKeysWithValues: project.stillAssets.map { ($0.id, $0) })
+        var placed: [String: String] = [:]
+        for insert in project.stillInserts { placed[insert.id] = insert.assetID }
+        for replacement in project.stillReplacements { placed[replacement.id] = replacement.assetID }
+        var checked: Set<String> = []
+        for window in windows {
+            guard let id = window.placementID, let assetID = placed[id], checked.insert(assetID).inserted,
+                  let asset = assets[assetID], !asset.isGap else { continue }
+            try engine.checkCancellation()
+            guard let file = try? CutProject.checkedMediaURL(asset.file, relativeTo: document),
+                  let info = try? StillImage.inspect(file) else { continue }
+            if info.bitsPerComponent > 8 { return true }
+        }
+        return false
     }
 
     private func openAsset(_ asset: StillAsset, placementID: String, document: URL, engine: CutEngine,

@@ -165,7 +165,7 @@
   },
   {
     "name": "export_editor_project_plan",
-    "description": "Plan the open project export and report eligible ranges, review findings and the occurrence-level cut map when available. An ordinary plan lists under warnings what the output does not keep: reductions made by an encode, and cover art, chapters or timecode that a copy leaves behind. A plain copy that keeps everything has no warnings field. A re-encode lists each audio track under audio_actions with its codec, bit_rate or bit_depth and reason. Multicam and still plans carry their warnings inside plan.",
+    "description": "Plan the open project export and report eligible ranges, review findings and the occurrence-level cut map when available. An ordinary plan lists under warnings what the output does not keep: reductions made by an encode, and cover art, attached files, chapters, timecode, or subtitle and data tracks that a copy leaves behind. A plain copy that keeps everything has no warnings field. A re-encode lists each audio track under audio_actions with its codec, bit_rate or bit_depth and reason. A multicam plan also lists under warnings, after the plan's own, what its program leaves out of its sources, such as the chapters of a camera other than the reference angle; plan.warnings keeps the plan's own. Still plans carry their warnings inside plan. When audio auto cannot copy a sound-only selection, applied names the conversion the export rules chose and warnings begin with what it gives up.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -306,7 +306,7 @@
   },
   {
     "name": "export_editor_project_render",
-    "description": "Render the open project to the output path and report its occurrence-level cut map when available. The result reports warnings and audio_actions as export_editor_project_plan does.",
+    "description": "Render the open project to the output path and report its occurrence-level cut map when available. The result reports warnings and audio_actions as export_editor_project_plan does. A written Smart Trim export of a sequence adds encoded_edge_results, one row for each encoded edge with its segment, from, to, encoded_bytes, target_bytes and retried, and for an AV1 edge max_qp, with first_attempt_bytes when it was retried. A written export adds written_warnings when writing changed something no plan could know, such as constant quality the encoder could not take or pictures decoded in software after the hardware decoder failed; the warnings of a plan and its render stay the same.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -600,7 +600,7 @@
   },
   {
     "name": "export_queue_plan",
-    "description": "Plan exports of queued entries using their captured ranges. range_plans has one row for each ordinary sequence entry: destination, mode, tracks, container, duration, copied_video_duration and encoded_video_duration for picture, audio_actions for converted sound, a summary, and warnings for what the output does not keep, such as cover art, chapters or timecode that a copy leaves behind. Still and multicam entries report under still_plans and multicam_plans.",
+    "description": "Plan exports of queued entries using their captured ranges. range_plans has one row for each ordinary sequence entry: destination, mode, tracks, container, duration, copied_video_duration and encoded_video_duration for picture, audio_actions for converted sound, a summary, and warnings for what the output does not keep, such as cover art, attached files, chapters, timecode, or subtitle and data tracks that a copy leaves behind. Still and multicam entries report under still_plans and multicam_plans. A multicam_plans row adds warnings, after its plan's own, with what its program leaves out of its sources, such as chapters.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -725,7 +725,7 @@
   },
   {
     "name": "export_queue_render",
-    "description": "Render the queued entries to the output directory. The result reports range_plans as export_queue_plan does.",
+    "description": "Render the queued entries to the output directory. The result reports range_plans as export_queue_plan does. A written ordinary range whose Smart Trim encoded edges adds encoded_edge_results to its row, as export_editor_project_render reports them. written_warnings lists, under each file name, what writing changed that no plan could know.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1048,7 +1048,7 @@
   },
   {
     "name": "project_editor_resolve_export",
-    "description": "Write an interchange timeline from the current project for Resolve.",
+    "description": "Write an interchange timeline from the current project for Resolve. The result lists warnings for what the timeline could not keep exactly, such as cuts rounded to the frame grid.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1083,7 +1083,7 @@
   },
   {
     "name": "project_editor_resolve_import",
-    "description": "Write an interchange timeline and import it into Resolve.",
+    "description": "Write an interchange timeline and import it into Resolve. The result lists warnings for what the timeline could not keep exactly, such as cuts rounded to the frame grid.",
     "inputSchema": {
       "type": "object",
       "properties": {

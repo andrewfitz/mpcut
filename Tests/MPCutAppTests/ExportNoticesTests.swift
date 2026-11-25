@@ -169,6 +169,9 @@ final class ExportNoticesTests: XCTestCase {
         XCTAssertEqual(actions.first?["bit_depth"] as? Int, 16)
         XCTAssertTrue((actions.first?["reason"] as? String)?.contains("written as PCM") == true, String(describing: actions.first))
         XCTAssertTrue(converted.summary.contains("Audio: Track 1: PCM (16-bit)"), converted.summary)
+        // The reason follows the row, in the engine's words.
+        let pcmReason = try XCTUnwrap(actions.first?["reason"] as? String)
+        XCTAssertTrue(converted.summary.contains("Audio: Track 1: PCM (16-bit)\nTrack 1: " + pcmReason), converted.summary)
         let row = try MCPRangePlan(destination: "/tmp/Clip-001.mov", plan: converted).json()
         XCTAssertEqual(row["mode"] as? String, "encode")
         XCTAssertEqual((row["audio_actions"] as? [[String: Any]])?.first?["bit_depth"] as? Int, 16)
@@ -181,6 +184,58 @@ final class ExportNoticesTests: XCTestCase {
         let aac = try XCTUnwrap(try plan(request).mcpNotes()["audio_actions"] as? [[String: Any]])
         XCTAssertEqual(aac.map { $0["codec"] as? String }, ["aac", "aac"])
         XCTAssertEqual(aac.map { $0["bit_rate"] as? Int }, [96_000, 96_000])
+    }
+
+    func testAFLACTrackOfAMovieReencodeStatesItsWordLengthAndReason() throws {
+        // MP4 holds FLAC. The whole recording's sound copies exactly; a trim at 1 s, where the picture and the sound share
+        // no verified start, cannot be copied, so Auto writes FLAC at the source's word length.
+        let flac = try fixture("Held-H264-FLAC", "mkv")
+        let whole = try plan(ExportRequest(clips: [.init(file: flac)], mode: .encode, container: "mp4"))
+        guard case .conversion(let copied) = whole else { return XCTFail("The re-encode did not plan a conversion.") }
+        XCTAssertEqual(copied.audioActions.first?.action, .copyOriginal)
+        let converted = try plan(ExportRequest(clips: [.init(file: flac, from: .init(numerator: 1), to: .init(numerator: 8))],
+                                               mode: .encode, container: "mp4"))
+        guard case .conversion(let conversion) = converted else { return XCTFail("The re-encode did not plan a conversion.") }
+        let track = try XCTUnwrap(conversion.audioActions.first)
+        XCTAssertEqual(track.action, .flac)
+        XCTAssertEqual(track.bitDepth, 16)
+        let reason = try XCTUnwrap(track.reason)
+        XCTAssertTrue(converted.summary.contains("\nAudio: Track 1: FLAC (16-bit)\nTrack 1: " + reason), converted.summary)
+    }
+
+    func testReencodeAudioRowsStateWhatEveryConvertedCodecWrites() {
+        func action(_ track: Int, _ audio: ReencodeAudio, codec: String, rate: Int? = nil, quality: Int? = nil,
+                    depth: Int? = nil, reason: String? = nil) -> ReencodeAudioAction {
+            var made = ReencodeAudioAction(track: track, action: audio, reason: reason)
+            made.codec = codec
+            made.bitRate = rate
+            made.quality = quality
+            made.bitDepth = depth
+            return made
+        }
+        let mixed = "The clips differ, so their sound is converted to one format."
+        let rows = ExportPlan.audioRows([
+            action(1, .flac, codec: "flac", depth: 16, reason: mixed),
+            action(2, .alac, codec: "alac", depth: 24, reason: mixed),
+            action(3, .mp3, codec: "mp3", rate: 192_000),
+            action(4, .mp3, codec: "mp3", quality: 2),
+            action(5, .opus, codec: "opus", rate: 96_000),
+            action(6, .aac, codec: "aac", rate: 128_000),
+            action(7, .pcm, codec: "pcm_f32le", depth: 32),
+            action(8, .pcm, codec: "pcm_s24le", depth: 24),
+            action(9, .pcm, codec: "pcm_s24le", depth: 24),
+        ])
+        // Rows are grouped by codec in the order the audio actions are declared (AAC, PCM, ALAC, MP3, FLAC, Opus).
+        // A reason shared by several tracks is stated once.
+        XCTAssertEqual(rows, [
+            "Audio: Track 6: AAC (128 kbps), Track 7: PCM (32-bit float), Tracks 8, 9: PCM (24-bit), Track 2: ALAC (24-bit), "
+                + "Track 3: MP3 (192 kbps), Track 4: MP3 (VBR quality 2), Track 1: FLAC (16-bit), Track 5: Opus (96 kbps)",
+            "Tracks 1, 2: " + mixed,
+        ])
+        // A reason the warnings already state is not repeated, and no tracks is said so.
+        XCTAssertEqual(ExportPlan.audioRows([action(1, .flac, codec: "flac", depth: 24, reason: mixed)], warnings: [mixed]),
+                       ["Audio: Track 1: FLAC (24-bit)"])
+        XCTAssertEqual(ExportPlan.audioRows([]), ["Audio: No audio tracks"])
     }
 
     // MARK: The export sheet
@@ -284,6 +339,186 @@ final class ExportNoticesTests: XCTestCase {
         options.copyContainer = "mkv"
         guard case .success(let kept) = await editor.reviewQueuedRanges(options: options) else { return XCTFail("The Matroska copy did not plan.") }
         XCTAssertNil(kept, "Matroska keeps the chapters, so there is nothing to review.")
+    }
+
+    func testAMulticamProgramReportsTheChaptersItLeavesOutOnEverySurface() throws {
+        // Camera b carries two chapters, but a program's chapters come from the reference angle a. The engine
+        // names what it leaves out, as `mpcut export` lists it under warnings.
+        let folder = try scratch()
+        let helper = try XCTUnwrap(ProcessInfo.processInfo.environment["MPCUT_FFMPEG_HELPER"], "The FFmpeg helper is not built.")
+        let reference = try fixture("Pause-Noisy", "mov")
+        let listing = folder.appendingPathComponent("chapters.txt")
+        try Data(";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=200\nEND=600\ntitle=One\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=600\nEND=1000\ntitle=Two\n".utf8)
+            .write(to: listing)
+        let chaptered = folder.appendingPathComponent("Camera-B.mov")
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: helper)
+        process.arguments = ["-v", "error", "-nostdin", "-i", reference.path, "-i", listing.path,
+                             "-map", "0", "-map_metadata", "1", "-map_chapters", "1", "-c", "copy", chaptered.path]
+        process.standardError = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0)
+
+        let engine = CutEngine(useSidecar: false)
+        let mediaA = try engine.inspectMulticamSource(reference), mediaB = try engine.inspectMulticamSource(chaptered)
+        let stream = try XCTUnwrap(mediaA.audio.first?.stream.index)
+        let project = MulticamProject(referenceAngle: "a", range: MulticamRange(from: .zero, to: mediaA.duration),
+                                      angles: [.init(id: "a", file: reference.path, audioStream: stream),
+                                               .init(id: "b", file: chaptered.path, audioStream: stream)],
+                                      audio: .follow, switches: [.init(at: .zero, angle: "b")])
+        let range = MulticamRange(from: RationalTime(numerator: 1, denominator: 2), to: RationalTime(numerator: 3))
+        let entry = MulticamQueuedRange(name: "Take", range: range, project: project, media: ["a": mediaA, "b": mediaB])
+        var choices = MulticamExportChoices(entry: .multicamQueue, preferred: .smart)
+        choices.settle()
+        let outputs = folder.appendingPathComponent("Outputs", isDirectory: true)
+        try FileManager.default.createDirectory(at: outputs, withIntermediateDirectories: false)
+        let batch = try AnalysisSidecar.$readsEnabled.withValue(false) {
+            try MulticamBulkExport(ranges: [entry], directory: outputs, container: choices.container, mode: choices.effectiveMode,
+                                   tracks: choices.tracks, settings: choices.settings, organization: .init(),
+                                   engine: MulticamEngine(), requireCameraCopy: choices.requireCameraCopy, cancelled: { false },
+                                   audioOutput: choices.audioOutput, audioAction: choices.requestedAudioAction,
+                                   pictureTiming: choices.pictureTiming)
+        }
+        let item = try XCTUnwrap(batch.items.first)
+        guard case .multicam(let plan) = item.payload else { return XCTFail("The range did not plan a multicam program.") }
+        let note = "Chapters come from the reference angle. 2 chapters of Camera-B.mov are not copied."
+        XCTAssertEqual(plan.copyOmissions, [note])
+        XCTAssertEqual(plan.reportedWarnings, plan.warnings + [note], "The plan's own warnings come first, as in the CLI.")
+
+        // The multicam export inspector and the Export Queue review.
+        XCTAssertTrue(plan.deliveryReview.hasSuffix("\n" + note), plan.deliveryReview)
+        XCTAssertTrue(item.review.contains(note), item.review)
+        let review = try AnalysisSidecar.$readsEnabled.withValue(false) {
+            try MulticamBulkExport.review([entry], choices: choices, organization: .init()).get()
+        }
+        XCTAssertTrue(review.contains("\n" + note), review)
+        XCTAssertEqual(review.components(separatedBy: note).count, 2, "The omission is listed once: \(review)")
+
+        // MCP: the plan and render results and each multicam_plans row list it under warnings.
+        XCTAssertEqual(plan.mcpNotes["warnings"] as? [String], plan.warnings + [note])
+
+        // The saved Export Result JSON lists it under plan.warnings, as for an ordinary export.
+        let output = folder.appendingPathComponent("Program.\(plan.container)")
+        let result = try ExportResultFile(output: output, plan: plan.resultPlan, cutMap: ExportCutMap(multicam: plan.mapping))
+        try Data().write(to: output)
+        XCTAssertTrue(result.completionMessage(for: output).contains(result.url.lastPathComponent))
+        let saved = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: result.url)) as? [String: Any])
+        let savedPlan = try XCTUnwrap(saved["plan"] as? [String: Any])
+        XCTAssertEqual(savedPlan["warnings"] as? [String], plan.warnings + [note])
+        XCTAssertEqual(savedPlan["container"] as? String, plan.container, "The rest of the plan is encoded as before.")
+        XCTAssertNotNil(savedPlan["mapping"])
+    }
+
+    // MARK: Encoded edges
+
+    func testAWrittenSmartTrimExportReportsWhatEachEdgeCostInItsMessageAndResultFile() throws {
+        // The range starts inside the first picture group, so Smart Trim encodes up to the next keyframe.
+        let folder = try scratch()
+        let clips = [ClipRequest(file: try fixture("SmartTrim-GOP", "mp4"), from: RationalTime(numerator: 7, denominator: 25))]
+        let smart = try plan(ExportRequest(clips: clips, mode: .smart, container: "mp4"))
+        let planned = smart.edit.segments.flatMap { $0.encodedEdges ?? [] }
+        XCTAssertFalse(planned.isEmpty, "The plan encodes no edge.")
+
+        let output = folder.appendingPathComponent("Smart.mp4")
+        let result = try smart.resultFile(for: output, cutMap: ExportCutMap(edit: smart.edit, clips: clips))
+        let edges = try smart.writingEncodedEdges {
+            try smart.writeOutput(to: output, cancelled: { false }) { _ in }
+        }
+        XCTAssertEqual(edges.count, planned.count, "Every encoded edge is reported once.")
+        XCTAssertEqual(edges.map(\.from), planned.sorted { $0.from < $1.from }.map(\.from))
+        XCTAssertTrue(edges.allSatisfy { $0.encodedBytes > 0 && $0.targetBytes > 0 && $0.segment == 1 })
+
+        // The message of the export ends with one compact sentence.
+        let line = try XCTUnwrap(ExportNotices.encodedEdges(edges))
+        XCTAssertTrue(line.hasPrefix("Smart Trim encoded \(edges.count == 1 ? "1 edge" : "\(edges.count) edges"): "), line)
+        XCTAssertTrue(line.hasSuffix(" target."), line)
+        XCTAssertFalse(line.contains("AV1"), "An H.264 edge is never retried.")
+        XCTAssertNil(ExportNotices.encodedEdges([]))
+        XCTAssertEqual(ExportNotices.sentence("Exported Smart.mp4", then: line), "Exported Smart.mp4. " + line)
+        XCTAssertEqual(ExportNotices.sentence("Exported Smart.mp4 and Smart.mp4.export.json.", then: line),
+                       "Exported Smart.mp4 and Smart.mp4.export.json. " + line)
+        XCTAssertEqual(ExportNotices.sentence("Exported Smart.mp4", then: nil), "Exported Smart.mp4")
+
+        // The saved Export Result JSON carries them under encoded_edge_results, as `mpcut export` reports them.
+        XCTAssertTrue(result.completionMessage(for: output, encodedEdges: edges).contains(result.url.lastPathComponent))
+        let saved = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: result.url)) as? [String: Any])
+        let rows = try XCTUnwrap(saved["encoded_edge_results"] as? [[String: Any]], String(describing: saved.keys))
+        XCTAssertEqual(rows.count, edges.count)
+        XCTAssertEqual(rows.first?["encoded_bytes"] as? Int, edges.first.map { Int($0.encodedBytes) })
+        XCTAssertEqual(rows.first?["target_bytes"] as? Int, edges.first.map { Int($0.targetBytes) })
+        XCTAssertEqual(rows.first?["retried"] as? Bool, false)
+        XCTAssertNil(rows.first?["first_attempt_bytes"])
+
+        // A plain copy encodes no edge: nothing is read and the result file has no such field.
+        let whole = [ClipRequest(file: try fixture("SmartTrim-GOP", "mp4"))]
+        let copy = try plan(ExportRequest(clips: whole, mode: .copy, container: "mp4"))
+        let copied = folder.appendingPathComponent("Copy.mp4")
+        let copyResult = try copy.resultFile(for: copied, cutMap: ExportCutMap(edit: copy.edit, clips: whole))
+        let none = try copy.writingEncodedEdges {
+            try copy.writeOutput(to: copied, cancelled: { false }) { _ in }
+        }
+        XCTAssertEqual(none.count, 0)
+        _ = copyResult.completionMessage(for: copied, encodedEdges: none)
+        let plain = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: copyResult.url)) as? [String: Any])
+        XCTAssertNil(plain["encoded_edge_results"])
+    }
+
+    @MainActor
+    func testTheExportQueueReportsWhatEachRangesSmartTrimEdgesCost() async throws {
+        let editor = EditorModel()
+        defer { editor.endSession() }
+        editor.useAnalysisSidecars = false
+        editor.importFiles([try fixture("SmartTrim-GOP", "mp4")])
+        try await ready(editor)
+        // Two ranges that start inside the first picture group. The first copies from the next keyframe and the second,
+        // with no keyframe inside it, is encoded whole: each encodes one edge of its own, ending at a different time.
+        editor.selectRange(0.28, 2)
+        editor.addMarkedRange()
+        editor.selectRange(0.28, 0.8)
+        editor.addMarkedRange()
+        var options = ExportSheetOptions()
+        options.copyContainer = ""
+        options.mode = .smart
+        let ranges = editor.readyQueuedRanges
+        XCTAssertEqual(ranges.count, 2)
+
+        // Each range's edges are taken right after its own write, as `mpcut export ranges separate` does, so a range
+        // reports exactly the edges its plan encodes.
+        let direct = try scratch()
+        let batch = try SequenceQueuePlan(ranges, directory: direct, options: options, useSidecar: false, cancelled: { false })
+        var written: [(output: URL, edges: [EncodedEdgeResult])] = []
+        for item in batch.items {
+            guard case .ordinary(let planned) = item.payload, case .packets(let edit, .smart, _) = planned.plan else {
+                return XCTFail("\(item.output.lastPathComponent) did not plan Smart Trim.")
+            }
+            let edges = try batch.writeReportingEdges(item) { _ in true }
+            let expected = edit.segments.flatMap { $0.encodedEdges ?? [] }.sorted { $0.from < $1.from }
+            XCTAssertEqual(edges.map(\.from), expected.map(\.from), item.output.lastPathComponent)
+            XCTAssertEqual(edges.map(\.to), expected.map(\.to), item.output.lastPathComponent)
+            XCTAssertTrue(edges.allSatisfy { $0.encodedBytes > 0 && $0.targetBytes > 0 && $0.segment == 1 })
+            written.append((item.output, edges))
+        }
+        XCTAssertEqual(written.map { $0.edges.count }, [1, 1])
+        XCTAssertNotEqual(written[0].edges.first?.to, written[1].edges.first?.to, "Each range reports its own edge.")
+        let lines = ExportNotices.queueEncodedEdges(written)
+        XCTAssertEqual(lines, written.map { "\($0.output.lastPathComponent): " + (ExportNotices.encodedEdges($0.edges) ?? "") })
+        XCTAssertEqual(ExportNotices.queueEncodedEdges([(direct.appendingPathComponent("Copy.mp4"), [])]), [],
+                       "A range that encodes no edge adds nothing.")
+
+        // The Export Queue's completion message lists each range's edges after the export.
+        let folder = try scratch()
+        editor.showBulkQueue()
+        editor.exportQueuedRanges(to: folder, options: options)
+        let deadline = ContinuousClock.now + .seconds(30)
+        while editor.isExporting, .now < deadline { try await Task.sleep(for: .milliseconds(20)) }
+        let message = editor.statusMessage
+        XCTAssertTrue(message.hasPrefix("Exported 2 files to "), message)
+        for (output, _) in written {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: folder.appendingPathComponent(output.lastPathComponent).path))
+            XCTAssertTrue(message.contains("\(output.lastPathComponent): Smart Trim encoded 1 edge: "), message)
+        }
     }
 
     func testTheMulticamQueueReviewShowsSmartTrimDurations() throws {
@@ -430,6 +665,99 @@ final class ExportNoticesTests: XCTestCase {
         XCTAssertEqual((encode["plan"] as? [String: Any])?["warnings"] as? [String], [Self.depthNote])
         XCTAssertNotNil(encode["audio_actions"] as? [Any])
         XCTAssertTrue((encode["summary"] as? String)?.hasSuffix(Self.depthNote) == true)
+    }
+
+    @MainActor
+    func testMCPRenderReportsWhatEachSmartTrimEdgeCost() async throws {
+        let preferences = EditorPreferences()
+        preferences.useAnalysisSidecars = false
+        let sessions = ProjectSessions(preferences: preferences)
+        let session = ProjectSession(id: UUID(), preferences: preferences)
+        let editor = session.editor
+        defer { editor.endSession() }
+        editor.tierPrompt = { _, answer in answer(.init(answer: .proceed)) }
+        let folder = try scratch()
+        func call(_ tool: String, _ arguments: [String: Any]) async throws -> [String: Any] {
+            let receipt = try await sessions.mcpOutputs(tool: tool, arguments: arguments.merging(["project_handle": session.mcpHandle]) { $1 },
+                                                        session: session, checkAccess: {})
+            return try await finished(receipt, owner: session.mcpHandle, in: sessions.mcpOutputJobs)
+        }
+
+        // Removing the first seven frames leaves the timeline starting inside a picture group.
+        editor.importFiles([try fixture("SmartTrim-GOP", "mp4")])
+        try await ready(editor)
+        editor.seek(7.0 / 25)
+        editor.split()
+        try await ready(editor)
+        let left = try XCTUnwrap(editor.timelineClips.first?.id)
+        editor.byHand { editor.deleteClip(left) }
+        try await ready(editor)
+
+        // A plan cannot know what an edge costs. The render reports it at the top level, as `mpcut export` does.
+        let planned = try await call("export_editor_project_plan", ["output": folder.appendingPathComponent("Plan.mp4").path, "mode": "smart"])
+        XCTAssertEqual(planned["eligible"] as? Bool, true, String(describing: planned))
+        XCTAssertNil(planned["encoded_edge_results"])
+        let rendered = folder.appendingPathComponent("Smart.mp4")
+        let render = try await call("export_editor_project_render", ["output": rendered.path, "mode": "smart"])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: rendered.path))
+        let edges = try XCTUnwrap(render["encoded_edge_results"] as? [[String: Any]], String(describing: render))
+        XCTAssertEqual(edges.count, 1, String(describing: edges))
+        XCTAssertEqual(edges.first?["segment"] as? Int, 1)
+        XCTAssertGreaterThan(edges.first?["encoded_bytes"] as? Int ?? 0, 0)
+        XCTAssertGreaterThan(edges.first?["target_bytes"] as? Int ?? 0, 0)
+        XCTAssertEqual(edges.first?["retried"] as? Bool, false)
+        XCTAssertNotNil(edges.first?["from"])
+        XCTAssertNotNil(edges.first?["to"])
+    }
+
+    @MainActor
+    func testMCPQueueRenderReportsWhatEachRangesSmartTrimEdgesCostInItsRow() async throws {
+        let preferences = EditorPreferences()
+        preferences.useAnalysisSidecars = false
+        let sessions = ProjectSessions(preferences: preferences)
+        let session = ProjectSession(id: UUID(), preferences: preferences)
+        let editor = session.editor
+        defer { editor.endSession() }
+        editor.tierPrompt = { _, answer in answer(.init(answer: .proceed)) }
+        let folder = try scratch()
+        func call(_ tool: String, _ arguments: [String: Any]) async throws -> [String: Any] {
+            let receipt = try await sessions.mcpOutputs(tool: tool, arguments: arguments.merging(["project_handle": session.mcpHandle]) { $1 },
+                                                        session: session, checkAccess: {})
+            return try await finished(receipt, owner: session.mcpHandle, in: sessions.mcpOutputJobs)
+        }
+
+        // Two ranges that start inside the first picture group, each encoding one edge that ends at a different time.
+        editor.importFiles([try fixture("SmartTrim-GOP", "mp4")])
+        try await ready(editor)
+        editor.selectRange(0.28, 2)
+        editor.addMarkedRange()
+        editor.selectRange(0.28, 0.8)
+        editor.addMarkedRange()
+
+        // A plan cannot know what an edge costs, so its rows have no such field.
+        let planned = try await call("export_queue_plan", ["output": folder.path, "container": "mov", "mode": "smart"])
+        let plannedRows = try XCTUnwrap(planned["range_plans"] as? [[String: Any]], String(describing: planned))
+        XCTAssertEqual(plannedRows.count, 2)
+        XCTAssertTrue(plannedRows.allSatisfy { $0["encoded_edge_results"] == nil })
+
+        // The render reports each range's own edges in its row, taken right after that range's write.
+        let rendered = try await call("export_queue_render", ["output": folder.path, "container": "mov", "mode": "smart"])
+        let rows = try XCTUnwrap(rendered["range_plans"] as? [[String: Any]], String(describing: rendered))
+        XCTAssertEqual(rows.compactMap { $0["destination"] as? String }, rendered["destinations"] as? [String])
+        var ends: [String] = []
+        for row in rows {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: row["destination"] as? String ?? ""))
+            let edges = try XCTUnwrap(row["encoded_edge_results"] as? [[String: Any]], String(describing: row))
+            XCTAssertEqual(edges.count, 1, String(describing: edges))
+            XCTAssertEqual(edges.first?["segment"] as? Int, 1)
+            XCTAssertGreaterThan(edges.first?["encoded_bytes"] as? Int ?? 0, 0)
+            XCTAssertGreaterThan(edges.first?["target_bytes"] as? Int ?? 0, 0)
+            XCTAssertEqual(edges.first?["retried"] as? Bool, false)
+            let end = try XCTUnwrap(edges.first?["to"])
+            ends.append(String(describing: end))
+        }
+        XCTAssertEqual(ends.count, 2)
+        XCTAssertNotEqual(ends.first, ends.last, "Each row reports its own range's edge.")
     }
 
     // MARK: Tier details

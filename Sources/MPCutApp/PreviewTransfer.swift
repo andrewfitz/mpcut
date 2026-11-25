@@ -63,7 +63,7 @@ struct PreviewTransfer {
         let options = [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary
         guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA,
                                   options, &output) == kCVReturnSuccess, let output else { return nil }
-        let image = CIImage(cvPixelBuffer: input, options: [.toneMapHDRtoSDR: true])
+        let image = CIImage(cvPixelBuffer: decodable(input), options: [.toneMapHDRtoSDR: true])
         guard !image.extent.isEmpty else { return nil }
         let destination = CIRenderDestination(pixelBuffer: output)
         destination.colorSpace = sRGB
@@ -81,5 +81,23 @@ struct PreviewTransfer {
             }
         }
         return output
+    }
+
+    /// VideoToolbox leaves the matrix of a BT.2020 picture that records none unset. Core Animation,
+    /// which shows the HDR preview and the FFmpeg preview's surface, decodes it as BT.2020, where
+    /// Core Image would read BT.709 (measured on macOS 27). The shared picture keeps its own tags:
+    /// a second buffer on the same surface carries the matrix, unpropagated, since a propagated
+    /// attachment is stored with the surface and the shared picture would read it too.
+    private static func decodable(_ input: CVPixelBuffer) -> CVPixelBuffer {
+        guard CVBufferCopyAttachment(input, kCVImageBufferYCbCrMatrixKey, nil) == nil,
+              CVBufferCopyAttachment(input, kCVImageBufferColorPrimariesKey, nil) as? String
+                == kCVImageBufferColorPrimaries_ITU_R_2020 as String,
+              let surface = CVPixelBufferGetIOSurface(input)?.takeUnretainedValue() else { return input }
+        var tagged: Unmanaged<CVPixelBuffer>?
+        guard CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, surface, nil, &tagged) == kCVReturnSuccess,
+              let buffer = tagged?.takeRetainedValue() else { return input }
+        CVBufferPropagateAttachments(input, buffer)
+        CVBufferSetAttachment(buffer, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020, .shouldNotPropagate)
+        return buffer
     }
 }

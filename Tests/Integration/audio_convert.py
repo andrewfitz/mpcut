@@ -343,22 +343,75 @@ class AudioConversionTests(unittest.TestCase):
                 # The picture changes nothing in the sound: the same conversion of the bare source decodes alike.
                 bare, _ = self.export(plain, "bare-" + name, "--audio", treatment, cuts=cuts)
                 self.assertEqual(pcm16(result), pcm16(bare))
-        # A source that has chapters too lends only its picture. Its chapter times belong to the source timeline.
+        # A source that has chapters too lends its picture, and its chapters follow the kept range onto the output timeline.
         listed, book = self.root / "book.ffmeta", self.root / "book.m4a"
         listed.write_text(";FFMETADATA1\n" + "".join(
             f"[CHAPTER]\nTIMEBASE=1/1000\nSTART={start}\nEND={start + 6000}\ntitle=Part {start // 6000 + 1}\n" for start in (0, 6000)))
         ffmpeg("-i", art_m4a, "-i", listed, "-map", "0", "-map_chapters", "1", "-c", "copy", book)
         self.assertEqual(len(probe(book, "-show_chapters")["chapters"]), 2)
-        for treatment, name in (("aac", "book-out.m4a"), ("mp3", "book-out.mp3")):
+        # M4A stores chapters in a QuickTime text track, which FFmpeg lists as a data stream, as it does in the source.
+        self.assertEqual([(stream["codec_type"], stream["codec_tag_string"]) for stream in probe(book, "-show_streams")["streams"]][:2],
+                         [("audio", "mp4a"), ("data", "text")])
+        for treatment, name, kinds in (("aac", "book-out.m4a", ["audio", "data", "video"]), ("mp3", "book-out.mp3", ["audio", "video"])):
             with self.subTest(source=book.name, output=name):
                 result, _ = self.export(book, name, "--audio", treatment, cuts=cuts)
-                self.assertEqual(probe(result, "-show_chapters")["chapters"], [])
-                self.assertEqual([stream["codec_type"] for stream in probe(result, "-show_streams")["streams"]], ["audio", "video"])
+                chapters = probe(result, "-show_chapters")["chapters"]
+                self.assertEqual([(float(item["start_time"]), float(item["end_time"]), item["tags"]["title"]) for item in chapters],
+                                 [(0.0, 2.0, "Part 1")])
+                streams = probe(result, "-show_streams")["streams"]
+                self.assertEqual([stream["codec_type"] for stream in streams], kinds)
+                if "data" in kinds:
+                    self.assertEqual(streams[1]["codec_tag_string"], "text")
+                self.assertEqual(streams[-1]["disposition"]["attached_pic"], 1)
+                self.assertEqual(picture(result), picture(book))
         # WAV holds no picture, and the plan says that it is left out.
         result, report = self.export(art_mp3, "art-out.wav", "--audio", "pcm", cuts=cuts)
         self.assertTrue(any("cover art of art.mp3 cannot be carried in .wav" in warning for warning in report["warnings"]),
                         report["warnings"])
         self.assertEqual([stream["codec_type"] for stream in probe(result, "-show_streams")["streams"]], ["audio"])
+
+    def test_conversion_carries_chapters_onto_the_kept_ranges(self):
+        listed, book = self.root / "chapters.ffmeta", self.root / "chapters.m4a"
+        # Three chapters of four seconds. The cuts keep 9–11.5 (chapter 3), then 1–3 (chapter 1), so chapter 2 is dropped.
+        listed.write_text(";FFMETADATA1\n" + "".join(
+            f"[CHAPTER]\nTIMEBASE=1/1000\nSTART={start}\nEND={start + 4000}\ntitle=Part {start // 4000 + 1}\n" for start in (0, 4000, 8000)))
+        ffmpeg("-i", self.m4a, "-i", listed, "-map", "0:a", "-map_chapters", "1", "-c", "copy", book)
+        cuts = [("9", "11.5"), ("1", "3")]
+        expected = [(0.0, 2.5, "Part 3"), (2.5, 4.5, "Part 1")]
+        for treatment, name in (("aac", "chapters.m4a"), ("mp3", "chapters.mp3"), ("opus", "chapters.mka"), ("pcm", "chapters.mov")):
+            with self.subTest(output=name):
+                result, report = self.export(book, "out-" + name, "--audio", treatment, cuts=cuts)
+                chapters = probe(result, "-show_chapters")["chapters"]
+                self.assertEqual([(round(float(item["start_time"]), 3), round(float(item["end_time"]), 3), item["tags"]["title"])
+                                  for item in chapters], expected, report)
+                self.assertFalse(any("chapters" in warning for warning in report["warnings"]), report["warnings"])
+        # WAV, FLAC and Opus files omit them, and the plan says so.
+        for treatment, name in (("pcm", "chapters.wav"), ("flac", "chapters.flac"), ("opus", "chapters.opus")):
+            with self.subTest(output=name):
+                result, report = self.export(book, "out-" + name, "--audio", treatment, cuts=cuts)
+                self.assertEqual(probe(result, "-show_chapters")["chapters"], [])
+                self.assertTrue(any("source chapters cannot be carried in ." + name.split(".")[1] in warning
+                                    for warning in report["warnings"]), report["warnings"])
+
+    def test_copies_the_muxer_cannot_write_are_refused_when_planned(self):
+        # MOV takes FLAC and Opus only in MP4 mode, and MP4 cannot finish PCM that states no channel layout.
+        wav = self.root / "unlabelled.wav"
+        ffmpeg("-f", "lavfi", "-i", "aevalsrc=0.5*sin(2*PI*440*t)|0.4*sin(2*PI*661*t):s=44100:d=2", "-c:a", "pcm_s16le", wav)
+        for source, container, works in ((self.flac, "mov", "MP4 or MKV"), (self.opus, "mov", "MP4 or MKV"), (wav, "mp4", "MOV or MKV")):
+            with self.subTest(source=source.name, container=container):
+                output = self.root / f"refused-{source.stem}.{container}"
+                for dry in (["--dry-run"], []):
+                    report = self.cli("export", "clips", "join", "--json", "--no-sidecar", *dry, "--mode", "copy",
+                                      "--output", output, "--clip", source, ok=False)
+                    self.assertIn(report["error"]["code"], ("unsupported_container", "audio_copy_unavailable"), report)
+                    self.assertIn(works, report["error"]["message"])
+                    self.assertFalse(output.exists())
+        # A stated layout is carried as before.
+        stereo = self.root / "stereo.mov"
+        ffmpeg("-i", wav, "-c:a", "pcm_s16le", "-channel_layout", "stereo", stereo)
+        output = self.root / "stereo-copy.mp4"
+        self.cli("export", "clips", "join", "--json", "--no-sidecar", "--mode", "copy", "--output", output, "--clip", stereo)
+        self.assertEqual(pcm16(output), pcm16(wav))
 
     def test_reordered_and_repeated_ranges_keep_their_samples(self):
         cuts = [("9", "11.5"), ("1", "3"), ("9", "10")]
@@ -515,6 +568,85 @@ class AudioConversionTests(unittest.TestCase):
                 self.assertEqual((action["codec"], action["bit_depth"]), (f"pcm_s{depth}le", depth))
                 self.assertEqual(pcm32(result), kept(pcm32(source), CUTS))
 
+    def test_auto_keeps_alac_as_alac_and_lossless_sources_lossless_in_the_named_container(self):
+        # Auto matches the original: a join that cannot be copied is written in the source's own codec where the named
+        # container holds it, and a lossless source otherwise keeps every sample in the codec that container holds.
+        noise = "anoisesrc=sample_rate=44100:duration=12:seed=7:amplitude=0.4"
+        alac16, alac24 = self.root / "lossless16.m4a", self.root / "lossless24.m4a"
+        ffmpeg("-f", "lavfi", "-i", noise, "-ac", "2", "-c:a", "alac", "-sample_fmt", "s16p", alac16)
+        ffmpeg("-f", "lavfi", "-i", noise, "-ac", "2", "-c:a", "alac", "-sample_fmt", "s32p", "-bits_per_raw_sample", "24", alac24)
+        self.assertEqual(self.stream(alac24)["bits_per_raw_sample"], "24")
+
+        # The reported bug: ALAC in M4A across a join planned AAC. It stays ALAC at the source's word length.
+        _, planned = self.export(alac16, "alac-join.m4a", "--audio", "auto", dry_run=True)
+        self.assertFalse((self.root / "alac-join.m4a").exists())
+        result, report = self.export(alac16, "alac-join.m4a", "--audio", "auto")
+        self.assertEqual({**planned, "dry_run": False}, report)
+        action = report["audio_actions"][0]
+        self.assertEqual((report["mode"], report["container"], report["applied"]), ("encode", "m4a", "convert_same_format"))
+        self.assertEqual((action["action"], action["codec"], action["bit_depth"]), ("alac", "alac", 16))
+        written = self.stream(result)
+        self.assertEqual((written["codec_name"], written["sample_fmt"], written["sample_rate"], written["channels"]),
+                         ("alac", "s16p", "44100", 2))
+        self.assertEqual(pcm16(result), kept(pcm16(alac16), CUTS))
+        self.assert_no_staging()
+
+        for name, depth in [("alac24-join.m4a", 24), ("alac24-join.mov", 24), ("alac24-join.mp4", 24)]:
+            with self.subTest(output=name):
+                result, report = self.export(alac24, name)
+                action = report["audio_actions"][0]
+                self.assertEqual((report["applied"], action["action"], action["bit_depth"]), ("convert_same_format", "alac", depth))
+                self.assertEqual(self.stream(result)["bits_per_raw_sample"], "24")
+                self.assertEqual(pcm32(result), kept(pcm32(alac24), CUTS))
+
+        # The copy refusal lists the ALAC conversion first, lossless, and it resolves as listed.
+        clips = [item for start, end in CUTS for item in ("--clip", alac16, "--from", start, "--to", end)]
+        error = self.cli("export", "clips", "join", "--json", "--no-sidecar", "--dry-run", "--mode", "copy",
+                         "--output", self.root / "alac-ladder.m4a", *clips, ok=False)["error"]
+        same = next(item for item in error["alternatives"] if item["id"] == "convert_same_format")
+        self.assertEqual((same["label"], same["container"], same["audio"], same["lossless"]),
+                         ("Convert to ALAC (same format, lossless)", "m4a", "alac", True))
+        self.assertLess(error["alternatives"].index(same),
+                        min(index for index, item in enumerate(error["alternatives"]) if item["id"] == "convert_aac"))
+        for item in (item for item in error["alternatives"] if "clips" not in item):
+            report = self.cli("export", "clips", "join", "--json", "--no-sidecar", "--dry-run", *item["arguments"],
+                              "--output", self.root / ("alac-offer-" + item["id"].replace(":", "-") + "." + item["container"]), *clips)
+            self.assertEqual((report["container"], report["audio_actions"][0]["action"]), (item["container"], item["audio"]))
+
+        # A container that cannot hold the source codec takes the lossless codec it holds, never AAC.
+        for source, name, applied, codec, depth, reader in [
+                (self.flac, "flac-as.m4a", "convert_pcm:m4a", "alac", 16, pcm16),
+                (self.flac24, "flac24-as.mov", "convert_pcm:mov", "pcm", 24, pcm32),
+                (alac24, "alac-as.flac", "convert_pcm:flac", "flac", 24, pcm32),
+                (alac24, "alac-as.mka", "convert_pcm:mka", "flac", 24, pcm32),
+                (alac16, "alac-as.caf", "convert_pcm:caf", "pcm", 16, pcm16),
+                (self.flac, "flac-in.mka", "convert_same_format", "flac", 16, pcm16),
+                (self.flac, "flac-in.mp4", "convert_same_format", "flac", 16, pcm16)]:
+            with self.subTest(output=name):
+                rate = 48_000 if source == self.flac24 else RATE
+                channels = 1 if source == self.flac24 else 2
+                result, report = self.export(source, name)
+                action = report["audio_actions"][0]
+                self.assertEqual((report["applied"], action["action"], action["bit_depth"]), (applied, codec, depth))
+                self.assertEqual(reader(result), kept(reader(source), CUTS, rate=rate, channels=channels))
+        # A lossy source has no lossless codec to keep, so M4A still means AAC.
+        _, report = self.export(self.mp3, "mp3-not-alac.m4a", dry_run=True)
+        self.assertEqual((report["applied"], report["audio_actions"][0]["action"]), ("convert_aac", "aac"))
+        # M4A reads ALAC with more than two channels back without its layout, and MKA does so for FLAC, so 5.1 PCM is
+        # not offered as ALAC there and auto falls back to AAC. Asked for by name, each is refused before writing.
+        _, report = self.export(self.six, "six-as.m4a", dry_run=True)
+        self.assertEqual((report["applied"], report["audio_actions"][0]["action"]), ("convert_aac", "aac"))
+        for name, treatment in [("six-alac.m4a", "alac"), ("six-flac.mka", "flac")]:
+            _, refused = self.export(self.six, name, "--audio", treatment, ok=False, dry_run=True)
+            self.assertEqual(refused["error"]["code"], "unsupported_audio", name)
+        # ALAC is written where MPCut reads it back exactly, and an explicit ALAC from a lossy source says it can clip.
+        _, refused = self.export(alac16, "explicit.caf", "--audio", "alac", ok=False, dry_run=True)
+        self.assertEqual(refused["error"]["code"], "unsupported_container")
+        _, report = self.export(self.mp3, "from-mp3.m4a", "--audio", "alac", dry_run=True)
+        self.assertEqual((report["audio_actions"][0]["codec"], report["audio_actions"][0]["bit_depth"]), ("alac", 24))
+        self.assertTrue(any("above full scale will clip" in warning for warning in report["warnings"]), report["warnings"])
+        self.assert_no_staging()
+
     def test_float_pcm_to_flac_warns_that_it_clips(self):
         source = self.root / "float.wav"
         ffmpeg("-f", "lavfi", "-i", TONES.format(rate=RATE, length=12), "-c:a", "pcm_f32le", source)
@@ -606,18 +738,30 @@ class AudioConversionTests(unittest.TestCase):
         self.assertEqual(self.cli("media", "inspect", "--json", "--no-sidecar", result)["media"]["duration"], report["duration"])
         self.assert_no_staging()
 
-        # A variable-rate source is matched at the customary rate nearest its average.
+        def packet_rate(path):
+            sizes = probe(path, "-select_streams", "a:0", "-show_entries", "packet=size")["packets"]
+            return sum(int(packet["size"]) for packet in sizes) * 8 / 12
+
+        # A variable-rate source is matched at its own packet average to the nearest 1 kbps: libopus takes any rate,
+        # so no ladder step moves it (141 kbps was written at 128 kbps).
         average = self.opus.stat().st_size * 8 / 12
         _, report = self.export(self.opus, "variable-join.opus", dry_run=True)
         rate = report["audio_actions"][0]["bit_rate"]
-        self.assertIn(rate // 1000, (8, 12, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 510))
+        self.assertEqual(rate % 1000, 0)
+        self.assertLessEqual(abs(rate - packet_rate(self.opus)), 1000)
         self.assertLess(abs(rate - average), 0.15 * average)
-        # A rate below the floor for two channels is raised to it, and one above the ceiling is lowered.
-        for name, options, expected_rate in [("low", ["-b:a", "8k"], 24_000), ("high", ["-b:a", "500k", "-vbr", "off"], 510_000)]:
+        # The written average follows the source: within 3% of the source's packets, where the ladder missed by 9%.
+        written, _ = self.export(self.opus, "variable-join.opus")
+        self.assertLess(abs(packet_rate(written) * 12 / 6.60001 - packet_rate(self.opus)), 0.03 * packet_rate(self.opus))
+        # A rate below the 24 kbps stereo floor is raised to it, so a mostly silent source cannot starve the kept sound.
+        # A rate near the 512 kbps stereo ceiling is kept as measured.
+        for name, options in [("low", ["-b:a", "8k"]), ("high", ["-b:a", "500k", "-vbr", "off"])]:
             source = self.root / f"{name}.opus"
             ffmpeg("-f", "lavfi", "-i", TONES.format(rate=48_000, length=12), "-c:a", "libopus", *options, source)
             _, report = self.export(source, f"{name}-join.opus", dry_run=True)
-            self.assertEqual(report["audio_actions"][0]["bit_rate"], expected_rate, name)
+            planned = report["audio_actions"][0]["bit_rate"]
+            self.assertEqual(planned % 1000, 0, name)
+            self.assertLessEqual(abs(planned - min(512_000, max(24_000, round(packet_rate(source) / 1000) * 1000))), 1000, name)
 
     def test_opus_conversion_keeps_its_container_and_lists_the_ladder(self):
         clips = [item for start, end in CUTS for item in ("--clip", self.steady, "--from", start, "--to", end)]
@@ -973,12 +1117,12 @@ class AudioConversionTests(unittest.TestCase):
         self.index_header(surround, earlier)
         self.assertEqual(self.layout(surround), (6, "5.1"))
         renewed = self.index_header(surround)
-        self.assertEqual((renewed["probe_revision"], renewed["streams"][0]["info"]["channel_layout"]), (10, "5.1"))
+        self.assertEqual((renewed["probe_revision"], renewed["streams"][0]["info"]["channel_layout"]), (13, "5.1"))
         self.assertGreater(renewed["audio"][0]["coded_bytes"], 0)
         # Every retired probe revision is rebuilt, including ordinary AAC movies.
         self.index_header(aac, earlier)
         self.assertEqual(rate(aac, "aac"), 96_000)
-        self.assertEqual(self.index_header(aac)["probe_revision"], 10)
+        self.assertEqual(self.index_header(aac)["probe_revision"], 13)
 
         # Revision 8 adds decoded packet counts to lossless tracks. Revision 9
         # changes the end points of H.264 and HEVC and reads MOV-family files
@@ -986,7 +1130,7 @@ class AudioConversionTests(unittest.TestCase):
         flac = folder / "soundtrack.flac"
         ffmpeg("-i", aac, "-map", "0:a:0", "-c:a", "flac", flac)
         self.layout(flac)
-        for source, expected in [(surround, 7), (flac, 10), (aac, 10)]:
+        for source, expected in [(surround, 7), (flac, 13), (aac, 13)]:
             self.index_header(source, lambda header: header.update(probe_revision=7))
             self.layout(source)
             self.assertEqual(self.index_header(source)["probe_revision"], expected)

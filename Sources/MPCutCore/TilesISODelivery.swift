@@ -9,6 +9,9 @@ public struct TilesISOManifest: Codable, Sendable {
         public let bytes: Int64
         public var feed: TilesISOPlan.Feed? = nil
         public var media: Media? = nil
+        /// What rendering this movie gave up: bit depth its codec cannot hold, or constant quality the encoder
+        /// could not take. Kept in the checkpoint, so a movie reused by a later run still reports it.
+        public var warnings: [String]? = nil
     }
 
     public struct Media: Codable, Equatable, Sendable {
@@ -254,7 +257,7 @@ extension TilesISODelivery {
                     let output = jobs[index].output
                     try ParticipantMulticam.verifyISOs(Set(ParticipantMulticam.usedSoundFiles(report)), against: prepared.snapshots)
                     files[entry.feed.id] = try record(key: feedKey(entry.feed.id), fingerprint: entry.fingerprint,
-                        output: output, feed: entry.feed)
+                        output: output, feed: entry.feed, warnings: report.allWarnings)
                 }
 
         var published = try plan.feeds.map { feed -> TilesISOManifest.File in
@@ -304,7 +307,7 @@ extension TilesISODelivery {
         let manifest = TilesISOManifest(schemaVersion: 1, status: "completed", sourceID: publicSourceID,
             sourceFingerprint: plan.sourceFingerprint, planDigest: try digest(plan), duration: plan.duration, sourceRange: plan.range,
             canvas: plan.canvas, framing: plan.framing,
-            cameraOff: plan.keepCameraOff, files: published, withheld: plan.withheld, issues: plan.issues,
+            cameraOff: plan.keepCameraOff, files: published, withheld: plan.withheld, issues: plan.issues + Self.renderIssues(published),
             blankRanges: unite(prepared.blanks + plan.issues.filter { $0.code == "unchecked_privacy" }.compactMap(\.range)),
             renderMetrics: metrics)
         for file in published {
@@ -355,22 +358,34 @@ extension TilesISODelivery {
                 try fs.moveItem(at: oldURL, to: newURL)
             }
             let updated = TilesISOManifest.File(filename: filename, sha256: entry.file.sha256, bytes: entry.file.bytes,
-                                                feed: feed?.published, media: expected)
+                                                feed: feed?.published, media: expected, warnings: entry.file.warnings)
             checkpoint.files[key] = .init(fingerprint: fingerprint, file: updated)
             try saveCheckpoint()
             return updated
         }
 
-        func record(key: String, fingerprint: String, output: URL, feed: TilesISOPlan.Feed?) throws -> TilesISOManifest.File {
+        func record(key: String, fingerprint: String, output: URL, feed: TilesISOPlan.Feed?,
+                    warnings: [String] = []) throws -> TilesISOManifest.File {
             let media = try inspect(output, frameRate: feed == nil ? nil : plan.canvas.frameRate, engine: engine)
             try checkMedia(media, feed: feed, duration: plan.duration, canvas: plan.canvas, filename: output.lastPathComponent)
-            let item = try artifact(output, feed: feed?.published, media: media, engine: engine)
+            var item = try artifact(output, feed: feed?.published, media: media, engine: engine)
+            item.warnings = warnings.isEmpty ? nil : warnings
             let old = checkpoint.files.updateValue(.init(fingerprint: fingerprint, file: item), forKey: key)
             try saveCheckpoint()
             if let old, old.file.filename != item.filename {
                 try removeUncommitted(workspace.appendingPathComponent(old.file.filename))
             }
             return item
+        }
+    }
+
+    /// One nonblocking issue for each warning of a published movie, so the receipt and the sheet list what its
+    /// render gave up beside the plan's own issues.
+    static func renderIssues(_ files: [TilesISOManifest.File]) -> [TilesISOIssue] {
+        files.flatMap { file in
+            (file.warnings ?? []).map {
+                TilesISOIssue(code: "iso_render_warning", message: "\(file.filename): \($0)", blocking: false, feedID: file.feed?.id)
+            }
         }
     }
 

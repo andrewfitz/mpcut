@@ -1,5 +1,6 @@
 #include "JPEGFrameReader.h"
 #include <libavcodec/avcodec.h>
+#include <libavcodec/bsf.h>
 #include <libavcodec/videotoolbox.h>
 #include <libavformat/avformat.h>
 #include <libavutil/hwcontext.h>
@@ -278,12 +279,122 @@ static int convert_in_blocks(MPJPEGReader *r, const int *matrix, uint8_t *out, i
     return ret;
 }
 
-// A picture without a recorded matrix is BT.709 when it is larger than 704x576
-// and BT.601 otherwise. VideoToolbox tags its untagged output by this rule, so
-// the native preview shows the same colors.
-static bool untagged_is_bt709(const AVFrame *f)
+// The color VideoToolbox, and so the native preview, gives a picture for the fields it leaves
+// unspecified (measured on macOS 27; FFPreviewDecoder.c keeps the same rule). With no color
+// recorded at all it goes by size: larger than 704x576 is BT.709, smaller is BT.601 with SMPTE C
+// primaries, or EBU Tech 3213 at exactly 704x576, with the BT.709 transfer. When every recorded
+// field is BT.709 or BT.601 (SMPTE 170M), a missing matrix is BT.709 for BT.709 primaries and
+// otherwise BT.601, missing primaries follow the matrix (BT.709, otherwise SMPTE C) and a missing
+// transfer is BT.709. Other recorded values (an sRGB or PQ transfer, BT.2020 or EBU fields) leave
+// the missing primaries and transfer unspecified, and Core Animation decodes a missing matrix as
+// BT.601, also for BT.2020 primaries. A PQ or HLG picture with recorded primaries is the exception:
+// Core Animation decodes its missing matrix, and BT.601, as BT.2020 for BT.2020 primaries and
+// otherwise BT.709, which is also what Core Image, and so the SDR preview of an HDR picture, reads
+// for a missing matrix. Returns whether the missing primaries and transfer are filled.
+static bool untagged_color(const AVFrame *f, enum AVColorSpace *matrix, enum AVColorPrimaries *primaries)
 {
-    return f->width > 704 || f->height > 576;
+    *matrix = f->colorspace;
+    *primaries = f->color_primaries;
+    if (f->colorspace == AVCOL_SPC_UNSPECIFIED && f->color_primaries == AVCOL_PRI_UNSPECIFIED &&
+        f->color_trc == AVCOL_TRC_UNSPECIFIED) {
+        const bool hd = f->width > 704 || f->height > 576;
+        *matrix = hd ? AVCOL_SPC_BT709 : AVCOL_SPC_SMPTE170M;
+        *primaries = hd ? AVCOL_PRI_BT709 : f->width == 704 && f->height == 576 ? AVCOL_PRI_BT470BG : AVCOL_PRI_SMPTE170M;
+        return true;
+    }
+    const bool fills = (f->colorspace == AVCOL_SPC_UNSPECIFIED || f->colorspace == AVCOL_SPC_BT709 ||
+                        f->colorspace == AVCOL_SPC_SMPTE170M) &&
+        (f->color_primaries == AVCOL_PRI_UNSPECIFIED || f->color_primaries == AVCOL_PRI_BT709 ||
+         f->color_primaries == AVCOL_PRI_SMPTE170M) &&
+        (f->color_trc == AVCOL_TRC_UNSPECIFIED || f->color_trc == AVCOL_TRC_BT709 || f->color_trc == AVCOL_TRC_SMPTE170M);
+    const bool hdr = (f->color_trc == AVCOL_TRC_SMPTE2084 || f->color_trc == AVCOL_TRC_ARIB_STD_B67) &&
+        *primaries != AVCOL_PRI_UNSPECIFIED;
+    if (*matrix == AVCOL_SPC_UNSPECIFIED)
+        *matrix = hdr && *primaries == AVCOL_PRI_BT2020 ? AVCOL_SPC_BT2020_NCL :
+            hdr || (fills && *primaries == AVCOL_PRI_BT709) ? AVCOL_SPC_BT709 : AVCOL_SPC_SMPTE170M;
+    if (fills && *primaries == AVCOL_PRI_UNSPECIFIED)
+        *primaries = *matrix == AVCOL_SPC_BT709 ? AVCOL_PRI_BT709 : AVCOL_PRI_SMPTE170M;
+    return fills;
+}
+
+static enum AVColorSpace untagged_matrix(const AVFrame *f)
+{
+    enum AVColorSpace matrix;
+    enum AVColorPrimaries primaries;
+    untagged_color(f, &matrix, &primaries);
+    return matrix;
+}
+
+// Each color field a video picture leaves unspecified takes VideoToolbox's value above, which
+// the native preview and the FFmpeg preview show. Without these tags Core Image reads the
+// picture as sRGB, 11 levels darker at mid grey than the preview. A JPEG picture without tags is
+// a JFIF image, which is sRGB by convention, and RGB or palette pictures are not video, so they
+// keep that reading.
+static void tag_unspecified_color(MPJPEGReader *r, CVPixelBufferRef buffer, const AVFrame *f)
+{
+    switch (r->codec->codec_id) {
+    case AV_CODEC_ID_MJPEG: case AV_CODEC_ID_MJPEGB: case AV_CODEC_ID_LJPEG:
+    case AV_CODEC_ID_JPEGLS: case AV_CODEC_ID_SMVJPEG:
+        return;
+    default:
+        break;
+    }
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(f->format);
+    if (!desc || (desc->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_PAL)) || f->colorspace == AVCOL_SPC_RGB)
+        return;
+    enum AVColorSpace matrix;
+    enum AVColorPrimaries primaries;
+    const bool fills = untagged_color(f, &matrix, &primaries);
+    bool tagged = false;
+    if (f->colorspace == AVCOL_SPC_UNSPECIFIED) {
+        CVBufferSetAttachment(buffer, kCVImageBufferYCbCrMatrixKey,
+                              matrix == AVCOL_SPC_BT709 ? kCVImageBufferYCbCrMatrix_ITU_R_709_2 :
+                              matrix == AVCOL_SPC_BT2020_NCL ? kCVImageBufferYCbCrMatrix_ITU_R_2020 :
+                              kCVImageBufferYCbCrMatrix_ITU_R_601_4, kCVAttachmentMode_ShouldPropagate);
+        tagged = true;
+    }
+    if (fills && f->color_primaries == AVCOL_PRI_UNSPECIFIED) {
+        CVBufferSetAttachment(buffer, kCVImageBufferColorPrimariesKey,
+                              primaries == AVCOL_PRI_BT709 ? kCVImageBufferColorPrimaries_ITU_R_709_2 :
+                              primaries == AVCOL_PRI_BT470BG ? kCVImageBufferColorPrimaries_EBU_3213 :
+                              kCVImageBufferColorPrimaries_SMPTE_C, kCVAttachmentMode_ShouldPropagate);
+        tagged = true;
+    }
+    if (fills && f->color_trc == AVCOL_TRC_UNSPECIFIED) {
+        CVBufferSetAttachment(buffer, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2,
+                              kCVAttachmentMode_ShouldPropagate);
+        tagged = true;
+    }
+    // Core Animation shows other primaries recorded without a transfer through a transfer of its
+    // own, where Core Image reads the picture as sRGB: the BT.709 transfer for EBU Tech 3213 or
+    // SMPTE C primaries, sRGB for P3 D65, and the ITU-R BT.2020 color space for BT.2020 primaries
+    // (measured on macOS 27; the FFmpeg preview leaves these to Core Animation).
+    if (!fills && f->color_trc == AVCOL_TRC_UNSPECIFIED) {
+        if (f->color_primaries == AVCOL_PRI_BT470BG || f->color_primaries == AVCOL_PRI_SMPTE170M) {
+            CVBufferSetAttachment(buffer, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2,
+                                  kCVAttachmentMode_ShouldPropagate);
+            tagged = true;
+        } else if (f->color_primaries == AVCOL_PRI_SMPTE432) {
+            CVBufferSetAttachment(buffer, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_sRGB,
+                                  kCVAttachmentMode_ShouldPropagate);
+            tagged = true;
+        } else if (f->color_primaries == AVCOL_PRI_BT2020) {
+            CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceITUR_2020);
+            if (space) {
+                CVBufferSetAttachment(buffer, kCVImageBufferCGColorSpaceKey, space, kCVAttachmentMode_ShouldPropagate);
+                CGColorSpaceRelease(space);
+            }
+            return;
+        }
+    }
+    if (!tagged) return;
+    CFDictionaryRef attachments = CVBufferCopyAttachments(buffer, kCVAttachmentMode_ShouldPropagate);
+    CGColorSpaceRef space = attachments ? CVImageBufferCreateColorSpaceFromAttachments(attachments) : NULL;
+    if (space) {
+        CVBufferSetAttachment(buffer, kCVImageBufferCGColorSpaceKey, space, kCVAttachmentMode_ShouldPropagate);
+        CGColorSpaceRelease(space);
+    }
+    if (attachments) CFRelease(attachments);
 }
 
 static int software_image(MPJPEGReader *r, int max_edge, CVPixelBufferRef *image)
@@ -305,8 +416,7 @@ static int software_image(MPJPEGReader *r, int max_edge, CVPixelBufferRef *image
             h = FFMAX(1, (int)FFMIN(h, ceil(samples_h)));
         }
     }
-    const int *matrix = sws_getCoefficients(f->colorspace != AVCOL_SPC_UNSPECIFIED ? f->colorspace
-        : untagged_is_bt709(f) ? SWS_CS_ITU709 : SWS_CS_DEFAULT);
+    const int *matrix = sws_getCoefficients(untagged_matrix(f));
     const bool limited = f->color_range != AVCOL_RANGE_JPEG;
     const bool unscaled = w == f->width && h == f->height;
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(f->format);
@@ -358,6 +468,7 @@ static int software_image(MPJPEGReader *r, int max_edge, CVPixelBufferRef *image
     CVPixelBufferUnlockBaseAddress(buffer, 0);
     if (written != h) { CVPixelBufferRelease(buffer); return written < 0 ? written : AVERROR_INVALIDDATA; }
     av_vt_pixbuf_set_attachments(r->codec, buffer, f);
+    tag_unspecified_color(r, buffer, f);
     *image = buffer;
     return 0;
 }
@@ -400,9 +511,10 @@ int mp_jpeg_frame(MPJPEGReader *r, int64_t pts, int64_t seek_dts, int max_edge,
                 // YUV. Give both decoders the same matrix when none was recorded.
                 if (r->frame->colorspace == AVCOL_SPC_UNSPECIFIED)
                     CVBufferSetAttachment(buffer, kCVImageBufferYCbCrMatrixKey,
-                                          untagged_is_bt709(r->frame) ? kCVImageBufferYCbCrMatrix_ITU_R_709_2
-                                                                      : kCVImageBufferYCbCrMatrix_ITU_R_601_4,
+                                          untagged_matrix(r->frame) == AVCOL_SPC_BT709 ? kCVImageBufferYCbCrMatrix_ITU_R_709_2
+                                                                                        : kCVImageBufferYCbCrMatrix_ITU_R_601_4,
                                           kCVAttachmentMode_ShouldPropagate);
+                tag_unspecified_color(r, buffer, r->frame);
                 *image = CVPixelBufferRetain(buffer);
             } else ret = AVERROR_INVALIDDATA;
         } else ret = software_image(r, max_edge, image);
@@ -410,4 +522,161 @@ int mp_jpeg_frame(MPJPEGReader *r, int64_t pts, int64_t seek_dts, int max_edge,
     }
     if (ret < 0) av_strerror(ret, error, capacity);
     return ret;
+}
+
+struct MPJPEGPackets {
+    AVFormatContext *format;
+    AVStream *stream;
+    AVPacket *packet;
+    bool check_layout;
+};
+
+void mp_jpeg_packets_close(MPJPEGPackets *p)
+{
+    if (!p) return;
+    av_packet_free(&p->packet);
+    avformat_close_input(&p->format);
+    av_free(p);
+}
+
+MPJPEGPackets *mp_jpeg_packets_open(const char *path, int stream, bool check_layout,
+                                    int (*cancelled)(void *), void *context)
+{
+    MPJPEGPackets *p = av_mallocz(sizeof(*p));
+    if (!p) return NULL;
+    p->check_layout = check_layout;
+    p->format = avformat_alloc_context();
+    p->packet = av_packet_alloc();
+    if (!p->format || !p->packet) goto fail;
+    p->format->interrupt_callback = (AVIOInterruptCB){ cancelled, context };
+    if (avformat_open_input(&p->format, path, NULL, NULL) < 0 || stream < 0 ||
+        stream >= (int)p->format->nb_streams) goto fail;
+    p->stream = p->format->streams[stream];
+    const AVCodecParameters *params = p->stream->codecpar;
+    if (params->codec_id != AV_CODEC_ID_MJPEG) goto fail;
+    // A copied JPEG cannot carry the container's display transform.
+    const AVPacketSideData *matrix = av_packet_side_data_get(params->coded_side_data, params->nb_coded_side_data,
+                                                             AV_PKT_DATA_DISPLAYMATRIX);
+    if (matrix) {
+        CGAffineTransform t = display_transform(matrix->data, matrix->size);
+        if (!CGAffineTransformIsIdentity(t)) goto fail;
+    }
+    for (unsigned i = 0; i < p->format->nb_streams; i++)
+        if (i != (unsigned)stream) p->format->streams[i]->discard = AVDISCARD_ALL;
+    return p;
+fail:
+    mp_jpeg_packets_close(p);
+    return NULL;
+}
+
+// 0: a complete 8-bit baseline JPEG of one whole picture. 1: the same without Huffman tables,
+// which an AVI MJPEG picture may leave to the decoder's standard ones. -1: anything else, such as a
+// progressive or lossless picture, two interlaced fields, an Exif orientation or ICC profile
+// (APP1, APP2 and later segments), a picture of another size, or data after the end marker.
+// With check_layout, the frame header must also code gray, or YCbCr with 4:2:0 or 4:2:2 chroma.
+static int jpeg_structure(const uint8_t *d, size_t n, int width, int height, bool check_layout)
+{
+    if (n < 6 || d[0] != 0xFF || d[1] != 0xD8 || d[n - 2] != 0xFF || d[n - 1] != 0xD9) return -1;
+    bool tables = false, frame = false;
+    size_t i = 2;
+    while (i + 4 <= n) {
+        if (d[i] != 0xFF) return -1;
+        const uint8_t marker = d[i + 1];
+        if (marker == 0xFF) { i++; continue; }
+        const size_t length = ((size_t)d[i + 2] << 8) | d[i + 3];
+        if (length < 2 || i + 2 + length > n) return -1;
+        const uint8_t *segment = d + i + 4;
+        switch (marker) {
+        case 0xC0: case 0xC1:
+            if (frame || length < 8 || segment[0] != 8) return -1;
+            if (((segment[1] << 8) | segment[2]) != height || ((segment[3] << 8) | segment[4]) != width) return -1;
+            if (check_layout) {
+                // Components: identifier, horizontal and vertical sampling, quantization table.
+                const uint8_t count = segment[5];
+                const uint8_t *c = segment + 6;
+                if (length < 8 + 3 * (size_t)count) return -1;
+                if (count == 3) {
+                    // FFmpeg reads components named R, G and B as RGB.
+                    if (c[0] == 'R' && c[3] == 'G' && c[6] == 'B') return -1;
+                    if ((c[1] != 0x22 && c[1] != 0x21) || c[4] != 0x11 || c[7] != 0x11) return -1;
+                } else if (count != 1) return -1;
+            }
+            frame = true;
+            break;
+        case 0xC4: tables = true; break;
+        case 0xDB: case 0xDD: break;
+        case 0xFE: {
+            // FFmpeg's decoder reads these comments as limited range, a flipped picture,
+            // half-height pixels or Avid fields. A JPEG viewer reads none of them.
+            static const char *const decoding[] = { "AVID", "CS=ITU601", "Intel(R) JPEG Library",
+                                                    "Metasoft MJPEG Codec", "MULTISCOPE II" };
+            for (size_t k = 0; k < sizeof(decoding) / sizeof(*decoding); k++) {
+                const size_t tag = strlen(decoding[k]);
+                if (length - 2 >= tag && !memcmp(segment, decoding[k], tag)) return -1;
+            }
+            break;
+        }
+        case 0xE0:
+            // AVI1 names the field of an interlaced picture in the byte after its tag.
+            if (length >= 7 && !memcmp(segment, "AVI1", 4) && segment[4] != 0) return -1;
+            break;
+        case 0xDA:
+            if (!frame) return -1;
+            // Entropy-coded data up to the final end marker may contain only stuffed bytes,
+            // restart markers and fill bytes: no second scan, picture or field.
+            for (size_t j = i + 2 + length; j + 1 < n - 2; j++) {
+                if (d[j] != 0xFF) continue;
+                const uint8_t next = d[j + 1];
+                if (next != 0x00 && next != 0xFF && (next < 0xD0 || next > 0xD7)) return -1;
+            }
+            return tables ? 0 : 1;
+        default:
+            return -1;
+        }
+        i += 2 + length;
+    }
+    return -1;
+}
+
+static int insert_standard_tables(const AVCodecParameters *params, AVPacket *packet)
+{
+    const AVBitStreamFilter *filter = av_bsf_get_by_name("mjpeg2jpeg");
+    AVBSFContext *bsf = NULL;
+    int ret = filter ? av_bsf_alloc(filter, &bsf) : AVERROR_BSF_NOT_FOUND;
+    if (ret >= 0) ret = avcodec_parameters_copy(bsf->par_in, params);
+    if (ret >= 0) ret = av_bsf_init(bsf);
+    if (ret >= 0) ret = av_bsf_send_packet(bsf, packet);
+    if (ret >= 0) ret = av_bsf_receive_packet(bsf, packet);
+    av_bsf_free(&bsf);
+    return ret;
+}
+
+int mp_jpeg_packet(MPJPEGPackets *p, int64_t pts, int width, int height, uint8_t **data, size_t *size)
+{
+    *data = NULL;
+    *size = 0;
+    int ret = av_seek_frame(p->format, p->stream->index, pts, AVSEEK_FLAG_BACKWARD);
+    if (ret < 0) return ret;
+    while ((ret = av_read_frame(p->format, p->packet)) >= 0) {
+        if (p->packet->stream_index != p->stream->index) { av_packet_unref(p->packet); continue; }
+        const int64_t time = p->packet->pts != AV_NOPTS_VALUE ? p->packet->pts : p->packet->dts;
+        if (time == AV_NOPTS_VALUE || time > pts) { ret = 0; break; }
+        if (time < pts) { av_packet_unref(p->packet); continue; }
+        int structure = (p->packet->flags & (AV_PKT_FLAG_CORRUPT | AV_PKT_FLAG_DISCARD)) ? -1 :
+            jpeg_structure(p->packet->data, p->packet->size, width, height, p->check_layout);
+        if (structure == 1) {
+            if (insert_standard_tables(p->stream->codecpar, p->packet) < 0 ||
+                jpeg_structure(p->packet->data, p->packet->size, width, height, p->check_layout) != 0) structure = -1;
+            else structure = 0;
+        }
+        if (structure != 0) { ret = 0; break; }
+        *data = malloc(p->packet->size);
+        if (!*data) { ret = AVERROR(ENOMEM); break; }
+        memcpy(*data, p->packet->data, p->packet->size);
+        *size = p->packet->size;
+        ret = 1;
+        break;
+    }
+    av_packet_unref(p->packet);
+    return ret == AVERROR_EOF ? 0 : ret;
 }

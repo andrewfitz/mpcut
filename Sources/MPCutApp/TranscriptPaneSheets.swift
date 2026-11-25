@@ -265,6 +265,11 @@ struct TranscriptEditReview: View {
                             timelineTime($0.seconds, milliseconds: true)
                         }.joined(separator: ", ")
                         LabeledContent("Copy-safe alternatives", value: alternatives.isEmpty ? "Unavailable" : alternatives)
+                        if boundary.unindexed == true {
+                            Label("The recording could not be indexed, so this boundary keeps the requested time.",
+                                  systemImage: "exclamationmark.triangle")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                     }
                     Divider()
                 }

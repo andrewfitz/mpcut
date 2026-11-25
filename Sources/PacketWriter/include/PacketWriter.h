@@ -133,9 +133,49 @@ int mpcut_check_video_timecode(const MPCutSegment *segments, size_t count, MPCut
                                const char *output_path, size_t *failed_segment,
                                MPCutProgress progress, void *context, char *error, size_t error_capacity);
 
+/* What a Smart Trim edge encode produced, in encoder output bytes. max_qp is the AV1 QP ceiling of the kept encode (0 for
+ * the hardware AVC/HEVC encoders). retried is set when an AV1 edge over its budget was encoded
+ * again; first_attempt_bytes is then the first encode's size, and bytes the size kept. */
+typedef struct {
+    MPCutTime from;
+    MPCutTime to;
+    size_t frame_count;
+    uint64_t bytes;
+    uint64_t target_bytes;
+    uint64_t first_attempt_bytes;
+    int retried;
+    int max_qp;
+} MPCutEdgeResult;
+
+/* 1 when Smart Trim encodes an edge of this HEVC picture with every layer: an hvcC record (FFmpeg's, with any lhvC
+ * arrays appended) of HEVC with an alpha layer, or of MV-HEVC with two views. AVFoundation decodes those edges and
+ * VideoToolbox encodes them, keeping the alpha mode, or the layer IDs and eyes. 0 for one layer or another kind. */
+int mpcut_smart_trim_keeps_layers(const uint8_t *config, size_t size);
+
+/* Edges are recorded process-wide in encode order. Reset before mpcut_write and take after it;
+ * take returns up to capacity of the most recent results and clears them. */
+void mpcut_edge_results_reset(void);
+size_t mpcut_edge_results_take(MPCutEdgeResult *results, size_t capacity);
+
+/* Checks, before writing, the Smart Trim refusals mpcut_write meets only while it writes: copied
+ * avc3/hev1 samples that carry parameter sets, and edge pictures whose decoded frames would carry
+ * captions or colour metadata, or SEI the encode drops (mp_preview_sample_keeps_sei). Reads only edge packets, and every copied packet of an
+ * avc3/hev1 source. Returns 0 when the edges can be written or there are none, 1 with a sentence
+ * in error (and the one-based segment in failed_segment), or 2 when cancelled. When it returns 0,
+ * notes holds one sentence per line about what the edges lose without refusing, such as the film
+ * grain a player would synthesize on the pictures they replace, or an empty string. */
+int mpcut_check_smart_trim(const MPCutSegment *segments, size_t count, size_t *failed_segment,
+                           MPCutProgress progress, void *context, char *error, size_t capacity,
+                           char *notes, size_t notes_capacity);
+
 /* List what mpcut_write would leave out with these arguments: cover art or chapters the
- * output container cannot store, and chapters that cannot be placed on the output timeline.
- * Writes one sentence per line into notes, or an empty string. Only file headers are read.
+ * output container cannot store, chapters that cannot be placed on the output timeline, and
+ * an HEVC picture that has to keep an 'hev1' description, which Apple's players cannot decode.
+ * Writes one sentence per line into notes, or an empty string. Only file headers are read,
+ * except that for HEVC from a source without MOV sample entries (Matroska, for example) copied
+ * into MOV or MP4, the video packets of each source up to its latest range start, and those of
+ * the copied ranges, are read for their parameter sets. A staged picture (MPCUT_TRACKS_VIDEO)
+ * gets only the HEVC sentence, since its copied samples go on into the delivered file.
  * Returns nonzero when a source or the output container cannot be examined. */
 int mpcut_copy_omissions(const MPCutSegment *segments, size_t count, const char *output_path,
                          int tracks, int audio_stream, char *notes, size_t capacity);

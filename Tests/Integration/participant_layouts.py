@@ -141,6 +141,28 @@ class ParticipantLayouts(ParticipantFixtureCase):
                 self.assert_color(masked[index], WIDTH, x + width // 2, y + height // 3, expected, role)
             self.assert_color(masked[index], WIDTH, 268, 48, HOST, f"unmasked host frame {index}")
 
+    def test_canvas_without_frame_rate_follows_recording_in_bt709(self):
+        project = self.approved(self.base())
+        size = (WIDTH, HEIGHT)
+        choices = plan("original", size=size)
+        del choices["canvas"]["frame_rate"]
+        output, report = self.export(project, "recording-rate", choices)
+        self.assertEqual(Fraction(report["canvas"]["frame_rate"]["numerator"],
+                                  report["canvas"]["frame_rate"]["denominator"]), FPS)
+        # decode() requires one picture per source frame at the recording's 8 fps.
+        frames = self.decode(output, size=size)
+        stream, = participant.probe(output, "-select_streams", "v:0", "-show_streams")["streams"]
+        self.assertEqual((stream["color_primaries"], stream["color_transfer"], stream["color_space"]),
+                         ("bt709", "bt709", "bt709"))
+        # The pixels are BT.709 too: recording colors keep their code values. sRGB pixels moved
+        # the mid-grey camera card by 12 levels.
+        for index in (0, 16, 30):
+            for tile in tiles_at(index):
+                x, y, width, height = tile.rect
+                self.assert_color(frames[index], WIDTH, x + width // 2, y + height // 2, tile.color,
+                                  f"{tile.appearance} code values frame {index}", tolerance=8)
+        self.assert_color(frames[0], WIDTH, 2, 2, BACKGROUND, "recording background code values", tolerance=8)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)

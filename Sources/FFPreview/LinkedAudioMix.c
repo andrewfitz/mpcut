@@ -121,6 +121,16 @@ bool linked_mix_unavailable(const LinkedAudioMix *mix)
     return false;
 }
 
+bool linked_mix_met_audio_damage(const LinkedAudioMix *mix)
+{
+    for (int i = 0; i < mix->count; i++) {
+        const AudioLane *lane = &mix->lanes[i];
+        if (lane->decoder && mp_preview_met_audio_damage(lane->decoder))
+            return true;
+    }
+    return false;
+}
+
 bool linked_mix_seek(LinkedAudioMix *mix, double seconds)
 {
     bool positioned = true;

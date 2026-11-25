@@ -325,8 +325,12 @@ class SceneRefresh(unittest.TestCase):
         replacement = self.folder / "replacement.mp4"
 
         def packet_payloads():
-            return subprocess.check_output(["ffmpeg", "-nostdin", "-v", "error", "-i", self.source,
-                                            "-map", "0", "-c", "copy", "-f", "streamhash", "-"], timeout=15)
+            # Stream hash version 2 appends ", S=" and a hash of a stream's side data, which holds
+            # the display matrix the first replacement changes on purpose (FFmpeg 9.1 writes it).
+            # Compare the codec configuration and packet payloads without it.
+            output = subprocess.check_output(["ffmpeg", "-nostdin", "-v", "error", "-i", self.source,
+                                              "-map", "0", "-c", "copy", "-f", "streamhash", "-"], timeout=15)
+            return [line.split(", S=")[0] for line in output.decode().splitlines()]
 
         original_payloads = packet_payloads()
         ffmpeg("-display_rotation:v:0", "90", "-i", self.source, "-map", "0", "-c", "copy", replacement)

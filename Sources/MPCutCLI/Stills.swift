@@ -315,6 +315,7 @@ extension StillOptions {
 struct StillCLIExportReport: Encodable {
     private enum CodingKeys: String, CodingKey {
         case ok, dryRun, output, outputBytes, copiedDuration, encodedDuration, audioActions, audioStream, tier, cutMap
+        case writtenWarnings
     }
 
     let dryRun: Bool
@@ -322,6 +323,8 @@ struct StillCLIExportReport: Encodable {
     let outputBytes: Int64?
     let report: StillExportReport
     let audioStream: Int?
+    /// What writing changed that the plan could not know. Only an export reports it.
+    var writtenWarnings: [String] = []
 
     func encode(to encoder: Encoder) throws {
         try report.encode(to: encoder)
@@ -331,6 +334,7 @@ struct StillCLIExportReport: Encodable {
         try fields.encode(output, forKey: .output)
         try fields.encodeIfPresent(outputBytes, forKey: .outputBytes)
         try fields.encodeIfPresent(audioStream, forKey: .audioStream)
+        if !writtenWarnings.isEmpty { try fields.encode(writtenWarnings, forKey: .writtenWarnings) }
         try fields.encode(report.cutMap, forKey: .cutMap)
         try fields.encode(report.selectedTier, forKey: .tier)
         try fields.encode(report.soundActions, forKey: .audioActions)

@@ -9,7 +9,7 @@ struct ParticipantCompositionSheet: View {
     let openProject: (URL) -> Void
 
     @Environment(\.dismiss) private var dismiss
-    @State private var plan = ParticipantRenderPlan(shots: [.init(layout: .original)])
+    @State private var plan = ParticipantRenderPlan(canvas: .init(frameRate: nil), shots: [.init(layout: .original)])
     @State private var shotIndex = 0
     @State private var rangeStart = ""
     @State private var rangeEnd = ""
@@ -176,16 +176,30 @@ struct ParticipantCompositionSheet: View {
                         .labelsHidden().frame(width: 60)
                 }
             }
-            Picker("Frame rate", selection: $plan.canvas.frameRate) {
+            Picker("Frame rate", selection: $plan.canvas.requestedFrameRate) {
+                Text(recordingFrameRate.map { "Recording (\($0.description) fps)" } ?? "Recording").tag(RationalTime?.none)
                 ForEach([24, 25, 30, 50, 60], id: \.self) { rate in
-                    Text("\(rate) fps").tag(RationalTime(numerator: Int64(rate)))
+                    Text("\(rate) fps").tag(Optional(RationalTime(numerator: Int64(rate))))
                 }
-                if ![24, 25, 30, 50, 60].contains(where: { RationalTime(numerator: Int64($0)) == plan.canvas.frameRate }) {
-                    Text(plan.canvas.frameRate.description).tag(plan.canvas.frameRate)
+                if let rate = plan.canvas.requestedFrameRate,
+                   ![24, 25, 30, 50, 60].contains(where: { RationalTime(numerator: Int64($0)) == rate }) {
+                    Text(rate.description).tag(Optional(rate))
                 }
             }
             ColorPicker("Canvas background", selection: colorBinding($plan.canvas.background), supportsOpacity: false)
         }
+    }
+
+    /// A canvas without a chosen rate renders at the reference recording's rate.
+    private var recordingFrameRate: RationalTime? {
+        let stream: StreamInfo?
+        if session.isMulticam, let project = session.multicam.project {
+            stream = project.recordings(for: project.referenceAngle).lazy
+                .compactMap { session.multicam.media[$0.id]?.videoStream }.first
+        } else {
+            stream = session.editor.stillReviewCanvas?.videoStream
+        }
+        return stream.flatMap { ParticipantRenderer.canvasRate($0.frameRate) }
     }
 
     private var shots: some View {
@@ -442,7 +456,7 @@ struct ParticipantCompositionSheet: View {
         perform {
             let draft = try documentForRender()
             let source = document
-            let rate = plan.canvas.frameRate
+            let rate = plan.canvas.requestedFrameRate ?? recordingFrameRate ?? plan.canvas.frameRate
             run { token in
                 let adjusted = try ParticipantDialogue.accepting(proposal, in: draft, document: source)
                 let frames = try proposal.at.multiplied(by: rate)
@@ -543,12 +557,16 @@ struct ParticipantCompositionSheet: View {
                         if session.isMulticam { try session.multicam.validateHistoryDestination(destination, includesContents: true) }
                         else { try session.editor.validateHistoryDestination(destination, includesContents: true) }
                         run { token in
-                            _ = try ParticipantMulticam.materialize(angles, project: project, document: source, canvas: canvas,
-                                                                     audio: audio, to: destination, cancelled: { token.isCancelled })
-                            return destination.appendingPathComponent("multicam.cut")
-                        } onSuccess: { url in
-                            renderedProject = url
-                            report = "Rendered \(angles.count) synchronized angles in \(destination.lastPathComponent)."
+                            let written = try ExportWriteNotices.collecting {
+                                try ParticipantMulticam.materialize(angles, project: project, document: source, canvas: canvas,
+                                                                    audio: audio, to: destination, cancelled: { token.isCancelled })
+                            }.notices
+                            return (destination.appendingPathComponent("multicam.cut"), written)
+                        } onSuccess: { result in
+                            renderedProject = result.0
+                            // What each angle's picture gave up, by angle name.
+                            report = (["Rendered \(angles.count) synchronized angles in \(destination.lastPathComponent)."] + result.1)
+                                .joined(separator: "\n")
                         }
                     }
                 }
@@ -687,6 +705,8 @@ struct ParticipantCompositionSheet: View {
         if !checked.staleSourceIDs.isEmpty {
             lines.append("Geometry needs review for \(checked.staleSourceIDs.joined(separator: ", ")).")
         }
+        // What the picture gives up, then what writing it changed.
+        lines += checked.allWarnings
         if !checked.privacyIssues.isEmpty {
             lines.append(checked.publishable ? "Full-frame cover for unresolved intervals" : "Export blocked by unresolved coverage")
             lines += checked.privacyIssues.prefix(12).map {

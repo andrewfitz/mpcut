@@ -173,6 +173,8 @@ sed -i '' 's|^prefix=.*|prefix=./svt|' svt/lib/pkgconfig/SvtAv1Enc.pc
 sed -i '' 's|^prefix=.*|prefix=./opus|' opus/lib/pkgconfig/opus.pc
 export PKG_CONFIG_LIBDIR=./svt/lib/pkgconfig:./opus/lib/pkgconfig
 export PKG_CONFIG_PATH=
+# The text subtitle encoders let Re-encode convert cues where the output container needs another codec. Configure names
+# components after their allcodecs.c symbols, so the mov_text encoder is `movtext`; an unmatched name is only a warning.
 src/configure \
     --prefix="$prefix" \
     --arch=aarch64 --cc="$compiler" \
@@ -187,8 +189,19 @@ src/configure \
     --disable-network --disable-encoders --enable-zlib --enable-bzlib \
     --enable-videotoolbox --enable-libsvtav1 --enable-libmp3lame --pkg-config-flags=--static \
     --enable-libopus --disable-decoder=libopus \
-    --enable-encoder=h264_videotoolbox,hevc_videotoolbox,prores_videotoolbox,libsvtav1,mjpeg,aac,alac,libmp3lame,flac,libopus,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_f64le,wrapped_avframe,rawvideo
+    --enable-encoder=h264_videotoolbox,hevc_videotoolbox,prores_videotoolbox,libsvtav1,mjpeg,aac,alac,libmp3lame,flac,libopus,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_f64le,wrapped_avframe,rawvideo \
+    --enable-encoder=movtext,srt,subrip,ass,ssa,webvtt
 make -j "$jobs" DESTDIR="$stage" install
+# Configure only warns about an encoder name it does not know, so a renamed component would ship without its encoder
+# and an export would fall back or fail later. Refuse the build unless every requested encoder is present.
+available=$("$stage$prefix/bin/ffmpeg" -hide_banner -encoders)
+for encoder in h264_videotoolbox hevc_videotoolbox prores_videotoolbox libsvtav1 mjpeg aac alac libmp3lame flac libopus \
+    pcm_s16le pcm_s24le pcm_s32le pcm_f32le pcm_f64le wrapped_avframe rawvideo mov_text srt subrip ass ssa webvtt; do
+    if ! grep -Eq "^ [A-Z.]{6} $encoder( |$)" <<< "$available"; then
+        echo "error: the FFmpeg build has no $encoder encoder" >&2
+        exit 1
+    fi
+done
 cd "$build_dir"
 install -m 644 "$stage/$source_name"/{COPYING.LGPLv2.1,LICENSE.md} "$stage$prefix/"
 mkdir -p "$stage$prefix/SVT-AV1"

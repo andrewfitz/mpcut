@@ -30,14 +30,26 @@ public enum ReencodeAudio: String, CaseIterable, Codable, Sendable {
 
 public struct ReencodeSettings: Codable, Equatable, Sendable {
     public let codec: ReencodeCodec
+    /// The quality the video encoder uses: the requested one, or the codec's default.
     public let quality: ReencodeQuality
     public let audio: ReencodeAudio
+    /// True only when a person chose the quality: CLI `--quality`, MCP `quality`, or a touched export-sheet picker.
+    /// Re-encode uses `quality` either way, but a still-only Smart Trim program keeps its own default (High Quality,
+    /// ProRes 422) unless the choice was explicit, so Balanced chosen on purpose differs from no choice. A non-nil
+    /// `quality` argument does not set it: the export sheet always passes one. Not encoded; decoded settings are unset.
+    public var qualityIsExplicit = false
+
+    /// The quality a person chose, or nil: what a still-only program's picture generator follows.
+    public var requestedQuality: ReencodeQuality? { qualityIsExplicit ? quality : nil }
+
+    enum CodingKeys: String, CodingKey { case codec, quality, audio }
 
     public init(codec: ReencodeCodec = .h264, quality: ReencodeQuality? = nil,
-                audio: ReencodeAudio = .auto) {
+                audio: ReencodeAudio = .auto, qualityIsExplicit: Bool = false) {
         self.codec = codec
         self.quality = quality ?? (codec == .prores ? .prores422 : .balanced)
         self.audio = audio
+        self.qualityIsExplicit = qualityIsExplicit && quality != nil
     }
 }
 
@@ -46,17 +58,21 @@ public struct ReencodeAudioAction: Encodable, Sendable {
     public let action: ReencodeAudio
     public let reason: String?
     /// The written codec and its rate control or word length. Reported for converted sound: an audio-only export,
-    /// and the AAC and PCM tracks of a movie re-encode. The movie writer encodes what is stated here.
+    /// and every converted track of a movie re-encode. The movie writer encodes what is stated here.
     public var codec: String? = nil
     public var bitRate: Int? = nil
     public var quality: Int? = nil
     public var bitDepth: Int? = nil
+    /// Encoder options of a FLAC, ALAC, MP3 or Opus track of a movie re-encode, without stream specifiers.
+    var encoderOptions: [String]? = nil
 
     public init(track: Int, action: ReencodeAudio, reason: String?) {
         self.track = track
         self.action = action
         self.reason = reason
     }
+
+    enum CodingKeys: String, CodingKey { case track, action, reason, codec, bitRate, quality, bitDepth }
 }
 
 public struct ReencodePlan: Encodable, Sendable {
@@ -82,6 +98,10 @@ public struct ReencodePlan: Encodable, Sendable {
     var assemblesStillHDR = false
     var independentStillInputs: Set<URL> = []
     var matroskaStillTiming: [MulticamRange] = []
+    /// Source subtitle and data tracks that the final mux carries as packet copies, and the ffconcat list of their
+    /// staged ranges once the writer has made it.
+    var extras: [ReencodeExtraTrack] = []
+    var extrasManifest: String? = nil
 
     enum CodingKeys: String, CodingKey { case edit, settings, audioActions, width, height, warnings, canvas }
 }
@@ -95,13 +115,14 @@ public struct ReencodeEngine: Sendable {
         self.helper = helper
     }
 
-    /// `carryingChapters` places the chapters of the sources on the output timeline. A movie export asks for it.
-    /// A picture rendered for a multicam or still program does not, because that program has its own timeline.
+    /// `carryingChapters` places the chapters of the sources on the output timeline, and carries their subtitle and
+    /// data tracks. A movie export asks for it. A picture rendered for a multicam or still program does not, because
+    /// that program has its own timeline.
     public func resolve(_ clips: [ClipRequest], output: URL? = nil, media cached: [URL: MediaInfo] = [:],
                         container: String = "mp4", settings: ReencodeSettings = .init(),
                         carryingChapters: Bool = false) throws -> ReencodePlan {
         try plan(clips, output: output, media: cached, container: container, settings: settings, verifyingEncoder: true,
-                 carryingChapters: carryingChapters)
+                 carryingChapters: carryingChapters, carryingExtras: carryingChapters)
     }
 
     func resolveStillPictures(_ clips: [ClipRequest], output: URL, media: [URL: MediaInfo],
@@ -114,13 +135,16 @@ public struct ReencodeEngine: Sendable {
     /// The timeline tier asks this on every edit, so it starts no process. The hardware encoder is verified at export.
     func staticWarnings(_ clips: [ClipRequest], media cached: [URL: MediaInfo], container: String,
                         settings: ReencodeSettings = .init()) throws -> [String] {
-        try plan(clips, output: nil, media: cached, container: container, settings: settings, verifyingEncoder: false).warnings
+        // The timeline tier asks for a movie export, which carries subtitle and data tracks.
+        try plan(clips, output: nil, media: cached, container: container, settings: settings, verifyingEncoder: false,
+                 carryingExtras: true).warnings
     }
 
     /// A plan made with `verifyingEncoder` false has no helper and is never written.
     private func plan(_ clips: [ClipRequest], output: URL?, media cached: [URL: MediaInfo],
                       container: String, settings: ReencodeSettings, verifyingEncoder: Bool,
-                      normalizedStills: Set<URL> = [], carryingChapters: Bool = false) throws -> ReencodePlan {
+                      normalizedStills: Set<URL> = [], carryingChapters: Bool = false,
+                      carryingExtras: Bool = false) throws -> ReencodePlan {
         try checkCancellation()
         guard !clips.isEmpty else { throw CutError(code: "empty_edit", message: "Add at least one clip before exporting.") }
         let container = container.lowercased()
@@ -139,6 +163,7 @@ public struct ReencodeEngine: Sendable {
         var warnings: [String] = []
         // The sources in order of first use, and the first one that a uniform timeline would have refused.
         var sources: [MixedSource] = []
+        var extraSources: [(file: URL, clip: Int, media: MediaInfo)] = []
         var difference: (clip: Int, labels: [String])?
         for (offset, clip) in clips.enumerated() {
             try checkCancellation()
@@ -155,6 +180,8 @@ public struct ReencodeEngine: Sendable {
                     }
                     try checkSource(info, normalizedStill: normalizedStills.contains(file))
                     for stream in info.streams where stream.index != info.video.index && stream.kind != "audio" {
+                        // A movie export carries subtitle and data tracks where it can, and names the rest below.
+                        if carryingExtras && (Self.isExtraTrack(stream) || Self.isChapterList(stream)) { continue }
                         warnings.append("Clip \(index) \(stream.codecTag == "tmcd" ? "timecode" : stream.kind) track \(stream.index) will be omitted.")
                     }
                     if let reference {
@@ -168,6 +195,7 @@ public struct ReencodeEngine: Sendable {
                         reference = info
                     }
                     sources.append(MixedSource(clip: index, media: info))
+                    extraSources.append((file: file, clip: index, media: info))
                     media[file] = info
                 }
             } catch let error as CutError where error.code != "cancelled" {
@@ -202,8 +230,10 @@ public struct ReencodeEngine: Sendable {
             duration = end
         }
         guard let reference else { throw CutError(code: "empty_edit", message: "Add at least one clip before exporting.") }
+        // The helper's encoders decide whether `auto` can keep a source format. A plan that starts no process assumes the bundled helper.
+        let encoders = verifyingEncoder ? AudioExportEngine.encoders(of: try Self.findHelper(override: helper)) : nil
         let mixed = try difference.map {
-            try resolveMixed(sources, difference: $0, settings: settings, container: container)
+            try resolveMixed(sources, difference: $0, settings: settings, container: container, encoders: encoders)
         }
         let encoding = try mixed?.encoding ?? ReencodeVideo(reference.video, settings: settings)
         if let mixed { warnings += mixed.warnings }
@@ -222,7 +252,7 @@ public struct ReencodeEngine: Sendable {
         let (actions, audioCopy, exactPCM) = try mixed.map { ($0.actions, nil, []) }
             ?? resolveAudio(reference: reference, settings: settings, clips: clips,
                             segments: segments, media: media, engine: engine,
-                            container: container)
+                            container: container, encoders: encoders)
         if mixed == nil {
             // One output track decodes the track at its position in every clip, so every clip is examined.
             for (position, action) in actions.enumerated() {
@@ -277,7 +307,15 @@ public struct ReencodeEngine: Sendable {
             let carried = try ReencodeChapter.remapped(segments, media: media, cancelled: cancelled)
             chapters = carried.chapters
             warnings += carried.warnings
+            // The output keeps no source metadata. Name what each source had.
+            warnings += ReencodeChapter.droppedMetadata(segments)
         }
+        // Subtitle and data tracks are decided from the streams and the helper's encoders alone, so the timeline tier
+        // states the same as an export with the bundled helper. An older helper without a subtitle encoder leaves out
+        // a track that needs converting.
+        let extras: (tracks: [ReencodeExtraTrack], warnings: [String]) = carryingExtras
+            ? Self.plannedExtraTracks(extraSources, segments: segments, container: container, encoders: encoders) : ([], [])
+        warnings += extras.warnings
         let identities = media.mapValues(\.identity)
         for (file, identity) in identities { try verifyIdentity(file, identity) }
         let edit = ResolvedEdit(segments: segments, duration: duration, container: container, identities: identities)
@@ -285,6 +323,7 @@ public struct ReencodeEngine: Sendable {
                                 height: encoding.height, warnings: warnings, canvas: mixed?.canvas, media: media, helper: executable, encoding: encoding,
                                 audioCopy: audioCopy, timeScale: timeScale, exactPCM: exactPCM)
         plan.chapters = chapters
+        plan.extras = extras.tracks
         return plan
     }
 
@@ -326,9 +365,7 @@ public struct ReencodeEngine: Sendable {
         guard info.video.pixelFormat != "unknown" else {
             throw CutError(code: "unsupported_format", message: "The source pixel format could not be verified for conversion.")
         }
-        guard !info.video.hasAdditionalVideoLayers else {
-            throw CutError(code: "unsupported_format", message: "The selected hardware profiles cannot preserve additional HEVC layers such as alpha or a second view.")
-        }
+        if info.video.hasAdditionalVideoLayers { throw ReencodeVideo.layerRefusal(info.video) }
         if info.video.multipleDescriptions, info.copyIssue == "The video sample descriptions have different picture formats." {
             throw CutError(code: "unsupported_format", message: "The source changes picture format mid-clip.")
         }
@@ -384,7 +421,8 @@ public struct ReencodeEngine: Sendable {
     }
 
     private func resolveAudio(reference: MediaInfo, settings: ReencodeSettings, clips: [ClipRequest],
-                              segments: [ResolvedSegment], media: [URL: MediaInfo], engine: CutEngine, container: String)
+                              segments: [ResolvedSegment], media: [URL: MediaInfo], engine: CutEngine, container: String,
+                              encoders: Set<String>?)
         throws -> ([ReencodeAudioAction], ResolvedEdit?, Set<Int>) {
         guard !reference.audio.isEmpty else { return ([], nil, []) }
         var copyFailure: CutError?
@@ -460,11 +498,19 @@ public struct ReencodeEngine: Sendable {
             var action = effective
             var note: String?
             if automatic {
-                // Auto decides for each track. A track that is lossless in every clip is written as PCM where the container carries it.
-                let lossless = tracks.count == sources.count && tracks.allSatisfy { ExportRules.isLosslessAudio(codec: $0.stream.codec) }
-                action = ExportRules.automaticAudio(codec: settings.codec, container: container, source: .movie,
-                                                    lossless: lossless, channels: audio.stream.channels).first ?? .aac
-                note = ExportRules.automaticAudioNote(action, lossless: lossless, channels: audio.stream.channels, container: container)
+                // Auto decides for each track: the source's own format where the container and the helper allow,
+                // otherwise PCM for a track that is lossless in every clip and AAC for any other.
+                guard var described = ExportRules.automaticAudioSource(tracks.map(\.stream)) else {
+                    throw CutError(code: "missing_audio", message: "Audio track \(audio.stream.index) is unavailable.", track: audio.stream.index)
+                }
+                if tracks.count != sources.count {
+                    described.codec = nil
+                    described.lossless = false
+                }
+                let choice = ExportRules.automaticAudio(codec: settings.codec, container: container, source: .movie,
+                                                        track: described, encoders: encoders)
+                action = choice.action
+                note = choice.note
                 if let refusal = ExportRules.reencodeRefusal(audio: action, container: container, source: .movie) { throw refusal }
             }
             if action != .removeAudio {
@@ -490,6 +536,11 @@ public struct ReencodeEngine: Sendable {
                 let pcm = AudioExportEngine.moviePCM(tracks.map(\.stream))
                 written.codec = pcm.codec
                 written.bitDepth = pcm.bitDepth
+            } else if [.flac, .alac, .mp3, .opus].contains(action) {
+                let pairs = sources.compactMap { source in
+                    source.audio.indices.contains(index) ? (media: source, audio: source.audio[index]) : nil
+                }
+                written.describeSourceFormat(pairs, channels: audio.stream.channels, sampleRate: audio.stream.sampleRate)
             }
             return written
         }, nil, exactPCM)

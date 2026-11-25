@@ -155,6 +155,8 @@ struct EditorPreview<Content: View>: View {
     let accessibilityTitle: String
     let issue: String?
     let audioWarning: String?
+    /// Pictures the preview omitted, such as after a damaged picture. Playback goes on.
+    var pictureNotice: String? = nil
     @ViewBuilder let content: Content
 
     var body: some View {
@@ -163,11 +165,20 @@ struct EditorPreview<Content: View>: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(.black)
             .overlay(alignment: .bottomLeading) {
-                if let audioWarning, issue == nil {
-                    Label(audioWarning, systemImage: "speaker.slash.fill")
-                        .modifier(PreviewNoticeStyle())
-                        .padding(12)
-                        .allowsHitTesting(false)
+                if issue == nil && (audioWarning != nil || pictureNotice != nil) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        if let pictureNotice {
+                            Label(pictureNotice, systemImage: "exclamationmark.triangle.fill")
+                                .modifier(PreviewNoticeStyle())
+                                .accessibilityIdentifier("preview.pictureNotice")
+                        }
+                        if let audioWarning {
+                            Label(audioWarning, systemImage: "speaker.slash.fill")
+                                .modifier(PreviewNoticeStyle())
+                        }
+                    }
+                    .padding(12)
+                    .allowsHitTesting(false)
                 }
             }
             .overlay {

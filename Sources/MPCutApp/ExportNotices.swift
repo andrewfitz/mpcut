@@ -68,6 +68,48 @@ enum ExportNotices {
     static func appending(_ lines: [String], to text: String) -> String {
         lines.reduce(text) { $0.contains($1) ? $0 : $0 + "\n" + $1 }
     }
+
+    /// "Smart Trim encoded 2 edges: 41 KB of a 45 KB target, 1 AV1 retry." for the message of a written export:
+    /// the bytes the edge encoder produced against the edges' target, from `encoded_edge_results`. Nil when the
+    /// export encoded no edge.
+    static func encodedEdges(_ results: [EncodedEdgeResult]) -> String? {
+        guard !results.isEmpty else { return nil }
+        let size = ByteCountFormatter()
+        size.countStyle = .file
+        let encoded = results.reduce(Int64(0)) { $0 + Int64(clamping: $1.encodedBytes) }
+        let target = results.reduce(Int64(0)) { $0 + Int64(clamping: $1.targetBytes) }
+        let retries = results.filter(\.retried).count
+        let edges = results.count == 1 ? "1 edge" : "\(results.count) edges"
+        let retry = retries == 0 ? "" : retries == 1 ? ", 1 AV1 retry" : ", \(retries) AV1 retries"
+        return "Smart Trim encoded \(edges): \(size.string(fromByteCount: encoded)) of a \(size.string(fromByteCount: target)) target\(retry)."
+    }
+
+    /// `next` as a further sentence of `message`, which may lack its full stop. `message` alone when `next` is nil.
+    static func sentence(_ message: String, then next: String?) -> String {
+        guard let next else { return message }
+        return message + (message.hasSuffix(".") ? " " : ". ") + next
+    }
+
+    /// "Clip-001.mov: Smart Trim encoded 1 edge: 41 KB of a 45 KB target." for each written queue range that encoded
+    /// an edge, in queue order, for the Export Queue's completion message. A range that encoded none adds nothing.
+    static func queueEncodedEdges(_ written: [(output: URL, edges: [EncodedEdgeResult])]) -> [String] {
+        written.compactMap { row in encodedEdges(row.edges).map { "\(row.output.lastPathComponent): \($0)" } }
+    }
+}
+
+extension ExportPlan {
+    /// Runs `write`, which writes this plan, and returns what each Smart Trim edge it encoded cost, as
+    /// `mpcut export` reports it under `encoded_edge_results`. Empty for any plan but Smart Trim. The edge encoder
+    /// keeps one record for the whole process, so an export that runs at the same time can leave edges out.
+    func writingEncodedEdges(_ write: () throws -> Void) rethrows -> [EncodedEdgeResult] {
+        guard case .packets(let edit, .smart, _) = self else {
+            try write()
+            return []
+        }
+        SmartTrimEdgeResults.reset()
+        try write()
+        return SmartTrimEdgeResults.take(for: edit)
+    }
 }
 
 // MARK: Export Queue
@@ -95,6 +137,17 @@ extension SequenceQueuePlan.Item {
 }
 
 extension SequenceQueuePlan {
+    /// Writes one range and returns what each Smart Trim edge of an ordinary range cost, as `mpcut export ranges separate`
+    /// reports it under `encoded_edge_results`. The edge encoder keeps one record for the whole process, so the edges are
+    /// taken right after this range's write, before the next range starts. Empty for a still or picture range.
+    func writeReportingEdges(_ item: Item, progress: @escaping @Sendable (Double) -> Bool) throws -> [EncodedEdgeResult] {
+        guard case .ordinary(let planned) = item.payload else {
+            try write(item, progress: progress)
+            return []
+        }
+        return try planned.plan.writingEncodedEdges { try write(item, progress: progress) }
+    }
+
     /// The review the Export Queue shows before it asks for a folder, in queue order. `others` holds the summaries of
     /// the ranges that are not ordinary exports, in their order. Nil when no range has anything to review.
     func review(interleaving others: [String]) -> String? {
@@ -119,20 +172,52 @@ extension MulticamExportPlan {
         return ExportNotices.smartTrimSplit(copied: copiedVideoDuration, encoded: encodedVideoDuration)
     }
 
+    /// The warnings of the plan as `mpcut export` reports them for a multicam program: those of the encode and the
+    /// sound, then what the program leaves out of its sources, such as the chapters of a camera other than the
+    /// reference angle or chapters the container cannot hold.
+    var reportedWarnings: [String] {
+        warnings + copyOmissions.filter { !warnings.contains($0) }
+    }
+
     /// What the multicam export sheet reviews before it writes: how much video Smart Trim encodes, the audio
-    /// delivery, and the warnings of the plan.
+    /// delivery, and the warnings of the plan with what it leaves out.
     var deliveryReview: String {
-        ExportNotices.appending(warnings, to: [smartTrimSplit, audioDeliverySummary].compactMap { $0 }.joined(separator: "\n"))
+        ExportNotices.appending(reportedWarnings, to: [smartTrimSplit, audioDeliverySummary].compactMap { $0 }.joined(separator: "\n"))
+    }
+
+    /// The top-level fields an MCP plan or render result adds for a multicam program, beside `plan` and `cut_map`:
+    /// `warnings` with what it leaves out, as `mpcut export` lists them, when there are any. `plan.warnings` keeps
+    /// the encoded plan's own.
+    var mcpNotes: [String: Any] {
+        let reported = reportedWarnings
+        return reported.isEmpty ? [:] : ["warnings": reported]
+    }
+
+    /// The plan as the saved Export Result JSON states it: the encoded plan, with what the program leaves out
+    /// after its own warnings under `warnings`, as for an ordinary export.
+    var resultPlan: MulticamResultPlan { MulticamResultPlan(plan: self) }
+}
+
+/// A multicam plan for the saved Export Result JSON. `warnings` adds what the program leaves out of its sources.
+struct MulticamResultPlan: Encodable {
+    let plan: MulticamExportPlan
+
+    private enum CodingKeys: String, CodingKey { case warnings }
+
+    func encode(to encoder: Encoder) throws {
+        try plan.encode(to: encoder)
+        var fields = encoder.container(keyedBy: CodingKeys.self)
+        try fields.encode(plan.reportedWarnings, forKey: .warnings)
     }
 }
 
 extension MulticamBulkExport.Item {
     /// The review of one multicam range: how much video Smart Trim copies and encodes, the audio delivery, and the
-    /// warnings of the plan.
+    /// warnings of the plan with what it leaves out.
     var review: String {
         guard case .multicam(let plan) = payload else { return audioDeliverySummary }
         let delivery = [plan.smartTrimSplit, audioDeliverySummary].compactMap { $0 }.joined(separator: "\n")
-        return ExportNotices.appending(plan.warnings, to: delivery)
+        return ExportNotices.appending(plan.reportedWarnings, to: delivery)
     }
 }
 

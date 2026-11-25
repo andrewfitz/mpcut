@@ -213,6 +213,8 @@ private final class MulticamPictureDecoder: @unchecked Sendable {
     private var reader = FFPreviewReader(videoOnly: true)
     private var source: MulticamPictureSource?
     private var native: HardwareFrames?
+    /// Why AVFoundation is not decoding the current camera, which FFmpeg then decodes (ffmpegDecoderNote).
+    private var nativeIssue: String?
     private var parked: [NativeEntry] = []
     private var previous: MulticamPicturePosition?
     private var frame: PreviewFrame?
@@ -255,7 +257,15 @@ private final class MulticamPictureDecoder: @unchecked Sendable {
             parked.append(prior)
             if parked.count > 3 { parked.removeFirst() }
         }
-        native = reuse ?? (try? HardwareFrames(url: target.url))
+        nativeIssue = nil
+        if let reuse {
+            native = reuse
+        } else {
+            do { native = try HardwareFrames(url: target.url) } catch {
+                native = nil
+                nativeIssue = error.localizedDescription
+            }
+        }
         source = target
         reader = FFPreviewReader(videoOnly: true)
         previous = nil
@@ -280,13 +290,18 @@ private final class MulticamPictureDecoder: @unchecked Sendable {
             // A cancelled request can leave the error of a damaged picture for the next request.
             // The decoder starts again at the keyframe after it reports an error.
             var decoded: PreviewFrame?
-            do { decoded = try picture() } catch { decoded = try? picture() }
+            do { decoded = try picture() } catch {
+                nativeIssue = error.localizedDescription
+                decoded = try? picture()
+            }
             guard !cancelled() else { return nil }
             if let decoded {
+                nativeIssue = nil
                 frame = decoded
                 previous = target
                 return decoded
             }
+            if nativeIssue == nil { nativeIssue = "AVFoundation returned no picture at this position." }
             previous = nil
         }
         let nativeRefused = native != nil
@@ -298,7 +313,7 @@ private final class MulticamPictureDecoder: @unchecked Sendable {
                 || $0.provisional != target.provisional || target.provisional
                 || target.frameTime <= $0.frameTime || target.frameTime.seconds - $0.frameTime.seconds > 0.5
         } ?? true
-        let decoded = try reader.perform(cancelled: cancelled) {
+        var decoded = try reader.perform(cancelled: cancelled) {
             if mustSeek {
                 try reader.seek(url: target.url, to: max(0, target.frameTime.seconds), audioOrigin: target.origin)
             }
@@ -306,7 +321,9 @@ private final class MulticamPictureDecoder: @unchecked Sendable {
                 : reader.indexedFrame(at: previewTime(target.frameTime), cancelled: cancelled)
         }
         guard !cancelled() else { return nil }
-        guard let decoded else { throw MulticamDecodeError.picture(target.url) }
+        guard decoded != nil else { throw MulticamDecodeError.picture(target.url) }
+        // FFmpeg reaches the same VideoToolbox decoder. The viewer's status names the switch and its reason.
+        decoded?.decoderNote = ffmpegDecoderNote(nativeIssue)
         // Both decoders refuse a damaged picture. A picture that only the native decoder
         // refuses shows that it cannot read this source.
         if nativeRefused { native = nil }

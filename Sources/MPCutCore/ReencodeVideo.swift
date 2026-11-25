@@ -9,6 +9,14 @@ struct ReencodeVideo: Sendable {
     let arguments: [String]
     let warning: String?
 
+    /// The refusal for a picture with more than one layer. The encoders write the primary picture only, so an
+    /// encode would drop the rest without a word.
+    static func layerRefusal(_ stream: StreamInfo) -> CutError {
+        CutError(code: "unsupported_format", message: stream.codec == "h264"
+            ? "The selected hardware profiles cannot preserve the H.264 auxiliary (alpha), MVC or SVC pictures of this source; an encode would keep only the primary picture."
+            : "The selected hardware profiles cannot preserve additional HEVC layers such as alpha or a second view; an encode would keep only the base layer. Lossless Copy and Smart Trim keep an alpha layer and both views of spatial video.")
+    }
+
     /// The picture a mixed timeline is fitted into. A uniform timeline has none and keeps its source's picture.
     struct Frame: Sendable {
         let width: Int
@@ -22,6 +30,7 @@ struct ReencodeVideo: Sendable {
         guard !stream.hasAlpha else {
             throw CutError(code: "unsupported_format", message: "The selected hardware profiles do not preserve the source’s alpha channel.")
         }
+        if stream.hasAdditionalVideoLayers { throw Self.layerRefusal(stream) }
         guard stream.rotation.isMultiple(of: 90) else {
             throw CutError(code: "unsupported_format", message: "Re-encode supports display rotations in 90-degree increments.")
         }
@@ -175,12 +184,13 @@ extension ReencodeEngine {
         struct Sound { let rate: Int; let channels: Int; let layout: String; let index: Int; let options: [String] }
         var converted: [Sound] = []
         if let canvas {
-            for (action, sound) in zip(actions, canvas.audio) where [.aac, .pcm].contains(action.action) {
+            for (action, sound) in zip(actions, canvas.audio) where [.aac, .pcm, .flac, .alac, .mp3, .opus].contains(action.action) {
                 converted.append(Sound(rate: sound.sampleRate, channels: sound.channels, layout: sound.layout, index: action.track,
                                        options: audioOptions(action, sound: sound, outputIndex: converted.count)))
             }
         } else {
-            for (action, track) in zip(actions, audio) where [.aac, .pcm].contains(action.action) || exactPCM.contains(action.track) {
+            for (action, track) in zip(actions, audio) where [.aac, .pcm, .flac, .alac, .mp3, .opus].contains(action.action)
+                || exactPCM.contains(action.track) {
                 converted.append(Sound(rate: track.sampleRate, channels: track.channels, layout: try audioLayout(track), index: track.index,
                                        options: audioOptions(action, track: track, outputIndex: converted.count,
                                                              exactPCM: exactPCM.contains(action.track))))

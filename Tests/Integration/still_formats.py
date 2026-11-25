@@ -39,6 +39,14 @@ class StillFormatTests(unittest.TestCase):
                 self.assertEqual(image["rendition"], "gain_map")
                 self.assertIn("iso_gain_map", image["auxiliary_images"])
 
+    def test_apple_gain_map_rendition(self):
+        # An iPhone-style HEIC whose only gain map is Apple's, with a headroom of 4 from its maker tags.
+        image = self.inspect(FIXTURES / "apple-gain-map.heic")["image"]
+        self.assertEqual((image["codec"], image["rendition"]), ("heic", "gain_map"))
+        self.assertIn("apple_gain_map", image["auxiliary_images"])
+        self.assertNotIn("iso_gain_map", image["auxiliary_images"])
+        self.assertAlmostEqual(image["headroom"], 4, delta=0.1)
+
     def test_jxl_high_precision_pq(self):
         image = self.inspect(FIXTURES / "pq_gradient.jxl")["image"]
         self.assertEqual((image["codec"], image["width"], image["height"]), ("jxl", 1088, 64))

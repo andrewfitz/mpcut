@@ -35,6 +35,7 @@ public struct AudioExportPlan: Sendable {
             return "MP3 · \((written.bitRate ?? 0) / 1000) kbps"
         case .aac: return "AAC · \((written.bitRate ?? 0) / 1000) kbps"
         case .flac: return "FLAC · \(written.bitDepth ?? 0)-bit"
+        case .alac: return "ALAC · \(written.bitDepth ?? 0)-bit"
         case .opus: return "Opus · \((written.bitRate ?? 0) / 1000) kbps"
         default:
             return written.codec == "pcm_f32le" ? "PCM · 32-bit float" : "PCM · \(written.bitDepth ?? 0)-bit"
@@ -59,8 +60,11 @@ public struct AudioExportEngine: Sendable {
         self.audioTrackOrdinal = audioTrackOrdinal
     }
 
+    /// Sound-only containers whose muxer writes chapters that read back where they were placed.
+    static let chapterContainers: Set<String> = ["m4a", "mp4", "mov", "mka", "mp3"]
+
     /// The conversions this build can describe, most faithful first.
-    public static let conversions: [ReencodeAudio] = [.flac, .pcm, .mp3, .aac, .opus]
+    public static let conversions: [ReencodeAudio] = [.flac, .alac, .pcm, .mp3, .aac, .opus]
 
     /// Output extensions for a conversion. The first is its default.
     public static func containers(for action: ReencodeAudio) -> [String] { ExportRules.conversionContainers(action) }
@@ -298,10 +302,35 @@ public struct AudioExportEngine: Sendable {
             } else if let decoded = streams.first(where: { !Self.decodesToInteger($0) }) {
                 warnings.append("FLAC stores integer samples. Peaks of the decoded \(decoded.codec) source above full scale will clip. Choose PCM to keep them.")
             }
+            // MP4 and Matroska read a FLAC track with more than two channels back without its layout, or in another one.
+            if container != "flac", plan.channels > 2 {
+                throw CutError(code: "unsupported_audio",
+                               message: "\(container.uppercased()) cannot keep the channel layout of FLAC with more than two channels. Choose .flac.")
+            }
             written.codec = "flac"
             written.bitDepth = depth
             plan.encoderArguments = depth == 16 ? ["-c:a", "flac", "-sample_fmt", "s16"]
                 : ["-c:a", "flac", "-sample_fmt", "s32", "-bits_per_raw_sample", "24"]
+        case .alac:
+            // Like FLAC: integer sources keep their word length up to 24 bits, the longest the encoder keeps here.
+            // M4A, MOV and MP4 read an ALAC track with more than two channels back without its layout.
+            guard plan.channels <= 2 else {
+                throw CutError(code: "unsupported_audio",
+                               message: "ALAC conversion keeps mono or stereo sound here. Choose FLAC in .flac or PCM for the \(plan.layout) channel layout.")
+            }
+            let depth = integerDepth.map { $0 <= 16 ? 16 : 24 } ?? 24
+            if let integerDepth, integerDepth > 24 {
+                warnings.append("ALAC is written with 24-bit samples here. The \(integerDepth)-bit source will be reduced to 24 bits.")
+            } else if integerDepth != nil {
+                lossless = true
+            } else if streams.contains(where: { $0.codec.hasPrefix("pcm_f") }) {
+                warnings.append("ALAC stores integer samples. The floating-point source will be reduced to 24 bits, and samples above full scale will clip. Choose PCM to keep them.")
+            } else if let decoded = streams.first(where: { !Self.decodesToInteger($0) }) {
+                warnings.append("ALAC stores integer samples. Peaks of the decoded \(decoded.codec) source above full scale will clip. Choose PCM to keep them.")
+            }
+            written.codec = "alac"
+            written.bitDepth = depth
+            plan.encoderArguments = ["-c:a", "alac", "-sample_fmt", depth == 16 ? "s16p" : "s32p", "-bits_per_raw_sample", "\(depth)"]
         case .aac:
             let measured = sources.compactMap { Self.averageBitRate($0.audio, in: indexed[$0.media.url]) }
             let rate = Self.aacBitRate(matching: native == .aac && measured.count == sources.count ? measured.max() : nil,
@@ -335,7 +364,7 @@ public struct AudioExportEngine: Sendable {
             // Without a named mapping family the helper's libopus encoder assigns the channels of 5.0 and 6.1 to the wrong speakers.
             if plan.channels > 2 { plan.encoderArguments? += ["-mapping_family", "1"] }
         default:
-            throw CutError(code: "invalid_arguments", message: "Choose auto, copy, aac, pcm, mp3, flac or opus for audio conversion.")
+            throw CutError(code: "invalid_arguments", message: "Choose auto, copy, aac, pcm, mp3, alac, flac or opus for audio conversion.")
         }
         // The first source with a cover picture supplies it, where the output format holds one.
         for (media, _) in sources {
@@ -351,6 +380,24 @@ public struct AudioExportEngine: Sendable {
                 warnings.append("The cover art of \(media.url.lastPathComponent) cannot be carried in .\(container) and will be omitted.")
             }
             break
+        }
+        // Source chapters follow the kept ranges onto the output timeline, as in a movie re-encode. MP4, M4A, MOV, MKA and MP3
+        // (in an ID3v2 tag) write them. FLAC, WAV and CAF have no chapter list here, and the helper's Ogg muxer misplaces
+        // chapter starts in Opus comments, so those files omit them and say so. A plan that names no output reads no chapters.
+        if output != nil {
+            let carried = try ReencodeChapter.remapped(plan.edit.segments, media: indexed, cancelled: cancelled)
+            warnings += carried.warnings
+            if !carried.chapters.isEmpty {
+                if Self.chapterContainers.contains(container) {
+                    plan.chapters = carried.chapters
+                    if action == .mp3, let version = plan.encoderArguments?.firstIndex(of: "-id3v2_version"),
+                       plan.encoderArguments?[version + 1] == "0" {
+                        plan.encoderArguments?[version + 1] = "3"
+                    }
+                } else {
+                    warnings.append("The source chapters cannot be carried in .\(container) and will be omitted.")
+                }
+            }
         }
         plan.muxer = container == "m4a" ? "ipod" : container == "mka" ? "matroska" : muxerName(container)
         plan.verifiesSampleRange = true
@@ -555,13 +602,21 @@ public struct AudioExportEngine: Sendable {
         return Int(exactly: (size.doubleValue * 8 / media.duration.seconds).rounded(.towardZero))
     }
 
-    /// The libopus target: the customary rate nearest the source's average, or a default for its channels.
+    /// The libopus target: the source's average to the nearest 1 kbps, or a default for its channels.
     static func opusBitRate(matching average: Int?, channels: Int) -> Int {
+        // libopus takes any rate from 500 bps to 256 kbps per channel (measured with the helper), so an Opus source is
+        // matched at its own average. A ladder step could miss it by a tenth: 141 kbps became 128 kbps.
+        // A source that is mostly silence averages a few kbps, which would starve the kept speech or music,
+        // so the match never goes below the floor the ladder used.
+        if let average {
+            let floor = max(16_000, channels * 12_000)
+            return min(max(1, channels) * 256_000, max(floor, (average + 500) / 1_000 * 1_000))
+        }
         let steps = [8, 12, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 510].map { $0 * 1000 }
         // The libopus default: 64 kbps for each stream and 32 kbps more for each coupled pair of channels.
         let pairs = [0, 1, 1, 2, 2, 2, 2, 3]
         let coupled = pairs.indices.contains(channels - 1) ? pairs[channels - 1] : 1
-        let target = average ?? (max(1, channels) * 64_000 - coupled * 32_000)
+        let target = max(1, channels) * 64_000 - coupled * 32_000
         // libopus accepts at most 256 kbps per channel.
         let allowed = steps.filter { $0 >= max(16_000, channels * 12_000) && $0 <= channels * 256_000 }
         return allowed.min { abs($0 - target) < abs($1 - target) } ?? 96_000
@@ -601,6 +656,9 @@ public struct AudioExportEngine: Sendable {
         }
     }
 
+    /// The encoder names of a helper, read once for each build of it.
+    static func encoders(of helper: URL) -> Set<String> { encoderCache.encoders(of: helper) }
+
     /// Refuses a conversion at planning time when the installed helper cannot encode it.
     static func requireEncoder(for action: ReencodeAudio, helper: URL) throws {
         let name: String
@@ -627,7 +685,7 @@ public struct AudioExportEngine: Sendable {
 /// An MP3 track in another container gives the average rate of its packets.
 struct MP3Profile {
     enum Control { case constant, average, variable }
-    let control: Control
+    private(set) var control: Control
     private(set) var bitRate: Int
     let quality: Int?
 
@@ -721,6 +779,14 @@ struct MP3Profile {
             control = .variable
             quality = lame ? level.map { max(0, min(9, (100 - $0) / 10)) } : nil
         }
+    }
+
+    /// The same rate taken as constant. A track in a movie container states only the average of its packets, and LAME's
+    /// ABR undershoots a requested average on dense material, while a constant rate at the nearest step meets it.
+    var asConstant: MP3Profile {
+        var profile = self
+        if profile.control == .average { profile.control = .constant }
+        return profile
     }
 
     /// Chooses the LAME setting closest to the sources, or a default for other sources.

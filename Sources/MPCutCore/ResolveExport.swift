@@ -87,8 +87,13 @@ public final class ResolveExport {
             let clips = project.sequenceClips ?? []
             let sequence = CutProject.sequence(clips)
             try InterchangeMediaPreflight.require(clips.map(\.file), relativeTo: location)
-            return try write(sequence.requests(relativeTo: location), to: output, useSidecar: useSidecar, matching: imported,
-                             auxiliaryOutput: auxiliaryOutput, cancelled: cancelled)
+            // The timeline links each clip's playable source. Say what of MPCut's replacement audio it leaves behind,
+            // as the native Resolve archive and Premiere exports do.
+            let replaced = clips.contains { $0.audioTrack != nil || $0.originalFile != nil || !$0.replacementNames.isEmpty }
+            let note = "The Resolve timeline links each playable source with its replacement audio. It omits MPCut’s original "
+                + "recording references, replacement track names and preview-track choices."
+            return try (replaced ? [note] : []) + write(sequence.requests(relativeTo: location), to: output, useSidecar: useSidecar,
+                                                        matching: imported, auxiliaryOutput: auxiliaryOutput, cancelled: cancelled)
         }
     }
 
@@ -608,6 +613,11 @@ public final class ResolveExport {
         }
         let standaloneRate = standalone.map { RationalTime(numerator: $0.cadence.denominator, denominator: $0.cadence.numerator) }
         let rate = video?.frameRate ?? standaloneRate ?? RationalTime(numerator: 24)
+        if video == nil, standalone == nil {
+            // An FCPXML timeline needs a picture format. With no picture to follow, say which one it was given.
+            let note = "No clip has picture, so the timeline uses 24 fps and 1920 × 1080."
+            if warned.insert(note).inserted { warnings.append(note) }
+        }
         var ordinal = 0
         for index in 0..<(clips.count + inserts.count) {
             try engine.checkCancellation()
@@ -659,7 +669,14 @@ public final class ResolveExport {
                 for (index, stream) in streams.enumerated() {
                     let sound = try soundFile(info, stream: stream)
                     let from = max(start, stream.start), to = try min(start.adding(length), stream.start.adding(sound.duration))
-                    guard from < to else { continue }
+                    // Outside its own extent a track is silent in MPCut too, so a shorter lane loses nothing. A track
+                    // with no sound in the clip at all is left out of it, and that is said.
+                    guard from < to else {
+                        let note = "Audio track \(stream.index) of \(info.url.lastPathComponent) has no sound inside clip "
+                            + "\(ordinal + 1) and is left out of that clip."
+                        if warned.insert(note).inserted { warnings.append(note) }
+                        continue
+                    }
                     node.child("audio", ["ref": try asset(sound), "lane": String(index - streams.count),
                         "offset": from.fcpxTime, "start": try from.subtracting(stream.start).fcpxTime,
                         "duration": try to.subtracting(from).fcpxTime])

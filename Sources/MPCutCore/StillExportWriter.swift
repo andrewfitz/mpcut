@@ -113,7 +113,7 @@ extension StillExportPlanner {
                                                     return reference.configuration.isEmpty
                                                 }
                                                 return false
-                                            })
+                                            }, quality: plan.settings.requestedQuality)
         let transcode = plan.report.mode == .encode
         let held = plan.report.pictureTiming == .held
         let container = output.pathExtension

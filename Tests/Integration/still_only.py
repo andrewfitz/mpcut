@@ -229,6 +229,71 @@ class StillOnlyTests(unittest.TestCase):
                     self.assertEqual(len(frames), 6 * 4)
                     self.assertGreater(frames[0], frames[-1] + 64)
 
+    def test_still_only_hevc_keeps_deep_images_in_main_10(self):
+        # A 16-bit ramp across four 8-bit codes. HEVC Main keeps 4 levels of it, Main 10 about 14.
+        with tempfile.TemporaryDirectory(prefix="mpcut-still-depth-") as directory:
+            root = Path(directory)
+            deep = root / "ramp16.png"
+            shallow = root / "ramp8.png"
+            ffmpeg("-f", "lavfi", "-i", "nullsrc=s=320x180,format=gray16le,geq=lum='32382+1028*X/W'",
+                   "-frames:v", "1", "-pix_fmt", "rgb48be", deep)
+            ffmpeg("-i", deep, "-pix_fmt", "rgb24", shallow)
+            for image, profile, pixel_format, minimum_levels in ((deep, "Main 10", "yuv420p10le", 10),
+                                                                  (shallow, "Main", "yuv420p", 1)):
+                with self.subTest(image=image.name):
+                    cut = root / f"{image.stem}.cut"
+                    output = root / f"{image.stem}.mov"
+                    run([CLI, "still", "project", "create", "--out-project", cut, "--image", image,
+                         "--width", "320", "--height", "180", "--rate", "30", "--codec", "hevc",
+                         "--container", "mov", "--frames", "5"])
+                    run([CLI, "export", "project", "render", "--project", cut, "--require-camera-copy",
+                         "--output", output, "--json"], allow_diagnostics=True)
+                    stream = probe(output, "-show_streams")["streams"][0]
+                    self.assertEqual((stream["profile"], stream["pix_fmt"]), (profile, pixel_format))
+                    self.assertEqual(stream["color_transfer"], "bt709")
+                    row = ffmpeg("-i", output, "-frames:v", "1", "-vf", "format=gray16le,crop=iw:1:0:ih/2",
+                                 "-f", "rawvideo", "-")
+                    levels = len(set(array("H", row)))
+                    self.assertGreaterEqual(levels, minimum_levels)
+                    if profile == "Main":
+                        self.assertLessEqual(levels, 5)
+
+    def test_still_only_quality_chooses_prores_profile_and_compression(self):
+        with tempfile.TemporaryDirectory(prefix="mpcut-still-quality-") as directory:
+            root = Path(directory)
+            image = root / "pattern.png"
+            ffmpeg("-f", "lavfi", "-i", "testsrc2=s=640x360", "-frames:v", "1", image)
+            sizes = {}
+            for codec, quality, tag in (("prores", None, "apcn"), ("prores", "422-lt", "apcs"),
+                                        ("prores", "422-hq", "apch"), ("h264", None, "avc1"),
+                                        ("h264", "smaller", "avc1"), ("h264", "balanced", "avc1"),
+                                        ("h264", "high", "avc1"), ("hevc", None, "hvc1"),
+                                        ("hevc", "smaller", "hvc1"), ("hevc", "balanced", "hvc1"),
+                                        ("hevc", "high", "hvc1")):
+                with self.subTest(codec=codec, quality=quality):
+                    name = f"{codec}-{quality or 'default'}"
+                    cut = root / f"{name}.cut"
+                    output = root / f"{name}.mov"
+                    run([CLI, "still", "project", "create", "--out-project", cut, "--image", image,
+                         "--width", "640", "--height", "360", "--rate", "30", "--codec", codec,
+                         "--container", "mov", "--frames", "30"])
+                    run([CLI, "export", "project", "render", "--project", cut, "--require-camera-copy",
+                         "--output", output, "--json", *(["--quality", quality] if quality else [])],
+                        allow_diagnostics=True)
+                    stream = probe(output, "-show_streams")["streams"][0]
+                    self.assertEqual((stream["codec_name"], stream["codec_tag_string"]), (codec, tag))
+                    sizes[(codec, quality)] = output.stat().st_size
+            self.assertLess(sizes[("prores", "422-lt")], sizes[("prores", None)])
+            self.assertGreater(sizes[("prores", "422-hq")], sizes[("prores", None)])
+            for codec in ("h264", "hevc"):
+                self.assertLess(sizes[(codec, "smaller")], sizes[(codec, None)] * 0.8)
+                # No --quality keeps the still default, which is Re-encode's High Quality: the same encode, byte for byte.
+                # An explicit Balanced is Re-encode's Balanced (q60 against q75: about three quarters of the size here),
+                # between Smaller File and High Quality.
+                self.assertEqual(sizes[(codec, "high")], sizes[(codec, None)])
+                self.assertLess(sizes[(codec, "balanced")], sizes[(codec, None)] * 0.9)
+                self.assertLess(sizes[(codec, "smaller")], sizes[(codec, "balanced")] * 0.9)
+
     def test_explicit_conversion_uses_stored_delivery(self):
         with tempfile.TemporaryDirectory(prefix="mpcut-still-convert-") as directory:
             root = Path(directory)
@@ -284,7 +349,9 @@ class StillOnlyTests(unittest.TestCase):
                           ("alac16.m4a", 16, ["-c:a", "alac", "-sample_fmt", "s16p"]),
                           ("alac24.mov", 24, ["-c:a", "alac", *planar]),
                           ("alac24.mka", 24, ["-c:a", "alac", *planar])]
-            targets = [("mov", [], "alac"), ("mov", ["--audio", "pcm"], "pcm_s{depth}le"), ("mp4", [], "alac"),
+            # By default a soundtrack keeps its own lossless codec where the container carries it. MOV cannot carry FLAC,
+            # so a FLAC soundtrack becomes ALAC there, and ALAC is not verified in Matroska, so it becomes FLAC there.
+            targets = [("mov", [], "alac"), ("mov", ["--audio", "pcm"], "pcm_s{depth}le"), ("mp4", [], "{native}"),
                        ("m4v", ["--audio", "alac"], "alac"), ("mp4", ["--audio", "flac"], "flac"), ("mkv", [], "flac")]
             for name, depth, encoder in recordings:
                 recording = root / name
@@ -294,15 +361,82 @@ class StillOnlyTests(unittest.TestCase):
                 if depth == 24:
                     # The fixture uses the low byte of its 24 bits, so a 16-bit path would fail the comparison.
                     self.assertTrue(any(expected[1::4]))
+                native = name.split("1")[0].split("2")[0]
                 for container, options, codec in targets:
                     with self.subTest(recording=name, container=container, options=options):
                         output, action = self.soundtrack_export(root, cover, recording, container, *options)
                         written = probe(output, "-select_streams", "a:0", "-show_streams")["streams"][0]
-                        self.assertEqual(written["codec_name"], codec.format(depth=depth))
+                        codec = codec.format(depth=depth, native=native)
+                        self.assertEqual(written["codec_name"], codec)
                         self.assertEqual(samples(output), expected)
                         self.assertEqual(action["warnings"], [])
                         if action["audio"] != "copy":
-                            self.assertEqual((action["codec"], action["bit_depth"]), (codec.format(depth=depth), depth))
+                            self.assertEqual((action["codec"], action["bit_depth"]), (codec, depth))
+                        if not options and codec == native and action["audio"] != "copy":
+                            self.assertIn(f"The {native.upper()} source is written as {native.upper()}", action["reason"])
+
+    def test_mpeg_audio_in_matroska_fits_and_renders_every_whole_sample(self):
+        # Matroska states the end of an MP3 or MP2 track to the millisecond, between two 44.1 kHz samples. The whole
+        # track is attached up to its last complete sample, and every kept sample is rendered.
+        with tempfile.TemporaryDirectory(prefix="mpcut-still-mpeg-mka-") as directory:
+            root = Path(directory)
+            cover = root / "cover.png"
+            ffmpeg("-f", "lavfi", "-i", "color=blue:size=64x36", "-frames:v", "1", cover)
+            for codec, name in (("libmp3lame", "mp3.mka"), ("mp2", "mp2.mka")):
+                with self.subTest(codec=codec):
+                    recording = root / name
+                    ffmpeg("-f", "lavfi", "-i", "anoisesrc=d=3:c=pink:r=44100:a=0.4:seed=4", "-ac", "2", "-c:a", codec, recording)
+                    for container in ("mkv", "mov"):
+                        output, action = self.soundtrack_export(root, cover, recording, container)
+                        self.assertNotEqual(action["audio"], "copy", action)
+                        renders = [output]
+                        if action["audio"] == "mp3":
+                            # Auto writes an MP3 source to MOV as MP3 again, a second lossy encoding. A PCM render
+                            # keeps every decoded sample to compare.
+                            renders.append(self.soundtrack_export(root, cover, recording, container, "--audio", "pcm")[0])
+
+                        def decoded(path):
+                            return array("f", ffmpeg("-i", path, "-map", "0:a:0", "-c:a", "pcm_f32le", "-f", "f32le", "-"))
+
+                        source = decoded(recording)
+                        for render in renders:
+                            written = decoded(render)
+                            # Whole samples only: the written track ends within a packet of the decoded source.
+                            self.assertLessEqual(abs(len(source) - len(written)), 2 * 1152)
+                            self.assertGreater(len(written), 2 * 44100 * 2)
+                        count = min(len(source), len(written))
+                        cross = sum(a * b for a, b in zip(source[:count], written[:count]))
+                        power = (sum(a * a for a in source[:count]) * sum(b * b for b in written[:count])) ** 0.5
+                        self.assertGreater(cross / power, 0.999)
+
+    def test_soundtrack_copies_that_cannot_be_written_are_refused_when_planned(self):
+        # Each of these copies used to plan and then fail while writing. The dry run and the export now agree.
+        with tempfile.TemporaryDirectory(prefix="mpcut-still-copy-refusals-") as directory:
+            root = Path(directory)
+            cover = root / "cover.png"
+            ffmpeg("-f", "lavfi", "-i", "color=blue:size=64x36", "-frames:v", "1", cover)
+            tone = ["-f", "lavfi", "-i", "aevalsrc=0.6*sin(2*PI*440*t)|0.5*sin(2*PI*661*t):s=48000:d=2"]
+            for name, codec, container, works in [("sound.flac", "flac", "mov", "MP4 or MKV"), ("sound.opus", "libopus", "mov", "MP4 or MKV"),
+                                                  ("sound.opus", "libopus", "mkv", "MP4"), ("sound.mp2", "mp2", "mp4", "MOV or MKV"),
+                                                  ("sound.m4a", "alac", "mkv", "MOV, MP4 or M4A"), ("sound.wav", "pcm_s16le", "mp4", "MOV or MKV")]:
+                with self.subTest(source=name, container=container):
+                    recording = root / name
+                    if not recording.exists():
+                        ffmpeg(*tone, "-c:a", codec, recording)
+                    folder = Path(tempfile.mkdtemp(dir=root))
+                    project = folder / "cover.cut"
+                    run([CLI, "still", "project", "create", "--out-project", project, "--image", cover, "--width", "64", "--height", "36",
+                         "--rate", "30", "--codec", "h264", "--container", container, "--soundtrack", recording, "--fit-soundtrack", "--json"],
+                        allow_diagnostics=True)
+                    output = folder / f"cover.{container}"
+                    for dry in (["--dry-run"], []):
+                        result = subprocess.run([CLI, "export", "project", "render", "--project", project, "--output", output, "--no-sidecar",
+                                                 "--json", "--audio", "copy", *dry], capture_output=True, text=True, timeout=120)
+                        report = json.loads(result.stdout)
+                        self.assertFalse(report["ok"], report)
+                        self.assertIn(report["error"]["code"], ("unsupported_container", "audio_copy_unavailable"), report)
+                        self.assertIn(works, report["error"]["message"])
+                        self.assertFalse(output.exists())
 
     def test_lossy_soundtrack_is_copied_by_default_and_converted_without_clipping(self):
         with tempfile.TemporaryDirectory(prefix="mpcut-still-lossy-soundtrack-") as directory:
@@ -352,12 +486,36 @@ class StillOnlyTests(unittest.TestCase):
             self.assertEqual((action["audio"], action["codec"]), ("aac", "aac"))
             self.assertEqual(action["bit_rate"], 192000)
 
-            # A lossy codec outside the measured set is decoded as before, and the action says so.
+            # A lossy codec outside the measured copy set keeps its own format where the container carries it, at its rate.
             other = root / "recording.mp3"
             ffmpeg("-i", recording, "-c:a", "libmp3lame", "-b:a", "128k", other)
             output, action = self.soundtrack_export(root, cover, other, "mov")
-            self.assertEqual((action["audio"], action["treatment"]), ("alac", "decoded source audio"))
-            self.assertTrue(any("mp3 source is decoded" in warning for warning in action["warnings"]), action["warnings"])
+            self.assertEqual((action["audio"], action["codec"], action["bit_rate"]), ("mp3", "mp3", 128000))
+            self.assertIn("The MP3 source is written as MP3 at its own rate", action["reason"])
+            self.assertEqual(probe(output, "-select_streams", "a:0", "-show_streams")["streams"][0]["codec_name"], "mp3")
+
+
+    def test_copied_dolby_soundtrack_from_a_movie_keeps_its_audible_length(self):
+        # The source's edit list hides the encoder padding of the final AC-3 or E-AC-3 frame. A copied soundtrack once
+        # played that padding in MOV and MP4 (512 samples here); it now ends at the planned, last audible sample.
+        def samples(path):
+            return ffmpeg("-i", path, "-map", "0:a:0", "-c:a", "pcm_s16le", "-f", "s16le", "-")
+
+        with tempfile.TemporaryDirectory(prefix="mpcut-still-dolby-soundtrack-") as directory:
+            root = Path(directory)
+            cover = root / "cover.png"
+            ffmpeg("-f", "lavfi", "-i", "color=blue:size=64x36", "-frames:v", "1", cover)
+            for codec in ("ac3", "eac3"):
+                recording = root / f"{codec}.mp4"
+                ffmpeg("-f", "lavfi", "-i", "aevalsrc=0.4*sin(2*PI*440*t)|0.3*sin(2*PI*661*t):s=48000:d=2", "-c:a", codec, recording)
+                source = samples(recording)
+                self.assertEqual(len(source), 2 * 48000 * 2 * 2)
+                for container in ("mov", "mp4"):
+                    with self.subTest(codec=codec, container=container):
+                        output, action = self.soundtrack_export(root, cover, recording, container)
+                        self.assertEqual((action["audio"], action["codec"]), ("copy", codec))
+                        self.assertEqual(sample_hashes(output, "a:0"), sample_hashes(recording, "a:0"))
+                        self.assertEqual(samples(output), source)
 
 
 if __name__ == "__main__":

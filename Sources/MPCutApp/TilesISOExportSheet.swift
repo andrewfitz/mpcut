@@ -217,6 +217,11 @@ struct TilesISOExportSheet: View {
         VStack(alignment: .leading, spacing: 8) {
             Label("Exported \(manifest.files.compactMap(\.feed).count) ISO movies", systemImage: "checkmark.circle")
             Text(destination.path).textSelection(.enabled).lineLimit(2)
+            // What a movie's render gave up, such as its bit depth or constant quality.
+            ForEach(Array(manifest.issues.filter { $0.code == "iso_render_warning" }.enumerated()), id: \.offset) { _, issue in
+                Label(issue.message, systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.secondary).textSelection(.enabled)
+            }
             HStack {
                 Button("Open Multicam Project") { openProject(destination.appending(path: "multicam.cut")) }
                 Button("Show Manifest") {

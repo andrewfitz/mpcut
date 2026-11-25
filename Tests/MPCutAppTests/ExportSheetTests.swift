@@ -87,7 +87,8 @@ final class ExportSheetTests: XCTestCase {
         var multicam = MulticamExportChoices(entry: .multicamQueue)
         multicam.placements = .replacement
         multicam.apply(alternative)
-        let settings = ReencodeSettings(codec: .hevc, quality: .highQuality, audio: .auto)
+        // The alternative names --quality, so the replay carries it as an explicit choice.
+        let settings = ReencodeSettings(codec: .hevc, quality: .highQuality, audio: .auto, qualityIsExplicit: true)
         XCTAssertEqual(replay.settings, settings)
         XCTAssertEqual(multicam.settings, settings)
         XCTAssertEqual(replay.container, "mov")

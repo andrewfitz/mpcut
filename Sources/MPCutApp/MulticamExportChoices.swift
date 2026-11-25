@@ -24,8 +24,10 @@ struct MulticamExportChoices: Equatable, Sendable {
     var codec = ExportRules.defaultCodec
     var audio: ReencodeAudio
     var audioOutput: MulticamAudioOutput = .separateTracks
-    var standardQuality = ExportRules.defaultQuality(.h264)
-    var proResQuality = ExportRules.defaultQuality(.prores)
+    // A quality chosen in the inspector or the queue is explicit for still generation.
+    var standardQuality = ExportRules.defaultQuality(.h264) { didSet { qualityChosen = true } }
+    var proResQuality = ExportRules.defaultQuality(.prores) { didSet { qualityChosen = true } }
+    var qualityChosen = false
 
     init(entry: ExportEntryPoint, preferred: ExportMode = ExportRules.defaultMode(for: .multicam)) {
         self.entry = entry
@@ -97,7 +99,8 @@ struct MulticamExportChoices: Equatable, Sendable {
     var qualities: [ReencodeQuality] { ExportRules.qualities(codec) }
     var quality: ReencodeQuality { codec == .prores ? proResQuality : standardQuality }
     var settings: ReencodeSettings {
-        ReencodeSettings(codec: codec, quality: quality, audio: participantAudio != nil && audio == .copyOriginal ? .auto : audio)
+        ReencodeSettings(codec: codec, quality: quality, audio: participantAudio != nil && audio == .copyOriginal ? .auto : audio,
+                         qualityIsExplicit: qualityChosen)
     }
     var requestedAudioAction: ReencodeAudio? { audio == .copyOriginal ? nil : audio }
 
@@ -133,6 +136,7 @@ struct MulticamExportChoices: Equatable, Sendable {
             codec = video.codec
             if video.codec == .prores { proResQuality = video.quality }
             else { standardQuality = video.quality }
+            qualityChosen = video.qualityIsExplicit
         }
         let requestedAudio = alternative.argument("--audio").flatMap(ReencodeAudio.init(rawValue:))
         if let action = requestedAudio ?? alternative.audio { audio = action }

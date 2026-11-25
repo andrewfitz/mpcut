@@ -46,6 +46,10 @@ private struct ReencodeInput {
 }
 
 extension ReencodeEngine {
+    /// The written warning of a render whose hardware decoder or filters failed and that ran again on the
+    /// compatibility path, which decodes, scales and converts in software.
+    static let softwareDecodeNotice = "The hardware decoder could not take a source, so Re-encode decoded and converted its pictures in software."
+
     public func write(_ plan: ReencodePlan, to output: URL,
                       progress: (@Sendable (Double) -> Void)? = nil) throws {
         try checkCancellation()
@@ -81,6 +85,14 @@ extension ReencodeEngine {
             try CutEngine(cancelled: cancelled).export(audioCopy, to: audio, audioOnly: true)
             extraInputs += ["-i", audio.path]
         }
+        // Subtitle and data tracks are staged on the output timeline. The final mux copies their packets, or converts
+        // the cues of a text track that the output container needs in another codec. The cues of a track converted to
+        // 3GPP text are prepared first: styling the encoder would drop is rewritten, and overlapping cues are joined,
+        // since 3GPP text shows one cue at a time (prepareThreeGPPText).
+        var plan = plan
+        if let manifest = try stageExtraTracks(plan, in: staging) {
+            plan.extrasManifest = try prepareThreeGPPText(plan, manifest: manifest, in: staging)
+        }
         let batches = try inputBatches(inputs, plan: plan)
         if batches.count == 1 {
             try render(plan, inputs: batches[0], in: staging, to: partial, intermediate: false,
@@ -92,9 +104,9 @@ extension ReencodeEngine {
         let container = plan.edit.container
         try checkCancellation()
         if container == "mkv", let tracks = plan.edit.segments.last?.tracks,
-           plan.audioActions.contains(where: { $0.action == .aac }) || tracks.contains(where: { $0.opusPreSkip != nil }) {
-            // The final mux measures coded blocks, including hidden AAC priming
-            // or Opus padding. A copied track can end before or after the video.
+           plan.audioActions.contains(where: { stagedAudioCodec($0) != nil }) || tracks.contains(where: { $0.opusPreSkip != nil }) {
+            // The final mux measures coded blocks, including hidden AAC, MP3 or Opus priming
+            // and Opus padding. A copied track can end before or after the video.
             // The output maps picture first, then sound in the plan's track order.
             // The last clip of a mixed timeline may lack a track that the output has. Every output track ends with the timeline.
             let trackEnds = try plan.canvas != nil
@@ -216,6 +228,9 @@ extension ReencodeEngine {
         var args = ["-xerror", "-copyts", "-f", "concat", "-safe", "1", "-i", "parts.ffconcat"]
         var laterInputs = copiedAudio
         let chapters = try chapterArguments(plan, in: staging, inputIndex: 1 + copiedAudio.count / 2, inputs: &laterInputs)
+        // The staged extra tracks are the last input. Inputs are counted, since the chapter input has a format option.
+        let extrasInput = 1 + laterInputs.filter { $0 == "-i" }.count
+        if let manifest = plan.extrasManifest { laterInputs += Self.extraTrackInput(manifest) }
         args += laterInputs
         args += (chapters ?? ["-map_metadata", "-1", "-map_chapters", "-1"]) + ["-map", "0:v:0", "-c:v", "copy"]
         var stagedOrdinal = 0
@@ -223,6 +238,7 @@ extension ReencodeEngine {
             // Every part carries the canvas sound, whichever clips it holds.
             args += ["-map", "0:a:\(index)", "-filter:a:\(index)", "asetpts=N/SR/TB"]
             args += audioOptions(pair.0, sound: pair.1, outputIndex: index)
+            if pair.0.action == .opus { args += opusTailOptions(container: plan.edit.container, specifier: "a:\(index)") }
         }
         for (index, pair) in zip(plan.audioActions, plan.canvas == nil ? source.audio : []).enumerated() {
             let (action, audio) = pair
@@ -235,7 +251,9 @@ extension ReencodeEngine {
             }
             args += audioOptions(action, track: audio.stream, outputIndex: index,
                                  exactPCM: plan.exactPCM.contains(action.track))
+            if action.action == .opus { args += opusTailOptions(container: plan.edit.container, specifier: "a:\(index)") }
         }
+        if plan.extrasManifest != nil { args += Self.extraTrackOutput(plan, input: extrasInput) }
         if plan.edit.container != "mkv" {
             args += ["-movflags", "+faststart", "-video_track_timescale", "\(plan.timeScale)",
                      "-movie_timescale", "\(plan.movieTimeScale)"]
@@ -335,9 +353,15 @@ extension ReencodeEngine {
         let container = intermediate ? "mov" : plan.edit.container
         // The published movie carries the chapters. They are one more input, after every input the filters number.
         var chapters: [String]?
+        var extraTracks: [String] = []
         if !intermediate {
             let index = decoders.count + extraInputs.count / 2
             chapters = try chapterArguments(plan, in: staging, inputIndex: index, inputs: &extraInputs)
+            // The staged extra tracks follow every other input. Inputs are counted, since the chapter input has a format option.
+            if let manifest = plan.extrasManifest {
+                extraTracks = Self.extraTrackOutput(plan, input: decoders.count + extraInputs.filter { $0 == "-i" }.count)
+                extraInputs += Self.extraTrackInput(manifest)
+            }
         }
         let unmapped = ["-map_chapters", "-1", "-map_metadata", "-1"]
         var args = (chapters ?? unmapped)
@@ -392,9 +416,13 @@ extension ReencodeEngine {
         var outputTrack = 0
         for (index, pair) in zip(plan.audioActions, plan.canvas?.audio ?? []).enumerated() {
             args += ["-map", "[sound\(index)]"]
-            // As below: AAC is encoded once, across the assembled recording.
-            args += intermediate && pair.0.action == .aac ? ["-c:a:\(index)", "pcm_f32le"]
-                : audioOptions(pair.0, sound: pair.1, outputIndex: index)
+            // As below: a compressed track is encoded once, across the assembled recording.
+            if intermediate, let staged = stagedAudioCodec(pair.0) {
+                args += ["-c:a:\(index)", staged]
+            } else {
+                args += audioOptions(pair.0, sound: pair.1, outputIndex: index)
+                if pair.0.action == .opus { args += opusTailOptions(container: container, specifier: "a:\(index)") }
+            }
         }
         for (index, pair) in zip(plan.audioActions, plan.canvas == nil ? reference.audio : []).enumerated() {
             let (action, audio) = pair
@@ -403,16 +431,18 @@ extension ReencodeEngine {
             let map = plan.filtersAudio(action) ? "[sound\(index)]"
                 : "\(copiedAudio.isEmpty ? 0 : decoders.count):a:\(index)"
             args += ["-map", map]
-            if intermediate && action.action == .aac {
-                // Keep the encoder's float input between batches. Encode AAC once
-                // across the assembled recording, with one priming interval.
-                args += ["-c:a:\(outputTrack)", "pcm_f32le"]
+            if intermediate, let staged = stagedAudioCodec(action) {
+                // Keep the encoder's input between batches as PCM that holds it exactly. Encode AAC, FLAC, ALAC,
+                // MP3 or Opus once across the assembled recording, with one priming interval and no seams.
+                args += ["-c:a:\(outputTrack)", staged]
             } else {
                 args += audioOptions(action, track: audio.stream, outputIndex: outputTrack,
                                      exactPCM: plan.exactPCM.contains(action.track))
+                if action.action == .opus { args += opusTailOptions(container: container, specifier: "a:\(outputTrack)") }
             }
             outputTrack += 1
         }
+        args += extraTracks
         let preferred = ReencodeDecode.preferred(for: decoders.compactMap { plan.media[$0.file]?.video },
                                                  output: plan.encoding.pixelFormat,
                                                  surfaces: plan.canvas?.normalizesPicture != true)
@@ -471,6 +501,7 @@ extension ReencodeEngine {
             } catch let error as CutError where error.code == "encode_failed" {
                 throw try damagedSound(error, inputs: decoders) ?? damagedPicture(error, inputs: decoders, plan: plan) ?? error
             }
+            ExportWriteNotices.record(Self.softwareDecodeNotice)
         }
     }
 
@@ -732,7 +763,7 @@ private extension ReencodePlan {
     }
 
     func filtersAudio(_ action: ReencodeAudioAction) -> Bool {
-        [.aac, .pcm].contains(action.action) || exactPCM.contains(action.track)
+        [.aac, .pcm, .flac, .alac, .mp3, .opus].contains(action.action) || exactPCM.contains(action.track)
     }
 }
 
@@ -760,10 +791,11 @@ func audioOptions(_ planned: ReencodeAudioAction, track: StreamInfo, outputIndex
     case .aac: codec = "aac"
     // Integer sources keep their word length. Float and decoded lossy sound stay float: integer PCM would clip samples above full scale.
     case .pcm: codec = planned.codec ?? AudioExportEngine.moviePCM([track]).codec
+    case .flac, .alac, .mp3, .opus: codec = planned.codec ?? action.rawValue
     default: return []
     }
-    var args = ["-c:\(specifier)", codec, "-metadata:s:\(specifier)", "language=\(track.language)",
-                "-disposition:\(specifier)", "\(track.disposition)"]
+    var args = sourceFormatOptions(planned, outputIndex: outputIndex) ?? ["-c:\(specifier)", codec]
+    args += ["-metadata:s:\(specifier)", "language=\(track.language)", "-disposition:\(specifier)", "\(track.disposition)"]
     if action == .aac {
         args += ["-b:\(specifier)", "\(planned.bitRate ?? AudioExportEngine.aacBitRate(matching: nil, channels: track.channels))"]
     }

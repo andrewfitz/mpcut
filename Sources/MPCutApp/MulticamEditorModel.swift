@@ -2575,13 +2575,20 @@ final class MulticamEditorModel: ObservableObject {
                                                    output: output, settings: settings,
                                                    audioOutput: audioOutput, audioAction: audioAction,
                                                    pictureTiming: pictureTiming)
-                    if dryRun { return (plan.inspectorSummary, plan.audioDeliverySummary) }
+                    // The review beside the save panel, and the completion message, state what the plan gives up,
+                    // as the program path's delivery review does.
+                    if dryRun { return (plan.inspectorSummary, ExportNotices.appending(plan.report.warnings, to: plan.audioDeliverySummary)) }
                     let result = saveResult ? try ExportResultFile(output: output, plan: plan.report, cutMap: plan.report.cutMap) : nil
-                    try planner.write(plan, to: output) {
-                        update(token, $0)
-                        return !token.isCancelled
+                    // What writing changed that the plan could not show joins the completion message.
+                    let written = try ExportWriteNotices.collecting {
+                        try planner.write(plan, to: output) {
+                            update(token, $0)
+                            return !token.isCancelled
+                        }
+                        return ExportResultFile.stillCompletionMessage(for: output, result: result)
                     }
-                    return (ExportResultFile.stillCompletionMessage(for: output, result: result), "")
+                    let message = [written.value] + plan.report.warnings.filter { !written.value.contains($0) } + written.notices
+                    return (message.joined(separator: " "), "")
                 }
                 let engine = MulticamEngine(cancelled: { token.isCancelled })
                 // The plan, or the failure with the alternatives of the export rules, as every export reports them.
@@ -2597,13 +2604,15 @@ final class MulticamEditorModel: ObservableObject {
                 if dryRun {
                     let encoder = JSONEncoder()
                     encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-                    return (String(decoding: try encoder.encode(plan), as: UTF8.self), plan.deliveryReview)
+                    return (String(decoding: try encoder.encode(plan.resultPlan), as: UTF8.self), plan.deliveryReview)
                 }
-                let result = saveResult ? try ExportResultFile(output: output, plan: plan,
+                let result = saveResult ? try ExportResultFile(output: output, plan: plan.resultPlan,
                                                                cutMap: ExportCutMap(multicam: plan.mapping)) : nil
-                try engine.write(plan, to: output) { update(token, $0) }
-                let message = ([result?.completionMessage(for: output) ?? "Exported \(output.lastPathComponent)."] + plan.warnings)
-                    .joined(separator: " ")
+                let written = try ExportWriteNotices.collecting {
+                    try engine.write(plan, to: output) { update(token, $0) }
+                    return result?.completionMessage(for: output) ?? "Exported \(output.lastPathComponent)."
+                }
+                let message = ([written.value] + plan.reportedWarnings + written.notices).joined(separator: " ")
                 return (message, "")
             }
         } onSuccess: { result in

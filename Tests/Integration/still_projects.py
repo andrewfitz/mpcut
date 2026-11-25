@@ -227,6 +227,49 @@ class StillProjectCLI(unittest.TestCase):
             self.assertEqual((frame["width"], frame["height"]), (320, 180))
             self.assertEqual((output / frame["file"]).read_bytes()[:2], b"\xff\xd8")
 
+    def create_sdr_still_project(self, image):
+        return self.run_json("still", "project", "create", "--out-project", self.project, "--image", image,
+                             "--width", 64, "--height", 64, "--rate", "30", "--codec", "h264",
+                             "--container", "mp4", "--color", "sdr", "--frames", 30)
+
+    def test_rendition_policy_two_is_saved_and_policy_one_projects_open_under_it(self):
+        # Rendition policy 2 shows a gain-map image on an SDR program as its SDR base. A project saved
+        # under policy 1 opens and is saved under policy 2, and a later policy is refused.
+        created = self.create_sdr_still_project(self.image)
+        saved = read_project(self.project)
+        self.assertEqual(saved["program_color_policy"]["rendition_policy_version"], 2)
+        saved["program_color_policy"]["rendition_policy_version"] = 1
+        self.project.write_text(json.dumps(saved))
+        self.assertEqual(len(self.run_json("still", "placement", "list", "--project", self.project)["placements"]), 1)
+        self.run_json("still", "placement", "update", "--project", self.project, "--placement",
+                      created["placement_id"], "--fit", "fill", "--in-place")
+        self.assertEqual(read_project(self.project)["program_color_policy"]["rendition_policy_version"], 2)
+        saved = read_project(self.project)
+        saved["program_color_policy"]["rendition_policy_version"] = 3
+        self.project.write_text(json.dumps(saved))
+        error = self.run_json("still", "placement", "list", "--project", self.project, success=False)["error"]
+        self.assertEqual(error["code"], "invalid_still_project")
+        self.assertIn("rendition policy 3", error["message"])
+
+    def test_apple_gain_map_shows_its_sdr_base_on_an_sdr_timeline(self):
+        # An iPhone-style Apple gain map (no ISO gain map). Its SDR base holds linear 0.5 and SDR
+        # white; its HDR rendition holds 0.5 and 4.0, which the SDR shoulder would put below white.
+        fixture = Path(__file__).with_name("fixtures") / "stills" / "apple-gain-map.heic"
+        self.create_sdr_still_project(fixture)
+        review = self.root / "review"
+        report = self.run_json("review", "frames", "export", "--project", self.project, "--preset", "full",
+                               "--at", "0", "--output", review)
+        movie = self.root / "apple-gain-map.mp4"
+        self.run_json("export", "project", "render", "--project", self.project, "--output", movie)
+        for picture in (review / report["frames"][0]["file"], movie):
+            pixels = subprocess.run(["ffmpeg", "-loglevel", "error", "-i", picture, "-frames:v", "1",
+                                     "-pix_fmt", "rgb24", "-f", "rawvideo", "-"],
+                                    check=True, capture_output=True, timeout=60).stdout
+            self.assertEqual(len(pixels), 64 * 64 * 3)
+            middle, white = (pixels[(32 * 64 + x) * 3] for x in (16, 48))
+            self.assertAlmostEqual(middle, 185, delta=6, msg=picture.name)
+            self.assertGreaterEqual(white, 253, msg=picture.name)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)

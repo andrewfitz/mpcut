@@ -18,7 +18,7 @@ These rules apply to the app and the CLI alike. Both resolve every export throug
 | Audio action | `copy` | Copy Original. Copy the original audio packets. Stop if they can’t be copied exactly. |
 | Audio action | `aac` | AAC. Encode AAC. |
 | Audio action | `pcm` | PCM. Write PCM. |
-| Audio action | `alac` | ALAC. Encode Apple Lossless audio for a still-bearing export. |
+| Audio action | `alac` | ALAC. Encode Apple Lossless audio for a sound-only conversion or a still-bearing export. |
 | Audio action | `remove` | Remove Audio. Omit the audio track. |
 | Audio action | `mp3` | MP3. Encode MP3 with LAME. |
 | Audio action | `flac` | FLAC. Encode FLAC, which is lossless. |
@@ -41,16 +41,16 @@ Containers marked *verified* are those the copy planner accepts for the source a
 | movie | video | encode | refused: `invalid_arguments` “A video-only selection uses Lossless Copy.” | — | — | — | — |
 | movie | audio | smart | Lossless Copy | *verified* | — | — | `copy_other_container`, `copy_sample_aligned`, `convert_same_format`, `convert_pcm`, `convert_aac` |
 | movie | audio | copy | Lossless Copy | *verified* | — | — | `copy_other_container`, `copy_sample_aligned`, `convert_same_format`, `convert_pcm`, `convert_aac` |
-| movie | audio | encode | Convert Audio | by audio action | `auto`, `copy`, `pcm`, `flac`, `aac`, `mp3`, `opus` | `auto` | `convert_same_format`, `convert_pcm`, `convert_aac` |
+| movie | audio | encode | Convert Audio | by audio action | `auto`, `copy`, `pcm`, `alac`, `flac`, `aac`, `mp3`, `opus` | `auto` | `convert_same_format`, `convert_pcm`, `convert_aac` |
 | audio | all | smart | Lossless Copy | *verified* | — | — | `copy_other_container`, `copy_sample_aligned`, `convert_same_format`, `convert_pcm`, `convert_aac` |
 | audio | all | copy | Lossless Copy | *verified* | — | — | `copy_other_container`, `copy_sample_aligned`, `convert_same_format`, `convert_pcm`, `convert_aac` |
-| audio | all | encode | Convert Audio | by audio action | `auto`, `copy`, `pcm`, `flac`, `aac`, `mp3`, `opus` | `auto` | `convert_same_format`, `convert_pcm`, `convert_aac` |
+| audio | all | encode | Convert Audio | by audio action | `auto`, `copy`, `pcm`, `alac`, `flac`, `aac`, `mp3`, `opus` | `auto` | `convert_same_format`, `convert_pcm`, `convert_aac` |
 | audio | video | smart | refused: `no_video` “The source has no video track.” | — | — | — | — |
 | audio | video | copy | refused: `no_video` “The source has no video track.” | — | — | — | — |
 | audio | video | encode | refused: `no_video` “The source has no video track.” | — | — | — | — |
 | audio | audio | smart | Lossless Copy | *verified* | — | — | `copy_other_container`, `copy_sample_aligned`, `convert_same_format`, `convert_pcm`, `convert_aac` |
 | audio | audio | copy | Lossless Copy | *verified* | — | — | `copy_other_container`, `copy_sample_aligned`, `convert_same_format`, `convert_pcm`, `convert_aac` |
-| audio | audio | encode | Convert Audio | by audio action | `auto`, `copy`, `pcm`, `flac`, `aac`, `mp3`, `opus` | `auto` | `convert_same_format`, `convert_pcm`, `convert_aac` |
+| audio | audio | encode | Convert Audio | by audio action | `auto`, `copy`, `pcm`, `alac`, `flac`, `aac`, `mp3`, `opus` | `auto` | `convert_same_format`, `convert_pcm`, `convert_aac` |
 | multicam | all | smart | Smart Trim | `mov`, `mp4`, `m4v`, `mkv`, `webm` | `auto`, `copy`, `aac`, `pcm`, `remove` | `copy` | `copy_other_container`, `smart_trim`, `reencode` |
 | multicam | all | copy | Lossless Copy | `mov`, `mp4`, `m4v`, `mkv`, `webm` | `auto`, `copy`, `aac`, `pcm`, `remove` | `copy` | `copy_other_container`, `smart_trim`, `reencode` |
 | multicam | all | encode | Re-encode | `mov`, `mp4`, `m4v`, `mkv` | `auto`, `copy`, `aac`, `pcm`, `remove` | `copy` | `convert_pcm`, `convert_aac`, `reencode` |
@@ -76,7 +76,8 @@ The multicam rows describe picture mode and the available audio actions. The exp
 | Convert Audio, `pcm` | `wav`, `caf`, `mov` |
 | Convert Audio, `aac` | `m4a`, `mp4`, `mov` |
 | Convert Audio, `mp3` | `mp3` |
-| Convert Audio, `flac` | `flac` |
+| Convert Audio, `alac` | `m4a`, `mov`, `mp4` |
+| Convert Audio, `flac` | `flac`, `mka`, `mp4` |
 | Convert Audio, `opus` | `opus`, `ogg`, `webm`, `mka` |
 | Multicam program, picture and sound | `mov`, `mp4`, `m4v`, `mkv`, `webm` |
 | Multicam re-encode, `h264` | `mov`, `mp4`, `m4v`, `mkv` |
@@ -96,7 +97,7 @@ An audio action its container cannot carry is refused with `unsupported_audio` a
 
 PCM bit depth is chosen by the engine that writes it. A sound-only conversion keeps the source depth (16, 24 or 32-bit, or 32-bit float). A movie re-encode keeps the depth of integer sources too, the longest among the clips of a track (16, 24 or 32-bit), and writes 32-bit float for float PCM and for decoded lossy sound, which can exceed full scale. A track of a mixed timeline that is resampled or mixed to stereo is written as 32-bit, or as 32-bit float under the same rule. A multicam re-encode writes 32-bit, or 32-bit float for a float source. A movie track made only of integer sources of up to 32 bits, neither resampled nor mixed, keeps every bit.
 
-When `auto` cannot copy the sound of a movie re-encode exactly it decides for each track. A track that is lossless in every clip (PCM, FLAC, ALAC, TrueHD or MLP) is written as PCM where the container carries it, so that no lossy encoding is added: in MOV, and in MKV for mono and stereo. MP4 cannot carry PCM here, and MKV states no speaker positions for wider PCM, so there the track is converted to AAC and its reason says so. Any other track is converted to AAC, or for ProRes to PCM under the same container limits. Converted AAC follows the bit rate of an AAC source, at the customary step nearest its measured average and at least 32 kbps for each channel. Any other source gets 96 kbps for each channel, up to 512 kbps. `audio_actions` reports the codec of each converted track with its bit rate or bit depth. A multicam export uses `separate_tracks` by default, with one selectable track per lane in project order. Copy preserves source formats and refuses a lane that needs rendering. Explicit `auto` tries copy for each lane and may render the affected lanes or insert silence while retaining eligible PCM samples. `downmix_mono` and `downmix_stereo` always render one track. For picture with sound, MOV renders PCM or AAC, MP4 and M4V render AAC, and MKV renders PCM. WebM offers audio copy. For sound-only output, WAV, WAVE and CAF render PCM, and M4A renders AAC.
+When `auto` cannot copy the sound of a movie re-encode exactly it decides for each track, and writes the track in its source's own codec and settings where the container and the FFmpeg helper allow. PCM stays PCM at its sample format in MOV, and in MKV for mono and stereo. FLAC stays FLAC at its word length in MP4 (mono and stereo) and MKV, and ALAC stays ALAC in MOV and MP4; MOV cannot carry FLAC, and ALAC in MKV is not read back exactly, so there they are written as PCM. AAC stays AAC, MP3 stays MP3 in MOV, MP4 (16 kHz and up) and MKV, and Opus stays Opus in MP4 and MKV, each at the source's rate: AAC at the first customary step not under the source's measured average, MP3 at the nearest constant rate, Opus at the source's measured average to the nearest 1 kbps. The built-in AAC encoder writes AAC-LC, so an HE-AAC source is written as AAC-LC and its reason says so. A track whose clips differ in format, a codec the helper cannot encode (AC-3, E-AC-3, Vorbis, TrueHD, MLP, DTS, WavPack) or a pair the container cannot carry falls back: a lossless track is written as PCM where the container carries it, and otherwise as AAC; any other track as AAC, or for ProRes as PCM under the same container limits. MP4 cannot carry PCM here, and MKV states no speaker positions for wider PCM, so there a lossless fallback is converted to AAC. Converted AAC from any other source gets 96 kbps for each channel, up to 512 kbps. `audio_actions` reports the codec of each converted track with its bit rate or bit depth and a reason naming the source format and, for a fallback, why. A multicam export uses `separate_tracks` by default, with one selectable track per lane in project order. Copy preserves source formats and refuses a lane that needs rendering. Explicit `auto` tries copy for each lane and may render the affected lanes or insert silence while retaining eligible PCM samples. A rendered lane whose every span has one compressed format keeps it where the container carries it (FLAC in MP4 and MKV, ALAC in MOV and MP4, AAC in MOV and MP4, MP3 in MOV and MP4, Opus in MP4 and MKV) and states why in `reason`. Other lanes and downmixes use the rendered codecs below. `downmix_mono` and `downmix_stereo` always render one track. For picture with sound, MOV renders PCM or AAC, MP4 and M4V render AAC, and MKV renders PCM. WebM offers audio copy. For sound-only output, WAV, WAVE and CAF render PCM, and M4A renders AAC.
 
 ## Defaults
 
@@ -122,8 +123,8 @@ Alternatives are checked in rank order and every one that works is reported, lea
 | 1 | `copy_other_container` | nothing | kept | none | Keep the original packets and use a container that supports these cuts. |
 | 2 | `copy_sample_aligned` | nothing | kept | none | Move each cut to the nearest audio sample, then copy the audio. Each cut moves by less than one sample. |
 | 3 | `smart_trim` | cut edges | kept | one generation | Copy complete sections and encode only the video at the cut edges. |
-| 4 | `convert_same_format` | sound | kept | one generation | Re-encode the selected audio once using the original codec (MP3, AAC, FLAC or Opus) and settings. |
-| 5 | `convert_pcm` | sound | changed | none | Save the selected audio as a PCM WAV file. This preserves the decoded samples and uses more disk space. |
+| 4 | `convert_same_format` | sound | kept | one generation | Re-encode the selected audio once using the original codec (MP3, AAC, ALAC, FLAC or Opus) and settings. |
+| 5 | `convert_pcm` | sound | changed | none | Save the selected audio as a PCM WAV file. This preserves the decoded samples and uses more disk space. A lossless source named into a container that cannot hold its own codec is also offered there as PCM, ALAC or FLAC, the first that container holds, when that keeps every sample. |
 | 6 | `convert_aac` | sound | changed | one generation | Save the selected audio as AAC in an M4A file. |
 | 7 | `reencode` | picture and sound | changed | one generation | Encode the whole timeline with the hardware video encoder. |
 
@@ -153,7 +154,7 @@ The tier of a mixed timeline is Re-encode with the factor `join_stream_mismatch`
 
 | Action | Result |
 | --- | --- |
-| `auto` | Converted: PCM for a track that is lossless in every clip that has it, in MOV, and in MKV for mono and stereo. Otherwise AAC, or for ProRes PCM under the same container limits. |
+| `auto` | Converted: a track whose clips all have one format keeps it where the container carries it, as in a uniform re-encode. Otherwise PCM for a track that is lossless in every clip that has it, in MOV, and in MKV for mono and stereo, and AAC, or for ProRes PCM under the same container limits. |
 | `copy` | Refused: `incompatible_clip`. Offers the re-encode with `auto`. |
 | `aac` | Converted to AAC in the canvas format. |
 | `pcm` | Converted to PCM in the canvas format. |

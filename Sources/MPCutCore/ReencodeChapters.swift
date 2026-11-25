@@ -25,17 +25,24 @@ struct ReencodeChapter: Sendable {
         let tags: [Tag]
     }
 
-    /// The chapters a container lists. Nil when the file cannot be opened.
-    private static func read(_ file: URL) -> [Listed]? {
+    /// The chapters a container lists, and how many it lists without a readable start. Nil when the file cannot be opened.
+    private static func read(_ file: URL) -> (listed: [Listed], unreadable: Int)? {
         var context: UnsafeMutablePointer<AVFormatContext>?
         guard avformat_open_input(&context, file.path, nil, nil) >= 0, let input = context else { return nil }
         defer { avformat_close_input(&context) }
         var listed: [Listed] = []
+        var unreadable = 0
         for index in 0..<Int(input.pointee.nb_chapters) {
             guard let chapter = input.pointee.chapters[index]?.pointee,
-                  chapter.time_base.num > 0, chapter.time_base.den > 0, chapter.start != Int64.min else { continue }
+                  chapter.time_base.num > 0, chapter.time_base.den > 0, chapter.start != Int64.min else {
+                unreadable += 1
+                continue
+            }
             let base = RationalTime(numerator: Int64(chapter.time_base.num), denominator: Int64(chapter.time_base.den))
-            guard let start = try? RationalTime(numerator: chapter.start).multiplied(by: base) else { continue }
+            guard let start = try? RationalTime(numerator: chapter.start).multiplied(by: base) else {
+                unreadable += 1
+                continue
+            }
             var end: RationalTime?
             if chapter.end != Int64.min { end = try? RationalTime(numerator: chapter.end).multiplied(by: base) }
             var tags: [Tag] = []
@@ -47,7 +54,7 @@ struct ReencodeChapter: Sendable {
             if let stated = end, stated < start { end = nil }
             listed.append(Listed(start: start, end: end, tags: tags))
         }
-        return listed
+        return (listed, unreadable)
     }
 
     /// Places the chapters of each source on the output timeline, as a packet copy of the same ranges does:
@@ -59,12 +66,19 @@ struct ReencodeChapter: Sendable {
         var known: [URL: [Listed]] = [:]
         var chapters: [ReencodeChapter] = []
         var unplaced: [String] = []
+        var skipped: [String] = []
         let whole = segments.count == 1 && segments[0].from == .zero && segments[0].reachesEnd
         for segment in segments {
             if cancelled?() == true { throw CutError(code: "cancelled", message: "The operation was cancelled.") }
             if !sources.contains(segment.file) {
                 sources.append(segment.file)
-                known[segment.file] = read(segment.file) ?? []
+                let found = read(segment.file)
+                known[segment.file] = found?.listed ?? []
+                if let count = found?.unreadable, count > 0 {
+                    // A chapter without a readable start cannot be placed. Say so rather than leave it out quietly.
+                    skipped.append("\(count == 1 ? "1 chapter" : "\(count) chapters") of \(segment.file.lastPathComponent) "
+                                   + "\(count == 1 ? "has" : "have") no readable start and will be omitted.")
+                }
             }
             guard let listed = known[segment.file], !listed.isEmpty, let source = sources.firstIndex(of: segment.file) else { continue }
             do {
@@ -103,9 +117,9 @@ struct ReencodeChapter: Sendable {
             }
         }
         guard unplaced.isEmpty else {
-            return ([], unplaced.map { "The chapters of \($0) could not be placed on the output timeline and will be omitted." })
+            return ([], unplaced.map { "The chapters of \($0) could not be placed on the output timeline and will be omitted." } + skipped)
         }
-        return (chapters, [])
+        return (chapters, skipped)
     }
 
     /// The chapters as an FFMETADATA document, which the helper reads as an input without streams.
@@ -135,5 +149,40 @@ struct ReencodeChapter: Sendable {
             lines += chapter.tags.map { "\(escaped($0.key))=\(escaped($0.value))" }
         }
         return lines.joined(separator: "\n") + "\n"
+    }
+}
+
+extension ReencodeChapter {
+    /// Keys the writer sets itself, or that only describe the file that held them: brands, the writing tool and timecode.
+    private static let writerKeys: Set<String> = ["major_brand", "minor_version", "compatible_brands", "encoder",
+                                                   "encoding_tool", "software", "timecode"]
+
+    /// The movie metadata of each source that a re-encode leaves out, one sentence for each source that has any: a
+    /// re-encode writes no source metadata, so a title, a creation date or a camera's make and model would go quietly.
+    static func droppedMetadata(_ segments: [ResolvedSegment]) -> [String] {
+        droppedMetadata(of: segments.map(\.file), by: ExportRules.displayName(mode: .encode))
+    }
+
+    /// The same for any output that writes none of its sources' metadata, such as a multicam or still program.
+    /// `subject` begins each sentence.
+    static func droppedMetadata(of files: [URL], by subject: String) -> [String] {
+        var seen: Set<URL> = []
+        var notes: [String] = []
+        for file in files where seen.insert(file.standardizedFileURL).inserted {
+            var context: UnsafeMutablePointer<AVFormatContext>?
+            guard avformat_open_input(&context, file.path, nil, nil) >= 0, let input = context else { continue }
+            defer { avformat_close_input(&context) }
+            var keys: [String] = []
+            var entry: UnsafePointer<AVDictionaryEntry>?
+            while let next = av_dict_iterate(input.pointee.metadata, entry) {
+                let key = String(cString: next.pointee.key)
+                if !writerKeys.contains(key.lowercased()) { keys.append(key) }
+                entry = next
+            }
+            guard !keys.isEmpty else { continue }
+            let listed = keys.prefix(6).joined(separator: ", ") + (keys.count > 6 ? " and \(keys.count - 6) more" : "")
+            notes.append("\(subject) does not carry the movie metadata of \(file.lastPathComponent): \(listed).")
+        }
+        return notes
     }
 }

@@ -409,6 +409,7 @@ final class MCPLocalControl {
             result["can_edit"] = canEdit && !modal
             result["playing"] = model.preview.isPlaying
             result["playhead"] = model.playhead
+            result["preview"] = model.preview.mcpState
             result["clock"] = "sequence"
             result["snap"] = model.effectiveSnapTarget.rawValue
             result["selected_clip"] = model.mcpSelectedItemID

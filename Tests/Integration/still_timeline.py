@@ -19,6 +19,7 @@ import unittest
 
 from media_regression import ffmpeg, frames, packets, probe, ratio, run, sample_hashes, timestamped_hashes
 from saved_project import read_project
+from smart_trim import CAPTION_SEI, FILM_GRAIN_SEI, film_grain_note, with_h264_sei
 
 CLI = None
 FPS = 24
@@ -738,6 +739,38 @@ class StillTimelineAcceptance(unittest.TestCase):
         self.assertEqual({at: actual[at] for at in retained}, retained)
         for seam in (2, Fraction(7, 2)):
             self.assertEqual(frames(output, seek=float(seam - Fraction(1, 4 * FPS)))[0], decoded[int(seam * FPS)])
+
+    def test_smart_camera_edges_plan_the_export_refusals(self):
+        # Captions on the camera pictures that Smart Trim would re-encode stop the export while it writes. A sequence
+        # or multicam program with a still placement plans those edges itself, and refuses them the same way.
+        row = ROWS[0]
+        wide, close = (with_h264_sei(source, self.root / f"captioned-{source.name}", CAPTION_SEI, fps=FPS,
+                                     timescale=FPS * 1_000) for source in self.sources[row.name])
+        for kind in ("sequence", "multicam"):
+            with self.subTest(kind=kind):
+                base = self.project(row, kind, sources=(wide, close), label="captioned")
+                # The camera returns mid-GOP at 3.5 s, so its first pictures are a Smart Trim edge.
+                project = self.replace(base, kind, 2, Fraction(7, 2))
+                output = self.root / f"captioned-{kind}.mp4"
+                for dry in (True, False):
+                    flags = ["--mode", "smart", "--tracks", "video"] + (["--dry-run"] if dry else [])
+                    error = self.export(project, output, *flags, ok=False)["error"]
+                    self.assertEqual((error["code"], error["reason"]), ("unsupported_format", "source_smart_ineligible"),
+                                     (dry, error))
+                    self.assertIn("captions or colour metadata", error["message"])
+                    self.assertFalse(output.exists())
+        # Film grain the camera edge loses is a warning in both reports. Only the returning camera has an edge.
+        grain = [with_h264_sei(source, self.root / f"grain-{source.name}", FILM_GRAIN_SEI, fps=FPS, timescale=FPS * 1_000)
+                 for source in self.sources[row.name]]
+        for kind, edged in (("sequence", grain[0]), ("multicam", grain[1])):
+            with self.subTest(kind=kind, grain=True):
+                project = self.replace(self.project(row, kind, sources=grain, label="grain"), kind, 2, Fraction(7, 2))
+                output = self.root / f"grain-{kind}.mp4"
+                plan = self.export(project, output, "--mode", "smart", "--tracks", "video", "--dry-run")
+                report = self.export(project, output, "--mode", "smart", "--tracks", "video")
+                for result in (plan, report):
+                    self.assertGreater(fraction(result["encoded_camera_duration"]), 0)
+                    self.assertEqual([note for note in result["warnings"] if "film grain" in note], [film_grain_note(edged)])
 
     def test_hdr_mid_gop_requires_boundary_adjustment_or_full_conversion(self):
         for row in (row for row in ROWS if row.hdr):

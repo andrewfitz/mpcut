@@ -212,6 +212,8 @@ public enum ParticipantMulticam {
             let name = "angle-\(index + 1).mov"
             let movie = staging.appendingPathComponent(name)
             let report = try renderer.render(source, document: document, plan: plan, to: movie)
+            // What this angle's picture gave up, for the caller that collects `written_warnings`.
+            ExportWriteNotices.record(report.allWarnings.map { "\(angle.name): \($0)" })
             usedISOs.formUnion(usedSoundFiles(report))
             let media = try engine.inspect(movie, keyframes: true)
             guard let firstFrame = media.frames.first, firstFrame.time == .zero,

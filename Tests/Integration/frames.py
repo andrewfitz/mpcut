@@ -179,8 +179,11 @@ class Frames(unittest.TestCase):
         # 75% red and green, stored with the BT.709 matrix at 1280x720 and with BT.601 at 640x360,
         # then stripped of every color tag. VideoToolbox tags untagged pictures larger than 704x576
         # as BT.709 and smaller ones as BT.601, which is what the native preview shows. Read with
-        # the other matrix, the red patch moves by 16 to 42 levels and the green by 32.
-        for size, matrix in (("1280x720", "bt709"), ("640x360", "bt601")):
+        # the other matrix, the red patch moves by 16 to 42 levels and the green by 32. VideoToolbox
+        # also gives both the BT.709 transfer (75% becomes 197 in sRGB) and the smaller one SMPTE C
+        # primaries, which the native preview converts to sRGB; these are its measured values.
+        for size, matrix, patches in (("1280x720", "bt709", ((197, 0, 0), (0, 197, 0))),
+                                      ("640x360", "bt601", ((193, 26, 0), (47, 195, 0)))):
             hardware = self.root / f"untagged-{matrix}.mp4"
             software = self.root / f"untagged-{matrix}.mkv"
             run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i",
@@ -196,9 +199,228 @@ class Frames(unittest.TestCase):
                 with self.subTest(size=size, decoder=source.suffix[1:]):
                     dest, report = self.export(f"untagged-{matrix}-{source.suffix[1:]}", "--at", "0", "--at", "1",
                                                "--preset", "full", count=2, source=source)
-                    for frame, expected in zip(report["frames"], ((191, 0, 0), (0, 191, 0)), strict=True):
+                    for frame, expected in zip(report["frames"], patches, strict=True):
                         for channel, wanted in zip(rgb(dest / frame["file"]), expected, strict=True):
                             self.assertAlmostEqual(channel, wanted, delta=6)
+
+    def test_matrix_only_tag_sets_the_primaries_the_native_preview_shows(self):
+        # Only the matrix is recorded, against the size rule: BT.709 at 640x360 and BT.601 at 1280x720.
+        # VideoToolbox then takes the primaries from the matrix (BT.709, or SMPTE C for BT.601) and the
+        # BT.709 transfer, whatever the size; these are the native preview's measured values.
+        for size, matrix, code, patches in (("640x360", "bt709", 1, ((197, 0, 0), (0, 197, 0))),
+                                            ("1280x720", "bt601", 6, ((193, 26, 0), (47, 195, 0)))):
+            hardware = self.root / f"matrix-only-{matrix}.mp4"
+            software = self.root / f"matrix-only-{matrix}.mkv"
+            run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i",
+                 f"color=c=0xBF0000:s={size}:r=1:d=1[r];color=c=0x00BF00:s={size}:r=1:d=1[g];"
+                 f"[r][g]concat=n=2:v=1:a=0,format=gbrp,scale=out_color_matrix={matrix}:out_range=tv,format=yuv420p",
+                 "-c:v", "libx264", "-bsf:v",
+                 f"h264_metadata=colour_primaries=2:transfer_characteristics=2:matrix_coefficients={code}", hardware])
+            run(["ffmpeg", "-loglevel", "error", "-i", hardware, "-c:v", "ffv1", software])
+            for source in (hardware, software):
+                with self.subTest(size=size, decoder=source.suffix[1:]):
+                    dest, report = self.export(f"matrix-only-{matrix}-{source.suffix[1:]}", "--at", "0", "--at", "1",
+                                               "--preset", "full", count=2, source=source)
+                    for frame, expected in zip(report["frames"], patches, strict=True):
+                        for channel, wanted in zip(rgb(dest / frame["file"]), expected, strict=True):
+                            self.assertAlmostEqual(channel, wanted, delta=6)
+
+    def test_srgb_tagged_picture_without_matrix_is_read_as_bt601(self):
+        # BT.709 primaries and the sRGB transfer but no matrix, as screen recordings often carry.
+        # VideoToolbox then leaves the matrix unset and Core Animation decodes BT.601, whatever the
+        # size. The old size rule read this 1280x720 picture as BT.709: red 207,19,0 and green 1,161,1.
+        hardware = self.root / "srgb-no-matrix.mp4"
+        software = self.root / "srgb-no-matrix.mkv"
+        run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i",
+             "color=c=0xBF0000:s=1280x720:r=1:d=1[r];color=c=0x00BF00:s=1280x720:r=1:d=1[g];"
+             "[r][g]concat=n=2:v=1:a=0,format=gbrp,scale=out_color_matrix=bt601:out_range=tv,format=yuv420p",
+             "-c:v", "libx264", "-bsf:v",
+             "h264_metadata=colour_primaries=1:transfer_characteristics=13:matrix_coefficients=2", hardware])
+        run(["ffmpeg", "-loglevel", "error", "-i", hardware, "-c:v", "ffv1", software])
+        for source in (hardware, software):
+            with self.subTest(decoder=source.suffix[1:]):
+                dest, report = self.export(f"srgb-no-matrix-{source.suffix[1:]}", "--at", "0", "--at", "1",
+                                           "--preset", "full", count=2, source=source)
+                for frame, expected in zip(report["frames"], ((191, 0, 0), (0, 191, 0)), strict=True):
+                    for channel, wanted in zip(rgb(dest / frame["file"]), expected, strict=True):
+                        self.assertAlmostEqual(channel, wanted, delta=6)
+
+    def assert_two_patches(self, name, colors, matrix, metadata, expected, delta=6, depth=8, sources=None):
+        """Exports a 1280x720 picture of each color, stored with `matrix` and the given color fields,
+        from H.264 (VideoToolbox) and FFV1 (software), and compares it with the native preview."""
+        fmt = "yuv420p10le" if depth == 10 else "yuv420p"
+        hardware = self.root / f"{name}.mp4"
+        software = self.root / f"{name}.mkv"
+        first, second = colors
+        graph = (f"color=c={first}:s=1280x720:r=1:d=1[a];color=c={second}:s=1280x720:r=1:d=1[b];"
+                 f"[a][b]concat=n=2:v=1:a=0,format=gbrp,scale=out_color_matrix={matrix}:out_range=tv,format={fmt}")
+        if sources is None:
+            run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", graph, "-c:v", "libx264",
+                 "-bsf:v", f"h264_metadata={metadata}", hardware])
+            run(["ffmpeg", "-loglevel", "error", "-i", hardware, "-c:v", "ffv1", software])
+            sources = (hardware, software)
+        else:
+            sources = sources(graph, hardware, software)
+        for source in sources:
+            with self.subTest(case=name, decoder=source.suffix[1:]):
+                dest, report = self.export(f"{name}-{source.suffix[1:]}", "--at", "0", "--at", "1",
+                                           "--preset", "full", count=2, source=source)
+                for frame, wanted in zip(report["frames"], expected, strict=True):
+                    pixel = rgb(dest / frame["file"])
+                    for channel, value in zip(pixel, wanted, strict=True):
+                        self.assertAlmostEqual(channel, value, delta=delta, msg=(pixel, wanted))
+
+    def test_out_of_gamut_signal_is_limited_like_the_native_preview(self):
+        # 75% red and blue stored with the BT.709 matrix but recording only the BT.709 transfer, so
+        # the native preview reads them with BT.601 and SMPTE C primaries. That leaves the green
+        # signal below zero, which Core Animation limits to zero before converting color; Core Image
+        # carried it on, and VideoToolbox pictures came out 11 and 6 levels lower in green.
+        self.assert_two_patches("bt709-read-as-bt601", ("0xBF0000", "0x0000BF"), "bt709",
+                                "colour_primaries=2:transfer_characteristics=1:matrix_coefficients=2",
+                                ((179, 23, 0), (17, 23, 192)), delta=4)
+
+    def test_primaries_without_transfer_take_the_native_preview_transfer(self):
+        # Only the primaries are recorded. Core Animation shows EBU Tech 3213 primaries with the
+        # BT.709 transfer, P3 D65 with sRGB and BT.2020 as the ITU-R BT.2020 color space, each with
+        # the BT.601 matrix; these are its measured values. Read as sRGB, as Core Image does without
+        # a transfer, both patches were 190, and BT.2020 was also read with its own matrix.
+        for code, name, expected in ((5, "ebu", ((202, 0, 1), (0, 198, 19))),
+                                     (12, "p3", ((209, 0, 0), (0, 194, 0))),
+                                     (9, "bt2020", ((235, 0, 0), (0, 198, 0)))):
+            self.assert_two_patches(f"primaries-only-{name}", ("0xBF0000", "0x00BF00"), "bt601",
+                                    f"colour_primaries={code}:transfer_characteristics=2:matrix_coefficients=2",
+                                    expected)
+
+    def test_sdr_bt2020_picture_without_matrix_is_read_as_bt601(self):
+        # BT.2020 primaries and an SDR transfer without a matrix. Core Animation decodes the missing
+        # matrix as BT.601 here; only a PQ or HLG picture takes BT.2020 from its primaries. Read
+        # with BT.2020, the green patch was 22 levels darker than the native preview.
+        self.assert_two_patches("sdr-bt2020-no-matrix", ("0xBF0000", "0x00BF00"), "bt601",
+                                "colour_primaries=9:transfer_characteristics=1:matrix_coefficients=2",
+                                ((249, 0, 0), (0, 209, 0)))
+
+    def test_hdr_picture_without_matrix_takes_the_sdr_preview_matrix(self):
+        # PQ with BT.709 primaries and no matrix, stored with the BT.709 matrix. Core Animation decodes
+        # the missing matrix as BT.709, as does Core Image, which maps the SDR preview of an HDR
+        # picture; these are that preview's measured values. Read with BT.601 they were 141,0,1 and
+        # 10,173,4.
+        tags = ["-color_primaries", "bt709", "-color_trc", "smpte2084"]
+
+        def sources(graph, hardware, software):
+            graph += ",setparams=color_primaries=bt709:color_trc=smpte2084:colorspace=unknown:range=tv"
+            run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", graph, "-c:v", "ffv1", *tags, software])
+            encoders = run(["ffmpeg", "-hide_banner", "-encoders"]).decode()
+            # HEVC Main 10 takes the VideoToolbox decoder.
+            if " libx265 " in encoders:
+                codec = ["-c:v", "libx265", "-x265-params", "log-level=error"]
+            elif " hevc_videotoolbox " in encoders:
+                codec = ["-c:v", "hevc_videotoolbox", "-profile:v", "main10"]
+            else:
+                return (software,)
+            run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", graph, *codec, "-tag:v", "hvc1", *tags, hardware])
+            return (hardware, software)
+
+        self.assert_two_patches("pq-bt709-no-matrix", ("0x860000", "0x008600"), "bt709", None,
+                                ((152, 0, 0), (0, 152, 0)), depth=10, sources=sources)
+
+    def test_untagged_mid_grey_takes_the_native_preview_transfer(self):
+        # Limited-range grey at codes 16, 126 and 235 without any color tag. The native preview shows
+        # it with VideoToolbox's BT.709 transfer, so mid grey is 139 in sRGB, not the 128 of reading
+        # the values as sRGB. PNG keeps the decoded values and names the profile they are in.
+        for size, profile in (("1280x720", "HDTV"), ("640x360", "Composite NTSC")):
+            hardware = self.root / f"untagged-grey-{size}.mp4"
+            software = self.root / f"untagged-grey-{size}.mkv"
+            run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i",
+                 f"nullsrc=s={size}:r=1:d=1,format=yuv420p,"
+                 "geq=lum='if(lt(X,W/3),16,if(lt(X,2*W/3),126,235))':cb=128:cr=128",
+                 "-c:v", "libx264", "-bsf:v",
+                 "h264_metadata=colour_primaries=2:transfer_characteristics=2:matrix_coefficients=2", hardware])
+            run(["ffmpeg", "-loglevel", "error", "-i", hardware, "-c:v", "ffv1", software])
+            for source in (hardware, software):
+                with self.subTest(size=size, decoder=source.suffix[1:]):
+                    dest, report = self.export(f"untagged-grey-{size}-{source.suffix[1:]}", "--at", "0",
+                                               "--preset", "full", count=1, source=source)
+                    image = dest / report["frames"][0]["file"]
+                    for xfrac, expected in ((1 / 6, 0), (1 / 2, 139), (5 / 6, 255)):
+                        for channel in rgb(image, xfrac=xfrac):
+                            self.assertAlmostEqual(channel, expected, delta=2, msg=(xfrac, image))
+                    dest, report = self.export(f"untagged-grey-{size}-{source.suffix[1:]}-png", "--at", "0",
+                                               "--preset", "full", "--format", "png", count=1, source=source,
+                                               signature=b"\x89PNG")
+                    image = dest / report["frames"][0]["file"]
+                    self.assertEqual(self.image_facts(image)[1], profile)
+                    for channel in rgb(image, xfrac=1 / 2):
+                        self.assertAlmostEqual(channel, 128, delta=1)
+
+    @staticmethod
+    def markers(jpeg):
+        """The marker codes of a JPEG up to its scan."""
+        found, i = [], 2
+        while i + 4 <= len(jpeg) and jpeg[i] == 0xFF:
+            found.append(jpeg[i + 1])
+            if jpeg[i + 1] == 0xDA:
+                break
+            i += 2 + int.from_bytes(jpeg[i + 2:i + 4], "big")
+        return found
+
+    def test_full_jpeg_of_stored_jpeg_pictures_is_the_stored_picture(self):
+        # Photo JPEG and AVI MJPEG pictures are complete JPEGs already. A Full JPEG of one is that
+        # picture's bytes rather than a second lossy encoding of its decoded pixels.
+        stored = self.root / "stored-pictures"
+        stored.mkdir()
+        photo = self.root / "photo.mov"
+        run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=s=640x360:r=25:d=1",
+             "-vf", "format=yuvj420p", "-c:v", "mjpeg", "-q:v", "3", photo])
+        run(["ffmpeg", "-loglevel", "error", "-i", photo, "-c:v", "copy", "-f", "image2", stored / "photo-%03d.jpg"])
+        dest, report = self.export("stored-photo", "--at", "0", "--at", "0.2", "--preset", "full", count=2, source=photo)
+        for frame, index in zip(report["frames"], (1, 6), strict=True):
+            self.assertEqual((frame["width"], frame["height"]), (640, 360))
+            self.assertEqual((dest / frame["file"]).read_bytes(), (stored / f"photo-{index:03d}.jpg").read_bytes())
+
+        # An AVI picture without Huffman tables gains the standard ones and decodes to the same pixels.
+        standard = self.root / "standard-tables.avi"
+        run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=s=640x360:r=25:d=0.2",
+             "-vf", "format=yuvj420p", "-c:v", "mjpeg", "-huffman", "default", "-q:v", "3", standard])
+        run(["ffmpeg", "-loglevel", "error", "-i", standard, "-c:v", "copy", "-f", "image2", stored / "avi-%03d.jpg"])
+        stripped = bytearray()
+        for picture in sorted(stored.glob("avi-*.jpg")):
+            data, i = picture.read_bytes(), 2
+            stripped += data[:2]
+            while data[i + 1] != 0xDA:
+                length = int.from_bytes(data[i + 2:i + 4], "big")
+                if data[i + 1] != 0xC4:
+                    stripped += data[i:i + 2 + length]
+                i += 2 + length
+            stripped += data[i:]
+        (self.root / "no-tables.mjpeg").write_bytes(stripped)
+        no_tables = self.root / "no-tables.avi"
+        run(["ffmpeg", "-loglevel", "error", "-f", "mjpeg", "-framerate", "25", "-i", self.root / "no-tables.mjpeg",
+             "-c:v", "copy", no_tables])
+        dest, report = self.export("stored-avi", "--at", "0", "--preset", "full", count=1, source=no_tables)
+        image = (dest / report["frames"][0]["file"]).read_bytes()
+        self.assertNotIn(0xC4, self.markers(stripped))
+        self.assertIn(0xC4, self.markers(image))
+        decoded = self.raw(dest / report["frames"][0]["file"], "rgb24")
+        self.assertEqual(decoded, self.raw(stored / "avi-001.jpg", "rgb24"))
+
+        # Pictures that need a conversion are still decoded and encoded: a review image, PNG,
+        # a BT.709 matrix (as MPCut's own Photo JPEG stills are tagged) and a display rotation.
+        tagged = self.root / "photo-709.mov"
+        run(["ffmpeg", "-loglevel", "error", "-i", photo, "-c", "copy", "-colorspace", "bt709",
+             "-color_primaries", "bt709", "-color_trc", "bt709", "-movflags", "+write_colr", tagged])
+        rotated = self.root / "photo-rotated.mov"
+        run(["ffmpeg", "-loglevel", "error", "-display_rotation", "90", "-i", photo, "-c", "copy", rotated])
+        for name, source, flags in (("review", photo, ["--preset", "review"]),
+                                    ("png", photo, ["--preset", "full", "--format", "png"]),
+                                    ("tagged", tagged, ["--preset", "full"]),
+                                    ("rotated", rotated, ["--preset", "full"])):
+            with self.subTest(case=name):
+                signature = b"\x89PNG" if "png" in flags else b"\xff\xd8"
+                dest, report = self.export(f"stored-{name}", "--at", "0", *flags, count=1, source=source,
+                                           signature=signature)
+                self.assertNotEqual((dest / report["frames"][0]["file"]).read_bytes(),
+                                    (stored / "photo-001.jpg").read_bytes())
+        self.assertEqual((report["frames"][0]["width"], report["frames"][0]["height"]), (360, 640))
 
     def test_hlg_ramp_is_tone_mapped_and_sdr_ramp_is_not(self):
         # A neutral ramp from black to peak signal. Converted to sRGB without

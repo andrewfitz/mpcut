@@ -55,6 +55,7 @@ private func exportOptions(_ args: [String: Any], container: String, source: Exp
     let quality = try outputEnum(args, "quality", options.codec == .prores ? ReencodeQuality.prores422 : .balanced)
     options.standardQuality = quality
     options.proResQuality = quality
+    options.qualityChosen = args["quality"] != nil
     options.copyContainer = container
     options.encodeContainer = container
     options.proResContainer = container
@@ -84,7 +85,9 @@ private func exportOptions(_ args: [String: Any], container: String, source: Exp
     }
     if options.tracks == .audio && options.mode == .encode {
         options.audioMode = .encode
-        options.audioFormat = args["audio"] == nil ? .pcm : options.audio
+        // Without an audio action a sound-only encode follows `mpcut export --audio auto`: an exact copy where it can,
+        // otherwise the source's own codec, rather than always converting to PCM.
+        options.audioFormat = args["audio"] != nil ? options.audio : cell.audioActions.contains(.auto) ? .auto : .pcm
         options.conversionContainer = container
         guard args["codec"] == nil, args["quality"] == nil, cell.audioActions.contains(options.audioFormat) else {
             throw MCPCommandError("invalid_arguments", "Choose a supported audio conversion action without video codec or quality settings.")
@@ -196,9 +199,15 @@ extension ProjectSessions {
         let ticket = try mcpOutputJobs.start(owner: owner, revision: revision, project: session.sidecarWork.project, nativeCancellation: conversion, finished: { [weak self] in
             if let self, let conversion, self.projectConversion === conversion { self.finishProjectConversion() }
         }) { progress in
-            try AnalysisSidecar.$excludedSources.withValue(excluded) {
-                try AnalysisSidecar.$readsEnabled.withValue(sidecars) { try work(progress) }
+            // What writing changed that no plan could know, kept apart from the `warnings` a plan and render share.
+            let written = try ExportWriteNotices.collecting {
+                try AnalysisSidecar.$excludedSources.withValue(excluded) {
+                    try AnalysisSidecar.$readsEnabled.withValue(sidecars) { try work(progress) }
+                }
             }
+            var result = written.value
+            if !written.notices.isEmpty, result["written_warnings"] == nil { result["written_warnings"] = written.notices }
+            return result
         }
         if let conversion {
             conversionOwner = owner
@@ -304,7 +313,7 @@ extension ProjectSessions {
             let quality = try outputEnum(args, "quality", ReencodeSettings(codec: codec).quality)
             let audio = try outputEnum(args, "audio", ReencodeAudio.auto)
             let audioOutput = try outputEnum(args, "audio_output", MulticamAudioOutput.separateTracks)
-            let settings = ReencodeSettings(codec: codec, quality: quality, audio: audio)
+            let settings = ReencodeSettings(codec: codec, quality: quality, audio: audio, qualityIsExplicit: args["quality"] != nil)
             let requireCopy = args["require_camera_copy"] as? Bool ?? false
             let useReviewedCuts = args["use_reviewed_cuts"] as? Bool ?? false
             let audioTrackOrdinal = args["audio_track_ordinal"] as? Int
@@ -334,7 +343,9 @@ extension ProjectSessions {
                     }
                     progress.published(output)
                 }
-                return ["eligible": true, "dry_run": dryRun, "plan": try Self.outputJSON(export.report)]
+                var result: [String: Any] = ["eligible": true, "dry_run": dryRun, "plan": try Self.outputJSON(export.report)]
+                if !export.notices.isEmpty { result["warnings"] = export.notices }
+                return result
             }
         }
         if let snapshot = try mcpRenderStillSnapshot(session: session, scope: scope) {
@@ -395,8 +406,11 @@ extension ProjectSessions {
                     try engine.write(plan, to: output) { progress.update($0) }
                     progress.published(output)
                 }
-                return ["eligible": true, "dry_run": dryRun, "plan": try Self.outputJSON(plan),
-                        "cut_map": try Self.outputJSON(ExportCutMap(multicam: plan.mapping))]
+                var result: [String: Any] = ["eligible": true, "dry_run": dryRun, "plan": try Self.outputJSON(plan),
+                                             "cut_map": try Self.outputJSON(ExportCutMap(multicam: plan.mapping))]
+                // What the program leaves out of its sources, after the plan's own warnings, as `mpcut export` lists them.
+                for (key, value) in plan.mcpNotes { result[key] = value }
+                return result
             }
         }
         guard scope != "group" else { throw MCPCommandError("invalid_target", "Group time requires a multicam project.") }
@@ -440,8 +454,11 @@ extension ProjectSessions {
                 return try Self.stillOutputResult(plan.report, output: output, dryRun: dryRun)
             case .ready(let plan):
                 let map = try ExportCutMap(edit: plan.edit, clips: input.clips, ids: input.occurrenceIDs)
+                var edges: [EncodedEdgeResult] = []
                 if !dryRun {
-                    try plan.writeOutput(to: output, cancelled: outputCancelled) { progress.update($0) }
+                    edges = try plan.writingEncodedEdges {
+                        try plan.writeOutput(to: output, cancelled: outputCancelled) { progress.update($0) }
+                    }
                     progress.published(output)
                 }
                 var result: [String: Any] = ["eligible": true, "dry_run": dryRun, "summary": plan.summary,
@@ -457,6 +474,14 @@ extension ProjectSessions {
                 }
                 // An encode's warnings and audio actions and what a copy leaves behind, as `mpcut export` lists them.
                 for (key, value) in try plan.mcpNotes() { result[key] = value }
+                // The alternative `audio: auto` applied in place of a copy, with what it gives up, as queue rows report it.
+                if let applied = resolved.applied {
+                    result["applied"] = applied.label
+                    let listed = result["warnings"] as? [String] ?? []
+                    result["warnings"] = applied.warnings.filter { !listed.contains($0) } + listed
+                }
+                // What each Smart Trim edge cost as written. Only a render reports it, as in the CLI.
+                if !edges.isEmpty { result["encoded_edge_results"] = try Self.outputJSON(edges) }
                 return result
             }
         }
@@ -505,7 +530,7 @@ extension ProjectSessions {
                 throw MCPCommandError("invalid_arguments", "Video codec and quality apply to Smart Trim or Re-encode with picture.")
             }
         }
-        let settings = ReencodeSettings(codec: codec, quality: quality, audio: audio)
+        let settings = ReencodeSettings(codec: codec, quality: quality, audio: audio, qualityIsExplicit: args["quality"] != nil)
         let requireCameraCopy = args["require_camera_copy"] as? Bool ?? false
         let audioOutput = try outputEnum(args, "audio_output", MulticamAudioOutput.separateTracks)
         let audioAction = args["audio"] != nil ? audio : nil
@@ -694,12 +719,14 @@ extension ProjectSessions {
         return { progress in
             try ProjectMediaVolume.$checking.withValue(checkingVolumes) {
                 if resolve {
-                    try ResolveExport.write(snapshot, relativeTo: location, to: output, useSidecar: AnalysisSidecar.readsEnabled,
-                                            matching: ordinary, matchingMulticam: indexed, auxiliaryOutput: progress.published,
-                                            cancelled: outputCancelled)
+                    // What the timeline gives up in FCPXML, as `mpcut project resolve export` lists it.
+                    let warnings = try ResolveExport.write(snapshot, relativeTo: location, to: output,
+                                                           useSidecar: AnalysisSidecar.readsEnabled,
+                                                           matching: ordinary, matchingMulticam: indexed,
+                                                           auxiliaryOutput: progress.published, cancelled: outputCancelled)
                     progress.published(output)
                     if open { try ResolveExport.openInResolve(output, cancelled: outputCancelled) }
-                    return ["opened_in_resolve": open]
+                    return ["opened_in_resolve": open, "warnings": warnings]
                 }
                 let warnings = try ProjectConverter.write(snapshot, relativeTo: location, to: output, mediaSnapshot: mediaSnapshot,
                                                           allowLoss: allowLoss, flattenMulticam: flatten,
@@ -768,7 +795,8 @@ extension ProjectSessions {
         return { progress in
             var rangePlans: [[String: Any]] = []
             let outputs: [URL]
-            let write: (Int, @escaping @Sendable (Double) -> Void) throws -> Void
+            // Writes one range and returns what its Smart Trim edges cost, for an ordinary range of the editor queue.
+            let write: (Int, @escaping @Sendable (Double) -> Void) throws -> [EncodedEdgeResult]
             var plans: [[String: Any]] = []
             var multicamPlans: [[String: Any]] = []
             var picturePlans: [[String: Any]] = []
@@ -789,9 +817,13 @@ extension ProjectSessions {
                     }
                     multicamPlans = try batch.items.compactMap { item in
                         guard case .multicam(let plan) = item.payload else { return nil }
-                        return ["destination": item.output.path, "plan": try Self.outputJSON(plan)]
+                        let row: [String: Any] = ["destination": item.output.path, "plan": try Self.outputJSON(plan)]
+                        return row.merging(plan.mcpNotes) { $1 }
                     }
-                    write = { try batch.write(batch.items[$0], progress: $1) }
+                    write = { index, update in
+                        try batch.write(batch.items[index], progress: update)
+                        return []
+                    }
                 } else {
                     let batch = try SequenceQueuePlan(ranges, directory: output, options: options, useSidecar: sidecars,
                                                       ordinaryModeWhenUnspecified: mode == nil ? defaultOrdinaryMode : nil,
@@ -807,7 +839,7 @@ extension ProjectSessions {
                         return ["destination": item.output.path, "plan": try Self.outputJSON(plan.report)]
                     }
                     write = { index, update in
-                        try batch.write(batch.items[index]) {
+                        try batch.writeReportingEdges(batch.items[index]) {
                             update($0)
                             return !Task.isCancelled
                         }
@@ -820,11 +852,20 @@ extension ProjectSessions {
                 return result
             }
             for path in outputs { try CutProject.validateMediaDestination(path, absoluteSources: protected) }
+            // What writing each range changed that its plan could not show, under its file name.
+            var written: [String] = []
             if !dryRun {
                 for (i, path) in outputs.enumerated() {
                     try Task.checkCancellation()
-                    try write(i) { progress.update((Double(i) + $0) / Double(outputs.count)) }
+                    let (edges, notices) = try ExportWriteNotices.collecting {
+                        try write(i) { progress.update((Double(i) + $0) / Double(outputs.count)) }
+                    }
+                    written += notices.map { "\(path.lastPathComponent) — \($0)" }
                     progress.published(path)
+                    // What each Smart Trim edge of this range cost as written, in its own row. Only a render reports it.
+                    if !edges.isEmpty, let row = rangePlans.firstIndex(where: { $0["destination"] as? String == path.path }) {
+                        rangePlans[row]["encoded_edge_results"] = try Self.outputJSON(edges)
+                    }
                 }
                 for index in plans.indices {
                     if let destination = plans[index]["destination"] as? String,
@@ -839,6 +880,7 @@ extension ProjectSessions {
             if !plans.isEmpty { result["still_plans"] = plans }
             if !picturePlans.isEmpty { result["picture_plans"] = picturePlans }
             if !multicamPlans.isEmpty { result["multicam_plans"] = multicamPlans }
+            if !written.isEmpty { result["written_warnings"] = written }
             return result
         }
     }

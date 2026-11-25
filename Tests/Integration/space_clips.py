@@ -128,10 +128,37 @@ class SpaceClips(unittest.TestCase):
         camera = self.output.with_name("camera-aac.mov")
         ffmpeg("-i", self.source, "-c:v", "copy", "-c:a", "aac", camera)
         self.source = camera
-        for audio_mode in ("auto", "copy"):
-            with self.subTest(audio_mode=audio_mode):
-                rejected = self.export("--space-clips", "source", "--audio", audio_mode, "--dry-run", succeeds=False)
-                self.assertEqual(rejected["error"]["code"], "generated_audio_required")
+        # Copy cannot generate silence, so it refuses.
+        with self.subTest(audio_mode="copy"):
+            rejected = self.export("--space-clips", "source", "--audio", "copy", "--dry-run", succeeds=False)
+            self.assertEqual(rejected["error"]["code"], "generated_audio_required")
+        # Auto matches the original: it converts the track in its source codec, AAC at the source sample rate and at
+        # the movie rule's bit rate (the first customary step not under the source's average, and at least 96 kbps for
+        # each channel), and reports the conversion.
+        with self.subTest(audio_mode="auto"):
+            written_source = probe(camera, "-select_streams", "a:0", "-show_streams")["streams"][0]
+            sizes = probe(camera, "-select_streams", "a:0", "-show_entries", "packet=size")["packets"]
+            average = sum(int(packet["size"]) for packet in sizes) * 8 / float(written_source["duration"])
+            steps = [32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512]
+            channels = int(written_source["channels"])
+            expected_rate = max(max(96, min(512, channels * 96)), next((step for step in steps if step * 100 >= average / 1000 * 97), 512)) * 1000
+            planned = self.export("--space-clips", "source", "--audio", "auto", "--dry-run")
+            converted = self.export("--space-clips", "source", "--audio", "auto")
+            try:
+                self.assertEqual(converted["sound_actions"], planned["sound_actions"])
+                action, = converted["sound_actions"]
+                self.assertEqual((action["audio"], action["codec"], action["sample_rate"], action["bit_rate"]),
+                                 ("aac", "aac", SAMPLE_RATE, expected_rate))
+                self.assertEqual(action["reason"], "The AAC source is written as AAC at its own rate.")
+                self.assertEqual(action["generated_silence"], [{"from": "2/5", "to": "6/5"}])
+                self.assertIn("Audio track 1, output 2/5–6/5: This interval requires generated silence, so the track is converted.",
+                              action["warnings"])
+                self.assert_rendered(20)
+                track = probe(self.output, "-select_streams", "a:0", "-show_streams")["streams"][0]
+                self.assertEqual((track["codec_name"], int(track["sample_rate"])), ("aac", SAMPLE_RATE))
+            finally:
+                # The PCM export below writes to the same path.
+                self.output.unlink(missing_ok=True)
         converted = self.export("--space-clips", "source", "--audio", "pcm")
         action, = converted["sound_actions"]
         self.assertEqual(action["audio"], "pcm")

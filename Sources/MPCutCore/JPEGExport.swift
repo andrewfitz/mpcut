@@ -55,11 +55,19 @@ public struct JPEGManifest: Encodable, Sendable {
     public let frames: [JPEGFrame]
     /// Present for PNG and TIFF exports. A JPEG manifest omits it.
     public var format: FrameImageFormat? = nil
+    /// What the frames leave out of the source picture, such as its alpha channel. Absent when nothing.
+    public var warnings: [String]? = nil
 
     private enum CodingKeys: String, CodingKey {
         case ok, schemaVersion, file, outputDirectory, selection, sourceStamp, timeBase, origin, duration
         case preset, sample, stream = "detection_audio_stream_index", thresholdDB, rangeCount, frames
-        case minimumPause = "min_pause_seconds", format
+        case minimumPause = "min_pause_seconds", format, warnings
+    }
+
+    /// Frames are written opaque. PNG and TIFF are chosen to keep the picture whole, so they say what they leave out.
+    static func frameWarnings(_ media: MediaInfo, format: FrameImageFormat) -> [String]? {
+        guard format != .jpeg, media.video.hasAlpha else { return nil }
+        return ["\(format.fileExtension.uppercased()) frames are written without the source's alpha channel."]
     }
 }
 
@@ -271,7 +279,8 @@ public enum JPEGExport {
                 sourceStamp: SceneSourceStamp(media: media), timeBase: media.video.timeBase, origin: media.origin,
                 duration: media.duration, preset: preset, sample: plan.kind == "times" ? nil : sample,
                 stream: plan.stream, thresholdDB: plan.thresholdDB, minimumPause: plan.minimumPause,
-                rangeCount: plan.ranges.count, frames: frames, format: format == .jpeg ? nil : format)
+                rangeCount: plan.ranges.count, frames: frames, format: format == .jpeg ? nil : format,
+                warnings: JPEGManifest.frameWarnings(media, format: format))
         }
     }
 
@@ -575,7 +584,12 @@ public enum JPEGExport {
                 let picture: CIImage
                 let requests: Range<Int>
                 let pts: Int64
+                /// The source's own JPEG picture and its size, written instead of encoding `picture`.
+                var stored: (jpeg: Data, width: Int, height: Int)? = nil
+                var width: Int { stored?.width ?? Int(picture.extent.width) }
+                var height: Int { stored?.height ?? Int(picture.extent.height) }
             }
+            let packets = JPEGPacketCopy(media, preset: preset, format: format, control: control)
             let pixels = Double(max(media.video.width, media.video.displayWidth)) *
                 Double(max(media.video.height, media.video.displayHeight))
             // Allow for a decoded surface, a render surface and JPEG scratch space.
@@ -605,19 +619,24 @@ public enum JPEGExport {
                         }
                     }
                     var profile: CGColorSpace?
-                    let picture = try autoreleasepool {
-                        guard format != .jpeg else { return try renderer.picture(at: pts, seekDTS: seekDTS, preset: preset) }
+                    let stored = try packets?.picture(at: pts)
+                    let picture = try stored != nil ? CIImage.empty() : autoreleasepool { () throws -> CIImage in
+                        guard format != .jpeg else {
+                            return try renderer.picture(at: pts, seekDTS: seekDTS, preset: preset, clampsLikePreview: true)
+                        }
                         let source = try renderer.sourcePicture(at: pts, seekDTS: seekDTS, preset: preset)
                         profile = source.profile
                         return source.image
                     }
                     previous = frame
                     repeat { next += 1 } while next < requests.count && requests[next].frame == frame
-                    jobs.append(Job(profile: profile, picture: picture, requests: first..<next, pts: pts))
+                    jobs.append(Job(profile: profile, picture: picture, requests: first..<next, pts: pts,
+                                    stored: stored.map { ($0, media.video.width, media.video.height) }))
                 }
                 try forEachOrderedBatch(count: jobs.count, batchSize: 1, workerLimit: workers, check: control.check, transform: { range in
                     let job = jobs[range.lowerBound]
                     return (job, try autoreleasepool {
+                        if let stored = job.stored { return stored.jpeg }
                         guard let profile = job.profile else { return try renderer.encode(job.picture, preset: preset) }
                         return try renderer.encode(job.picture, profile: profile, format: format)
                     })
@@ -632,7 +651,7 @@ public enum JPEGExport {
                             view: r.scene?.view, viewLabel: r.scene?.viewLabel, viewName: r.viewName, from: r.span.from, to: r.span.to,
                             clipFrom: req.clip.from, clipTo: req.clip.to, requestedTime: req.requested,
                             frameTime: info.time, frameDuration: info.duration, framePTS: job.pts,
-                            width: Int(job.picture.extent.width), height: Int(job.picture.extent.height))
+                            width: job.width, height: job.height)
                         completed += 1
                         progress(completed, requests.count)
                     }
@@ -746,7 +765,9 @@ final class JPEGRenderer {
 
     var displayTransform: CGAffineTransform { mp_jpeg_transform(reader) }
 
-    func picture(at pts: Int64, seekDTS: Int64, preset: JPEGPreset, toneMapHDR: Bool = true) throws -> CIImage {
+    /// `clampsLikePreview` limits the decoded signal the way the preview does; frame export asks for it.
+    func picture(at pts: Int64, seekDTS: Int64, preset: JPEGPreset, toneMapHDR: Bool = true,
+                 clampsLikePreview: Bool = false) throws -> CIImage {
         var buffer: CVPixelBuffer?
         var error = [CChar](repeating: 0, count: 256)
         guard mp_jpeg_frame(reader, pts, seekDTS, preset == .review ? 640 : 0, &buffer, &error, error.count) >= 0,
@@ -760,7 +781,8 @@ final class JPEGRenderer {
         let transfer = CVBufferCopyAttachment(buffer, kCVImageBufferTransferFunctionKey, nil) as? String
         let isHDR = transfer == (kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String) ||
             transfer == (kCVImageBufferTransferFunction_ITU_R_2100_HLG as String)
-        var image = isHDR && toneMapHDR ? CIImage(cvPixelBuffer: buffer, options: [.toneMapHDRtoSDR: true]) : CIImage(cvPixelBuffer: buffer)
+        var image = isHDR && toneMapHDR ? CIImage(cvPixelBuffer: buffer, options: [.toneMapHDRtoSDR: true])
+            : clampsLikePreview ? Self.clampedSignal(buffer) : CIImage(cvPixelBuffer: buffer)
         let display = mp_jpeg_display_size(reader)
         let natural = CGAffineTransform(scaleX: display.width / image.extent.width,
                                        y: display.height / image.extent.height)
@@ -775,6 +797,18 @@ final class JPEGRenderer {
         let transform = CGAffineTransform(translationX: -extent.minX, y: -extent.minY)
             .concatenating(CGAffineTransform(scaleX: width / extent.width, y: height / extent.height))
         return image.transformed(by: transform, highQualityDownsample: true).cropped(to: rect)
+    }
+
+    /// Core Animation, which shows the native and the FFmpeg preview, limits each decoded R′G′B′
+    /// value to 0...1 before converting color, where Core Image carries it on. They differ where a
+    /// picture's values leave its primaries' gamut: BT.709 bars read with BT.601 and SMPTE C
+    /// primaries came out up to 11 levels lower in green than the preview (measured on macOS 27).
+    private static func clampedSignal(_ buffer: CVPixelBuffer) -> CIImage {
+        let tagged = CIImage(cvPixelBuffer: buffer)
+        guard let space = tagged.colorSpace,
+              let clamped = CIImage(cvPixelBuffer: buffer, options: [.colorSpace: NSNull()])
+                .applyingFilter("CIColorClamp").matchedToWorkingSpace(from: space) else { return tagged }
+        return clamped
     }
 
     func encode(_ image: CIImage, preset: JPEGPreset) throws -> Data {
@@ -852,6 +886,57 @@ extension JPEGRenderer {
                                     bitmapInfo: layout, provider: provider, decode: nil,
                                     shouldInterpolate: false, intent: .defaultIntent) else { throw Self.failure }
         return try format.encode(picture)
+    }
+}
+
+/// Writes an MJPEG or Photo JPEG picture as stored when a Full JPEG would only encode it again: same
+/// size, no display transform, square pixels and the color a JFIF viewer assumes (full-range BT.601
+/// YCbCr shown as sRGB). A picture that is not a standalone baseline JPEG of the whole frame is decoded.
+final class JPEGPacketCopy {
+    private let packets: OpaquePointer
+    private let control: JPEGControl
+    private let width: Int32
+    private let height: Int32
+
+    init?(_ media: MediaInfo, preset: JPEGPreset, format: FrameImageFormat, control: JPEGControl) {
+        let video = media.video
+        let unspecified: Set<String> = ["", "unknown", "unspecified", "reserved"]
+        let sar = video.sampleAspectRatio
+        // The index runs no picture decoder, so an AVI MJPEG stream whose pictures omit Huffman tables has
+        // no known layout. Each picture's frame header then decides (mp_jpeg_packets_open).
+        let layoutUnknown = video.bitDepth == 0 && unspecified.contains(video.pixelFormat)
+            && unspecified.contains(video.colorRange)
+        guard preset == .full, format == .jpeg, video.codec == "mjpeg", !video.hasAlpha,
+              layoutUnknown || (video.bitDepth == 8 && video.colorRange == "pc"
+                                && (video.pixelFormat.hasPrefix("yuvj") || video.pixelFormat == "gray")),
+              unspecified.union(["bt470bg", "smpte170m"]).contains(video.colorMatrix),
+              unspecified.union(["iec61966-2-1"]).contains(video.colorTransfer),
+              unspecified.union(["bt709"]).contains(video.colorPrimaries),
+              video.rotation == 0, video.width == video.displayWidth, video.height == video.displayHeight,
+              sar.numerator == sar.denominator || sar.numerator == 0,
+              ["progressive", "unknown"].contains(video.fieldOrder),
+              let width = Int32(exactly: video.width), let height = Int32(exactly: video.height) else { return nil }
+        let state = Unmanaged.passUnretained(control).toOpaque()
+        guard let packets = mp_jpeg_packets_open(media.url.path, Int32(video.index), layoutUnknown, {
+            Unmanaged<JPEGControl>.fromOpaque($0!).takeUnretainedValue().cancelled() ? 1 : 0
+        }, state) else { return nil }
+        self.packets = packets
+        self.control = control
+        self.width = width
+        self.height = height
+    }
+    deinit { mp_jpeg_packets_close(packets) }
+
+    /// The stored picture at this presentation time, or nil when it has to be decoded.
+    func picture(at pts: Int64) throws -> Data? {
+        var data: UnsafeMutablePointer<UInt8>?
+        var size = 0
+        // A read failure leaves the picture to the decoder, which reports its own errors.
+        guard mp_jpeg_packet(packets, pts, width, height, &data, &size) > 0, let data else {
+            try control.check()
+            return nil
+        }
+        return Data(bytesNoCopy: data, count: size, deallocator: .free)
     }
 }
 

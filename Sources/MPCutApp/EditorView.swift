@@ -537,7 +537,7 @@ private struct ViewerPanel: View {
                 }
             } else {
                 EditorPreview(accessibilityTitle: "Movie preview", issue: preview.issue,
-                              audioWarning: preview.audioWarning) {
+                              audioWarning: preview.audioWarning, pictureNotice: preview.pictureNotice) {
                     PreviewView(preview: preview)
                 }
             }

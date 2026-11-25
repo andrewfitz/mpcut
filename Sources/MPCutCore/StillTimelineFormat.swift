@@ -106,8 +106,12 @@ extension StillTimelineFormat {
         }
     }
 
+    /// `deep` selects HEVC Main 10 for an SDR program whose images have more than 8 bits, and
+    /// `quality` the ProRes profile (422 LT, 422 or 422 HQ). Without them the stream is HEVC Main
+    /// for SDR and ProRes 422.
     func targetStream(color: StillProgramColorPolicy, duration: RationalTime,
-                      pictureClock: Int64? = nil) throws -> StreamInfo {
+                      pictureClock: Int64? = nil, deep: Bool = false,
+                      quality: ReencodeQuality? = nil) throws -> StreamInfo {
         try validate(color: color)
         guard duration > .zero else {
             throw CutError(code: "invalid_still_time", message: "The still duration must be positive.")
@@ -121,11 +125,17 @@ extension StillTimelineFormat {
         case .h264:
             (codecTag, profile, pixelFormat, bitDepth) = ("avc1", 100, "yuv420p", 8)
         case .hevc:
-            (codecTag, profile, pixelFormat, bitDepth) = ("hvc1", hdr ? 2 : 1, hdr ? "yuv420p10le" : "yuv420p", hdr ? 10 : 8)
+            let ten = hdr || deep
+            (codecTag, profile, pixelFormat, bitDepth) = ("hvc1", ten ? 2 : 1, ten ? "yuv420p10le" : "yuv420p", ten ? 10 : 8)
         case .jpeg:
             (codecTag, profile, pixelFormat, bitDepth) = ("jpeg", 192, "yuvj420p", 8)
         case .prores:
-            (codecTag, profile, pixelFormat, bitDepth) = ("apcn", 2, "yuv422p10le", 10)
+            switch quality {
+            case .proresLT: (codecTag, profile) = ("apcs", 1)
+            case .proresHQ: (codecTag, profile) = ("apch", 3)
+            default: (codecTag, profile) = ("apcn", 2)
+            }
+            (pixelFormat, bitDepth) = ("yuv422p10le", 10)
         }
         return StreamInfo(index: 0, trackID: 1, kind: "video", codec: codec == .jpeg ? "mjpeg" : codec.rawValue, codecTag: codecTag,
                           profile: profile, width: width, height: height, displayWidth: width, displayHeight: height,

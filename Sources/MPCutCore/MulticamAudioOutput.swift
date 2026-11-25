@@ -19,13 +19,15 @@ public struct MulticamExportAudioLane: Encodable, Sendable, Identifiable {
     public let generatedSilence: [MulticamRange]
     public let retainedPCM: Bool
     public let warnings: [String]
-    /// The rate of a rendered AAC lane and the word length of a rendered PCM lane, as they are encoded.
+    /// The rate of a rendered lossy lane and the word length of a rendered PCM, FLAC or ALAC lane, as they are encoded.
     public var bitRate: Int? = nil
     public var bitDepth: Int? = nil
+    /// Why `auto` wrote this format, for a rendered lane that keeps its source's compressed format.
+    public var reason: String? = nil
 
     private enum CodingKeys: String, CodingKey {
         case id, label, colorSlot, segments, action, codec, sampleRate, channelLayout, generatedSilence, retainedPCM, warnings
-        case bitRate, bitDepth
+        case bitRate, bitDepth, reason
         case sourceLaneIDs = "source_lane_ids"
     }
 }
@@ -37,7 +39,7 @@ struct MulticamExportSound: Sendable {
         case downmix(MulticamAudioDownmixPlan)
     }
 
-    let report: MulticamExportAudioLane
+    var report: MulticamExportAudioLane
     let treatment: Treatment
 
     var edit: ResolvedEdit {
@@ -168,6 +170,18 @@ extension MulticamEngine {
                 } catch let issue as CutError {
                     throw try conversionIssue(issue, at: .init(from: .zero, to: mapping.duration), lane: lane, mapping: mapping)
                 }
+            }
+            // Auto keeps the lane's own compressed format where the container and the helper allow.
+            if action == .auto, let kept = sourceFormatPlan(spans, duration: mapping.duration,
+                                                            container: container, source: .multicam,
+                                                            silenceFormat: format, contextual: { issue, index in
+                                                                try self.conversionIssue(issue, at: spans[index].output, lane: lane, mapping: mapping)
+                                                            }) {
+                var plan = kept.plan
+                plan.verifiesSampleRange = container != "mkv"
+                var rendered = try renderedLane(lane, plan: plan, retained: false, warning: copyFailure?.message)
+                rendered.report.reason = kept.note
+                return rendered
             }
             let choices: [ReencodeAudio]
             do {

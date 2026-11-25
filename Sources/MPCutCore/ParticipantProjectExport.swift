@@ -9,6 +9,9 @@ package struct ParticipantProjectExport: Sendable {
     let range: MulticamRange?
     let audioOutput: MulticamAudioOutput
     private let soundOnly: StillExportPlan?
+    /// What the caller chose in place of what was asked, such as HEVC for an HDR composition asked for in H.264.
+    /// Listed first among `notices`.
+    package var substitutions: [String] = []
 
     package static var requiresEncoding: CutError {
         CutError(code: "participant_render_requires_encoding",
@@ -111,18 +114,28 @@ package struct ParticipantProjectExport: Sendable {
                           warnings: soundOnly.report.warnings)
         }
         return .known(tier: .reencode, factors: [TierFactor(Self.requiresEncoding, forces: .reencode)],
-                      container: container, warnings: [report.picturePrivacyNotice, report.audioPrivacyNotice].compactMap { $0 })
+                      container: container, warnings: notices)
     }
 
+    /// The privacy notices of the plan, then what its picture gives up, as the export sheet, queue, CLI and MCP list them.
+    package var notices: [String] {
+        substitutions + [report.picturePrivacyNotice, report.audioPrivacyNotice].compactMap { $0 } + (report.warnings ?? [])
+    }
+
+    /// Writes the export and returns what only writing showed, reported as `written_warnings`: constant quality the
+    /// encoder could not take. Empty for a sound-only export.
+    @discardableResult
     package func write(to output: URL, cancelled: (@Sendable () -> Bool)? = nil,
-                       progress: ((Double) -> Bool)? = nil) throws {
+                       progress: ((Double) -> Bool)? = nil) throws -> [String] {
         if let soundOnly {
             try StillExportPlanner(cancelled: cancelled).write(soundOnly, to: output, progress: progress)
-            return
+            return []
         }
-        _ = try ParticipantRenderer(cancelled: cancelled, legacyWholeFramePrivacy: false, allowsOriginal: true).render(
+        let written = try ParticipantRenderer(cancelled: cancelled, legacyWholeFramePrivacy: false, allowsOriginal: true).render(
             project, document: document, to: output, settings: settings, range: range, audioOutput: audioOutput, progress: progress
         )
+        ExportWriteNotices.record(written.writtenWarnings ?? [])
+        return written.writtenWarnings ?? []
     }
 
     static func sharedAudioNotice(_ project: CutProject, audio: ParticipantRenderAudio,

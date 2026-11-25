@@ -3,9 +3,19 @@ import Foundation
 public struct ParticipantCanvas: Codable, Equatable, Sendable {
     public var width: Int
     public var height: Int
-    public var frameRate: RationalTime
+    /// The chosen output rate. Nil, stored by omitting `frame_rate`, follows the reference recording's
+    /// rate when the composition renders, so its pictures are neither dropped nor repeated.
+    public var requestedFrameRate: RationalTime?
     /// RGB, in 0xRRGGBB order.
     public var background: UInt32
+
+    /// The output rate. A canvas without a chosen rate reads as 30 fps until rendering resolves it.
+    public var frameRate: RationalTime {
+        get { requestedFrameRate ?? Self.fallbackFrameRate }
+        set { requestedFrameRate = newValue }
+    }
+
+    public static let fallbackFrameRate = RationalTime(numerator: 30)
 
     private enum CodingKeys: String, CodingKey { case width, height, background, frameRate = "frame_rate" }
 
@@ -14,15 +24,23 @@ public struct ParticipantCanvas: Codable, Equatable, Sendable {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         self.init(width: try values.decodeIfPresent(Int.self, forKey: .width) ?? 1920,
                   height: try values.decodeIfPresent(Int.self, forKey: .height) ?? 1080,
-                  frameRate: try values.decodeIfPresent(RationalTime.self, forKey: .frameRate) ?? .init(numerator: 30),
+                  frameRate: try values.decodeIfPresent(RationalTime.self, forKey: .frameRate),
                   background: try values.decodeIfPresent(UInt32.self, forKey: .background) ?? 0)
     }
 
-    public init(width: Int = 1920, height: Int = 1080, frameRate: RationalTime = .init(numerator: 30),
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(width, forKey: .width)
+        try values.encode(height, forKey: .height)
+        try values.encode(background, forKey: .background)
+        try values.encodeIfPresent(requestedFrameRate, forKey: .frameRate)
+    }
+
+    public init(width: Int = 1920, height: Int = 1080, frameRate: RationalTime? = ParticipantCanvas.fallbackFrameRate,
                 background: UInt32 = 0) {
         self.width = width
         self.height = height
-        self.frameRate = frameRate
+        self.requestedFrameRate = frameRate
         self.background = background
     }
 }
@@ -187,7 +205,7 @@ public struct ParticipantRenderPlan: Codable, Equatable, Sendable {
     public init(from decoder: Decoder) throws {
         try ProjectField.rejectUnknown(CodingKeys.self, in: decoder, code: "invalid_participant_plan")
         let values = try decoder.container(keyedBy: CodingKeys.self)
-        self.init(canvas: try values.decodeIfPresent(ParticipantCanvas.self, forKey: .canvas) ?? .init(),
+        self.init(canvas: try values.decodeIfPresent(ParticipantCanvas.self, forKey: .canvas) ?? .init(frameRate: nil),
                   shots: try values.decode([ParticipantShot].self, forKey: .shots),
                   audio: try values.decodeIfPresent(ParticipantRenderAudio.self, forKey: .audio) ?? .init(),
                   redactions: try values.decodeIfPresent([ParticipantRedaction].self, forKey: .redactions) ?? [],

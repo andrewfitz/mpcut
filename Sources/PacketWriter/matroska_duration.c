@@ -65,6 +65,20 @@ static void update_crc(Element section) {
     }
 }
 
+/* Video (1) and audio (2) tracks carry the planned ends, in output order. */
+static int timed_track(Element entry) {
+    uint64_t type = integer(child(entry, 0x83));
+    return type == 1 || type == 2;
+}
+
+/* Whether `uid` names a track without a planned end, such as subtitles. */
+static int untimed_track(Element tracks, uint64_t uid) {
+    Element entry;
+    while (next(&tracks, &entry))
+        if (entry.id == 0xae && !timed_track(entry) && integer(child(entry, 0x73c5)) == uid) return 1;
+    return 0;
+}
+
 static int update_duration_tags(Element segment, const int64_t *ends, size_t count, uint64_t *uids) {
     Element info = child(segment, 0x1549a966);
     Element duration = child(info, 0x4489);
@@ -73,12 +87,15 @@ static int update_duration_tags(Element segment, const int64_t *ends, size_t cou
     if (duration.size != 8 || !tracks.data || !tags.data ||
         integer(child(info, 0x2ad7b1)) != 1000000) return -1;
 
-    Element entry;
-    while (next(&tracks, &entry)) {
-        if (entry.id != 0xae) continue;
-        uint64_t number = integer(child(entry, 0xd7));
-        if (!number || number > count || uids[number - 1]) return -1;
-        uids[number - 1] = integer(child(entry, 0x73c5));
+    // Pair the ends with the video and audio tracks in the order the muxer wrote them.
+    // Other tracks, such as subtitles, keep the tags the muxer wrote.
+    Element remaining = tracks, entry;
+    size_t timed = 0;
+    while (next(&remaining, &entry)) {
+        if (entry.id != 0xae || !timed_track(entry)) continue;
+        uint64_t uid = integer(child(entry, 0x73c5));
+        if (timed == count || !uid) return -1;
+        uids[timed++] = uid;
     }
 
     int64_t longest = 0;
@@ -90,6 +107,7 @@ static int update_duration_tags(Element segment, const int64_t *ends, size_t cou
         if (!uid) continue;
         size_t index = 0;
         while (index < count && uids[index] != uid) index++;
+        if (index == count && untimed_track(tracks, uid)) continue;
         if (index == count || ends[index] < 0) return -1;
         Element simple;
         while (next(&tag, &simple)) {

@@ -22,7 +22,8 @@ struct MulticamMux {
     }
 
     func export(picture: URL?, sounds: [URL], to output: URL, container: String, duration: RationalTime,
-                audio: [MulticamExportAudioLane] = [], progress: ((Double) -> Bool)? = nil, verifySources: () throws -> Void = {}) throws {
+                audio: [MulticamExportAudioLane] = [], chapters: [ReencodeChapter] = [],
+                progress: ((Double) -> Bool)? = nil, verifySources: () throws -> Void = {}) throws {
         let written = ExportRules.multicamMuxContainer(container)
         try check(container: written)
         let process = ReencodeEngine(cancelled: cancelled)
@@ -52,18 +53,27 @@ struct MulticamMux {
         do {
             try update(0)
             if Self.movieContainers.contains(written) || written == "m4a" {
-                try MulticamMOV.combine(picture: picture, sounds: sounds, output: partial, progress: update)
+                let track = chapters.isEmpty ? nil : MulticamChapterTrack.plan(chapters, container: written).track
+                try MulticamMOV.combine(picture: picture, sounds: sounds, output: partial, chapters: track, progress: update)
             } else {
                 let helper = try ReencodeEngine.findHelper(override: nil)
                 let muxer = written == "mkv" || written == "mka" ? "matroska" : written
                 var arguments = ["-xerror", "-copyts"]
                 for input in [picture].compactMap({ $0 }) + sounds { arguments += ["-i", input.path] }
+                // The chapters are one more input, without streams, after the picture and sound.
+                var chapterInput = "-1"
+                if !chapters.isEmpty {
+                    try ReencodeChapter.metadata(chapters).write(to: staging.appendingPathComponent("chapters.ffmeta"),
+                                                                 atomically: true, encoding: .utf8)
+                    chapterInput = String(sounds.count + (picture == nil ? 0 : 1))
+                    arguments += ["-f", "ffmetadata", "-i", "chapters.ffmeta"]
+                }
                 if picture != nil { arguments += ["-map", "0:v:0"] }
                 for index in sounds.indices {
                     arguments += ["-map", "\(index + (picture == nil ? 0 : 1)):a:0",
                                   "-disposition:a:\(index)", index == 0 ? "default" : "0"]
                 }
-                arguments += ["-map_chapters", "-1", "-c", "copy", "-copyinkf", "-avoid_negative_ts",
+                arguments += ["-map_chapters", chapterInput, "-c", "copy", "-copyinkf", "-avoid_negative_ts",
                               "disabled", "-f", muxer, "-n", partial.path]
                 try runner.runHelper(helper, arguments: arguments, in: staging, duration: duration) { fraction in
                     if progress?(fraction) == false { interruption.stop() }

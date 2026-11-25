@@ -45,6 +45,8 @@ final class ParticipantPictureWriter {
         try ParticipantRenderSession.validateEncoding(settings, color: session.color)
         let canvas = session.plan.canvas
         let color = session.color
+        // HDR, and SDR from a recording deeper than eight bits, keep ten bits through HEVC and ProRes.
+        let tenBit = color != .sdr || (session.deepSource && (settings.codec == .hevc || settings.codec == .prores))
         let writer = try AVAssetWriter(outputURL: file, fileType: .mov)
         writer.movieTimeScale = session.timescale
         let codec: AVVideoCodecType
@@ -52,14 +54,14 @@ final class ParticipantPictureWriter {
         switch settings.codec {
         case .h264, .hevc:
             codec = settings.codec == .h264 ? .h264 : .hevc
+            // Constant quality with Re-encode's VideoToolbox tiers, so both exports of a picture match.
             compression = [
                 AVVideoAllowFrameReorderingKey: false,
-                AVVideoAverageBitRateKey: Self.bitRate(canvas, quality: settings.quality),
-                AVVideoExpectedSourceFrameRateKey: canvas.frameRate.seconds
+                AVVideoQualityKey: Self.quality(settings.quality),
+                AVVideoExpectedSourceFrameRateKey: canvas.frameRate.seconds,
+                AVVideoProfileLevelKey: settings.codec == .h264 ? kVTProfileLevel_H264_High_AutoLevel
+                    : tenBit ? kVTProfileLevel_HEVC_Main10_AutoLevel : kVTProfileLevel_HEVC_Main_AutoLevel
             ]
-            if color != .sdr {
-                compression[AVVideoProfileLevelKey] = kVTProfileLevel_HEVC_Main10_AutoLevel
-            }
         case .jpeg:
             codec = .jpeg
             compression[AVVideoQualityKey] = settings.quality == .smallerFile ? 0.55 : settings.quality == .highQuality ? 0.90 : 0.75
@@ -81,11 +83,16 @@ final class ParticipantPictureWriter {
             ]
         ]
         if !compression.isEmpty { outputSettings[AVVideoCompressionPropertiesKey] = compression }
+        let accepted = Self.acceptedSettings(outputSettings, canvas: canvas, settings: settings) {
+            writer.canApply(outputSettings: $0, forMediaType: .video)
+        }
+        outputSettings = accepted.settings
+        session.writtenWarning = accepted.warning
         guard writer.canApply(outputSettings: outputSettings, forMediaType: .video) else { throw Self.failure(writer) }
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: outputSettings)
         input.mediaTimeScale = session.timescale
         let adapter = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
-            kCVPixelBufferPixelFormatTypeKey as String: color.pixelFormat,
+            kCVPixelBufferPixelFormatTypeKey as String: tenBit ? kCVPixelFormatType_ARGB2101010LEPacked : color.pixelFormat,
             kCVPixelBufferWidthKey as String: canvas.width,
             kCVPixelBufferHeightKey as String: canvas.height,
             kCVPixelBufferIOSurfacePropertiesKey as String: [:]
@@ -106,6 +113,33 @@ final class ParticipantPictureWriter {
 
     deinit { if writer.status == .writing { writer.cancelWriting() } }
 
+    /// Constant quality needs a hardware encoder session. When none takes it, as in a render of many ISOs at once,
+    /// the picture is encoded at the tier's average rate instead of failing, and the warning says so.
+    /// `canApply` is the writer's check of the settings.
+    static func acceptedSettings(_ outputSettings: [String: Any], canvas: ParticipantCanvas, settings: ReencodeSettings,
+                                 canApply: ([String: Any]) -> Bool) -> (settings: [String: Any], warning: String?) {
+        guard var compression = outputSettings[AVVideoCompressionPropertiesKey] as? [String: Any],
+              compression[AVVideoQualityKey] != nil, !canApply(outputSettings) else { return (outputSettings, nil) }
+        let rate = bitRate(canvas, quality: settings.quality)
+        compression[AVVideoQualityKey] = nil
+        compression[AVVideoAverageBitRateKey] = rate
+        var changed = outputSettings
+        changed[AVVideoCompressionPropertiesKey] = compression
+        let codec = settings.codec == .hevc ? "HEVC" : "H.264"
+        return (changed, "No hardware encoder session took constant quality, so the \(codec) picture was encoded at an "
+                + "average of \(String(format: "%.1f", Double(rate) / 1_000_000)) Mbps instead.")
+    }
+
+    /// VideoToolbox quality for H.264 and HEVC: Re-encode's `-q:v` 45, 60 and 75.
+    static func quality(_ quality: ReencodeQuality) -> Double {
+        switch quality {
+        case .smallerFile: 0.45
+        case .highQuality: 0.75
+        default: 0.60
+        }
+    }
+
+    /// An estimate of the encoded picture rate for space checks, and the average rate when constant quality is refused.
     static func bitRate(_ canvas: ParticipantCanvas, quality: ReencodeQuality) -> Int {
         let bitsPerPixel: Double
         switch quality {

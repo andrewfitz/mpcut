@@ -1228,7 +1228,10 @@
           "const": 1
         },
         "rendition_policy_version": {
-          "const": 1
+          "enum": [
+            1,
+            2
+          ]
         },
         "diffuse_white_nits": {
           "type": "integer",

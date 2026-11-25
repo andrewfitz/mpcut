@@ -80,7 +80,13 @@ struct ProjectOutputSettingsView: View {
     private var settings: TileOutputSettings { document.projectOutputSettings }
     private var isStill: Bool { document.stillFormat != nil }
     private var usesOutputCanvas: Bool { document.hasStoredOutputCanvas }
-    private var canvas: ParticipantCanvas { usesOutputCanvas ? settings.canvas : sourceCanvas }
+    private var canvas: ParticipantCanvas {
+        guard usesOutputCanvas else { return sourceCanvas }
+        // A stored canvas without a chosen rate renders at the recording's rate.
+        var stored = settings.canvas
+        if stored.requestedFrameRate == nil { stored.frameRate = sourceCanvas.frameRate }
+        return stored
+    }
 
     private var sourceCanvas: ParticipantCanvas {
         let stream: StreamInfo?

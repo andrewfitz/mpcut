@@ -3885,20 +3885,31 @@ final class EditorModel: ObservableObject {
             let batch = try SequenceQueuePlan(ranges, directory: directory, options: options,
                                               useSidecar: useSidecar, cancelled: { token.isCancelled })
             for item in batch.items { try CutProject.validateMediaDestination(item.output, absoluteSources: protected) }
+            // What each range's Smart Trim edges cost, taken right after that range's write.
+            var written: [(output: URL, edges: [EncodedEdgeResult])] = []
+            // What writing each range changed that its plan could not show, under its file name.
+            var writtenNotices: [String] = []
             for (index, item) in batch.items.enumerated() {
                 do {
-                    try batch.write(item) { progress((Double(index) + $0) / Double(batch.items.count)) }
+                    let (edges, notices) = try ExportWriteNotices.collecting {
+                        try batch.writeReportingEdges(item) { progress((Double(index) + $0) / Double(batch.items.count)) }
+                    }
+                    written.append((item.output, edges))
+                    writtenNotices += notices.map { "\(item.output.lastPathComponent) — \($0)" }
                 } catch {
                     throw CutError(code: "bulk_interrupted", message: "Wrote \(index) of \(ranges.count) files. "
                                    + "Range \(index + 1): \(error.localizedDescription)")
                 }
             }
             let count = ranges.count == 1 ? "1 file" : "\(ranges.count) files"
-            let notices = batch.items.compactMap { item -> String? in
-                guard case .picture(let plan) = item.payload, let notice = plan.report.picturePrivacyNotice else { return nil }
-                return "\(item.output.lastPathComponent) — \(notice)"
+            let notices = batch.items.flatMap { item -> [String] in
+                guard case .picture(let plan) = item.payload else { return [] }
+                return ([plan.report.picturePrivacyNotice].compactMap { $0 } + (plan.report.warnings ?? []))
+                    .map { "\(item.output.lastPathComponent) — \($0)" }
             }
-            let message = (["Exported \(count) to \(batch.folder.lastPathComponent)."] + notices).joined(separator: " ")
+            let edges = ExportNotices.queueEncodedEdges(written)
+            let message = (["Exported \(count) to \(batch.folder.lastPathComponent)."] + notices + edges + writtenNotices)
+                .joined(separator: " ")
             return (batch.folder, message)
         }
     }
@@ -4452,12 +4463,13 @@ final class EditorModel: ObservableObject {
             guard self.canExport(to: output) else { return }
             let checkingVolumes = self.interchangeCheckingVolumes
             self.runExport { token, _ in
-                try ProjectMediaVolume.$checking.withValue(checkingVolumes) {
+                // What the timeline gives up in FCPXML: rounded cuts, replaced name characters, narrowed sound.
+                let warnings = try ProjectMediaVolume.$checking.withValue(checkingVolumes) {
                     try ResolveExport.write(project, relativeTo: location ?? output, to: output,
                                             matching: imported, cancelled: { token.isCancelled })
                 }
                 if open { try ResolveExport.openInResolve(output, cancelled: { token.isCancelled }) }
-                return (output, "Exported \(output.lastPathComponent).")
+                return (output, (["Exported \(output.lastPathComponent)."] + warnings).joined(separator: " "))
             }
         }
     }
@@ -4597,9 +4609,7 @@ final class EditorModel: ObservableObject {
                 let export = try Self.planParticipantExport(project, document: document, output: output,
                                                             tracks: tracks, range: range, cancelled: cancelled)
                 try export.write(to: output, cancelled: cancelled, progress: progress)
-                let message = ["Exported \(output.lastPathComponent).", export.report.picturePrivacyNotice,
-                               export.report.audioPrivacyNotice]
-                    .compactMap { $0 }.joined(separator: " ")
+                let message = (["Exported \(output.lastPathComponent)."] + export.notices).joined(separator: " ")
                 return (output, message)
             }
         }
@@ -4614,10 +4624,17 @@ final class EditorModel: ObservableObject {
                 tracks: tracks, settings: .init(codec: codec, audio: tracks == .audio ? .pcm : .auto),
                 audioOutput: tracks == .audio ? .downmixStereo : .separateTracks, range: range, cancelled: cancelled)
         }
-        do { return try plan(codec) }
+        var export: ParticipantProjectExport
+        do { export = try plan(codec) }
         catch let issue as CutError where issue.code == "unsupported_format" && codec == .h264 && tracks != .audio {
-            return try plan(.hevc)
+            // H.264 cannot hold the composition's HDR picture. The export says so rather than switching quietly.
+            export = try plan(.hevc)
+            export.substitutions.append("H.264 cannot hold this HDR composition, so the picture is encoded in HEVC.")
         }
+        if tracks == .audio, export.report.audioActions.contains(where: { ($0.sourceLaneIDs?.count ?? 0) > 1 }) {
+            export.substitutions.append("Audio Only mixes the program's sound lanes to one stereo PCM track.")
+        }
+        return export
     }
 
     /// The state the export sheet opens in. `verified` is the container the opening mode plans in
@@ -5284,8 +5301,12 @@ final class EditorModel: ObservableObject {
             } else {
                 result = nil
             }
-            try plan.writeOutput(to: output, cancelled: { token.isCancelled }) { _ = progress($0) }
-            return (output, result?.completionMessage(for: output) ?? "Exported \(output.lastPathComponent)")
+            let edges = try plan.writingEncodedEdges {
+                try plan.writeOutput(to: output, cancelled: { token.isCancelled }) { _ = progress($0) }
+            }
+            // The cost of the Smart Trim edges follows, as a sentence of the status line and in the saved result.
+            let message = result?.completionMessage(for: output, encodedEdges: edges) ?? "Exported \(output.lastPathComponent)"
+            return (output, ExportNotices.sentence(message, then: ExportNotices.encodedEdges(edges)))
         }
     }
 
@@ -5313,10 +5334,15 @@ final class EditorModel: ObservableObject {
         }
         exportTasks[currentSession] = Task {
             let result = await sidecarWork.detached(priority: .userInitiated) {
-                Result {
-                    try AnalysisSidecar.$excludedSources.withValue(excluded) {
-                        try AnalysisSidecar.$readsEnabled.withValue(useSidecar) { try work(token, reportProgress) }
+                Result { () throws -> (URL, String) in
+                    // What writing changed that the plan could not show joins the completion message.
+                    let written = try ExportWriteNotices.collecting {
+                        try AnalysisSidecar.$excludedSources.withValue(excluded) {
+                            try AnalysisSidecar.$readsEnabled.withValue(useSidecar) { try work(token, reportProgress) }
+                        }
                     }
+                    let (output, message) = written.value
+                    return (output, ([message] + written.notices.filter { !message.contains($0) }).joined(separator: " "))
                 }
             }.value
 

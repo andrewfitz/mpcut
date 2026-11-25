@@ -335,6 +335,211 @@ static bool av1_units(const uint8_t *bytes, size_t size, int *reduced_header)
     return false;
 }
 
+/* VP8, VP9 and AV1 packets are coded in presentation order, one shown picture each, so the
+ * packets before any packet decode without it. A packet can also code hidden pictures, shown
+ * later or never: a VP8 or VP9 alternate reference, or an AV1 frame shown by a later
+ * show_existing_frame. A copy may end before a packet when every picture coded since the last
+ * displayed keyframe was shown before it. Anything not understood blocks these ends until the
+ * next keyframe. Verified by decoding truncated copies (libavcodec, and VideoToolbox for VP9 and
+ * AV1) of one- and two-pass libvpx VP8 and VP9 (8- and 10-bit) and libsvtav1 random-access and
+ * low-delay AV1 in WebM, Matroska and MP4. */
+typedef struct {
+    bool active;          /* A displayed keyframe started the current group. */
+    bool blocked;         /* A hidden picture that is never shown, or an unknown header. */
+    unsigned serial;      /* VP9: hidden pictures in this group. */
+    uint64_t pending;     /* VP9: hidden pictures not yet shown, by serial. */
+    unsigned char slot[8];/* VP9: serial + 1 of the hidden picture in each reference slot. */
+    int av1_pending;      /* AV1: showable hidden pictures not yet shown. */
+    int reduced_header;   /* AV1: reduced_still_picture_header, or -1 before a sequence header. */
+} PictureEnds;
+
+typedef struct {
+    const uint8_t *data;
+    size_t size, bit;
+} BitReader;
+
+static unsigned read_bits(BitReader *reader, int count)
+{
+    unsigned value = 0;
+    for (int i = 0; i < count; i++, reader->bit++) {
+        unsigned byte = reader->bit / 8 < reader->size ? reader->data[reader->bit / 8] : 0;
+        value = value << 1 | (byte >> (7 - reader->bit % 8) & 1);
+    }
+    return value;
+}
+
+/* One VP9 frame. Returns the number of pictures it shows, or -1 when not understood. */
+static int vp9_picture(PictureEnds *ends, const uint8_t *data, size_t size)
+{
+    BitReader bits = {data, size, 0};
+    if (size < 1 || read_bits(&bits, 2) != 2)
+        return -1;
+    unsigned profile = read_bits(&bits, 1);
+    profile |= read_bits(&bits, 1) << 1;
+    if (profile == 3 && read_bits(&bits, 1))
+        return -1;
+    if (read_bits(&bits, 1)) { /* show_existing_frame */
+        unsigned shown = ends->slot[read_bits(&bits, 3)];
+        if (shown)
+            ends->pending &= ~(UINT64_C(1) << (shown - 1));
+        return 1;
+    }
+    bool key = !read_bits(&bits, 1);
+    bool show = read_bits(&bits, 1);
+    bool error_resilient = read_bits(&bits, 1);
+    if (key) {
+        if (!show)
+            return -1;
+        ends->pending = 0;
+        ends->serial = 0;
+        memset(ends->slot, 0, sizeof(ends->slot));
+        return 1;
+    }
+    bool intra_only = show ? false : read_bits(&bits, 1);
+    if (!error_resilient)
+        read_bits(&bits, 2); /* reset_frame_context */
+    if (intra_only) {
+        if (read_bits(&bits, 24) != 0x498342)
+            return -1;
+        if (profile > 0) {
+            if (profile >= 2)
+                read_bits(&bits, 1);
+            if (read_bits(&bits, 3) != 7) { /* not sRGB */
+                read_bits(&bits, 1);
+                if (profile == 1 || profile == 3)
+                    read_bits(&bits, 3);
+            } else if (profile == 1 || profile == 3) {
+                read_bits(&bits, 1);
+            }
+        }
+    }
+    unsigned refresh = read_bits(&bits, 8);
+    if (bits.bit > size * 8)
+        return -1;
+    unsigned char id = 0;
+    if (!show) {
+        if (ends->serial >= 64)
+            return -1;
+        id = (unsigned char)++ends->serial;
+        ends->pending |= UINT64_C(1) << (id - 1);
+    }
+    for (int i = 0; i < 8; i++)
+        if (refresh >> i & 1)
+            ends->slot[i] = id;
+    return show;
+}
+
+static int vp9_pictures(PictureEnds *ends, const uint8_t *data, size_t size)
+{
+    uint8_t marker = size ? data[size - 1] : 0;
+    if ((marker & 0xe0) == 0xc0) {
+        size_t count = (marker & 7) + 1, width = ((marker >> 3) & 3) + 1, index = 2 + width * count;
+        if (size >= index && data[size - index] == marker) {
+            const uint8_t *sizes = data + size - index + 1;
+            size_t position = 0;
+            int shown = 0;
+            for (size_t frame = 0; frame < count; frame++) {
+                size_t length = 0;
+                for (size_t byte = 0; byte < width; byte++)
+                    length |= (size_t)sizes[frame * width + byte] << (8 * byte);
+                if (length > size - index - position)
+                    return -1;
+                int result = vp9_picture(ends, data + position, length);
+                if (result < 0)
+                    return -1;
+                shown += result;
+                position += length;
+            }
+            return shown;
+        }
+    }
+    return vp9_picture(ends, data, size);
+}
+
+/* One AV1 temporal unit. Returns the number of pictures it shows, or -1 when not understood. */
+static int av1_pictures(PictureEnds *ends, const uint8_t *data, size_t size)
+{
+    int shown = 0;
+    for (size_t i = 0; i < size;) {
+        uint8_t header = data[i++];
+        if (header & 0x81)
+            return -1;
+        if (header & 4)
+            return -1; /* Scalable layers. */
+        uint64_t length = size - i;
+        if (header & 2) {
+            length = 0;
+            for (unsigned shift = 0;; shift += 7) {
+                if (i == size || shift >= 56)
+                    return -1;
+                unsigned value = data[i++];
+                length |= (uint64_t)(value & 127) << shift;
+                if (!(value & 128))
+                    break;
+            }
+        }
+        if (length > size - i)
+            return -1;
+        unsigned type = header >> 3;
+        if (type == 1 && length) {
+            ends->reduced_header = !!(data[i] & 8);
+        } else if ((type == 3 || type == 6) && length) {
+            if (ends->reduced_header < 0)
+                return -1;
+            uint8_t first = data[i];
+            if (ends->reduced_header || (first & 0x80)) {
+                // A still picture, or show_existing_frame of an earlier hidden picture.
+                if (!ends->reduced_header && ends->av1_pending-- <= 0)
+                    return -1;
+                shown++;
+            } else if (first & 0x10) {
+                shown++;
+            } else if (first & 0x08) {
+                ends->av1_pending++; /* showable_frame */
+            } else {
+                ends->blocked = true;
+            }
+        }
+        i += length;
+    }
+    return shown;
+}
+
+static void picture_end(PictureEnds *ends, const AVCodecParameters *params, const AVPacket *packet,
+                        MPProbePacket *sample, bool alpha)
+{
+    enum AVCodecID codec = params->codec_id;
+    if (codec != AV_CODEC_ID_VP8 && codec != AV_CODEC_ID_VP9 && codec != AV_CODEC_ID_AV1)
+        return;
+    if (alpha) {
+        // An alpha stream codes its own hidden pictures in block additions.
+        ends->active = false;
+        return;
+    }
+    if (codec == AV_CODEC_ID_AV1 && ends->reduced_header < 0 && params->extradata_size > 4 && params->extradata[0] == 0x81)
+        av1_pictures(ends, params->extradata + 4, params->extradata_size - 4); /* av1C sequence header */
+    if (sample->start) {
+        ends->active = true;
+        ends->blocked = false;
+        ends->pending = 0;
+        ends->serial = 0;
+        ends->av1_pending = 0;
+        memset(ends->slot, 0, sizeof(ends->slot));
+    } else if (ends->active && !ends->blocked && !ends->pending && !ends->av1_pending && !sample->key) {
+        sample->end = 1;
+    }
+    int shown;
+    if (codec == AV_CODEC_ID_VP8)
+        shown = packet->size >= 3 ? packet->data[0] >> 4 & 1 : -1;
+    else if (codec == AV_CODEC_ID_VP9)
+        shown = vp9_pictures(ends, packet->data, packet->size);
+    else
+        shown = av1_pictures(ends, packet->data, packet->size);
+    // Each packet shows exactly one picture. VP8 cannot show a hidden picture later.
+    if (shown != 1)
+        ends->blocked = true;
+}
+
 static bool independent(const AVPacket *packet, const AVCodecParameters *params, bool source_start, int *multilayer)
 {
     if (params->codec_id == AV_CODEC_ID_PRORES)
@@ -428,7 +633,7 @@ static bool matching_shape(enum AVCodecID codec, const MPDescriptionShape *a, co
 }
 
 static int record_packet(MPProbeResult *result, const AVCodecParameters *params, const AVPacket *packet,
-                         MPDescriptionShape *first_description)
+                         MPDescriptionShape *first_description, PictureEnds *pictures)
 {
     MPProbeStream *stream = &result->streams[packet->stream_index];
     bool video = packet->stream_index == result->video_index;
@@ -524,6 +729,10 @@ static int record_packet(MPProbeResult *result, const AVCodecParameters *params,
             sample->start = 1;
         else if (first && independent(packet, params, true, &stream->multilayer))
             sample->start = 2;
+        // H.264 auxiliary (alpha) pictures, MVC views and SVC layers come with every access unit, keyframes included.
+        // A decoder of the primary pictures drops them, as an encode of those pictures would.
+        if (params->codec_id == AV_CODEC_ID_H264 && sample->key && !stream->multilayer && mp_h264_layered(packet, params))
+            stream->multilayer = 1;
         if (params->codec_id == AV_CODEC_ID_VP8 || params->codec_id == AV_CODEC_ID_VP9) {
             const uint8_t *alpha = av_packet_get_side_data(packet, AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL, &side_size);
             const bool has_alpha = alpha && side_size > 8 && AV_RB64(alpha) == 1;
@@ -538,6 +747,8 @@ static int record_packet(MPProbeResult *result, const AVCodecParameters *params,
         }
         sample->end = sample->key && (interior_cut_codec(params->codec_id) ||
                                       (params->codec_id == AV_CODEC_ID_MJPEG && sample->start == 1));
+        if (pictures)
+            picture_end(pictures, params, packet, sample, stream->alpha_bits != 0);
         if (packet->flags & AV_PKT_FLAG_DISCARD)
             issue(result, "The video track contains disposable packets from a presentation edit.");
         if (params->codec_id == AV_CODEC_ID_PRORES) {
@@ -646,8 +857,7 @@ typedef struct {
 } CutPoint;
 
 /* `picture_ends` marks every point where the decode order is also split by presentation
- * time as an end, whether or not the next coded picture is a keyframe. It applies only
- * to a stream whose pictures are all one duration apart. */
+ * time as an end, whether or not the next coded picture is a keyframe. */
 static int reorder_video(MPProbeStream *video, bool *source_start, bool matroska_avc_or_hevc, bool picture_ends)
 {
     MPProbePacket *packets = video->packets;
@@ -676,8 +886,8 @@ static int reorder_video(MPProbeStream *video, bool *source_start, bool matroska
         if (prefix_max < cut->first_presentation) {
             cut->start = packet->start == 1 ||
                 (packet->start == 2 && cut->first_presentation == packet->pts);
-            // 1 ends before a keyframe. 2 ends inside a picture group.
-            cut->end = packet->end ? 1 : picture_ends ? 2 : 0;
+            // An end before a keyframe, or with picture_ends, one inside a picture group.
+            cut->end = packet->end || picture_ends;
         }
         prefix_max = FFMAX(prefix_max, packet->pts);
         packet->start = packet->end = 0;
@@ -707,14 +917,11 @@ static int reorder_video(MPProbeStream *video, bool *source_start, bool matroska
             packets[i].dts = (int64_t)dts;
         }
     }
-    // MOV times a track by decode intervals. When a picture is held longer than its
-    // neighbours, the decode clock of a prefix that stops inside its picture group can end
-    // before the presentation does, and a reader that measures the track by its samples
-    // shortens the last picture. Keyframe ends do not show this, so a stream with varying
-    // picture durations keeps those only.
-    bool steady = picture_ends && video->count > 1;
-    for (size_t i = 2; steady && i < video->count; i++)
-        steady = av_sat_sub64(packets[i].pts, packets[i - 1].pts) == av_sat_sub64(packets[1].pts, packets[0].pts);
+    // After a held picture, neither a MOV sample's decode interval nor a Matroska block's
+    // (often default) duration reaches the next picture, so a prefix that stops inside its
+    // picture group can end its last picture early. The writer runs the range's last picture
+    // to the planned end and extends the last decoded MOV sample to it (mpcut_mov_cover_edits),
+    // so these ends are kept for sources with varying picture durations too.
     size_t frame = 0;
     for (size_t i = 0; i < video->count; i++) {
         const CutPoint *cut = &cuts[i];
@@ -724,7 +931,7 @@ static int reorder_video(MPProbeStream *video, bool *source_start, bool matroska
             frame++;
         if (frame < video->count && packets[frame].pts == cut->first_presentation) {
             packets[frame].start = cut->start;
-            packets[frame].end = cut->end == 1 || (cut->end == 2 && steady);
+            packets[frame].end = cut->end;
         }
     }
     av_free(cuts);
@@ -794,6 +1001,14 @@ static int build_video_index(MPProbeResult *result, const AVStream *input_video)
         // The pictures before any picture decode without it.
         for (size_t i = 0; i < video->count; i++)
             packets[i].end = 1;
+    }
+    if (sorted && av_match_name("matroska", result->format) &&
+        (codec == AV_CODEC_ID_H264 || codec == AV_CODEC_ID_HEVC)) {
+        // Matroska stores no decode time. A packet-only demux leaves it unset for AVC/HEVC
+        // whose blocks are in presentation order, where it equals the presentation time.
+        for (size_t i = 0; i < video->count; i++)
+            if (packets[i].dts == AV_NOPTS_VALUE)
+                packets[i].dts = packets[i].pts;
     }
     result->origin = video->start == AV_NOPTS_VALUE ? packets[0].pts : video->start;
     result->source_start_safe = source_start && packets[0].pts == result->origin;
@@ -963,7 +1178,7 @@ static int indexed_prores(const MPMOVIndex *index, AVFormatContext *file, MPProb
                 .duration = duration, .flags = AV_PKT_FLAG_KEY,
                 .data = header, .size = sizeof(header),
             };
-            status = record_packet(result, params, &packet, NULL);
+            status = record_packet(result, params, &packet, NULL, NULL);
             if (status < 0)
                 goto done;
             indexed->packets[indexed->count - 1].byte_count = entry->size;
@@ -978,7 +1193,7 @@ static int indexed_prores(const MPMOVIndex *index, AVFormatContext *file, MPProb
                 .stream_index = i, .duration = expected, .size = last_audio_size,
                 .flags = AV_PKT_FLAG_KEY,
             };
-            status = record_packet(result, params, &packet, NULL);
+            status = record_packet(result, params, &packet, NULL, NULL);
             if (status < 0)
                 goto done;
         }
@@ -1106,7 +1321,7 @@ static int indexed_wave_audio(AVFormatContext *file, MPProbeResult *result)
     if (!mp_wave_pcm_layout(file, &start)) return 0;
     AVStream *stream = file->streams[0];
     AVPacket packet = {.pts = 0, .dts = 0, .duration = stream->duration};
-    int status = record_packet(result, stream->codecpar, &packet, NULL);
+    int status = record_packet(result, stream->codecpar, &packet, NULL, NULL);
     return status < 0 ? status : 1;
 }
 
@@ -1182,7 +1397,6 @@ MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only,
     snprintf(result->format, sizeof(result->format), "%s", file->iformat->name);
     bool timecode = false;
     int first_audio = -1;
-    bool cover_art = false;
     for (int i = 0; i < result->stream_count; i++) {
         AVStream *stream = file->streams[i];
         status = describe_stream(file, stream, &result->streams[i]);
@@ -1201,19 +1415,23 @@ MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only,
                 issue(result, "RAW video is unsupported.");
                 snprintf(result->timeline_issue, sizeof(result->timeline_issue), "RAW video is unsupported.");
             }
-        } else if (type == AVMEDIA_TYPE_VIDEO && (stream->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
-            cover_art = true;
         } else if (type == AVMEDIA_TYPE_AUDIO) {
             if (first_audio == -1) first_audio = i;
         } else if (type == AVMEDIA_TYPE_DATA && stream->codecpar->codec_tag == MKTAG('t', 'm', 'c', 'd') &&
                    av_match_name("mov", file->iformat->name) && !timecode) {
             timecode = true;
-        } else if (type != AVMEDIA_TYPE_AUDIO && !chapter_track(file, stream)) {
+        } else if ((type != AVMEDIA_TYPE_VIDEO && type != AVMEDIA_TYPE_SUBTITLE && type != AVMEDIA_TYPE_DATA &&
+                    type != AVMEDIA_TYPE_ATTACHMENT) ||
+                   (type == AVMEDIA_TYPE_DATA && stream->discard == AVDISCARD_ALL && !chapter_track(file, stream)) ||
+                   (type == AVMEDIA_TYPE_DATA && stream->codecpar->codec_tag == MKTAG('t', 'm', 'c', 'd') &&
+                    av_match_name("mov", file->iformat->name))) {
+            // Cover art, attached files, subtitles and timed data travel beside a copy where the output
+            // can hold them, and the copy names any it leaves out. A track of no known kind, one the
+            // demuxer set aside without reading its chapters, or a second timecode track (a copy writes
+            // one) cannot be judged.
             result->has_unsupported_auxiliary = 1;
         }
     }
-    if (cover_art && result->video_index >= 0)
-        result->has_unsupported_auxiliary = 1;
     int primary = result->video_index >= 0 ? result->video_index : first_audio;
     if (primary < 0) {
         status = AVERROR_STREAM_NOT_FOUND;
@@ -1264,6 +1482,7 @@ MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only,
     unsigned packet_number = 0;
     double packet_bytes = 0;
     MPDescriptionShape first_description = {0};
+    PictureEnds pictures = {.reduced_header = -1};
     while (status == 0) {
         if (cancelled && cancelled(context)) {
             status = AVERROR_EXIT;
@@ -1307,7 +1526,8 @@ MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only,
         }
         if (packet->stream_index < result->stream_count) {
             mp_probe_evidence_packet(evidence, file->streams[packet->stream_index], packet);
-            status = record_packet(result, file->streams[packet->stream_index]->codecpar, packet, &first_description);
+            status = record_packet(result, file->streams[packet->stream_index]->codecpar, packet, &first_description,
+                                   packet->stream_index == result->video_index ? &pictures : NULL);
         } else
             issue(result, "The source introduces a track after its stream headers.");
         av_packet_unref(packet);

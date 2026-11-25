@@ -63,7 +63,7 @@ class ReencodeTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
 
-    def export(self, output, clips, *, video="h264", audio="remove", quality=None, dry=False, ok=True):
+    def export(self, output, clips, *, video="h264", audio="remove", quality=None, dry=False, ok=True, env=None):
         args = [CLI, "export", "clips", "join", "--json", "--mode", "encode", "--video", video, "--audio", audio,
                 "--output", output]
         if quality is not None:
@@ -72,7 +72,7 @@ class ReencodeTests(unittest.TestCase):
             args.append("--dry-run")
         for source, start, end in clips:
             args += ["--clip", source, "--from", str(start), "--to", str(end)]
-        process = subprocess.run(args, capture_output=True, text=True, timeout=90)
+        process = subprocess.run(args, capture_output=True, text=True, timeout=90, env=env)
         self.assertEqual(process.returncode == 0, ok, process.stdout + process.stderr)
         report = json.loads(process.stdout)
         self.assertIs(report["ok"], ok, report)
@@ -311,7 +311,7 @@ class ReencodeTests(unittest.TestCase):
         first, count = round(start * rate), round((end - start) * rate)
         return self.integer_samples(path, index)[first * channels:(first + count) * channels]
 
-    def test_auto_writes_lossless_sound_as_pcm_with_identical_samples(self):
+    def test_auto_keeps_the_lossless_source_format_with_identical_samples(self):
         picture = self.ntsc_picture()
         noise = ["-f", "lavfi", "-i", "anoisesrc=d=3:c=pink:r=48000:a=0.5:seed=5"]
         frames = (Fraction(7 * 1001, 30000), Fraction(61 * 1001, 30000))
@@ -319,11 +319,20 @@ class ReencodeTests(unittest.TestCase):
         # Matroska states each picture to the millisecond.
         milliseconds = (Fraction(234, 1000), Fraction(2035, 1000))
         sources = {}
-        for name, codec, options, source_container, cut, container, written, depth in [
-            ("s16", "pcm_s16le", [], "mov", frames, "mov", "pcm_s16le", 16),
-            ("s24", "pcm_s24le", [], "mov", frames, "mkv", "pcm_s24le", 24),
-            ("alac", "alac", ["-sample_fmt", "s32p"], "mov", frames, "mov", "pcm_s24le", 24),
-            ("flac", "flac", ["-sample_fmt", "s16"], "mkv", milliseconds, "mov", "pcm_s16le", 16),
+        # Auto keeps the source's own codec and word length where the container carries it. MOV cannot carry FLAC and
+        # ALAC is not verified in Matroska, so there the lossless source is written as PCM, and the reason says why.
+        for name, codec, options, source_container, cut, container, action_name, written, depth, reason in [
+            ("s16", "pcm_s16le", [], "mov", frames, "mov", "pcm", "pcm_s16le", 16, "The PCM source is written as PCM"),
+            ("s24", "pcm_s24le", [], "mov", frames, "mkv", "pcm", "pcm_s24le", 24, "The PCM source is written as PCM"),
+            ("alac", "alac", ["-sample_fmt", "s32p"], "mov", frames, "mov", "alac", "alac", 24, "The ALAC source is written as ALAC"),
+            ("alac-mp4", "alac", ["-sample_fmt", "s16p"], "mov", frames, "mp4", "alac", "alac", 16, "The ALAC source is written as ALAC"),
+            ("alac-mkv", "alac", ["-sample_fmt", "s32p"], "mov", frames, "mkv", "pcm", "pcm_s24le", 24,
+             "MKV cannot carry ALAC here, so the lossless ALAC source is written as PCM."),
+            ("flac", "flac", ["-sample_fmt", "s16"], "mkv", milliseconds, "mov", "pcm", "pcm_s16le", 16,
+             "MOV cannot carry FLAC here, so the lossless FLAC source is written as PCM."),
+            ("flac-mkv", "flac", ["-sample_fmt", "s32", "-bits_per_raw_sample", "24"], "mkv", milliseconds, "mkv", "flac", "flac", 24,
+             "The FLAC source is written as FLAC"),
+            ("flac-mp4", "flac", ["-sample_fmt", "s16"], "mkv", milliseconds, "mp4", "flac", "flac", 16, "The FLAC source is written as FLAC"),
         ]:
             with self.subTest(source=name):
                 source = sources[name] = self.root / f"{name}.{source_container}"
@@ -332,10 +341,13 @@ class ReencodeTests(unittest.TestCase):
                 output = self.root / f"{name}-auto.{container}"
                 report = self.export(output, [(source, *cut)], audio="auto")
                 action = report["audio_actions"][0]
-                self.assertEqual((action["action"], action["codec"], action["bit_depth"]), ("pcm", written, depth))
+                self.assertEqual((action["action"], action["codec"], action["bit_depth"]), (action_name, written, depth))
                 self.assertIn("Exact audio copy could not be verified", action["reason"])
-                self.assertIn("The lossless source is written as PCM", action["reason"])
-                self.assertEqual(stream(output, "a:0")["codec_name"], written)
+                self.assertIn(reason, action["reason"])
+                written_stream = stream(output, "a:0")
+                self.assertEqual(written_stream["codec_name"], written)
+                if written in ("flac", "alac"):
+                    self.assertEqual(int(written_stream["bits_per_raw_sample"]), depth)
                 self.assertEqual(self.integer_samples(output), self.kept_samples(source, *cut))
         # MP4 cannot carry PCM here. The conversion to AAC and its reason are reported.
         action = self.export(self.root / "lossless.mp4", [(sources["s24"], *frames)], audio="auto", dry=True)["audio_actions"][0]
@@ -373,6 +385,93 @@ class ReencodeTests(unittest.TestCase):
                 self.assertEqual(self.integer_samples(output), self.kept_samples(source, start, end))
         # Two channels get 192 kbps without a measured AAC source. This one is written at its own rate.
         self.assertGreater(int(stream(self.root / "two-tracks-auto.mov", "a:1")["bit_rate"]), 224_000)
+
+    @staticmethod
+    def coded_rate(path, seconds, index=0):
+        sizes = probe(path, "-select_streams", f"a:{index}", "-show_entries", "packet=size")["packets"]
+        return sum(int(packet["size"]) for packet in sizes) * 8 / float(seconds)
+
+    def test_auto_keeps_a_lossy_source_format_at_its_rate_or_falls_back_to_aac(self):
+        picture = self.ntsc_picture()
+        noise44 = ["-f", "lavfi", "-i", "anoisesrc=d=3:c=pink:r=44100:a=0.5:seed=7"]
+        noise48 = ["-f", "lavfi", "-i", "anoisesrc=d=3:c=pink:r=48000:a=0.5:seed=5"]
+        # Two clips: an AAC or Opus track is never copied across a join, and the other codecs miss a verified boundary.
+        ntsc = [(Fraction(7 * 1001, 30000), Fraction(31 * 1001, 30000)), (Fraction(40 * 1001, 30000), Fraction(70 * 1001, 30000))]
+        milliseconds = [(Fraction(234, 1000), Fraction(1034, 1000)), (Fraction(1335, 1000), Fraction(2336, 1000))]
+        for name, noise, codec, source_container, container, action_name, reason in [
+            ("mp3", noise44, ["-c:a", "libmp3lame", "-b:a", "192k"], "mov", "mov", "mp3", "The MP3 source is written as MP3 at its own rate."),
+            ("mp3", noise44, ["-c:a", "libmp3lame", "-b:a", "192k"], "mov", "mp4", "mp3", "The MP3 source is written as MP3 at its own rate."),
+            ("mp3", noise44, ["-c:a", "libmp3lame", "-b:a", "192k"], "mov", "mkv", "mp3", "The MP3 source is written as MP3 at its own rate."),
+            ("opus", noise48, ["-c:a", "libopus", "-b:a", "128k"], "mkv", "mkv", "opus", "The Opus source is written as Opus at its own rate."),
+            ("opus", noise48, ["-c:a", "libopus", "-b:a", "128k"], "mkv", "mov", "aac",
+             "MOV cannot carry Opus here, so the lossy Opus source is written as AAC."),
+            ("aac", noise48, ["-c:a", "aac", "-b:a", "256k"], "mp4", "mp4", "aac", "The AAC source is written as AAC at its own rate."),
+            ("ac3", noise48, ["-c:a", "ac3", "-b:a", "384k"], "mkv", "mkv", "aac",
+             "The FFmpeg helper has no AC-3 encoder, so the lossy AC-3 source is written as AAC."),
+        ]:
+            with self.subTest(source=name, container=container):
+                source = self.root / f"{name}-source.{source_container}"
+                if not source.exists():
+                    ffmpeg("-i", picture, *noise, "-map", "0:v", "-map", "1:a", "-ac", "2", "-c:v", "copy", *codec, source)
+                cuts = milliseconds if source_container == "mkv" else ntsc
+                output = self.root / f"{name}-auto.{container}"
+                action = self.export(output, [(source, *cut) for cut in cuts], audio="auto")["audio_actions"][0]
+                self.assertEqual((action["action"], action["codec"]), (action_name, action_name))
+                self.assertIn(reason, action["reason"])
+                written = stream(output, "a:0")
+                self.assertEqual(written["codec_name"], action_name)
+                self.assertEqual(written["sample_rate"], stream(source, "a:0")["sample_rate"])
+                duration = sum(end - start for start, end in cuts)
+                rate = int(written["sample_rate"])
+                if action_name == name:
+                    # The track is encoded at the source's own rate, measured from the packets of both files.
+                    source_rate = self.coded_rate(source, 3)
+                    self.assertLess(abs(self.coded_rate(output, duration) - source_rate) / source_rate, 0.12, action)
+                    self.assertLess(abs(action["bit_rate"] - source_rate) / source_rate, 0.12, action)
+                # The sound stays on the picture clock: it starts at zero and correlates with the kept source ranges.
+                self.assertEqual(float(written["start_time"]), 0)
+                expected = array("f")
+                decoded = pcm(source, rate)
+                total = Fraction(0)
+                for start, end in cuts:
+                    first = round(start * rate)
+                    count = round((total + end - start) * rate) - round(total * rate)
+                    expected.extend(decoded[2 * first:2 * (first + count)])
+                    total += end - start
+                actual = pcm(output, rate)[:len(expected)]
+                self.assertGreater(correlation(actual, expected), 0.9)
+
+    def test_auto_keeps_each_track_format_and_encodes_compressed_tracks_once_across_batches(self):
+        noise44 = ["-f", "lavfi", "-i", "anoisesrc=d=5:c=pink:r=44100:a=0.5:seed=7"]
+        noise48 = ["-f", "lavfi", "-i", "anoisesrc=d=5:c=pink:r=48000:a=0.5:seed=5"]
+        source = self.root / "flac-mp3.mkv"
+        ffmpeg("-i", self.video, *noise48, *noise44, "-map", "0:v", "-map", "1:a", "-map", "2:a", "-ac", "2", "-c:v", "copy",
+               "-c:a:0", "flac", "-sample_fmt:a:0", "s16", "-c:a:1", "libmp3lame", "-b:a:1", "160k", source)
+        frames = [(i * 17) % 65 for i in range(40)]
+        # Distinct names of one source and a small descriptor limit make several export batches, joined in a final mux.
+        links = []
+        for index in range(len(frames)):
+            link = self.root / f"link-{index}.mkv"
+            os.link(source, link)
+            links.append(link)
+        output = self.root / "batches.mkv"
+        args = [CLI, "--no-sidecar", "export", "clips", "join", "--json", "--mode", "encode", "--audio", "auto", "--output", output]
+        for link, frame in zip(links, frames):
+            args += ["--clip", link, "--from", str(Fraction(frame, FPS)), "--to", str(Fraction(frame + 1, FPS))]
+        report = json.loads(run(args, preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64)),
+                                allow_diagnostics=True, timeout=300))
+        lossless, lossy = report["audio_actions"]
+        self.assertEqual((lossless["action"], lossless["codec"], lossless["bit_depth"]), ("flac", "flac", 16))
+        self.assertEqual((lossy["action"], lossy["codec"], lossy["bit_rate"]), ("mp3", "mp3", 160_000))
+        self.assertEqual([stream(output, f"a:{index}")["codec_name"] for index in range(2)], ["flac", "mp3"])
+        # FLAC samples are identical to the kept frames: no batch seam adds or loses a sample.
+        decoded = self.integer_samples(source)
+        stride = 48000 // FPS * 2
+        expected = array("i")
+        for frame in frames:
+            expected.extend(decoded[frame * stride:(frame + 1) * stride])
+        self.assertEqual(self.integer_samples(output), expected)
+        self.assertFalse(any(self.root.glob(".mpcut-*")))
 
     def test_pcm_from_lossy_sound_is_float_and_keeps_samples_above_full_scale(self):
         source = self.root / "hot.mp4"
@@ -529,6 +628,389 @@ class ReencodeTests(unittest.TestCase):
         self.assertEqual((self.chapters(output), report["warnings"]), ([], []))
         self.assertEqual([item["codec_type"] for item in probe(output, "-show_streams")["streams"]], ["video", "audio"])
 
+    def test_subtitle_and_data_tracks_follow_the_kept_ranges(self):
+        # Re-encode copies subtitle cues and telemetry samples where the container holds their codec, as a copy does:
+        # a cue that runs across a cut is shortened, and its text is not touched.
+        captions = self.root / "captions.srt"
+        captions.write_text("1\n00:00:00,500 --> 00:00:02,000\nHello\n\n2\n00:00:02,500 --> 00:00:05,500\nAcross\n\n"
+                            "3\n00:00:06,000 --> 00:00:07,000\nLater\n")
+        base = self.root / "base.mp4"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=160x96:r=25:d=8", "-f", "lavfi", "-i", "sine=r=48000:d=8",
+               "-c:v", "libx264", "-g", "25", "-bf", "0", "-pix_fmt", "yuv420p", "-c:a", "aac", base)
+
+        def cues(path, selector="s:0"):
+            listed = probe(path, "-select_streams", selector, "-show_entries", "packet=pts_time,duration_time,data_hash",
+                           "-show_data_hash", "sha256")["packets"]
+            # MP4 can end an empty range with a zero-length cue that has no duration.
+            return [(Fraction(item["pts_time"]), Fraction(item.get("duration_time", "0")), item["data_hash"]) for item in listed]
+
+        def kinds(path):
+            return [track["codec_type"] for track in probe(path, "-show_streams")["streams"]]
+
+        for extension, codec in [("mp4", "mov_text"), ("mov", "mov_text"), ("mkv", "srt"), ("mkv", "ass"), ("mkv", "webvtt")]:
+            with self.subTest(extension=extension, codec=codec):
+                source = self.root / f"captions-{codec}.{extension}"
+                ffmpeg("-i", base, "-i", captions, "-map", "0", "-map", "1", "-c:v", "copy", "-c:a", "copy", "-c:s", codec,
+                       "-metadata:s:s:0", "language=fra", source)
+                whole = self.root / f"whole-{codec}.{extension}"
+                report = self.export(whole, [(source, 0, 8)])
+                self.assertEqual(report["warnings"], [])
+                self.assertEqual(kinds(whole), ["video", "subtitle"])
+                self.assertEqual(cues(whole), cues(source))
+                self.assertEqual(stream(whole, "s:0")["tags"].get("language"), "fra")
+                # 3 s to 6.4 s: "Across" starts before the cut and is shortened. "Hello" lies outside and is dropped.
+                trimmed = self.root / f"trim-{codec}.{extension}"
+                planned = self.export(trimmed, [(source, 3, Fraction(32, 5))], dry=True)
+                self.assertEqual(self.export(trimmed, [(source, 3, Fraction(32, 5))])["warnings"], planned["warnings"])
+                hello, across, later = (digest for start, _, digest in cues(source) if start in (Fraction(1, 2), Fraction(5, 2), 6))
+                self.assertEqual([cue for cue in cues(trimmed) if cue[2] in (hello, across, later)],
+                                 [(0, Fraction(5, 2), across), (3, Fraction(2, 5), later)])
+                # Two ranges, the first without a cue: each cue moves by its own range's output offset.
+                joined = self.root / f"joined-{codec}.{extension}"
+                self.export(joined, [(source, Fraction(36, 5), 8), (source, Fraction(12, 25), 2)])
+                self.assertEqual([cue for cue in cues(joined) if cue[2] in (hello, across, later)],
+                                 [(Fraction(41, 50), Fraction(3, 2), hello)])
+                self.assertEqual(len(packets(joined)), 58)
+                if codec == "srt":
+                    # Beside converted sound in Matroska: the picture and sound durations are finalized, the cues stay.
+                    joined = self.root / "joined-aac.mkv"
+                    self.export(joined, [(source, Fraction(12, 25), Fraction(13, 5)), (source, 3, Fraction(32, 5))], audio="aac")
+                    self.assertEqual(kinds(joined), ["video", "audio", "subtitle"])
+                    self.assertEqual([cue for cue in cues(joined) if cue[2] in (hello, across, later)],
+                                     [(Fraction(1, 50), Fraction(3, 2), hello), (Fraction(101, 50), Fraction(1, 10), across),
+                                      (Fraction(53, 25), Fraction(5, 2), across), (Fraction(128, 25), Fraction(2, 5), later)])
+                    self.assertEqual(len(packets(joined)), 138)
+
+        # A codec the container has no place for is left out, and named in the plan and the result alike. A helper
+        # without subtitle encoders, as before text conversion, cannot make 3GPP text into SubRip for Matroska.
+        millisecond = "MKV uses millisecond presentation timestamps. Sub-millisecond timing will be rounded."
+        mp4_captions = self.root / "captions-mov_text.mp4"
+        earlier = self.earlier_helper()
+        for dry in (True, False):
+            report = self.export(self.root / "no-captions.mkv", [(mp4_captions, 0, 8)], dry=dry, env=earlier)
+            self.assertEqual(report["warnings"], [millisecond, "Clip 1 subtitle track 2 (mov_text) cannot be carried in MKV and is left out."])
+        self.assertEqual(kinds(self.root / "no-captions.mkv"), ["video"])
+        report = self.export(self.root / "no-captions.mp4", [(self.root / "captions-srt.mkv", 0, 8)], dry=True, env=earlier)
+        self.assertEqual(report["warnings"], ["Clip 1 subtitle track 2 (subrip) cannot be carried in MP4 and is left out."])
+
+        # GoPro telemetry: one-second samples. A trim keeps the samples that lie wholly inside the range, and says so.
+        blob = self.root / "telemetry.bin"
+        blob.write_bytes(b"".join(bytes([sample]) * 1024 for sample in range(8)))
+        telemetry = self.root / "telemetry.mov"
+        ffmpeg("-i", base, "-f", "data", "-raw_packet_size", "1024", "-i", blob, "-map", "0", "-map", "1", "-c", "copy",
+               "-tag:d", "gpmd", "-bsf:d", "setts=ts=N*90000:duration=90000:time_base=1/90000", telemetry)
+        samples = cues(telemetry, "d:0")
+        self.assertEqual(len(samples), 8)
+        for extension in ("mov", "mp4"):
+            with self.subTest(telemetry=extension):
+                whole = self.root / f"telemetry-whole.{extension}"
+                self.assertEqual(self.export(whole, [(telemetry, 0, 8)])["warnings"], [])
+                self.assertEqual(cues(whole, "d:0"), samples)
+                self.assertEqual(stream(whole, "d:0")["codec_tag_string"], "gpmd")
+                trimmed = self.root / f"telemetry-trim.{extension}"
+                report = self.export(trimmed, [(telemetry, 2, 5)])
+                self.assertEqual(report["warnings"], ["Data track 2 (gpmd) keeps only the samples that lie wholly inside the kept ranges."])
+                self.assertEqual(cues(trimmed, "d:0"), [(start - 2, length, digest) for start, length, digest in samples[2:5]])
+        report = self.export(self.root / "telemetry.mkv", [(telemetry, 0, 8)], dry=True)
+        self.assertEqual(report["warnings"], [millisecond, "Clip 1 data track 2 (gpmd) cannot be carried in MKV and is left out."])
+
+    def earlier_helper(self):
+        """The environment of a helper that lists no subtitle encoder, as helpers before text conversion did. It runs
+        the helper that MPCut finds for this suite: MPCUT_FFMPEG_HELPER, the one beside the CLI, or the development build."""
+        candidates = [os.environ.get("MPCUT_FFMPEG_HELPER"), Path(CLI).parent / "ffmpeg",
+                      Path(__file__).resolve().parents[2] / ".build/mpcut-ffmpeg/install/bin/ffmpeg"]
+        real = next(Path(path) for path in candidates if path and Path(path).is_file() and os.access(path, os.X_OK))
+        earlier = self.root / "earlier helper" / "ffmpeg"
+        earlier.parent.mkdir()
+        earlier.write_text('#!/bin/sh\ncase " $* " in\n  *" -encoders "*) "%s" "$@" | grep -v "^ S"; exit 0 ;;\n'
+                           'esac\nexec "%s" "$@"\n' % (real, real))
+        earlier.chmod(0o755)
+        return dict(os.environ, MPCUT_FFMPEG_HELPER=str(earlier))
+
+    @staticmethod
+    def text_cues(path):
+        """The cues of the first subtitle track as (start, length, text), without the empty samples between MP4 cues."""
+        codec = stream(path, "s:0")["codec_name"]
+        listed = probe(path, "-select_streams", "s:0", "-show_entries", "packet=pts_time,duration_time,data",
+                       "-show_data")["packets"]
+        cues = []
+        for item in listed:
+            # ffprobe dumps 16 bytes a line: an offset, eight groups of hex digits, then the characters.
+            data = bytes.fromhex("".join("".join(line[10:49].split()) for line in item.get("data", "").splitlines()))
+            if codec == "mov_text":
+                data = data[2:2 + int.from_bytes(data[:2], "big")]
+            if data:
+                cues.append((Fraction(item["pts_time"]), Fraction(item.get("duration_time", "0")), data.decode()))
+        return cues
+
+    def test_text_subtitles_are_converted_where_the_container_needs_another_codec(self):
+        # SubRip, ASS and WebVTT become 3GPP text in MP4 and MOV, and 3GPP text becomes SubRip in Matroska. The kept ranges
+        # are staged as packet copies, as above, and then converted, so each cue keeps its text, remapped start and length.
+        captions = self.root / "captions.srt"
+        captions.write_text("1\n00:00:00,500 --> 00:00:02,000\nHello\n\n2\n00:00:02,500 --> 00:00:05,500\nAcross\n\n"
+                            "3\n00:00:06,000 --> 00:00:07,000\nLater\n")
+        base = self.root / "base.mp4"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=160x96:r=25:d=8", "-f", "lavfi", "-i", "sine=r=48000:d=8",
+               "-c:v", "libx264", "-g", "25", "-bf", "0", "-pix_fmt", "yuv420p", "-c:a", "aac", base)
+        ranges = {"whole": [(0, 8)], "trim": [(3, Fraction(32, 5))], "joined": [(Fraction(36, 5), 8), (Fraction(12, 25), 2)]}
+        expected = {"whole": [(Fraction(1, 2), Fraction(3, 2), "Hello"), (Fraction(5, 2), 3, "Across"), (6, 1, "Later")],
+                    "trim": [(0, Fraction(5, 2), "Across"), (3, Fraction(2, 5), "Later")],
+                    "joined": [(Fraction(41, 50), Fraction(3, 2), "Hello")]}
+        millisecond = "MKV uses millisecond presentation timestamps. Sub-millisecond timing will be rounded."
+        overlap = (" 3GPP text shows one cue at a time, so where cues overlap the track is split at each cue's start "
+                   "and end, and each part shows every cue on screen then, one under the other in cue order.")
+        kept = {"subrip": "its bold, italic, underline, colour, font and size are kept; its strikethrough, alignment and "
+                          "position are not",
+                "ass": "the bold, italic, underline, colour, transparency, font and size of its styles and overrides are kept; "
+                       "strikethrough, outline and shadow colours, scaling, spacing, rotation, blur, positions, alignment, "
+                       "margins, outlines, shadows, animation and karaoke are not",
+                "webvtt": "its bold, italic and underline are kept; its cue settings, classes, voices and timed karaoke are not"}
+        # The font table holds the fonts a style line can name, sizes are scaled to the picture and held in one byte,
+        # ASS layers are flattened, and a 3GPP text sample has one highlight span, which only ASS sets.
+        fonts = " A font whose name has a comma or is longer than 255 bytes is shown in the default font."
+        clamp = "; a size above 255 pixels, the most 3GPP text holds, is written at 255."
+        highlight = {"subrip": fonts + " Font sizes are measured against 288 lines and scaled to the picture's height" + clamp,
+                     "ass": fonts + " Font sizes are scaled from the script's PlayResY (288 when it states none) to the "
+                     "picture's height" + clamp + " Layers are flattened: lines shown at once are placed one under the other, "
+                     "and identical lines on different layers appear once, in the style of the one drawn on top. Where two cues "
+                     "shown together both set a highlight (secondary colour), it runs from the first to the last."}
+        written = {"mp4": ("mov_text", "tx3g"), "mov": ("mov_text", "text"), "mkv": ("subrip", "[0][0][0][0]")}
+        for codec, extension, target in [("srt", "mkv", "mp4"), ("srt", "mkv", "mov"), ("ass", "mkv", "mp4"), ("ass", "mkv", "mov"),
+                                         ("webvtt", "mkv", "mp4"), ("webvtt", "mkv", "mov"),
+                                         ("mov_text", "mp4", "mkv"), ("mov_text", "mov", "mkv")]:
+            with self.subTest(codec=codec, source=extension, target=target):
+                source = self.root / f"captions-{codec}.{extension}"
+                if not source.exists():
+                    ffmpeg("-i", base, "-i", captions, "-map", "0", "-map", "1", "-c:v", "copy", "-c:a", "copy",
+                           "-c:s", codec, "-metadata:s:s:0", "language=fra", source)
+                name = "subrip" if codec == "srt" else codec
+                if target == "mkv":
+                    # FFmpeg writes 3GPP text on a microsecond clock; Matroska keeps milliseconds.
+                    note = [millisecond, "Subtitle track 2 (mov_text) is converted to SubRip for MKV. Its text and line "
+                            "breaks are kept, and its bold, italic, underline, colour, font, size and alignment become SubRip "
+                            "tags; its background colour, transparency, highlighting and text box are not kept. "
+                            "Cue times finer than a millisecond are rounded."]
+                else:
+                    note = [f"Subtitle track 2 ({name}) is converted to 3GPP text for {target.upper()}. Its text and line "
+                            f"breaks and {kept[name]}.{overlap}{highlight.get(name, '')}"]
+                for label, spans in ranges.items():
+                    output = self.root / f"{label}-{codec}-{extension}.{target}"
+                    clips = [(source, start, end) for start, end in spans]
+                    planned = self.export(output, clips, dry=True)
+                    report = self.export(output, clips)
+                    self.assertEqual(report["warnings"], planned["warnings"])
+                    self.assertEqual(report["warnings"], note)
+                    track = stream(output, "s:0")
+                    self.assertEqual((track["codec_name"], track["codec_tag_string"]), written[target])
+                    self.assertEqual(track["tags"].get("language"), "fra")
+                    self.assertEqual(self.text_cues(output), expected[label])
+
+        # Overlapping cues: 3GPP text holds one sample at a time, so the track is split at every cue start and end, and
+        # each part holds the text of every cue shown then, in cue order. Each cue keeps its own styling: the italic that
+        # "One" leaves open stops at its own line, and "Two" alone is bold.
+        overlapping = self.root / "overlap.srt"
+        overlapping.write_text("1\n00:00:01,000 --> 00:00:04,000\nOne <i>italic\n\n2\n00:00:02,000 --> 00:00:05,000\n<b>Two</b>\n\n"
+                               "3\n00:00:02,000 --> 00:00:03,500\nSame start\n\n4\n00:00:06,000 --> 00:00:07,000\nLater\n")
+        together, pair = "One italic\nTwo\nSame start", "One italic\nTwo"
+        joined_cues = {"whole": [(0, 8)], "trim": [(3, 6)], "joined": [(3, 6), (Fraction(62, 25), Fraction(87, 25))]}
+        joined_expected = {
+            "whole": [(1, 1, "One italic"), (2, Fraction(3, 2), together), (Fraction(7, 2), Fraction(1, 2), pair),
+                      (4, 1, "Two"), (6, 1, "Later")],
+            # Three cues that all cross the start of the range land at zero together.
+            "trim": [(0, Fraction(1, 2), together), (Fraction(1, 2), Fraction(1, 2), pair), (1, 1, "Two")],
+            "joined": [(0, Fraction(1, 2), together), (Fraction(1, 2), Fraction(1, 2), pair), (1, 1, "Two"), (3, 1, together)]}
+        for codec in ("srt", "ass", "webvtt"):
+            source = self.root / f"overlap-{codec}.mkv"
+            ffmpeg("-i", base, "-i", overlapping, "-map", "0:v", "-map", "1", "-c:v", "copy", "-c:s", codec, source)
+            name = "subrip" if codec == "srt" else codec
+            for target in ("mp4", "mov"):
+                for label, spans in joined_cues.items():
+                    with self.subTest(overlap=codec, target=target, range=label):
+                        output = self.root / f"overlap-{label}-{codec}.{target}"
+                        clips = [(source, start, end) for start, end in spans]
+                        planned = self.export(output, clips, dry=True)
+                        report = self.export(output, clips)
+                        self.assertEqual(report["warnings"], planned["warnings"])
+                        self.assertEqual(report["warnings"], [
+                            f"Subtitle track 1 ({name}) is converted to 3GPP text for {target.upper()}. Its text and line "
+                            f"breaks and {kept[name]}.{overlap}{highlight.get(name, '')}"])
+                        self.assertEqual(self.text_cues(output), joined_expected[label])
+                        if label == "whole":
+                            text, records = next((text, records) for _, text, records in self.text_styles(output)
+                                                 if text == together)
+                            italic = set(range(4, 10))
+                            bold = set(range(11, 14))
+                            self.assertEqual([self.style_at(records, index)[0] for index, character in enumerate(text) if character != "\n"],
+                                             [2 if index in italic else 1 if index in bold else 0
+                                              for index, character in enumerate(text) if character != "\n"])
+
+        # ASS cues of different styles keep their own style when they are shown together.
+        script = self.root / "styled.ass"
+        script.write_text(
+            "[Script Info]\nScriptType: v4.00+\nPlayResX: 384\nPlayResY: 288\n\n[V4+ Styles]\n"
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, "
+            "Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, "
+            "MarginV, Encoding\n"
+            "Style: Default,Arial,16,&H00FFFFFF,&H00FFFFFF,&H0,&H0,0,0,0,0,100,100,0,0,1,1,0,2,10,10,10,0\n"
+            "Style: Loud,Arial,16,&H000000FF,&H00FFFFFF,&H0,&H0,1,0,0,0,100,100,0,0,1,1,0,2,10,10,10,0\n\n"
+            "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+            "Dialogue: 0,0:00:01.00,0:00:03.00,Loud,,0,0,0,,Loud\n"
+            "Dialogue: 0,0:00:02.00,0:00:04.00,Default,,0,0,0,,Plain\n")
+        source = self.root / "styled.mkv"
+        ffmpeg("-i", base, "-i", script, "-map", "0:v", "-map", "1", "-c:v", "copy", "-c:s", "copy", source)
+        output = self.root / "styled.mp4"
+        self.export(output, [(source, 0, 8)])
+        self.assertEqual(self.text_cues(output), [(1, 1, "Loud"), (2, 1, "Loud\nPlain"), (3, 1, "Plain")])
+        text, records = next((text, records) for _, text, records in self.text_styles(output) if text == "Loud\nPlain")
+        # Bold red from the Loud style for its own line only.
+        self.assertEqual([self.style_at(records, index) for index, character in enumerate(text) if character != "\n"],
+                         [(1, 0xFF0000FF)] * 4 + [(0, 0xFFFFFFFF)] * 5)
+        # A reset does not clear italic in the encoder, so a later cue states its whole style: "Plain" is not italic.
+        script.write_text(script.read_text().replace(",Loud,,0,0,0,,Loud\n", ",Default,,0,0,0,,{\\i1}One\n"))
+        source = self.root / "unclosed.mkv"
+        ffmpeg("-i", base, "-i", script, "-map", "0:v", "-map", "1", "-c:v", "copy", "-c:s", "copy", source)
+        output = self.root / "unclosed.mp4"
+        self.export(output, [(source, 0, 8)])
+        text, records = next((text, records) for _, text, records in self.text_styles(output) if text == "One\nPlain")
+        self.assertEqual([self.style_at(records, index)[0] for index, character in enumerate(text) if character != "\n"],
+                         [2] * 3 + [0] * 5)
+
+    def test_three_gpp_text_keeps_colours_sizes_and_fonts(self):
+        # FFmpeg's 3GPP text encoder drops \c colours (SubRip font colours become them), writes size zero after a bare
+        # \fs (a closing SubRip font size), knows only the fonts of the script's styles, and starts each style record
+        # from the default style. The cues are rewritten so each character keeps its colour, size and font.
+        # A 288-line picture, the height SubRip sizes and this script are measured against, keeps sizes as written.
+        base = self.root / "styles-base.mp4"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=512x288:r=25:d=9", "-c:v", "libx264", "-g", "25", "-bf", "0",
+               "-pix_fmt", "yuv420p", base)
+        subrip = self.root / "styles.srt"
+        subrip.write_text('1\n00:00:01,000 --> 00:00:02,000\na <font color="#ff0000">Red</font> b\n\n'
+                          '2\n00:00:03,000 --> 00:00:04,000\na <font size="30">Big</font> b\n\n'
+                          '3\n00:00:05,000 --> 00:00:06,000\na <font face="Courier">Mono</font> b\n')
+        script = self.root / "styles.ass"
+        script.write_text(
+            "[Script Info]\nScriptType: v4.00+\nPlayResX: 384\nPlayResY: 288\n\n[V4+ Styles]\n"
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, "
+            "Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, "
+            "MarginV, Encoding\n"
+            "Style: Default,Arial,16,&H00FFFFFF,&H00FFFFFF,&H0,&H0,0,0,0,0,100,100,0,0,1,1,0,2,10,10,10,0\n"
+            "Style: Green,Arial,20,&H0000FF00,&H00FFFFFF,&H0,&H0,0,0,0,0,100,100,0,0,1,1,0,2,10,10,10,0\n\n"
+            "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+            "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,a {\\c&H0000FF&}Red{\\c} b\n"
+            "Dialogue: 0,0:00:03.00,0:00:04.00,Green,,0,0,0,,a {\\fs30}Big{\\fs} b\n"
+            "Dialogue: 0,0:00:05.00,0:00:06.00,Default,,0,0,0,,a {\\fnCourier}Mono{\\fn} b\n"
+            "Dialogue: 0,0:00:07.00,0:00:08.00,Default,,0,0,0,,a {\\alpha&H80&}Half{\\alpha} b\n")
+        white, red, green = 0xFFFFFFFF, 0xFF0000FF, 0x00FF00FF
+        # (font, flags, size, RGBA colour) of each character; font 1 is Arial, the default style's font.
+        plain = (1, 0, 16, white)
+        expected = {"a Red b": [plain] * 2 + [(1, 0, 16, red)] * 3 + [plain] * 2,
+                    "a Big b": [plain] * 2 + [(1, 0, 30, white)] * 3 + [plain] * 2,
+                    "a Mono b": [plain] * 2 + [(2, 0, 16, white)] * 4 + [plain] * 2}
+        for codec, captions in (("srt", subrip), ("ass", script)):
+            with self.subTest(codec=codec):
+                source = self.root / f"styles-{codec}.mkv"
+                ffmpeg("-i", base, "-i", captions, "-map", "0:v", "-map", "1", "-c:v", "copy", "-c:s", codec, source)
+                output = self.root / f"styles-{codec}.mp4"
+                self.export(output, [(source, 0, 9)])
+                samples = {text: records for _, text, records in self.text_styles(output)}
+                wanted = dict(expected)
+                if codec == "ass":
+                    # Green keeps its colour and size around the override, and \alpha sets the transparency.
+                    wanted["a Big b"] = [(1, 0, 20, green)] * 2 + [(1, 0, 30, green)] * 3 + [(1, 0, 20, green)] * 2
+                    wanted["a Half b"] = [plain] * 2 + [(1, 0, 16, 0xFFFFFF7F)] * 4 + [plain] * 2
+                for text, styles in wanted.items():
+                    self.assertEqual([self.full_style_at(samples[text], index) for index in range(len(text))], styles, text)
+                # Courier is in the sample description's font table, as font 2.
+                dump = probe(output, "-select_streams", "s:0", "-show_streams", "-show_data")["streams"][0].get("extradata", "")
+                description = bytes.fromhex("".join("".join(line[10:49].split()) for line in dump.splitlines()))
+                self.assertIn(b"\x00\x02\x07Courier", description)
+
+    def test_three_gpp_text_scales_sizes_and_flattens_layers(self):
+        # 3GPP text sizes are pixels of the picture, so the script's sizes are scaled from its height (SubRip and a
+        # script without PlayResY: 288 lines) to the picture's, and held in one byte: a larger size is written at 255.
+        base = self.root / "tall-base.mp4"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=1920x1080:r=25:d=8", "-c:v", "libx264", "-g", "25", "-bf", "0",
+               "-pix_fmt", "yuv420p", base)
+        subrip = self.root / "sizes.srt"
+        subrip.write_text('1\n00:00:01,000 --> 00:00:02,000\na <font size="30">Big</font> b\n')
+        script = self.root / "layers.ass"
+        script.write_text(
+            "[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\n"
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, "
+            "Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, "
+            "MarginV, Encoding\n"
+            "Style: Default,Arial,16,&H00FFFFFF,&H00FFFFFF,&H0,&H0,0,0,0,0,100,100,0,0,1,1,0,2,10,10,10,0\n"
+            "Style: Huge,Arial,100,&H00FFFFFF,&H00FFFFFF,&H0,&H0,0,0,0,0,100,100,0,0,1,1,0,2,10,10,10,0\n\n"
+            "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+            "Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,{\\c&H000000&\\bord4}Sign\n"
+            "Dialogue: 1,0:00:01.00,0:00:03.00,Default,,0,0,0,,{\\c&H0000FF&}Sign\n"
+            "Dialogue: 0,0:00:02.00,0:00:03.00,Default,,0,0,0,,Speech\n"
+            "Dialogue: 0,0:00:04.00,0:00:05.00,Default,,0,0,0,,a {\\fs100}Big{\\fs} b\n"
+            "Dialogue: 0,0:00:06.00,0:00:07.00,Huge,,0,0,0,,Huge\n")
+        white, red = 0xFFFFFFFF, 0xFF0000FF
+        default = (1, 0, 60, white)  # 16 at 288 lines is 60 at 1080
+        for codec, captions in (("srt", subrip), ("ass", script)):
+            with self.subTest(codec=codec):
+                source = self.root / f"tall-{codec}.mkv"
+                ffmpeg("-i", base, "-i", captions, "-map", "0:v", "-map", "1", "-c:v", "copy", "-c:s", codec, source)
+                output = self.root / f"tall-{codec}.mp4"
+                self.export(output, [(source, 0, 8)])
+                dump = probe(output, "-select_streams", "s:0", "-show_streams", "-show_data")["streams"][0].get("extradata", "")
+                description = bytes.fromhex("".join("".join(line[10:49].split()) for line in dump.splitlines()))
+                self.assertEqual(description[25], 60)  # the default style record's size
+                samples = {text: records for _, text, records in self.text_styles(output)}
+
+                def styles(text):
+                    return [self.full_style_at(samples[text], index, default) for index in range(len(text))]
+
+                if codec == "srt":
+                    self.assertEqual(styles("a Big b"), [default] * 2 + [(1, 0, 113, white)] * 3 + [default] * 2)
+                    continue
+                # 100 at 288 lines would be 375 pixels: written at 255, where FFmpeg would have wrapped it to 119.
+                self.assertEqual(styles("a Big b"), [default] * 2 + [(1, 0, 255, white)] * 3 + [default] * 2)
+                self.assertEqual(styles("Huge"), [(1, 0, 255, white)] * 4)
+                # The two layers of "Sign" are one line in the top layer's red; "Speech" beside it stays.
+                self.assertEqual([text for _, _, text in self.text_cues(output)][:2], ["Sign", "Sign\nSpeech"])
+                self.assertEqual(styles("Sign"), [(1, 0, 60, red)] * 4)
+
+    @staticmethod
+    def text_styles(path):
+        """The 3GPP text samples of the first subtitle track that hold text, as (start, text, style records), each record
+        (first character, end character, font, flags, size, RGBA colour) from the sample's 'styl' box."""
+        listed = probe(path, "-select_streams", "s:0", "-show_entries", "packet=pts_time,data", "-show_data")["packets"]
+        samples = []
+        for item in listed:
+            data = bytes.fromhex("".join("".join(line[10:49].split()) for line in item.get("data", "").splitlines()))
+            length = int.from_bytes(data[:2], "big")
+            if not length:
+                continue
+            text, boxes, records = data[2:2 + length].decode(), data[2 + length:], []
+            while len(boxes) >= 8:
+                size = int.from_bytes(boxes[:4], "big")
+                if boxes[4:8] == b"styl":
+                    count = int.from_bytes(boxes[8:10], "big")
+                    for offset in range(10, 10 + 12 * count, 12):
+                        record = boxes[offset:offset + 12]
+                        records.append((int.from_bytes(record[0:2], "big"), int.from_bytes(record[2:4], "big"),
+                                        int.from_bytes(record[4:6], "big"), record[6], record[7],
+                                        int.from_bytes(record[8:12], "big")))
+                boxes = boxes[max(size, 8):]
+            samples.append((Fraction(item["pts_time"]), text, records))
+        return samples
+
+    @staticmethod
+    def style_at(records, index):
+        """The style flags (1 bold, 2 italic, 4 underline) and RGBA colour of the character at `index`, where no record
+        covers it the white of the default style."""
+        return next(((flags, color) for start, end, _, flags, _, color in records if start <= index < end), (0, 0xFFFFFFFF))
+
+    @staticmethod
+    def full_style_at(records, index, default=(1, 0, 16, 0xFFFFFFFF)):
+        """The font, style flags, size and RGBA colour of the character at `index`, where no record covers it those of
+        the sample description's default style, by default Arial (font 1) at 16 in white."""
+        return next(((font, flags, size, color) for start, end, font, flags, size, color in records if start <= index < end),
+                    default)
+
     def test_damaged_sound_is_named_as_sound(self):
         good, damaged = self.root / "good.mp4", self.root / "damaged.mp4"
         ffmpeg("-f", "lavfi", "-i", "testsrc2=s=160x96:r=25:d=3", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=3",
@@ -586,11 +1068,13 @@ class ReencodeTests(unittest.TestCase):
         clips = [(source, Fraction(start, FPS), Fraction(end, FPS)) for start, end in ranges]
         output = self.root / "portrait-av1.mp4"
         report = self.export(output, clips, audio="auto")
-        self.assertEqual([action["action"] for action in report["audio_actions"]], ["aac"])
+        # MP4 carries Opus, so Auto keeps the source's codec.
+        self.assertEqual([action["action"] for action in report["audio_actions"]], ["opus"])
+        self.assertIn("The Opus source is written as Opus at its own rate.", report["audio_actions"][0]["reason"])
         metadata = stream(output, "v:0")
         self.assertEqual((metadata["width"], metadata["height"]), (180, 320))
         sound = stream(output, "a:0")
-        self.assertEqual(sound["codec_name"], "aac")
+        self.assertEqual(sound["codec_name"], "opus")
         self.assertEqual(int(sound["start_pts"]), 0)
         expected = bytes(i for start, end in ranges for i in range(start, end))
         self.assertEqual(int(sound["duration_ts"]) * Fraction(sound["time_base"]), Fraction(len(expected), FPS))
@@ -733,9 +1217,11 @@ class ReencodeTests(unittest.TestCase):
         result = subprocess.run([CLI, "export", "clips", "join", "--json", "--mode", "smart", "--output", cut,
                                  "--clip", source, "--from", "1/25", "--to", "12/25"],
                                 capture_output=True, timeout=90)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(json.loads(result.stdout)["error"]["code"], "unsafe_boundary")
-        self.assertFalse(cut.exists())
+        # Smart Trim encodes the edges with the alpha layer (layered_edge.m), so the cut is exact and keeps it.
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertTrue(json.loads(result.stdout)["ok"])
+        edge = json.loads(run([CLI, "media", "inspect", "--json", cut], allow_diagnostics=True))
+        self.assertTrue(edge["media"]["streams"][0]["has_additional_video_layers"])
 
     def test_conversion_checks_alpha_in_packet_data_throughout_the_source(self):
         for bits in [16, 0]:

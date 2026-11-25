@@ -47,6 +47,8 @@ struct MulticamAudioConversionPlan: Sendable {
     var conformsSources = false
     /// A cover picture copied into a sound-only file: the source file and the index of its picture stream.
     var coverArt: CoverArt? = nil
+    /// Source chapters on the output timeline, for a sound-only file whose muxer writes chapters.
+    var chapters: [ReencodeChapter] = []
 
     struct CoverArt: Sendable {
         let file: URL
@@ -59,7 +61,7 @@ struct MulticamAudioConversionPlan: Sendable {
     var writtenCodec: String {
         if let chosen = encoderArguments.flatMap({ arguments in
             arguments.firstIndex(of: "-c:a").flatMap { arguments.indices.contains($0 + 1) ? arguments[$0 + 1] : nil }
-        }) { return chosen }
+        }) { return chosen == "libmp3lame" ? "mp3" : chosen == "libopus" ? "opus" : chosen }
         return action == .aac ? "aac" : "pcm_\(rawFormat)"
     }
     /// The word length of written PCM, FLAC and ALAC. Nil for a codec that has none.
@@ -126,7 +128,7 @@ extension MulticamEngine {
         }
 
         let engine = CutEngine(cancelled: cancelled)
-        var aacClocks: [URL: [Int: Bool]] = [:]
+        var frameClocks: [URL: [Int: Bool]] = [:]
         var losslessClocks: [URL: [Int: Bool]] = [:]
         let spans: [SourceRange?] = try lane.enumerated().map { index, span in
             try engine.checkCancellation()
@@ -160,11 +162,18 @@ extension MulticamEngine {
                 var contiguous = (audio.pcmContinuity && audio.stream.isPCM) || opus != nil ||
                     (audio.stream.codec == "mp3" && media.format == "mp3")
                 if audio.stream.codec == "aac" {
-                    if let known = aacClocks[media.url]?[stream] {
+                    if let known = frameClocks[media.url]?[stream] {
                         contiguous = known
                     } else {
                         contiguous = try usesContinuousAACClock(audio, engine: engine)
-                        aacClocks[media.url, default: [:]][stream] = contiguous
+                        frameClocks[media.url, default: [:]][stream] = contiguous
+                    }
+                } else if ["mp1", "mp2", "mp3"].contains(audio.stream.codec), !contiguous {
+                    if let known = frameClocks[media.url]?[stream] {
+                        contiguous = known
+                    } else {
+                        contiguous = try usesContinuousMPEGAudioClock(media, audio, engine: engine)
+                        frameClocks[media.url, default: [:]][stream] = contiguous
                     }
                 }
                 if preserveSamples, ["flac", "alac"].contains(audio.stream.codec) {
@@ -340,18 +349,105 @@ extension MulticamEngine {
         return plan
     }
 
+    /// Under `auto`, a rendered lane whose every span has one compressed source format keeps it where the container and the
+    /// helper allow: FLAC and ALAC keep their samples, AAC, MP3 and Opus their rate. Nil for a lane of PCM, a lane whose spans
+    /// differ, or a format the container cannot carry; those keep the rendered codecs of the container. Returns the plan
+    /// and the reason, or nil when the source format does not apply or cannot be planned.
+    func sourceFormatPlan(_ spans: [ConvertedSoundSpan], duration: RationalTime, container: String, source: ExportSourceKind,
+                          silenceFormat: ConvertedSoundFormat?,
+                          contextual: (CutError, Int) throws -> CutError) -> (plan: MulticamAudioConversionPlan, note: String)? {
+        let audible = spans.compactMap { span -> (media: MediaInfo, audio: AudioIndex)? in
+            guard let media = span.media, let stream = span.stream,
+                  let audio = media.audio.first(where: { $0.stream.index == stream }) else { return nil }
+            return (media, audio)
+        }
+        // Sound-only containers follow the movie container of their family: M4A carries AAC and ALAC, MKA what MKV
+        // carries, and a FLAC file FLAC.
+        let written = ExportRules.multicamMuxContainer(container)
+        let family = ["mka", "flac"].contains(written) ? "mkv" : written == "m4a" ? "mp4" : written
+        guard ["mov", "mp4", "mkv"].contains(family),
+              let described = ExportRules.automaticAudioSource(audible.map(\.audio.stream)), let codec = described.codec,
+              let format = ExportRules.sourceFormat(for: codec), format != .pcm,
+              written != "m4a" || [.aac, .alac].contains(format), written != "flac" || format == .flac,
+              // An MP3 track in Matroska does not keep the planned presentation sample range, so it is rendered as before.
+              format != .mp3 || family != "mkv",
+              ExportRules.sourceFormatIssue(format, track: described, container: family, source: source) == nil,
+              let helper = try? ReencodeEngine.findHelper(override: nil),
+              ExportRules.automaticEncoders[format].map({ AudioExportEngine.encoders(of: helper).contains($0) }) ?? false else { return nil }
+        do {
+            var plan = try resolveConvertedSound(spans, duration: duration, container: container, action: format,
+                                                 allowsSilence: true, silenceFormat: silenceFormat,
+                                                 preserveSamples: format == .flac || format == .alac, contextual: contextual)
+            guard plan.sampleRate == described.sampleRate, plan.channels == described.channels else { return nil }
+            switch format {
+            case .mp3:
+                let profiles = audible.compactMap { MP3Profile(media: $0.media, sound: $0.audio)?.asConstant }
+                let chosen = MP3Profile.encoding(matching: profiles.count == audible.count ? profiles : [],
+                                                 sampleRate: plan.sampleRate, channels: plan.channels)
+                plan.encoderArguments = ["-c:a", "libmp3lame"] + chosen.arguments
+            case .opus:
+                let measured = audible.compactMap(\.audio.averageBitRate)
+                let rate = AudioExportEngine.opusBitRate(matching: measured.count == audible.count ? measured.max() : nil,
+                                                         channels: plan.channels)
+                plan.encoderArguments = ["-c:a", "libopus", "-b:a", "\(rate)", "-vbr", "constrained"]
+                    + (plan.channels > 2 ? ["-mapping_family", "1"] : [])
+            default:
+                break
+            }
+            let label = ExportRules.audioCodecName(codec)
+            let note: String
+            switch format {
+            case .flac, .alac: note = "The \(label) source is written as \(label) at its own word length, so no lossy encoding is added."
+            case .aac where described.highEfficiency != nil:
+                note = "The \(described.highEfficiency ?? "HE-AAC") source is written as AAC-LC at its own rate: the AAC encoder writes LC only."
+            default: note = "The \(label) source is written as \(label) at its own rate."
+            }
+            return (plan, note)
+        } catch {
+            return nil
+        }
+    }
+
     private func usesContinuousAACClock(_ audio: AudioIndex, engine: CutEngine) throws -> Bool {
         let stream = audio.stream
         let config = stream.configuration
         // Ordinary AAC-LC AudioSpecificConfig with a table sample rate and an
         // explicit channel configuration. GASpecificConfig supplies frameLengthFlag.
-        guard audio.presentationEdits.isEmpty, config.count >= 2, let first = audio.packets.first else { return false }
+        guard audio.presentationEdits.isEmpty, config.count >= 2, !audio.packets.isEmpty else { return false }
         let sampleRateIndex = ((config[0] & 7) << 1) | (config[1] >> 7)
         guard config[0] >> 3 == 2, sampleRateIndex < 13, config[1] & 0x78 != 0 else { return false }
         let frameLength: Int64 = config[1] & 4 == 0 ? 1024 : 960
         let rate = Int64(stream.sampleRate)
         guard stream.timeBase > RationalTime(numerator: 1, denominator: rate),
               stream.timeBase < RationalTime(numerator: frameLength / 2, denominator: rate) else { return false }
+        return try followsFrameClock(audio, frameLength: frameLength, engine: engine)
+    }
+
+    /// Matroska times MP3 and MP2 blocks to the millisecond, between samples at 44.1 kHz, so trimming the decoded
+    /// sound by those timestamps can start a few samples off and keep a different count. When every block lies on
+    /// the track's own frame clock, the decoded samples are contiguous from the indexed start and are cut by count.
+    private func usesContinuousMPEGAudioClock(_ media: MediaInfo, _ audio: AudioIndex, engine: CutEngine) throws -> Bool {
+        let stream = audio.stream
+        guard media.format.split(separator: ",").contains("matroska"), audio.presentationEdits.isEmpty,
+              stream.sampleRate > 0 else { return false }
+        let frameLength: Int64
+        switch stream.codec {
+        case "mp1": frameLength = 384
+        case "mp2": frameLength = 1152
+        // MPEG-2 and MPEG-2.5 Layer III, below 32 kHz, code half as many samples in a frame.
+        case "mp3": frameLength = stream.sampleRate >= 32_000 ? 1152 : 576
+        default: return false
+        }
+        guard stream.timeBase < RationalTime(numerator: frameLength / 2, denominator: Int64(stream.sampleRate)) else { return false }
+        return try followsFrameClock(audio, frameLength: frameLength, engine: engine)
+    }
+
+    /// Every packet starts one frame after the previous one, within a tick of the stream clock, and only the first
+    /// skips samples and only the last discards them.
+    private func followsFrameClock(_ audio: AudioIndex, frameLength: Int64, engine: CutEngine) throws -> Bool {
+        guard let first = audio.packets.first else { return false }
+        let stream = audio.stream
+        let rate = Int64(stream.sampleRate)
         for (index, packet) in audio.packets.enumerated() {
             if index.isMultiple(of: 1024) { try engine.checkCancellation() }
             if index > 0 && packet.skipSamples != 0 { return false }
@@ -606,6 +702,29 @@ extension MulticamEngine {
             // Only the picture is taken from that source. Its chapters are on the source timeline, not this one.
             arguments += ["-map", "1:\(art.stream)", "-c:v", "copy", "-disposition:v:0", "attached_pic", "-map_chapters", "-1"]
         }
+        var chapterFile: URL?
+        defer { if let chapterFile { try? FileManager.default.removeItem(at: chapterFile) } }
+        if !plan.chapters.isEmpty, let firstMap = arguments.firstIndex(of: "-map") {
+            // The remapped chapters are one more input without streams. They replace any refusal to map chapters above.
+            let metadata = directory.appendingPathComponent("chapters-\(UUID().uuidString).ffmeta")
+            chapterFile = metadata
+            do {
+                try ReencodeChapter.metadata(plan.chapters).write(to: metadata, atomically: true, encoding: .utf8)
+            } catch {
+                throw CutError(code: "write_failed", message: error.localizedDescription)
+            }
+            let index = arguments[..<firstMap].filter { $0 == "-i" }.count
+            arguments.insert(contentsOf: ["-f", "ffmetadata", "-i", metadata.path], at: firstMap)
+            var position = arguments.startIndex
+            while position < arguments.count - 1 {
+                if arguments[position] == "-map_chapters" && arguments[position + 1] == "-1" {
+                    arguments.removeSubrange(position...(position + 1))
+                } else {
+                    position += 1
+                }
+            }
+            arguments += ["-map_chapters", "\(index)"]
+        }
         if container == "caf", plan.layout == "7.1" {
             // FFmpeg tags 7.1 in CAF as side surrounds then back surrounds but writes the samples in its own
             // order, back then side. Writing them in the order of the tag keeps each sound on its speaker.
@@ -613,6 +732,7 @@ extension MulticamEngine {
         }
         if let custom = plan.encoderArguments {
             arguments += custom
+            if custom.contains("libopus") { arguments += opusTailOptions(container: container, specifier: "a") }
         } else if plan.action == .aac, let rate = plan.writtenBitRate {
             // The plan reports this rate, so the report states what is encoded here.
             arguments += ["-c:a", "aac", "-b:a", "\(rate)"]

@@ -117,6 +117,12 @@ private final class FCPReader {
 
     func loss(_ message: String) throws {
         guard allowLoss else { throw CutError(code: "conversion_loss", message: message) }
+        note(message)
+    }
+
+    /// A warning for what the import rebuilt another way without losing the timeline, such as a group whose saved
+    /// MPCut editing no longer matches the edited storyline.
+    func note(_ message: String) {
         if warned.insert(message).inserted { warnings.append(message) }
     }
 
@@ -629,11 +635,19 @@ private final class FCPReader {
         return result
     }
 
-    private func editingMetadata(_ multicam: XMLElement) -> FCPMulticamEditing? {
+    /// MPCut's saved editing of a group. Nil without it, and nil with a note when it is present but unreadable.
+    private func editingMetadata(_ multicam: XMLElement, noting: Bool = false) -> FCPMulticamEditing? {
         let fields = multicam.elements(forName: "metadata").flatMap { $0.elements(forName: "md") }
         guard let value = fields.first(where: { $0.attr("key") == FCPGroupMetadata.editing })?.attr("value") else { return nil }
-        return try? JSONDecoder().decode(FCPMulticamEditing.self, from: Data(value.utf8))
+        guard let editing = try? JSONDecoder().decode(FCPMulticamEditing.self, from: Data(value.utf8)) else {
+            if noting { note(Self.rebuiltGroup) }
+            return nil
+        }
+        return editing
     }
+
+    static let rebuiltGroup = "The saved MPCut editing of the multicam group no longer matches the timeline, so the group was "
+        + "rebuilt from its visible clips. Audio switches, coverage and the audio policy kept only in MPCut are not restored."
 
     func multicam(_ timeline: [XMLElement], inserts: [Int: StillInsert] = [:], assets: [StillAsset] = [],
                   color: StillProgramColorPolicy? = nil, orphanGroupID: String? = nil) throws -> MulticamProject {
@@ -668,7 +682,7 @@ private final class FCPReader {
         let ids = Set(angleIDs)
         guard ids.count == nodes.count else { throw invalidFCP("Duplicate multicam angle ID.") }
         var recordingIDs = ids
-        let editing = editingMetadata(group)
+        let editing = editingMetadata(group, noting: true)
         try checkChildren(group, keeping: ["mc-angle"])
         for (angle, id) in zip(nodes, angleIDs) {
             var cursor = tc
@@ -820,10 +834,13 @@ private final class FCPReader {
         for index in cameras.indices where cameras[index].coverage == nil && segmented.contains(cameras[index].id) {
             cameras[index].coverage = coverage[cameras[index].id]?.first?.range
         }
-        if let editing, let restored = try? restore(editing, edits: visible, inserts: inserts, reference: reference,
-                                                     cameras: cameras, microphones: microphones, assets: assets,
-                                                     color: color, audioStreams: audioStreams) {
-            return restored
+        if let editing {
+            if let restored = try? restore(editing, edits: visible, inserts: inserts, reference: reference,
+                                           cameras: cameras, microphones: microphones, assets: assets,
+                                           color: color, audioStreams: audioStreams) {
+                return restored
+            }
+            note(Self.rebuiltGroup)
         }
         guard !visible.isEmpty else { throw invalidFCP("The still assembly's multicam metadata no longer matches its resources.") }
         let edits = visible

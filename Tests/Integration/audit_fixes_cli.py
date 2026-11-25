@@ -66,7 +66,11 @@ class CLIAuditFixes(unittest.TestCase):
         expected = self.report(*args, request=request)
         self.assertEqual(expected["mode"], "smart")
         args[1:3] = ["soundtrack", "replace"]
-        self.assertEqual(self.report(*args, request={**request, "replace_audio": "omitted.wav"}), expected)
+        # A soundtrack bound to clip 1's source, which the order leaves out, would replace nothing: refused, not ignored.
+        error = self.failure(*args, request={**request, "replace_audio": "omitted.wav"})
+        self.assertEqual(error["code"], "invalid_arguments")
+        self.assertIn("--order leaves out", error["message"])
+        # A soundtrack bound to a clip the order leaves out goes with that clip.
         clips[0]["replace_audio"] = "omitted.wav"
         self.assertEqual(self.report(*args, request=request), expected)
         clips[0]["file"] = str(source)

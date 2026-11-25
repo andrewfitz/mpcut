@@ -97,6 +97,7 @@ extension ParticipantRenderer {
             try session.verifySources()
             try sound.verifySources()
             let settings = ReencodeSettings(codec: session.color == .sdr ? .h264 : .hevc)
+            session.noteEncoding(settings)
             let container = try Self.validateDestination(job.output, hasAudio: !sound.actions.isEmpty,
                                                          settings: settings, color: session.color)
             return ParticipantISOJob(session: session, output: job.output, sound: sound, container: container,

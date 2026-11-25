@@ -11,11 +11,18 @@ public enum StillSoundtrack {
             throw CutError(code: "missing_audio", message: "Choose an audio track for the still soundtrack.", track: stream)
         }
         let start = from ?? max(.zero, track.start)
-        let end = to ?? track.end
+        let rate = RationalTime(numerator: Int64(track.stream.sampleRate))
+        var end = to ?? track.end
+        if to == nil, track.stream.sampleRate > 0, start < track.end {
+            // Matroska states the end of a compressed track to the millisecond, which can fall between samples
+            // (an MP3 or MP2 track in MKA at 44.1 kHz). The whole track ends on its last complete sample.
+            let samples = try track.end.subtracting(start).multiplied(by: rate)
+            end = try start.adding(RationalTime(numerator: samples.numerator / samples.denominator,
+                                                denominator: Int64(track.stream.sampleRate)))
+        }
         guard track.stream.sampleRate > 0, start >= max(.zero, track.start), end <= track.end, start < end else {
             throw stillError("The soundtrack range must lie within the selected track's audible extent.")
         }
-        let rate = RationalTime(numerator: Int64(track.stream.sampleRate))
         for edge in [start, end] {
             guard try edge.subtracting(track.start).multiplied(by: rate).denominator == 1 else {
                 throw stillError("The soundtrack range must begin and end on audio sample boundaries.")

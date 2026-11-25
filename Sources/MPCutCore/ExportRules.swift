@@ -56,8 +56,8 @@ public enum ExportRung: String, CaseIterable, Codable, Sendable {
         case .copyOtherContainer: return "Keep the original packets and use a container that supports these cuts."
         case .copySampleAligned: return "Move each cut to the nearest audio sample, then copy the audio. Each cut moves by less than one sample."
         case .smartTrim: return "Copy complete sections and encode only the video at the cut edges."
-        case .convertSameFormat: return "Re-encode the selected audio once using the original codec (MP3, AAC, FLAC or Opus) and settings."
-        case .convertPCM: return "Save the selected audio as a PCM WAV file. This preserves the decoded samples and uses more disk space."
+        case .convertSameFormat: return "Re-encode the selected audio once using the original codec (MP3, AAC, ALAC, FLAC or Opus) and settings."
+        case .convertPCM: return "Save the selected audio as a PCM WAV file. This preserves the decoded samples and uses more disk space. A lossless source named into a container that cannot hold its own codec is also offered there as PCM, ALAC or FLAC, the first that container holds, when that keeps every sample."
         case .convertAAC: return "Save the selected audio as AAC in an M4A file."
         case .reencode: return "Encode the whole timeline with the hardware video encoder."
         }
@@ -75,7 +75,10 @@ public enum ExportRung: String, CaseIterable, Codable, Sendable {
             let name = audio.map(ExportRules.displayName(audio:)) ?? "the source format"
             return "Convert to \(name) (same format\(lossless ? ", lossless" : ""))"
         case .convertPCM:
-            return source == .multicam ? "\(reencode) with PCM sound (no further quality loss)" : "Convert to WAV (no further quality loss)"
+            if source == .multicam { return "\(reencode) with PCM sound (no further quality loss)" }
+            // The lossless conversion of a named container other than WAV says which codec it writes there.
+            guard container != ExportRules.conversionContainers(.pcm)[0] else { return "Convert to WAV (no further quality loss)" }
+            return "Convert to \(ExportRules.displayName(audio: audio ?? .pcm)) in \(ExportRules.containerDisplayName(container)) with no further quality loss"
         case .convertAAC:
             return source == .multicam ? "\(reencode) with AAC sound" : "Convert to AAC (.m4a, smaller)"
         case .reencode:
@@ -243,7 +246,7 @@ public enum ExportRules {
         case .auto: return "Copy the original audio when possible. Otherwise, use the first supported alternative."
         case .copyOriginal: return "Copy the original audio packets. Stop if they can’t be copied exactly."
         case .aac: return "Encode AAC."
-        case .alac: return "Encode Apple Lossless audio for a still-bearing export."
+        case .alac: return "Encode Apple Lossless audio for a sound-only conversion or a still-bearing export."
         case .pcm: return "Write PCM."
         case .removeAudio: return "Omit the audio track."
         case .mp3: return "Encode MP3 with LAME."
@@ -387,11 +390,194 @@ public enum ExportRules {
             return nil
         }
     }
+
+    // MARK: Auto keeps the source format
+
+    /// The sound of one output track that `auto` cannot copy, as every clip of the track has it.
+    public struct AutomaticAudioSource: Sendable, Equatable {
+        /// The codec every clip shares. Nil when the clips differ in codec or settings.
+        public var codec: String?
+        /// True when every clip is lossless.
+        public var lossless: Bool
+        /// The word length of a FLAC or ALAC source. Nil when unknown.
+        public var integerDepth: Int?
+        public var sampleRate: Int
+        public var channels: Int
+        /// The channel layout name, such as `stereo` or `5.1(side)`.
+        public var layout: String
+        /// "HE-AAC" or "HE-AAC v2" for an AAC source with a High Efficiency profile.
+        public var highEfficiency: String?
+
+        public init(codec: String?, lossless: Bool, integerDepth: Int? = nil, sampleRate: Int, channels: Int,
+                    layout: String, highEfficiency: String? = nil) {
+            self.codec = codec
+            self.lossless = lossless
+            self.integerDepth = integerDepth
+            self.sampleRate = sampleRate
+            self.channels = channels
+            self.layout = layout
+            self.highEfficiency = highEfficiency
+        }
+    }
+
+    /// The encoders of the bundled FFmpeg helper that `auto` can write a source format with.
+    static let automaticEncoders: [ReencodeAudio: String] = [.aac: "aac", .flac: "flac", .alac: "alac", .mp3: "libmp3lame", .opus: "libopus"]
+    /// The name of a source codec in a reason.
+    static func audioCodecName(_ codec: String) -> String {
+        if codec.hasPrefix("pcm_") { return "PCM" }
+        switch codec {
+        case "aac": return "AAC"
+        case "flac": return "FLAC"
+        case "alac": return "ALAC"
+        case "mp3": return "MP3"
+        case "mp2": return "MP2"
+        case "opus": return "Opus"
+        case "vorbis": return "Vorbis"
+        case "ac3": return "AC-3"
+        case "eac3": return "E-AC-3"
+        case "truehd": return "TrueHD"
+        case "mlp": return "MLP"
+        case "wavpack": return "WavPack"
+        default:
+            return codec.hasPrefix("dts") ? "DTS" : codec.uppercased()
+        }
+    }
+    /// The codec `auto` writes back for a source codec, when the helper has its encoder.
+    static func sourceFormat(for codec: String) -> ReencodeAudio? {
+        switch codec {
+        case "aac": return .aac
+        case "flac": return .flac
+        case "alac": return .alac
+        case "mp3": return .mp3
+        case "opus": return .opus
+        default: return codec.hasPrefix("pcm_") ? .pcm : nil
+        }
+    }
+    /// The channel layouts the FLAC and ALAC encoders keep, as `ExactSoundEncoding` states them.
+    static func losslessEncoderLayouts(_ action: ReencodeAudio) -> [String] {
+        action == .alac ? ["mono", "stereo", "3.0", "4.0", "5.0", "5.1", "6.1(back)", "7.1(wide)"]
+            : ["mono", "stereo", "3.0", "quad", "5.0", "5.1", "6.1", "7.1"]
+    }
+
+    /// Why the source format of a track cannot be written in a re-encode container, or nil when it can. These pairs were
+    /// checked against the muxers of the bundled helper: MOV refuses FLAC and Opus ("only supported in MP4"), MP4 refuses
+    /// MP3 below 16 kHz, and Matroska takes all of them, though ALAC there is not read back exactly and is left out.
+    /// Multicam AAC keeps the movie edit list it needs for gapless timing.
+    static func sourceFormatIssue(_ action: ReencodeAudio, track: AutomaticAudioSource, container: String,
+                                  source: ExportSourceKind) -> String? {
+        let written = multicamMuxContainer(container)
+        let name = written.uppercased()
+        let label = displayName(audio: action)
+        switch action {
+        case .pcm:
+            return nil
+        case .aac:
+            if source == .multicam && !["mov", "mp4"].contains(written) { return "Multicam AAC needs a movie edit list, which \(name) lacks" }
+            return track.channels > 8 ? "AAC carries at most eight channels" : nil
+        case .flac, .alac:
+            // The helper writes ALAC into Matroska, but MPCut cannot read its word length back there, so it is not verified.
+            guard (action == .flac ? ["mp4", "mkv"] : ["mov", "mp4"]).contains(written) else { return "\(name) cannot carry \(label) here" }
+            if let depth = track.integerDepth, depth > 24 { return "The \(label) encoder keeps at most 24 bits" }
+            if track.integerDepth == nil { return "The \(label) source does not declare its word length" }
+            guard losslessEncoderLayouts(action).contains(track.layout) else { return "The \(label) encoder cannot keep the \(track.layout) channel layout" }
+            // MP4 reads a FLAC 5.1 track back as 5.1(side).
+            if action == .flac && written == "mp4" && track.channels > 2 { return "MP4 cannot keep the channel layout of FLAC with more than two channels" }
+            if action == .flac && track.sampleRate >= 1 << 20 { return "FLAC cannot carry this sample rate" }
+            return nil
+        case .mp3:
+            guard ["mov", "mp4", "mkv"].contains(written) else { return "\(name) cannot carry MP3 here" }
+            if track.channels > 2 { return "MP3 carries mono or stereo sound" }
+            if written == "mp4" && track.sampleRate < 16_000 { return "MP4 cannot carry MP3 below 16 kHz" }
+            return [8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000].contains(track.sampleRate)
+                ? nil : "MP3 cannot carry this sample rate"
+        case .opus:
+            guard ["mp4", "mkv"].contains(written) else { return "\(name) cannot carry Opus here" }
+            if track.sampleRate != 48_000 { return "Opus decodes at 48 kHz only" }
+            return track.channels <= 2 || track.layout == StreamInfo.opusSurroundLayout(channels: track.channels)
+                ? nil : "Opus cannot keep the \(track.layout) channel layout"
+        default:
+            return "\(name) cannot carry \(label) here"
+        }
+    }
+
+    /// What `auto` writes for one sound track of a movie re-encode that it cannot copy, and why. The track keeps its
+    /// source's codec and settings where the container and the helper allow: PCM stays PCM at its sample format, FLAC
+    /// and ALAC keep their word length, and AAC, MP3 and Opus keep their rate. Otherwise a lossless track falls back to
+    /// PCM and a lossy one to AAC, or for ProRes to PCM, as `automaticAudio(codec:container:source:lossless:channels:)`
+    /// decides, and the reason says why. Tracks whose clips differ in format follow that rule too. `encoders` lists the
+    /// helper's encoders when they are known, so no process starts while planning.
+    public static func automaticAudio(codec: ReencodeCodec, container: String, source: ExportSourceKind,
+                                      track: AutomaticAudioSource, encoders: Set<String>? = nil) -> (action: ReencodeAudio, note: String) {
+        let name = multicamMuxContainer(container).uppercased()
+        func fallback(_ why: String?) -> (action: ReencodeAudio, note: String) {
+            let action = automaticAudio(codec: codec, container: container, source: source,
+                                        lossless: track.lossless, channels: track.channels).first ?? .aac
+            let kind = track.lossless ? "lossless" : "lossy"
+            let subject = track.codec.map { "\(audioCodecName($0)) source" }
+                ?? "\(track.lossless ? "lossless " : "")sources of this track, which differ in format,"
+            guard let why else {
+                // Clips that differ in format follow the rule by category.
+                switch action {
+                case .pcm where track.lossless:
+                    return (action, "The \(subject) are written as PCM, so no lossy encoding is added.")
+                case .pcm:
+                    return (action, "The \(subject) are written as PCM for ProRes.")
+                case .aac where track.lossless:
+                    let pcm = reencodeRefusal(audio: .pcm, container: container, source: source) == nil
+                    return (action, "The \(subject) are converted to AAC, because \(name) "
+                        + (pcm ? "cannot keep the channel layout of PCM with more than two channels" : "cannot carry PCM here")
+                        + ". Choose \(track.channels <= 2 && !pcm ? "MOV or MKV" : "MOV") to keep it lossless.")
+                default:
+                    return (action, "The \(subject) are converted to AAC.")
+                }
+            }
+            switch action {
+            case .pcm where track.lossless:
+                return (action, "\(why), so the lossless \(subject) is written as PCM.")
+            case .pcm:
+                return (action, "\(why), so the lossy \(subject) is written as PCM for ProRes.")
+            case .aac where track.lossless:
+                let pcm = reencodeRefusal(audio: .pcm, container: container, source: source) == nil
+                return (action, "\(why), and \(name) "
+                    + (pcm ? "cannot keep the channel layout of PCM with more than two channels" : "cannot carry PCM here")
+                    + ", so the lossless \(subject) is converted to AAC. Choose \(track.channels <= 2 && !pcm ? "MOV or MKV" : "MOV") to keep it lossless.")
+            default:
+                return (action, "\(why), so the \(kind) \(subject) is written as \(displayName(audio: action)).")
+            }
+        }
+        guard let codec = track.codec else { return fallback(nil) }
+        let label = audioCodecName(codec)
+        guard let format = sourceFormat(for: codec) else {
+            return fallback("The FFmpeg helper has no \(label) encoder")
+        }
+        if format == .pcm {
+            // PCM keeps its sample format where the container carries PCM, as before.
+            let action = automaticAudio(codec: .h264, container: container, source: source, lossless: true, channels: track.channels).first ?? .aac
+            if action == .pcm { return (.pcm, "The PCM source is written as PCM at its own sample format, so no lossy encoding is added.") }
+            let pcm = reencodeRefusal(audio: .pcm, container: container, source: source) == nil
+            return (action, "The PCM source is lossless, but \(name) "
+                + (pcm ? "cannot keep the channel layout of PCM with more than two channels" : "cannot carry PCM here")
+                + ", so it is converted to AAC. Choose \(track.channels <= 2 && !pcm ? "MOV or MKV" : "MOV") to keep it lossless.")
+        }
+        if let encoders, !encoders.isEmpty, let encoder = automaticEncoders[format], !encoders.contains(encoder) {
+            return fallback("The FFmpeg helper has no \(label) encoder")
+        }
+        if let issue = sourceFormatIssue(format, track: track, container: container, source: source) { return fallback(issue) }
+        switch format {
+        case .flac, .alac:
+            return (format, "The \(label) source is written as \(label) at its own word length, so no lossy encoding is added.")
+        case .aac where track.highEfficiency != nil:
+            let profile = track.highEfficiency ?? "HE-AAC"
+            return (format, "The \(profile) source is written as AAC-LC at its own rate: the AAC encoder writes LC only.")
+        default:
+            return (format, "The \(label) source is written as \(label) at its own rate.")
+        }
+    }
     static func audioActionRefusal(_ audio: ReencodeAudio, source: ExportSourceKind) -> CutError {
         let choices = movieAudioActions.map(\.rawValue)
         let list = choices.dropLast().joined(separator: ", ") + " or " + (choices.last ?? "")
         if audio == .alac {
-            return CutError(code: "unsupported_audio", message: "ALAC conversion is available for still-bearing exports. Choose \(list) for a movie.")
+            return CutError(code: "unsupported_audio", message: "ALAC conversion applies to audio-only and still-bearing exports. Choose \(list) for a movie.")
         }
         return CutError(code: "unsupported_audio", message: source == .multicam
             ? "Multicam conversion writes AAC or PCM sound. Choose \(list)."
@@ -404,9 +590,9 @@ public enum ExportRules {
     /// Legacy settings use Auto as the default spelling of copy. Explicit Auto is resolved per lane.
     public static func multicamAudio(_ requested: ReencodeAudio) -> ReencodeAudio { requested == .auto ? .copyOriginal : requested }
     /// Audio treatments of a sound-only conversion.
-    public static let soundAudioActions: [ReencodeAudio] = [.auto, .copyOriginal, .pcm, .flac, .aac, .mp3, .opus]
+    public static let soundAudioActions: [ReencodeAudio] = [.auto, .copyOriginal, .pcm, .alac, .flac, .aac, .mp3, .opus]
     /// The sound-only conversions that name a format, in the order help and the written rules list them.
-    static let soundConversions: [ReencodeAudio] = [.pcm, .aac, .mp3, .flac, .opus]
+    static let soundConversions: [ReencodeAudio] = [.pcm, .aac, .mp3, .alac, .flac, .opus]
     /// The refusal of a sound-only conversion whose output names no extension.
     static var soundExtensionRefusal: CutError {
         let extensions = [ReencodeAudio.mp3, .flac, .opus, .pcm, .aac].map { "." + conversionContainers($0)[0] }
@@ -438,13 +624,17 @@ public enum ExportRules {
         CutError(code: "invalid_arguments",
                  message: "Audio conversion accepts --audio \(soundAudioActions.map(\.rawValue).joined(separator: ", ")). Video settings apply to movies.")
     }
-    /// Containers of each sound-only conversion. The first is its default.
+    /// Containers of each sound-only conversion. The first is its default. These were checked against the muxers of the
+    /// bundled helper and MPCut's own read-back: MPCut reads ALAC in CAF with priming and a shorter span, and ALAC in
+    /// Matroska without its word length, so ALAC is written to M4A, MOV and MP4 only. Those read ALAC with more than two
+    /// channels back without a layout, as MKA and MP4 do for FLAC, so there the conversion is planned for mono and stereo.
     public static func conversionContainers(_ action: ReencodeAudio) -> [String] {
         switch action {
         case .pcm: return ["wav", "caf", "mov"]
         case .aac: return ["m4a", "mp4", "mov"]
         case .mp3: return ["mp3"]
-        case .flac: return ["flac"]
+        case .alac: return ["m4a", "mov", "mp4"]
+        case .flac: return ["flac", "mka", "mp4"]
         case .opus: return ["opus", "ogg", "webm", "mka"]
         default: return []
         }
@@ -454,6 +644,7 @@ public enum ExportRules {
         switch codec {
         case "mp3": return .mp3
         case "aac": return .aac
+        case "alac": return .alac
         case "flac": return .flac
         case "opus": return .opus
         default: return nil
@@ -789,7 +980,7 @@ public enum ExportRules {
             + ReencodeCodec.allCases.map { "\($0.rawValue): \(list(multicamReencodeContainers($0)))" }.joined(separator: "; ")
             + ". Independently of picture mode, --audio-output accepts \(list(MulticamAudioOutput.allCases.map(\.rawValue))). "
             + "Separate tracks default to copy. A downmix renders one track. --audio accepts \(list(multicamAudioActions.map(\.rawValue))). "
-            + "Explicit auto tries copy per lane for separate tracks and renders when copy is unavailable. An unavailable export lists error.alternatives."
+            + "Explicit auto tries copy per lane for separate tracks and renders when copy is unavailable, in the lane's own compressed format where the container carries it. An unavailable export lists error.alternatives."
     }
 
     /// One paragraph for command help, derived from the matrix.
@@ -803,7 +994,7 @@ public enum ExportRules {
             + "Movie re-encode audio accepts \(list(movieAudioActions)). H.264/HEVC write \(reencodeContainers(.h264).joined(separator: ", ")) and ProRes \(reencodeContainers(.prores).joined(separator: ", ")). "
             + "Sound-only encode (a source without picture, or --tracks audio) accepts \(list(soundAudioActions)): \(conversions). "
             + "auto copies when the copy is exact and otherwise applies the first working alternative. "
-            + "In a movie re-encode, auto decides for each track it cannot copy: a lossless track (PCM, FLAC, ALAC, TrueHD, MLP) is written as PCM in MOV, or in MKV for mono and stereo, and otherwise as AAC. Any other track is written as AAC, or for ProRes as PCM under the same container limits. Each converted movie track reports codec and bit_rate or bit_depth in audio_actions. "
+            + "In a movie re-encode, auto decides for each track it cannot copy and keeps the source's own format where the container and the FFmpeg helper allow: PCM at its sample format (MOV, MKV for mono and stereo), FLAC at its word length (MP4, MKV), ALAC at its word length (MOV, MP4), and AAC, MP3 (MOV, MP4, MKV) and Opus (MP4, MKV) at the source's rate. Otherwise a lossless track is written as PCM where the container carries it, and any other track as AAC, or for ProRes as PCM. Each converted movie track reports codec, bit_rate or bit_depth and a reason in audio_actions. "
             + "An unavailable export lists error.alternatives in this order: \(ladder). Each has an id, label, lossless flag and the arguments that request it. Nothing switches unless auto was asked for. "
             + tierHelp
     }
@@ -865,7 +1056,7 @@ public enum ExportRules {
         }
         lines += ["", "An audio action its container cannot carry is refused with `unsupported_audio` and offers the containers that carry it, then `auto` for a movie. No front end substitutes another action. A multicam `m4v` is written as MP4. Multicam AAC needs a movie edit list for gapless timing, so it is not written into Matroska.", "",
                   "PCM bit depth is chosen by the engine that writes it. A sound-only conversion keeps the source depth (16, 24 or 32-bit, or 32-bit float). A movie re-encode keeps the depth of integer sources too, the longest among the clips of a track (16, 24 or 32-bit), and writes 32-bit float for float PCM and for decoded lossy sound, which can exceed full scale. A track of a mixed timeline that is resampled or mixed to stereo is written as 32-bit, or as 32-bit float under the same rule. A multicam re-encode writes 32-bit, or 32-bit float for a float source. A movie track made only of integer sources of up to 32 bits, neither resampled nor mixed, keeps every bit.", "",
-                  "When `auto` cannot copy the sound of a movie re-encode exactly it decides for each track. A track that is lossless in every clip (PCM, FLAC, ALAC, TrueHD or MLP) is written as PCM where the container carries it, so that no lossy encoding is added: in MOV, and in MKV for mono and stereo. MP4 cannot carry PCM here, and MKV states no speaker positions for wider PCM, so there the track is converted to AAC and its reason says so. Any other track is converted to AAC, or for ProRes to PCM under the same container limits. Converted AAC follows the bit rate of an AAC source, at the customary step nearest its measured average and at least 32 kbps for each channel. Any other source gets 96 kbps for each channel, up to 512 kbps. `audio_actions` reports the codec of each converted track with its bit rate or bit depth. A multicam export uses `separate_tracks` by default, with one selectable track per lane in project order. Copy preserves source formats and refuses a lane that needs rendering. Explicit `auto` tries copy for each lane and may render the affected lanes or insert silence while retaining eligible PCM samples. `downmix_mono` and `downmix_stereo` always render one track. For picture with sound, MOV renders PCM or AAC, MP4 and M4V render AAC, and MKV renders PCM. WebM offers audio copy. For sound-only output, WAV, WAVE and CAF render PCM, and M4A renders AAC.", "",
+                  "When `auto` cannot copy the sound of a movie re-encode exactly it decides for each track, and writes the track in its source's own codec and settings where the container and the FFmpeg helper allow. PCM stays PCM at its sample format in MOV, and in MKV for mono and stereo. FLAC stays FLAC at its word length in MP4 (mono and stereo) and MKV, and ALAC stays ALAC in MOV and MP4; MOV cannot carry FLAC, and ALAC in MKV is not read back exactly, so there they are written as PCM. AAC stays AAC, MP3 stays MP3 in MOV, MP4 (16 kHz and up) and MKV, and Opus stays Opus in MP4 and MKV, each at the source's rate: AAC at the first customary step not under the source's measured average, MP3 at the nearest constant rate, Opus at the source's measured average to the nearest 1 kbps. The built-in AAC encoder writes AAC-LC, so an HE-AAC source is written as AAC-LC and its reason says so. A track whose clips differ in format, a codec the helper cannot encode (AC-3, E-AC-3, Vorbis, TrueHD, MLP, DTS, WavPack) or a pair the container cannot carry falls back: a lossless track is written as PCM where the container carries it, and otherwise as AAC; any other track as AAC, or for ProRes as PCM under the same container limits. MP4 cannot carry PCM here, and MKV states no speaker positions for wider PCM, so there a lossless fallback is converted to AAC. Converted AAC from any other source gets 96 kbps for each channel, up to 512 kbps. `audio_actions` reports the codec of each converted track with its bit rate or bit depth and a reason naming the source format and, for a fallback, why. A multicam export uses `separate_tracks` by default, with one selectable track per lane in project order. Copy preserves source formats and refuses a lane that needs rendering. Explicit `auto` tries copy for each lane and may render the affected lanes or insert silence while retaining eligible PCM samples. A rendered lane whose every span has one compressed format keeps it where the container carries it (FLAC in MP4 and MKV, ALAC in MOV and MP4, AAC in MOV and MP4, MP3 in MOV and MP4, Opus in MP4 and MKV) and states why in `reason`. Other lanes and downmixes use the rendered codecs below. `downmix_mono` and `downmix_stereo` always render one track. For picture with sound, MOV renders PCM or AAC, MP4 and M4V render AAC, and MKV renders PCM. WebM offers audio copy. For sound-only output, WAV, WAVE and CAF render PCM, and M4A renders AAC.", "",
                   "## Defaults", "", "| Setting | Default |", "| --- | --- |"]
         for source in ExportSourceKind.allCases {
             lines.append("| Mode, \(source.displayName.lowercased()) | `\(defaultMode(for: source).rawValue)` |")
@@ -1320,8 +1511,18 @@ public struct ExportPlanner: Sendable {
                 // The source format stays in the named container when it writes there, then in the source's own.
                 let kept = [request.container, own].compactMap { $0 }.first(where: containers.contains)
                 next.container = rung == .convertSameFormat ? kept ?? containers[0] : containers[0]
-                if request.mode == .encode, request.audio == action { continue }
-                candidates.append((rung, next))
+                if !(request.mode == .encode && request.audio == action) { candidates.append((rung, next)) }
+                // A lossless source named into a container that cannot hold its own codec keeps its samples there: as PCM,
+                // ALAC or FLAC, the first that container holds. Only an offer that plans losslessly is kept below.
+                let holdsNative = native.map { ExportRules.conversionContainers($0).contains(request.container ?? "") } ?? false
+                if rung == .convertPCM, !holdsNative, let named = request.container, named != containers[0],
+                   let codec = selected?.codec, ExportRules.isLosslessAudio(codec: codec),
+                   let target = ([.pcm, .alac, .flac] as [ReencodeAudio]).first(where: { ExportRules.conversionContainers($0).contains(named) }),
+                   !(request.mode == .encode && request.audio == target) {
+                    next.audio = target
+                    next.container = named
+                    candidates.append((rung, next))
+                }
             case .reencode where request.mode == .encode:
                 // Keep the audio action in the containers that carry it, then offer `auto` where the request was made.
                 let here = request.container ?? ExportRules.defaultReencodeContainer(request.codec)
@@ -1359,6 +1560,9 @@ public struct ExportPlanner: Sendable {
                 action = audio.actions.first
                 lossless = audio.isLossless
             }
+            // The lossless conversion into a named container other than WAV is offered only when it keeps every sample.
+            let losslessInNamed = rung == .convertPCM && kind != .multicam && container != ExportRules.conversionContainers(.pcm)[0]
+            if losslessInNamed && !lossless { continue }
             let changed = zip(candidate.clips, request.clips).contains { $0.from != $1.from || $0.to != $1.to }
             let warnings = plan.warnings + (rung == .copySampleAligned ? ["Cuts were placed on the nearest audio sample."] : [])
             // A re-encode offered for a re-encode names its container and audio action.
@@ -1367,7 +1571,7 @@ public struct ExportPlanner: Sendable {
             let smartOtherContainer = rung == .smartTrim && candidate.container != request.container
             let label = rung.label(container: container, audio: variant ? candidate.audio : action?.action, lossless: lossless)
             let alternative = ExportAlternative(
-                id: rung == .copyOtherContainer || named || smartOtherContainer ? "\(rung.rawValue):\(container)" : rung.rawValue, rung: rung,
+                id: rung == .copyOtherContainer || named || smartOtherContainer || losslessInNamed ? "\(rung.rawValue):\(container)" : rung.rawValue, rung: rung,
                 label: smartOtherContainer ? "\(label) in \(ExportRules.containerDisplayName(container))" : label,
                 mode: plan.mode, tracks: candidate.tracks, container: container, audio: variant ? candidate.audio : action?.action,
                 codec: action?.codec, bitRate: action?.bitRate, quality: action?.quality, lossless: lossless,

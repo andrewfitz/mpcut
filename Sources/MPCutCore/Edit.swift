@@ -147,6 +147,8 @@ public struct ResolvedEdit: Encodable, Sendable {
     var keepsTimecode = false
     /// Why a delivered picture leaves the source’s timecode track behind.
     var timecodeIssue: String? = nil
+    /// What Smart Trim edges lose without being refused, one sentence each, such as film grain synthesis.
+    var smartTrimNotes: [String] = []
 
     enum CodingKeys: String, CodingKey { case segments, duration, container }
 

@@ -64,6 +64,11 @@ struct ProjectSilenceReport: Encodable {
     var dryRun: Bool?
     var preflight: MulticamExportPlan?
     var stillPreflight: StillExportReport?
+    /// What the program export gives up, as `mpcut export` lists it under `warnings`: the plan's warnings and what a
+    /// copy leaves behind.
+    var warnings: [String]?
+    /// What writing changed that the plan could not know. Only an export reports it.
+    var writtenWarnings: [String]?
     /// The tier of the retained ranges, reported with `--output`.
     var tier: TierSummary?
 
@@ -72,7 +77,7 @@ struct ProjectSilenceReport: Encodable {
         case maxBlip = "max_blip_seconds", minimumPause = "min_pause_seconds", padding = "padding_per_side_seconds"
         case pauses, removals, clips, skippedPauses, removedDuration, output, outputBytes, dryRun, preflight, stillPreflight, tier
         case outProject = "out_project"
-        case cards, retainedDuration, takeCandidates
+        case cards, retainedDuration, takeCandidates, warnings, writtenWarnings
     }
 
     init(_ document: MulticamProject, at location: URL, options: SilenceOptions, container: String,

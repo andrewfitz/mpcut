@@ -166,7 +166,7 @@ extension ExportRules {
         for action in movieAudioActions {
             let result: String
             switch action {
-            case .auto: result = "Converted: PCM for a track that is lossless in every clip that has it, in MOV, and in MKV for mono and stereo. Otherwise AAC, or for ProRes PCM under the same container limits."
+            case .auto: result = "Converted: a track whose clips all have one format keeps it where the container carries it, as in a uniform re-encode. Otherwise PCM for a track that is lossless in every clip that has it, in MOV, and in MKV for mono and stereo, and AAC, or for ProRes PCM under the same container limits."
             case .copyOriginal: result = "Refused: `incompatible_clip`. Offers the re-encode with `auto`."
             case .removeAudio: result = "No sound is written."
             default: result = "Converted to \(displayName(audio: action)) in the canvas format."

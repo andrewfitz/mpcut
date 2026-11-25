@@ -1,5 +1,95 @@
 import AVFoundation
 
+extension ExportRules {
+    /// The source format of one output track, from the streams of every clip that has it. The codec is kept only when
+    /// every stream shares it with the same sample rate, channel layout, word length (FLAC and ALAC) and AAC profile.
+    static func automaticAudioSource(_ streams: [StreamInfo]) -> AutomaticAudioSource? {
+        guard let first = streams.first else { return nil }
+        let layouts = streams.map { (try? audioLayout($0)) ?? $0.channelLayout }
+        let depths = streams.map(AudioExportEngine.declaredDepth)
+        let profiles = streams.map(AudioExportEngine.highEfficiencyProfile)
+        let lossless = streams.allSatisfy { isLosslessAudio(codec: $0.codec) }
+        let shared = streams.allSatisfy { $0.codec == first.codec && $0.sampleRate == first.sampleRate && $0.channels == first.channels }
+            && layouts.allSatisfy { $0 == layouts[0] } && profiles.allSatisfy { $0 == profiles[0] }
+            && (!["flac", "alac"].contains(first.codec) || depths.allSatisfy { $0 == depths[0] })
+        return AutomaticAudioSource(codec: shared ? first.codec : nil, lossless: lossless,
+                                    integerDepth: ["flac", "alac"].contains(first.codec) ? depths[0] : nil,
+                                    sampleRate: first.sampleRate, channels: first.channels, layout: layouts[0],
+                                    highEfficiency: profiles[0])
+    }
+}
+
+extension ReencodeAudioAction {
+    /// States what a FLAC, ALAC, MP3 or Opus track that keeps its source format writes: the codec, its word length or
+    /// rate, and the encoder options. The rate follows the sources as a sound-only conversion to the same format does.
+    mutating func describeSourceFormat(_ sources: [(media: MediaInfo, audio: AudioIndex)], channels: Int, sampleRate: Int) {
+        switch action {
+        case .flac, .alac:
+            let depth = sources.compactMap { AudioExportEngine.declaredDepth($0.audio.stream) }.max() ?? 24
+            let written = depth <= 16 ? 16 : 24
+            codec = action.rawValue
+            bitDepth = written
+            let format = written == 16 ? "s16" : "s32"
+            // A fixed block size, as in a sound-only conversion: a range can start with a very short decoded frame.
+            encoderOptions = ["-sample_fmt", action == .alac ? format + "p" : format, "-bits_per_raw_sample", "\(written)"]
+                + (action == .flac ? ["-frame_size", "4608"] : [])
+        case .mp3:
+            let profiles = sources.compactMap { MP3Profile(media: $0.media, sound: $0.audio)?.asConstant }
+            let chosen = MP3Profile.encoding(matching: profiles.count == sources.count ? profiles : [],
+                                             sampleRate: sampleRate, channels: channels)
+            codec = "mp3"
+            bitRate = chosen.bitRate
+            quality = chosen.quality
+            encoderOptions = chosen.arguments.map { $0 == "-b:a" ? "-b" : $0 == "-q:a" ? "-q" : $0 }
+        case .opus:
+            let measured = sources.compactMap(\.audio.averageBitRate)
+            let rate = AudioExportEngine.opusBitRate(matching: measured.count == sources.count ? measured.max() : nil, channels: channels)
+            codec = "opus"
+            bitRate = rate
+            // Unconstrained libopus VBR can miss the target by a third. Surround needs a named mapping family.
+            encoderOptions = ["-b", "\(rate)", "-vbr", "constrained"] + (channels > 2 ? ["-mapping_family", "1"] : [])
+        default:
+            break
+        }
+    }
+}
+
+/// The encoder and options of a FLAC, ALAC, MP3 or Opus track, with the stream specifier of output track `index`.
+func sourceFormatOptions(_ planned: ReencodeAudioAction, outputIndex index: Int) -> [String]? {
+    let encoder: String
+    switch planned.action {
+    case .flac: encoder = "flac"
+    case .alac: encoder = "alac"
+    case .mp3: encoder = "libmp3lame"
+    case .opus: encoder = "libopus"
+    default: return nil
+    }
+    var args = ["-c:a:\(index)", encoder]
+    for option in planned.encoderOptions ?? [] {
+        args.append(option.hasPrefix("-") ? "\(option):a:\(index)" : option)
+    }
+    return args
+}
+
+/// The bundled FFmpeg 9.0.2 MOV muxer stores the final Opus packet with its trimmed duration, so the edit list ends
+/// where that shortened sample does and readers (FFmpeg and AVFoundation) decode the encoder's padding after the
+/// planned end, up to 19 ms. With the packet's coded 20 ms duration the edit list ends inside it, as FFmpeg 9.1 writes
+/// it. libopus codes 20 ms frames, 960 samples at Opus's 48 kHz clock, unless told otherwise.
+func opusTailOptions(container: String, specifier: String) -> [String] {
+    guard ["mov", "mp4", "m4a"].contains(container) else { return [] }
+    return ["-bsf:\(specifier)", "setts=duration=if(lt(DURATION\\,960)\\,960\\,DURATION)"]
+}
+
+/// The PCM format a converted track takes between export batches. Compressed tracks are encoded once in the final mux:
+/// lossless ones are staged as 32-bit integers, which hold their samples exactly, and lossy ones as 32-bit float.
+func stagedAudioCodec(_ planned: ReencodeAudioAction) -> String? {
+    switch planned.action {
+    case .flac, .alac: return "pcm_s32le"
+    case .aac, .mp3, .opus: return "pcm_f32le"
+    default: return nil
+    }
+}
+
 extension ReencodeEngine {
     // FFmpeg's MOV demuxer can expose hidden AAC decoder history as audible
     // packets in empty edits. AVAssetReader renders the presentation edits.

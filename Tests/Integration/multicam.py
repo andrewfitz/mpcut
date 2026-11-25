@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 from media_regression import audio, ffmpeg, frames, probe, ratio, run, sample_hashes, timestamped_hashes
-from smart_trim import picture_ids, vcl_hashes
+from smart_trim import CAPTION_SEI, FILM_GRAIN_SEI, film_grain_note, picture_ids, vcl_hashes, with_h264_sei
 from saved_project import read_project
 
 RATE = 48_000
@@ -261,6 +261,57 @@ class MulticamTests(unittest.TestCase):
         streams = probe(self.output, "-show_streams")["streams"]
         self.assertEqual([stream["codec_type"] for stream in streams], ["video"])
 
+    def test_program_keeps_reference_angle_chapters(self):
+        # The program's chapters are the reference angle's, on the program clock, whichever camera is on screen:
+        # "Intro" runs on through the close-up at 1-2 s. Another camera's own chapters are named and left out.
+        def chaptered(source, name, *spans):
+            listing = self.root / f"{name}.ffmeta"
+            listing.write_text(";FFMETADATA1\n" + "".join(
+                f"[CHAPTER]\nTIMEBASE=1/1000\nSTART={int(start * 1000)}\nEND={int(end * 1000)}\ntitle={title}\n"
+                for start, end, title in spans))
+            path = self.root / f"{name}.mov"
+            ffmpeg("-i", source, "-i", listing, "-map", "0", "-map_chapters", "1", "-c", "copy", path)
+            return path
+
+        def chapters(path):
+            return [(Fraction(item["start_time"]), Fraction(item["end_time"]), item.get("tags", {}).get("title"))
+                    for item in probe(path, "-show_chapters")["chapters"]]
+
+        spans = [(0, Fraction(3, 2), "Intro"), (Fraction(3, 2), 3, "Middle"), (3, 4, "End")]
+        wide = chaptered(self.wide, "chaptered-wide", *spans)
+        close = chaptered(self.pcm_close, "chaptered-close", (0, 4, "Close-up"))
+        self.project(wide=wide, close=close)
+        other = "Chapters come from the reference angle. 1 chapter of chaptered-close.mov is not copied."
+        for name, tracks in [("program.mov", []), ("picture.mov", ["--tracks", "video"]), ("picture.mp4", ["--tracks", "video"])]:
+            with self.subTest(name=name):
+                output = self.root / name
+                planned = self.export(*tracks, "--dry-run", output=output)
+                self.assertEqual(planned["warnings"], [other])
+                report = self.export(*tracks, output=output)
+                self.assertEqual(report["warnings"], [other])
+                self.assertEqual(chapters(output), spans)
+                kinds = [stream["codec_type"] for stream in probe(output, "-show_streams")["streams"]]
+                self.assertEqual(("video" in kinds, "audio" in kinds), (True, not tracks))
+                self.assertEqual(sample_hashes(output), sample_hashes(wide)[:25] + sample_hashes(close)[25:50]
+                                 + sample_hashes(wide)[50:])
+        # A cut on the group clock clips and moves the chapters as an ordinary copy of the same ranges does.
+        self.project(wide=wide, close=close, assembly=[{"from": "1", "to": "2"}, {"from": "3", "to": "4"}])
+        self.export("--tracks", "video", output=self.root / "assembled.mov")
+        self.assertEqual(chapters(self.root / "assembled.mov"),
+                         [(0, Fraction(1, 2), "Intro"), (Fraction(1, 2), 1, "Middle"), (1, 2, "End")])
+        # The sound alone has no chapter track to carry them. The report says so.
+        report = self.export("--tracks", "audio", output=self.root / "sound.mov")
+        self.assertIn("Chapters are copied only with the program picture. 3 chapters are not copied.", report["warnings"])
+        self.assertEqual(chapters(self.root / "sound.mov"), [])
+        # One camera for the whole range: the same chapters as a picture copy of that file.
+        self.project(wide=wide, close=close, switches=[{"group_time": "0", "angle_id": "wide"}])
+        single = self.root / "single.mov"
+        self.assertEqual(self.export("--tracks", "video", output=single)["warnings"], [])
+        ordinary = self.root / "ordinary.mov"
+        self.cli("export", "clips", "join", "--json", "--no-sidecar", "--mode", "copy", "--tracks", "video",
+                 "--clip", wide, "--output", ordinary)
+        self.assertEqual(chapters(single), chapters(ordinary))
+
     def test_mix_v4_format_round_trips_order_relative_offset_and_history(self):
         fixture = Path(__file__).parent / "fixtures" / "multicam" / "mix-v4.cut"
         original = fixture.read_bytes()
@@ -436,6 +487,34 @@ class MulticamTests(unittest.TestCase):
                 self.project_path.write_text(project)
                 failure = self.export("--dry-run", ok=False)["error"]
                 self.assertEqual(failure["code"], "invalid_cut_project")
+
+    def test_smart_trim_plan_checks_the_angle_edges_it_encodes(self):
+        # The incoming side of each switch is encoded up to the next keyframe. Captions on those pictures refuse the
+        # plan as they refuse the export, and film grain they lose is a warning in both reports.
+        switches = [{"group_time": "0", "angle_id": "wide"}, {"group_time": "32/25", "angle_id": "close"},
+                    {"group_time": "69/25", "angle_id": "wide"}]
+        captioned = [with_h264_sei(source, self.root / f"captioned-{source.name}", CAPTION_SEI)
+                     for source in (self.wide, self.close)]
+        self.project(wide=captioned[0], close=captioned[1], switches=switches)
+        for args in (["--dry-run"], []):
+            error = self.export(*args, mode="smart", ok=False)["error"]
+            self.assertEqual((error["code"], error["reason"]), ("unsupported_format", "source_smart_ineligible"), error)
+            self.assertIn("captions or colour metadata", error["message"])
+            self.assertFalse(self.output.exists())
+
+        grain = [with_h264_sei(source, self.root / f"grain-{source.name}", FILM_GRAIN_SEI)
+                 for source in (self.wide, self.close)]
+        for cameras in ([self.wide, self.close], grain):
+            with self.subTest(wide=cameras[0].name):
+                self.output = self.root / f"program-{cameras[0].stem}.mov"
+                self.project(wide=cameras[0], close=cameras[1], switches=switches)
+                notes = [film_grain_note(source) for source in cameras]
+                plan = self.export("--dry-run", mode="smart")
+                self.assertEqual(rational_time(plan["encoded_video_duration"]), Fraction(24, 25))
+                report = self.export(mode="smart")
+                for result in (plan, report):
+                    found = [note for note in notes if note in result["warnings"]]
+                    self.assertEqual(found, notes if cameras is grain else [], result["warnings"])
 
     def test_smart_trim_encodes_edges_and_keeps_interior_video(self):
         # Cameras that reorder pictures end a copy only where every earlier-coded picture also presents earlier:

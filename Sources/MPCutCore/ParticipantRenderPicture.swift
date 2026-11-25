@@ -1,5 +1,6 @@
 import CoreImage
 import Foundation
+import MediaProbe
 import Metal
 
 struct ParticipantFrameGeometry {
@@ -151,7 +152,8 @@ final class ParticipantPictureReader {
     init(_ media: MediaInfo, control: JPEGControl, toneMapHDR: Bool) throws {
         self.media = media
         self.toneMapHDR = toneMapHDR
-        renderer = try JPEGRenderer(media: media, control: control)
+        // Software-decoded pictures deeper than 8 bits keep 16 bits per channel into the compositor.
+        renderer = try JPEGRenderer(media: media, control: control, lossless: true)
         seekPoints = media.frames.indices.filter { media.frames[$0].canStart && media.frames[$0].dts != nil }
         scanOrientation = Self.rotation(media.video.rotation)
     }
@@ -171,14 +173,40 @@ final class ParticipantPictureReader {
             throw CutError(code: "participant_display_transform_changed",
                            message: "The preview rotation differs from the participant scan.")
         }
-        let transfer = CVBufferCopyAttachment(decoded.buffer, kCVImageBufferTransferFunctionKey, nil) as? String
+        return try displayed(decoded.buffer, pixelAspect: source.video.sampleAspectRatio.seconds,
+                             displayTransform: decoded.displayTransform, toneMapHDR: toneMapHDR)
+    }
+
+    /// The decoded picture in display geometry with its origin at zero. Export and Output share this
+    /// path: non-square pixels are resampled once with Lanczos to a whole display width, then rotated.
+    static func displayed(_ buffer: CVPixelBuffer, pixelAspect: Double, displayTransform: CGAffineTransform,
+                          toneMapHDR: Bool) throws -> CIImage {
+        let transfer = CVBufferCopyAttachment(buffer, kCVImageBufferTransferFunctionKey, nil) as? String
         let hdr = transfer == kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String
             || transfer == kCVImageBufferTransferFunction_ITU_R_2100_HLG as String
-        let image = CIImage(cvPixelBuffer: decoded.buffer, options: [.toneMapHDRtoSDR: toneMapHDR && hdr])
-        let aspect = source.video.sampleAspectRatio.seconds
-        let transformed = image.transformed(by: CGAffineTransform(scaleX: aspect > 0 ? aspect : 1, y: 1)
-            .concatenating(decoded.displayTransform))
-        return transformed.transformed(by: .init(translationX: -transformed.extent.minX, y: -transformed.extent.minY))
+        var image = CIImage(cvPixelBuffer: buffer, options: [.toneMapHDRtoSDR: toneMapHDR && hdr])
+        let width = (image.extent.width * (pixelAspect > 0 && pixelAspect.isFinite ? pixelAspect : 1)).rounded()
+        guard width >= 1, width.isFinite, image.extent.height >= 1 else { throw JPEGRenderer.failure }
+        if width != image.extent.width {
+            image = ParticipantCompositor.resample(image, to: CGRect(x: 0, y: 0, width: width, height: image.extent.height))
+        }
+        let rotated = image.transformed(by: displayTransform)
+        return rotated.transformed(by: .init(translationX: -rotated.extent.minX, y: -rotated.extent.minY))
+    }
+
+    private func decode(at pts: Int64, seekDTS: Int64) throws -> CIImage {
+        var buffer: CVPixelBuffer?
+        var error = [CChar](repeating: 0, count: 256)
+        guard mp_jpeg_frame(renderer.reader, pts, seekDTS, 0, &buffer, &error, error.count) >= 0, let buffer else {
+            try renderer.control.check()
+            throw CutError(code: "frame_export_failed",
+                           message: "Could not decode source picture at PTS \(pts): " + String(cString: error))
+        }
+        // The decoder reports the frame's own sample aspect ratio as its display width.
+        let display = mp_jpeg_display_size(renderer.reader)
+        let coded = Double(CVPixelBufferGetWidth(buffer))
+        return try Self.displayed(buffer, pixelAspect: coded > 0 ? display.width / coded : 1,
+                                  displayTransform: renderer.displayTransform, toneMapHDR: toneMapHDR)
     }
 
     func picture(at index: Int, usingScannedGeometry: Bool) throws -> CIImage {
@@ -212,7 +240,7 @@ final class ParticipantPictureReader {
                 seek = try ticks(first.dts ?? first.time)
             }
         }
-        let image = try renderer.picture(at: ticks(frame.time), seekDTS: seek, preset: .full, toneMapHDR: toneMapHDR)
+        let image = try decode(at: ticks(frame.time), seekDTS: seek)
         let orientation = renderer.displayTransform
         last = (index, image, orientation)
         return try checked(image, orientation: orientation)
@@ -257,14 +285,18 @@ enum ParticipantCompositor {
                width: bounds.width * extent.width, height: bounds.height * extent.height)
     }
 
-    static func color(_ rgb: UInt32, in extent: CGRect) -> CIImage {
-        func channel(_ shift: UInt32) -> Double { Double((rgb >> shift) & 0xFF) / 255 }
-        let color = CGColor(srgbRed: channel(16), green: channel(8), blue: channel(0), alpha: 1)
-        return CIImage(color: CIColor(cgColor: color)).cropped(to: extent)
+    /// A canvas color. `space` names the encoding of its components; SDR video passes its own space so
+    /// that a color is written with the same code values on every system.
+    static func color(_ rgb: UInt32, in extent: CGRect, space: CGColorSpace = ParticipantCompositor.colorSpace) -> CIImage {
+        func channel(_ shift: UInt32) -> CGFloat { CGFloat((rgb >> shift) & 0xFF) / 255 }
+        let color = CIColor(red: channel(16), green: channel(8), blue: channel(0), alpha: 1, colorSpace: space)
+            ?? CIColor(cgColor: CGColor(srgbRed: channel(16), green: channel(8), blue: channel(0), alpha: 1))
+        return CIImage(color: color).cropped(to: extent)
     }
 
     static func redact(_ original: CIImage, appearances: [ParticipantAppearance],
-                       treatments: [String: ParticipantRedaction], allowMetal: Bool = true) -> CIImage {
+                       treatments: [String: ParticipantRedaction], allowMetal: Bool = true,
+                       space: CGColorSpace = ParticipantCompositor.colorSpace) -> CIImage {
         let regions = appearances.flatMap { appearance -> [(CGRect, ParticipantRedaction)] in
             guard let id = appearance.participantID, let treatment = treatments[id] else { return [] }
             return [appearance.bounds, appearance.labelBounds].compactMap { bounds in
@@ -291,7 +323,7 @@ enum ParticipantCompositor {
         }
         // Cover layers are applied last so a neighboring blur cannot overwrite them.
         for (area, treatment) in regions where treatment.treatment == .opaque || treatment.treatment == .omit {
-            result = color(treatment.color, in: area).composited(over: result)
+            result = color(treatment.color, in: area, space: space).composited(over: result)
         }
         return result
     }
@@ -299,7 +331,33 @@ enum ParticipantCompositor {
     static func place(_ picture: CIImage, inside slot: CGRect, framing: ParticipantSlotFraming,
                       anchorX: Double = 0.5, anchorY: Double = 0.5) -> CIImage {
         let fitted = placementTransform(picture.extent, inside: slot, framing: framing, anchorX: anchorX, anchorY: anchorY)
-        return picture.transformed(by: fitted, highQualityDownsample: true).cropped(to: slot)
+        // Whole-pixel edges keep neighboring cells seamless and need no second, interpolating translation.
+        let placed = pixelAligned(picture.extent.applying(fitted))
+        return resample(picture, to: placed).cropped(to: placed.intersection(pixelAligned(slot)))
+    }
+
+    static func pixelAligned(_ rect: CGRect) -> CGRect {
+        let minX = rect.minX.rounded(), minY = rect.minY.rounded()
+        return CGRect(x: minX, y: minY, width: max(1, rect.maxX.rounded() - minX), height: max(1, rect.maxY.rounded() - minY))
+    }
+
+    /// Scales a picture onto a whole-pixel rectangle with Lanczos in both directions. Edge pixels are
+    /// repeated, so the filter neither darkens the border nor reads pixels outside the picture's extent.
+    static func resample(_ picture: CIImage, to target: CGRect) -> CIImage {
+        let source = picture.extent
+        guard !source.isInfinite, source.width > 0, source.height > 0, target.width > 0, target.height > 0 else {
+            return picture.cropped(to: .null)
+        }
+        let scaleX = target.width / source.width, scaleY = target.height / source.height
+        var scaled = picture
+        if scaleX != 1 || scaleY != 1 {
+            scaled = picture.clampedToExtent().applyingFilter("CILanczosScaleTransform", parameters: [
+                kCIInputScaleKey: scaleY, kCIInputAspectRatioKey: scaleX / scaleY
+            ])
+        }
+        let shift = CGAffineTransform(translationX: (target.minX - source.minX * scaleX).rounded(),
+                                      y: (target.minY - source.minY * scaleY).rounded())
+        return scaled.transformed(by: shift).cropped(to: target)
     }
 
     static func placementTransform(_ extent: CGRect, inside slot: CGRect, framing: ParticipantSlotFraming,

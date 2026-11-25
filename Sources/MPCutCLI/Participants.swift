@@ -340,13 +340,18 @@ struct ParticipantCLI {
             } else {
                 let directory = try request.url("output_directory", directory: true)
                 try loaded.media.validateDestination(directory, relativeTo: document, includesContents: true)
-                let delivered = try ParticipantMulticam.materialize(angles, project: legacy, document: document,
-                    canvas: canvas, audio: audio, to: directory, cancelled: cancelled)
+                let (delivered, written) = try ExportWriteNotices.collecting {
+                    try ParticipantMulticam.materialize(angles, project: legacy, document: document,
+                                                        canvas: canvas, audio: audio, to: directory, cancelled: cancelled)
+                }
                 struct Result: Encodable {
                     let projectPath: String
                     let project: MulticamProject
+                    /// What each angle's picture gave up, by angle name.
+                    let warnings: [String]?
                 }
-                try writeJSON(Result(projectPath: directory.appendingPathComponent("multicam.cut").path, project: delivered),
+                try writeJSON(Result(projectPath: directory.appendingPathComponent("multicam.cut").path, project: delivered,
+                                     warnings: written.isEmpty ? nil : written),
                               pretty: !json, checkCancellation: false)
             }
         }

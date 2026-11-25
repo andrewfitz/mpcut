@@ -137,12 +137,15 @@ extension MulticamEditorModel {
                     if mode == .playhead {
                         if programPicture || angle == nil, let still {
                             try still.writeDirectory(to: directory, preset: preset, cancelled: cancelled)
-                            return 1
+                            return (1, 0)
                         }
                         let manifest = try JPEGExport.writeMulticam(project, document: document, at: times,
                             to: directory, preset: preset, useSidecar: useSidecar, indexedSources: indexed,
                             cancelled: cancelled)
-                        return manifest.frames.filter { $0.file != nil }.count
+                        // A camera whose recording is missing or unreadable writes no frame. Count those too, so the
+                        // status does not read as if every camera was compared.
+                        let failed = manifest.frames.filter { [.missingSource, .sourceError].contains($0.availability) }.count
+                        return (manifest.frames.filter { $0.file != nil }.count, failed)
                     }
                     guard let angle, let cameraURL else {
                         throw CutError(code: "no_source", message: "Choose a camera source to sample its scenes or audio.")
@@ -163,10 +166,13 @@ extension MulticamEditorModel {
                     } else {
                         selection = .nonSilent(stream: stream, thresholdDB: threshold, minimumPause: minimum, maxBlip: maxBlip)
                     }
-                    return try JPEGExport.write(media, to: directory, selection: selection, sample: sample,
-                        preset: preset, limit: limit, useSidecar: useSidecar, cancelled: cancelled).frames.count
-                } onSuccess: { count in
-                    self.status = "Exported \(count) JPEG frames to \(directory.lastPathComponent)."
+                    return (try JPEGExport.write(media, to: directory, selection: selection, sample: sample,
+                        preset: preset, limit: limit, useSidecar: useSidecar, cancelled: cancelled).frames.count, 0)
+                } onSuccess: { result in
+                    let (count, failed) = result
+                    let missing = failed == 0 ? "" : failed == 1 ? " 1 camera frame was not written because its recording is missing or unreadable."
+                        : " \(failed) camera frames were not written because their recordings are missing or unreadable."
+                    self.status = "Exported \(count) JPEG frames to \(directory.lastPathComponent)." + missing
                 }
             } catch { self.notice = Notice(title: "Export JPEG Frames", message: error.localizedDescription) }
         }

@@ -259,7 +259,8 @@ final class StillEditorModelTests: XCTestCase {
         let movie = try engine.inspect(destination, keyframes: true)
         XCTAssertEqual(movie.frames.map(\.duration), [newDuration])
         XCTAssertEqual(movie.audio.first?.end, newDuration)
-        XCTAssertEqual(movie.audio.first?.stream.codec, "alac")
+        // Auto keeps the recording's own format: the 16-bit PCM WAV soundtrack stays 16-bit PCM in MOV.
+        XCTAssertEqual(movie.audio.first?.stream.codec, "pcm_s16le")
 
         let picture = try XCTUnwrap(reopened.timelineClips.first)
         // One second lies on the picture grid but the recording has one more sample.

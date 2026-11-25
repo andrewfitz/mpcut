@@ -24,6 +24,10 @@ struct FFPreviewBatch {
     var noAudio = false
     var partialAudio = false
     var hasPictureGap = false
+    /// Why pictures since the last seek are missing (mp_preview_notice), or nil.
+    var pictureNotice: String?
+    /// A damaged audio packet was dropped since the last seek, which leaves a silent gap.
+    var audioDamage = false
 }
 
 final class FFPreviewReader: @unchecked Sendable {
@@ -136,6 +140,15 @@ final class FFPreviewReader: @unchecked Sendable {
         return (kind, image, pts, duration)
     }
 
+    /// Why a still's picture is missing: damage, or a change of description the decoder could not follow there.
+    private func omittedPicture() -> String {
+        switch mp_preview_omission(decoder) {
+        case Int32(MPPreviewOmitsUnalignedSwitch.rawValue): return WebSequencePlayback.descriptionChangePicture
+        case Int32(MPPreviewOmitsLeadingPictures.rawValue): return WebSequencePlayback.leadingPicture
+        default: return WebSequencePlayback.damagedPicture
+        }
+    }
+
     func scrubSamples(url: URL, range: Range<Double>, audioOrigin: RationalTime? = nil,
                       audioTrack: Int? = nil) throws -> [CMSampleBuffer] {
         if audioOnly, self.url == url, openedOrigin == audioOrigin, openedAudioTrack == audioTrack,
@@ -168,7 +181,7 @@ final class FFPreviewReader: @unchecked Sendable {
         while !cancelled() {
             let (kind, image, pts, duration) = try readPicture()
             if kind == MPPreviewEnd.rawValue {
-                if missing() { throw FFPreviewError.decode(WebSequencePlayback.damagedPicture) }
+                if missing() { throw FFPreviewError.decode(omittedPicture()) }
                 guard let preceding else {
                     throw FFPreviewError.decode("The source produced no picture at this position.")
                 }
@@ -180,7 +193,7 @@ final class FFPreviewReader: @unchecked Sendable {
             if nearbyKeyframe, !mp_preview_met_damage(decoder), frame.time.seconds >= target - 8,
                frame.time.seconds <= target, frame.time.seconds < end { return frame }
             if frame.time.seconds > target + 0.000_000_001, missing() {
-                throw FFPreviewError.decode(WebSequencePlayback.damagedPicture)
+                throw FFPreviewError.decode(omittedPicture())
             }
             if frame.time.seconds >= end { return preceding }
             // Mapping a stepped sequence time back to its clip can land a
@@ -286,6 +299,8 @@ final class FFPreviewReader: @unchecked Sendable {
             output.noAudio = !output.partialAudio
         }
         output.hasPictureGap = output.hasPictureGap || mp_preview_met_damage(decoder)
+        output.pictureNotice = mp_preview_notice(decoder).map { String(cString: $0) }
+        output.audioDamage = mp_preview_met_audio_damage(decoder)
         return output
     }
 
@@ -354,6 +369,7 @@ final class WebSequencePlayback {
     private let onIssue: (String) -> Void
     private let onGap: () -> Void
     private let onAudioWarning: (String?) -> Void
+    private let onPictureNotice: (String?) -> Void
 
     private let requests = FFPreviewRequests()
     private let synchronizer = AVSampleBufferRenderSynchronizer()
@@ -374,6 +390,7 @@ final class WebSequencePlayback {
     private var hasStartedClock = false
     private var lastClockCommand: ContinuousClock.Instant = .now
     private var audioWarning: String?
+    private var pictureNotice: String?
     private var pictureGaps: [Double] = []
     private var video: [PreviewFrame] = []
     private var audio: [CMSampleBuffer] = []
@@ -381,7 +398,7 @@ final class WebSequencePlayback {
     init(ranges: [PreviewRange], screen: @escaping () -> NSScreen? = { nil }, onFrame: @escaping (PreviewFrame) -> Void,
          onTime: @escaping (Double) -> Void, onIssue: @escaping (String) -> Void,
          onAudioWarning: @escaping (String?) -> Void, onGap: @escaping () -> Void = {},
-         separatesPicture: Bool = false) {
+         onPictureNotice: @escaping (String?) -> Void = { _ in }, separatesPicture: Bool = false) {
         (self.offsets, self.duration) = previewOffsets(ranges)
         self.screen = screen
         self.ranges = ranges
@@ -391,6 +408,7 @@ final class WebSequencePlayback {
         self.onIssue = onIssue
         self.onGap = onGap
         self.onAudioWarning = onAudioWarning
+        self.onPictureNotice = onPictureNotice
         MutedLaunch.mute(audioRenderer)
         synchronizer.addRenderer(audioRenderer)
         synchronizer.delaysRateChangeUntilHasSufficientMediaData = false
@@ -405,6 +423,18 @@ final class WebSequencePlayback {
     nonisolated static let undecodableAudio = "The source audio could not be decoded."
     /// Raised for one position. Playback resumes at the next keyframe.
     nonisolated static let damagedPicture = "The picture at this position is damaged and could not be decoded."
+    /// Raised for one position, as damagedPicture is: a picture between a change of sample description that is not
+    /// at a keyframe and the next keyframe.
+    nonisolated static let descriptionChangePicture =
+        "The picture at this position follows a change of sample description between keyframes and could not be decoded."
+    /// Raised for one position, as damagedPicture is: a leading picture of an open keyframe where the description
+    /// changes, which a decoder starting there cannot reconstruct.
+    nonisolated static let leadingPicture =
+        "The picture at this position leads an open keyframe where the sample description changes and could not be decoded."
+    /// The messages for a position without a picture, from which playback can still go on.
+    nonisolated static let omittedPictures: Set<String> = [damagedPicture, descriptionChangePicture, leadingPicture]
+    /// Shown for one decoding pass. A seek or a new playback request starts another.
+    nonisolated static let damagedAudio = "Some audio is damaged and could not be decoded, so it is silent."
 
     func park(at position: Double) { time = min(max(position, 0), duration) }
 
@@ -437,6 +467,8 @@ final class WebSequencePlayback {
     func seek(to time: Double) {
         guard time.isFinite, !ranges.isEmpty else { return }
         resetRequests()
+        // Pictures omitted in an earlier pass are not this one's.
+        reportPictureNotice(nil)
         self.time = min(max(time, 0), duration)
         onTime(self.time)
         rangeIndex = max(0, offsets.lowerBound { $0 > self.time } - 1)
@@ -576,9 +608,14 @@ final class WebSequencePlayback {
                         self.reportAudioWarning("Audio preview is unavailable for this clip.")
                     } else if batch.partialAudio {
                         self.reportAudioWarning("Some audio tracks are unavailable for preview.")
+                    } else if batch.audioDamage {
+                        self.reportAudioWarning(Self.damagedAudio)
                     } else if self.audioRenderer.status != .failed {
                         self.reportAudioWarning(nil)
                     }
+                    // Playback goes on from the next keyframe after a damaged picture or a change of
+                    // description it cannot follow. The pictures in between are missing, so say so.
+                    if let notice = batch.pictureNotice, !soundOnly { self.reportPictureNotice(notice) }
                     if self.hasStartedClock { self.fill() } else { self.tick() }
                 case .failure(let error):
                     if self.separatesPicture {
@@ -598,6 +635,12 @@ final class WebSequencePlayback {
         guard message != audioWarning else { return }
         audioWarning = message
         onAudioWarning(message)
+    }
+
+    private func reportPictureNotice(_ message: String?) {
+        guard message != pictureNotice else { return }
+        pictureNotice = message
+        onPictureNotice(message)
     }
 
     private func readClock() {

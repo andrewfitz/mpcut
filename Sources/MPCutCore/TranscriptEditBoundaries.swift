@@ -326,8 +326,11 @@ final class TranscriptBoundaryResolver {
             resolved = candidate
         }
         let output = try resolved.adding(shift)
-        boundaries.append(try .init(space: space, requested: requested.adding(shift), resolved: output,
-                                    copySafeAlternatives: copy.map { try $0.adding(shift) }))
+        var boundary = try TranscriptEditBoundary(space: space, requested: requested.adding(shift), resolved: output,
+                                                  copySafeAlternatives: copy.map { try $0.adding(shift) })
+        // Without an index the time cannot be checked or snapped. The plan says so instead of passing it as a frame.
+        if media == nil { boundary.unindexed = true }
+        boundaries.append(boundary)
         return output
     }
 

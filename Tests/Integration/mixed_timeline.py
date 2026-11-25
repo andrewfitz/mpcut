@@ -327,7 +327,9 @@ class MixedTimelineTests(unittest.TestCase):
                 planned = report["audio_actions"][0]
                 self.assertEqual((planned["action"], planned["codec"], planned["track"]), (action, codec, 1))
                 self.assertIn("The clips differ, so their sound is converted to one format.", planned["reason"])
-                self.assertIn("The lossless source is written as PCM" if action == "pcm" else "MP4 cannot carry PCM", planned["reason"])
+                # The clips differ in rate and layout, so the track has no one source format to keep and follows the rule by category.
+                self.assertIn("The lossless sources of this track, which differ in format, are written as PCM" if action == "pcm"
+                              else "MP4 cannot carry PCM", planned["reason"])
                 self.assertEqual(streams(output)[1]["codec_name"], codec)
         # A clip with AAC at the same position makes the track lossy, and Auto converts it as before.
         report = self.export(self.root / "lossy.mov", [(self.portrait, "0", "1"), (self.wide, "0", "1")], dry=True)

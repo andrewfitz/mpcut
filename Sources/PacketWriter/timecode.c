@@ -185,3 +185,51 @@ cleanup:
     avformat_close_input(&reader);
     return result;
 }
+
+int mpcut_timecode_breaks(const char *url, unsigned stream_index, const MPCutTimecode *timecode,
+                          MPCutTime from, MPCutTime to)
+{
+    if (from.denominator <= 0 || to.denominator <= 0)
+        return 0;
+    AVFormatContext *reader = NULL;
+    AVPacket *packet = av_packet_alloc();
+    int breaks = 0;
+    if (!packet || avformat_open_input(&reader, url, NULL, NULL) < 0 || stream_index >= reader->nb_streams)
+        goto cleanup;
+    AVRational base = reader->streams[stream_index]->time_base;
+    if (base.num <= 0 || base.den <= 0)
+        goto cleanup;
+    for (unsigned i = 0; i < reader->nb_streams; i++) {
+        if (i != stream_index)
+            reader->streams[i]->discard = AVDISCARD_ALL;
+    }
+    int have = 0;
+    int64_t previous_pts = 0;
+    Wide previous_frame = 0;
+    while (av_read_frame(reader, packet) >= 0) {
+        if ((unsigned)packet->stream_index == stream_index && packet->size == 4 && packet->pts != AV_NOPTS_VALUE) {
+            Wide frame = (Wide)AV_RB32(packet->data) * timecode->frames_per_count;
+            if (have) {
+                /* A later sample that does not continue the count of the one before it is a break. */
+                Wide numerator = (Wide)(packet->pts - previous_pts) * base.num * timecode->rate.num;
+                Wide denominator = (Wide)base.den * timecode->rate.den;
+                int continuous = denominator > 0 && numerator % denominator == 0
+                                 && previous_frame + numerator / denominator == frame;
+                Wide at = (Wide)packet->pts * base.num;
+                int inside = at * from.denominator > (Wide)from.numerator * base.den
+                             && at * to.denominator < (Wide)to.numerator * base.den;
+                if (!continuous && inside)
+                    breaks++;
+            }
+            have = 1;
+            previous_pts = packet->pts;
+            previous_frame = frame;
+        }
+        av_packet_unref(packet);
+    }
+
+cleanup:
+    av_packet_free(&packet);
+    avformat_close_input(&reader);
+    return breaks;
+}

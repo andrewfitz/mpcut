@@ -471,7 +471,8 @@ public final class TimelineTierEvaluator: @unchecked Sendable {
                 if step.mode == .smart, let container = scan.container, let first = prepared.media[clips[0].file.standardizedFileURL],
                    !engine.smartTrimEligible(in: first, container: container) {
                     factors.removeAll { $0.id == .sourceSmartIneligible }
-                    factors.append(TierFactor(id: .sourceSmartIneligible, forces: next, message: TierFactorID.sourceSmartIneligible.summary))
+                    factors.append(TierFactor(id: .sourceSmartIneligible, forces: next,
+                                              message: engine.smartTrimLayerNote(in: first) ?? TierFactorID.sourceSmartIneligible.summary))
                 }
             }
             if !found.contains(where: { $0.factor == failure.factor && $0.segment == failure.segment && $0.boundary == failure.boundary }) {

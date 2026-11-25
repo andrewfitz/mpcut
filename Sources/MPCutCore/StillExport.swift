@@ -166,7 +166,8 @@ public struct StillExportPlanner: Sendable {
         let strictSoundtrackCopy = mode == .copy && tracks == .audio && project.stillSoundtrack != nil
         let settings = ReencodeSettings(codec: codec,
                                         quality: codec == requestedSettings.codec ? requestedSettings.quality : nil,
-                                        audio: strictSoundtrackCopy && selectedAudio == .auto ? .copyOriginal : selectedAudio)
+                                        audio: strictSoundtrackCopy && selectedAudio == .auto ? .copyOriginal : selectedAudio,
+                                        qualityIsExplicit: codec == requestedSettings.codec && requestedSettings.qualityIsExplicit)
         let explicitAudioTreatment = audioAction.map { $0 != .copyOriginal || source == .multicam } ?? false
         let independentAudio = usesMix || explicitAudioTreatment || soundtrackAudio != nil || audioOutput != .separateTracks ||
             (source == .multicam && requestedSettings.audio != .auto)
@@ -272,7 +273,8 @@ public struct StillExportPlanner: Sendable {
                             if preserveSamples && audio == .pcm && candidate != "mov" { continue }
                             let options = ReencodeSettings(codec: codec,
                                                            quality: codec == settings.codec ? settings.quality : nil,
-                                                           audio: audio)
+                                                           audio: audio,
+                                                           qualityIsExplicit: codec == settings.codec && settings.qualityIsExplicit)
                             do {
                                 let alternative = try plan(project, document: document, timeline: timeline, visible: visible,
                                                            tracks: tracks, audioStream: audioStream, audioTrackOrdinal: audioTrackOrdinal,
@@ -342,7 +344,9 @@ public struct StillExportPlanner: Sendable {
         switch mode {
         case .copy where copies: rung = .copyOtherContainer
         case .smart: rung = .smartTrim
-        default: rung = report.tracks == .audio && audio == .aac ? .convertAAC : .reencode
+        // Auto may keep a lossy soundtrack in its own format, which is a conversion to the same format.
+        default: rung = report.tracks != .audio ? .reencode : audio == .aac ? .convertAAC
+            : [.mp3, .opus].contains(audio) ? .convertSameFormat : .reencode
         }
         var arguments = ["--mode", mode.rawValue]
         if report.tracks != .all { arguments += ["--tracks", report.tracks.rawValue] }

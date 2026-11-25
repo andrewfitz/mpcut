@@ -135,6 +135,49 @@ final class StillPreviewTests: XCTestCase {
         XCTAssertEqual(CVBufferCopyAttachment(input, kCVImageBufferTransferFunctionKey, nil) as? String, pq as String)
     }
 
+    func testSDRPresentationReadsBT2020PictureWithoutMatrixAsBT2020() throws {
+        // VideoToolbox leaves the matrix of a PQ BT.2020 picture that records none unset. The HDR
+        // preview decodes it as BT.2020; Core Image alone would read BT.709 (225 instead of 242 here).
+        func picture(matrix: CFString?) throws -> CVPixelBuffer {
+            var buffer: CVPixelBuffer?
+            let attributes = [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary
+            XCTAssertEqual(CVPixelBufferCreate(nil, 16, 16, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+                                               attributes, &buffer), kCVReturnSuccess)
+            let picture = try XCTUnwrap(buffer)
+            CVPixelBufferLockBaseAddress(picture, [])
+            // A saturated green in 10-bit limited range, high-aligned as VideoToolbox stores it.
+            for (plane, values) in [(0, [UInt16(400)]), (1, [UInt16(300), UInt16(300)])] {
+                let base = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(picture, plane))
+                for row in 0..<CVPixelBufferGetHeightOfPlane(picture, plane) {
+                    let line = base.advanced(by: row * CVPixelBufferGetBytesPerRowOfPlane(picture, plane))
+                        .assumingMemoryBound(to: UInt16.self)
+                    for sample in 0..<CVPixelBufferGetWidthOfPlane(picture, plane) * values.count {
+                        line[sample] = values[sample % values.count] << 6
+                    }
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(picture, [])
+            CVBufferSetAttachment(picture, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020, .shouldPropagate)
+            CVBufferSetAttachment(picture, kCVImageBufferTransferFunctionKey,
+                                  kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, .shouldPropagate)
+            if let matrix { CVBufferSetAttachment(picture, kCVImageBufferYCbCrMatrixKey, matrix, .shouldPropagate) }
+            return picture
+        }
+        func firstPixel(_ buffer: CVPixelBuffer?) throws -> [UInt8] {
+            let buffer = try XCTUnwrap(buffer)
+            CVPixelBufferLockBaseAddress(buffer, .readOnly)
+            defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+            let bytes = try XCTUnwrap(CVPixelBufferGetBaseAddress(buffer)).assumingMemoryBound(to: UInt8.self)
+            return [bytes[2], bytes[1], bytes[0]]
+        }
+        let untagged = try picture(matrix: nil)
+        let mapped = try firstPixel(PreviewTransfer.mapToSDR(untagged))
+        XCTAssertEqual(mapped, try firstPixel(PreviewTransfer.mapToSDR(picture(matrix: kCVImageBufferYCbCrMatrix_ITU_R_2020))))
+        XCTAssertNotEqual(mapped, try firstPixel(PreviewTransfer.mapToSDR(picture(matrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2))))
+        // The shared picture keeps its own description.
+        XCTAssertNil(CVBufferCopyAttachment(untagged, kCVImageBufferYCbCrMatrixKey, nil))
+    }
+
     @MainActor
     func testSoundtrackPreviewKeepsOneSelectedAudioRangeAcrossStills() async throws {
         let movie = try XCTUnwrap(Bundle.module.url(forResource: "Standalone-Multitrack", withExtension: "mov",

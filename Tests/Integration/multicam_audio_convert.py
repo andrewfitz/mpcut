@@ -125,6 +125,48 @@ class MulticamAudioConversionTests(unittest.TestCase):
                 self.assertEqual((lane["codec"], lane["bit_depth"], lane["warnings"]), ("pcm_f64le", 64, []))
                 self.assertEqual(doubles(output), expected[cut:] + expected[:cut])
 
+    def test_auto_keeps_the_single_compressed_format_of_a_rendered_lane(self):
+        noise = ["-f", "lavfi", "-i", "anoisesrc=d=3:c=pink:r=48000:a=0.4:seed=3", "-ac", "2"]
+        alac = self.root / "lane-alac.m4a"
+        mp3 = self.root / "lane-mp3.mp3"
+        opus = self.root / "lane-opus.mka"
+        ffmpeg(*noise, "-c:a", "alac", "-sample_fmt", "s16p", alac)
+        ffmpeg(*noise, "-c:a", "libmp3lame", "-b:a", "192k", mp3)
+        ffmpeg(*noise, "-c:a", "libopus", "-b:a", "96k", opus)
+
+        def integers(path):
+            return ffmpeg("-i", path, "-map", "0:a:0", "-c:a", "pcm_s32le", "-f", "s32le", "-")
+
+        # The reordered assembly needs a render. Auto keeps the lane's own codec where the container carries it,
+        # and otherwise renders the container's codec as before.
+        for source, suffix, codec, reason in [
+            (alac, "mov", "alac", "The ALAC source is written as ALAC at its own word length"),
+            (alac, "mp4", "alac", "The ALAC source is written as ALAC at its own word length"),
+            (alac, "mkv", "pcm_s32le", None),
+            (mp3, "mov", "mp3", "The MP3 source is written as MP3 at its own rate."),
+            # MP3 in Matroska does not keep the planned sample range, so that lane renders PCM as before.
+            (mp3, "mkv", "pcm_f32le", None),
+            (opus, "mkv", "opus", "The Opus source is written as Opus at its own rate."),
+            (opus, "mov", "pcm_f32le", None),
+        ]:
+            with self.subTest(source=source.name, suffix=suffix):
+                output, report = self.export(source, first=source, treatment="auto", suffix=suffix)
+                lane, = report["audio_lanes"]
+                self.assertEqual(lane["codec"], codec)
+                if reason:
+                    self.assertIn(reason, lane.get("reason") or "", lane)
+                else:
+                    self.assertIsNone(lane.get("reason"), lane)
+                written = probe(output, "-select_streams", "a:0", "-show_streams")["streams"][0]
+                self.assertEqual(written["codec_name"], codec)
+                if codec == "alac":
+                    self.assertEqual(lane["bit_depth"], 16)
+                    decoded = integers(source)
+                    cut = 48 * RATE // 25 * 2 * 4
+                    self.assertEqual(integers(output), decoded[cut:] + decoded[:cut])
+                elif codec == "mp3":
+                    self.assertEqual(lane["bit_rate"], 192000)
+
     def test_shared_compressed_decode_matches_individual_reordered_ranges(self):
         coarse = self.root / "shared-aac.mka"
         ffmpeg("-i", self.aac, "-c:a", "copy", coarse)

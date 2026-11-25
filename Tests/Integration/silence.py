@@ -675,7 +675,9 @@ class Silence(unittest.TestCase):
                             "-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8", "-lag-in-frames", "0",
                             "-g", "25", "-c:a", "libopus", source], check=True, timeout=120)
             result = self.cli("--mode", "copy", "--padding-per-side-seconds", "0", "--min-pause-seconds", "1", "--output", output, source)
-            self.assertEqual(spans(result, "segments"), [(1, 5)])
+            # The decoded tone runs from 1.78 to 4.38 s. The copy starts at the keyframe before it and, as
+            # realtime VP9 codes no hidden picture, ends at the first picture boundary after it.
+            self.assertEqual(spans(result, "segments"), [(1, Fraction(22, 5))])
             self.assertEqual(result["silence"]["shortened_pauses"], 2)
             self.assertEqual(seconds(result["encoded_duration"]), 0)
 

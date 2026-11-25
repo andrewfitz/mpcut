@@ -98,6 +98,8 @@ struct PreviewFrame: @unchecked Sendable {
     var sourcePicture: SequenceSourcePicture? = nil
     var timelinePictureTime: RationalTime? = nil
     var privacyCoverNote: String? = nil
+    /// Set when FFmpeg decoded this picture in place of AVFoundation: why. The viewer's status says so.
+    var decoderNote: String? = nil
 
     func tagged(transfer: String?, cameraTransfer: String? = nil) -> Self {
         var result = self
@@ -443,6 +445,11 @@ final class LatestPreviewWork: @unchecked Sendable {
     }
 }
 
+/// The viewer status line for a picture FFmpeg decoded (with VideoToolbox) in place of AVFoundation.
+func ffmpegDecoderNote(_ reason: String?) -> String {
+    "Decoded by FFmpeg with VideoToolbox" + (reason.map { " because AVFoundation could not: \($0)" } ?? ".")
+}
+
 private final class DecodeRequests: @unchecked Sendable {
     let queue: DispatchQueue
     let pictureWork = LatestPreviewWork()
@@ -453,6 +460,7 @@ private final class DecodeRequests: @unchecked Sendable {
     private var recent = ScrubFrameCache()
     private var fallback = FFPreviewReader(videoOnly: true)
     private var fallbackURL: URL?
+    private var fallbackReason: String?
 
     init(label: String, qos: DispatchQoS) {
         queue = DispatchQueue(label: label, qos: qos)
@@ -476,6 +484,7 @@ private final class DecodeRequests: @unchecked Sendable {
             self.recent = ScrubFrameCache()
             self.fallback = FFPreviewReader(videoOnly: true)
             self.fallbackURL = nil
+            self.fallbackReason = nil
         }
     }
 
@@ -491,17 +500,22 @@ private final class DecodeRequests: @unchecked Sendable {
                     }
                     if let frame = try decoder?.frame(at: time, before: end, cancelled: cancelled) { return frame }
                     if !pictureOnlyFallback { return nil }
+                    fallbackReason = "AVFoundation returned no picture at this position."
                 } catch {
                     guard pictureOnlyFallback, !cancelled() else { throw error }
+                    fallbackReason = error.localizedDescription
                 }
                 fallbackURL = url
             }
             let end = end ?? .infinity
-            return try fallback.perform(cancelled: cancelled) {
+            var frame = try fallback.perform(cancelled: cancelled) {
                 let seekTime = time == end ? max(0, time - 0.001) : time
                 try fallback.seek(url: url, to: seekTime)
                 return try fallback.still(at: time, before: end, cancelled: cancelled)
             }
+            // The same VideoToolbox decoder, reached through FFmpeg. Say so rather than switch silently.
+            frame?.decoderNote = ffmpegDecoderNote(fallbackReason)
+            return frame
         }
         if !scrubbing { return try decode() }
         return try recent.frame(url: url, at: time, before: end, decode: decode)
@@ -585,6 +599,25 @@ final class SequencePreview: ObservableObject {
     private var issueAllowsRetry = false
     var hasBlockingIssue: Bool { issue != nil && !issueAllowsRetry }
     @Published private(set) var audioWarning: String?
+    /// Pictures the FFmpeg preview omitted in this playback pass, and why. Shown beside the picture.
+    @Published private(set) var pictureNotice: String?
+    /// Why the FFmpeg preview replaced AVFoundation for this sequence, when it did.
+    private(set) var fallbackReason: String?
+    var usesFallbackDecoder: Bool { fallback != nil }
+
+    /// What the viewer shows about the preview, and which decoder plays it, for project_editor_state_read.
+    var mcpState: [String: Any] {
+        var state: [String: Any] = ["decoder": usesFallbackDecoder ? "ffmpeg" : "avfoundation",
+                                    "blocking": hasBlockingIssue]
+        state["issue"] = issue
+        state["audio_warning"] = audioWarning
+        state["picture_notice"] = pictureNotice
+        state["picture_issue"] = programPictureIssue
+        state["fallback_reason"] = usesFallbackDecoder ? fallbackReason : nil
+        // A paused picture can come from FFmpeg even while AVFoundation plays (DecodeRequests).
+        state["picture_decoder_note"] = frame?.decoderNote
+        return state
+    }
 
     @Published var volume: Float = 1 {
         didSet {
@@ -781,6 +814,8 @@ final class SequencePreview: ObservableObject {
         issueAllowsRetry = false
         canPlayWithoutPicture = false
         audioWarning = nil
+        pictureNotice = nil
+        fallbackReason = nil
         clearPicture()
         removeAudioItem()
         guard !ranges.isEmpty else {
@@ -959,6 +994,8 @@ final class SequencePreview: ObservableObject {
         removeAudioItem()
         audioPlayer = nil
         let generation = sequenceGeneration
+        fallbackReason = nativeIssue ?? (ranges.contains(where: \.usesMP3GaplessClock)
+            ? "Only the FFmpeg preview reads MP3 gapless timing." : nil)
         let alternative = WebSequencePlayback(ranges: ranges, screen: { [weak self] in self?.playbackScreen }, onFrame: { [weak self] frame in
             guard let self, self.sequenceGeneration == generation,
                   self.auditionPosition != nil || !self.showingProgramStill else { return }
@@ -966,7 +1003,8 @@ final class SequencePreview: ObservableObject {
             self.programPictureIssue = nil
             self.issueAllowsRetry = false
             self.canPlayWithoutPicture = false
-            let tagged = frame.tagged(transfer: self.auditionPosition == nil ? self.programTransfer : nil)
+            var tagged = frame.tagged(transfer: self.auditionPosition == nil ? self.programTransfer : nil)
+            tagged.decoderNote = tagged.decoderNote ?? ffmpegDecoderNote(self.fallbackReason)
             self.frame = tagged
             let clock = self.auditionPosition == nil ? (tagged.timelinePictureTime ?? timelineRationalTime(self.time)) : nil
             self.displayParticipantPicture(tagged, at: clock)
@@ -987,7 +1025,7 @@ final class SequencePreview: ObservableObject {
         }, onIssue: { [weak self] error in
             guard let self, self.sequenceGeneration == generation else { return }
             self.clearPicture()
-            self.canPlayWithoutPicture = error == WebSequencePlayback.damagedPicture
+            self.canPlayWithoutPicture = WebSequencePlayback.omittedPictures.contains(error)
             self.issueAllowsRetry = error == WebSequencePlayback.undecodableAudio || self.canPlayWithoutPicture
             self.issue = nativeIssue.map { "\(error) \($0)" } ?? error
             self.pause()
@@ -1000,6 +1038,9 @@ final class SequencePreview: ObservableObject {
             self.canPlayWithoutPicture = true
             self.issue = nil
             self.issueAllowsRetry = false
+        }, onPictureNotice: { [weak self] message in
+            guard let self, self.sequenceGeneration == generation else { return }
+            self.pictureNotice = message
         }, separatesPicture: programStills != nil)
         alternative.setGain(isMuted ? 0 : volume)
         fallback = alternative

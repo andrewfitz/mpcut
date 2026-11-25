@@ -311,7 +311,9 @@ final class PreviewSurface: NSView {
         let display = window?.screen?.localizedName ?? "display unresolved"
         let details = ["Source \(transfer?.source ?? "unresolved")",
                        "program \(transfer?.program ?? "unresolved")", display].joined(separator: ", ")
-        let description = "\(status). \(details). \(reason ?? "")"
+        // Which decoder made the picture belongs with how it is shown (FFmpeg after an AVFoundation failure).
+        let description = ["\(status). \(details). \(reason ?? "")", frame?.decoderNote ?? ""]
+            .filter { !$0.isEmpty }.joined(separator: " ")
         if badge.stringValue != status { badge.stringValue = status }
         let error = status == "Unavailable" || status == "Covered" ? reason ?? "" : ""
         if failure.stringValue != error { failure.stringValue = error }

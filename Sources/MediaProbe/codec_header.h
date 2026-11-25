@@ -12,6 +12,13 @@ bool mp_h26x_random_access(const AVPacket *packet, const AVCodecParameters *para
 
 bool mp_h26x_no_leading_random_access(const AVPacket *packet, const AVCodecParameters *params);
 
+/* Whether an H.264 NAL unit belongs to pictures beside the primary coded picture: an auxiliary coded picture (alpha),
+ * a subset sequence parameter set, a prefix unit or a slice extension of MVC or SVC, or a sequence parameter set
+ * extension that declares an auxiliary picture format. A decoder of the primary pictures ignores them all. */
+bool mp_h264_layer_unit(const uint8_t *unit, size_t size);
+/* Whether an H.264 sample (avcC length-prefixed, or Annex B) holds such a unit. */
+bool mp_h264_layered(const AVPacket *packet, const AVCodecParameters *params);
+
 static inline bool mp_hevc_multilayer_unit(const uint8_t *unit, size_t size)
 {
     if (size < 2)

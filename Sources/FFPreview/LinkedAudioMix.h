@@ -9,5 +9,6 @@ void linked_mix_preserve_surround(LinkedAudioMix *);
 void linked_mix_close(LinkedAudioMix *);
 bool linked_mix_has_audio(const LinkedAudioMix *);
 bool linked_mix_unavailable(const LinkedAudioMix *);
+bool linked_mix_met_audio_damage(const LinkedAudioMix *);
 bool linked_mix_seek(LinkedAudioMix *, double seconds);
 int linked_mix_next(LinkedAudioMix *, CMSampleBufferRef *);

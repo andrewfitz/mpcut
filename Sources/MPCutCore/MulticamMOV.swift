@@ -5,7 +5,9 @@ enum MulticamMOV {
         try combine(picture: Optional(picture), sounds: [sound], output: output, progress: progress)
     }
 
-    static func combine(picture: URL?, sounds: [URL], output: URL, progress: (Double) throws -> Void) throws {
+    /// `chapters` adds a QuickTime chapter track whose samples follow the lanes' media (MulticamChapterTrack).
+    static func combine(picture: URL?, sounds: [URL], output: URL, chapters: MulticamChapterTrack? = nil,
+                        progress: (Double) throws -> Void) throws {
         var lanes: [Lane] = []
         defer { for lane in lanes { try? lane.file.close() } }
         for url in [picture].compactMap({ $0 }) + sounds {
@@ -22,8 +24,15 @@ enum MulticamMOV {
             guard !overflow, end <= UInt64(Int64.max) else { throw invalidMovie }
             mediaEnd = end
         }
+        let chapterStart = mediaEnd
+        if let chapters {
+            let (end, overflow) = mediaEnd.addingReportingOverflow(UInt64(chapters.samples.count))
+            guard !overflow, end <= UInt64(Int64.max) else { throw invalidMovie }
+            mediaEnd = end
+        }
         let mediaSize = mediaEnd - UInt64(prefix.count)
-        let movie = try merge(lanes: lanes, starts: starts, audioAlternatesFrom: sounds.count > 1 ? (picture == nil ? 0 : 1) : nil)
+        let movie = try merge(lanes: lanes, starts: starts, audioAlternatesFrom: sounds.count > 1 ? (picture == nil ? 0 : 1) : nil,
+                              chapters: chapters.map { ($0, chapterStart) })
 
         guard FileManager.default.createFile(atPath: output.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
             throw CutError(code: "write_failed", message: "Could not create the staged multicam movie.")
@@ -49,6 +58,7 @@ enum MulticamMOV {
                 try progress(Double(copied) / Double(mediaSize))
             }
         }
+        if let chapters { try writer.write(contentsOf: chapters.samples) }
         try writer.write(contentsOf: movie)
         try writer.close()
     }
@@ -112,11 +122,12 @@ enum MulticamMOV {
         try writer.close()
     }
 
-    private static var invalidMovie: CutError {
+    static var invalidMovie: CutError {
         CutError(code: "write_failed", message: "The staged video or audio movie has an unsupported track or media layout.")
     }
 
-    private static func merge(lanes: [Lane], starts: [UInt64], audioAlternatesFrom: Int?) throws -> Data {
+    private static func merge(lanes: [Lane], starts: [UInt64], audioAlternatesFrom: Int?,
+                              chapters: (track: MulticamChapterTrack, offset: UInt64)? = nil) throws -> Data {
         let parts = try lanes.map { try children(of: $0.movie) }
         let headers = try parts.map { try only("mvhd", in: $0) }
         let clocks = try headers.map { try movieClock($0.data) }
@@ -145,6 +156,8 @@ enum MulticamMOV {
         var duration: UInt64 = 0
         var nextID: UInt32 = 1
         var tracks = Data()
+        // Each lane track takes the next ID, so a chapter track numbers after all of them.
+        let chapterID = UInt32(clamping: parts.reduce(1) { $0 + $1.filter { $0.type == "trak" }.count })
         for index in lanes.indices {
             let entries = parts[index].filter { $0.type == "trak" }
             guard !entries.isEmpty else { throw invalidMovie }
@@ -166,8 +179,17 @@ enum MulticamMOV {
                 let track = try relocate(entry.data, lane: lanes[index], destination: starts[index],
                                          ids: ids, from: clocks[index].rate, to: rate, enabledInAlternateGroup: enabledInAlternateGroup)
                 duration = max(duration, track.duration)
-                tracks.append(try box("trak", track.data))
+                let referenced = try chapters.map { _ in try MulticamChapterTrack.referencing(track.data, chapterTrack: chapterID) }
+                    ?? track.data
+                tracks.append(try box("trak", referenced))
             }
+        }
+        if let chapters {
+            guard nextID == chapterID else { throw invalidMovie }
+            let track = try chapters.track.trak(id: chapterID, movieRate: rate, offset: chapters.offset)
+            duration = max(duration, track.duration)
+            tracks.append(track.data)
+            nextID += 1
         }
         var header = headers[0].data
         let clock = clocks[0]
@@ -364,18 +386,18 @@ enum MulticamMOV {
         var contentSize: UInt64 { size - header }
     }
 
-    private struct Child {
+    struct Child {
         let type: String
         let data: Data
     }
 
-    private static func only(_ type: String, in children: [Child]) throws -> Child {
+    static func only(_ type: String, in children: [Child]) throws -> Child {
         let matches = children.filter { $0.type == type }
         guard matches.count == 1, let value = matches.first else { throw invalidMovie }
         return value
     }
 
-    private static func children(of data: Data) throws -> [Child] {
+    static func children(of data: Data) throws -> [Child] {
         var children: [Child] = []
         var cursor = 0
         while cursor < data.count {
@@ -387,7 +409,7 @@ enum MulticamMOV {
         return children
     }
 
-    private static func box(_ type: String, _ data: Data) throws -> Data {
+    static func box(_ type: String, _ data: Data) throws -> Data {
         guard let size = UInt32(exactly: data.count + 8) else { throw invalidMovie }
         var value = Data()
         value.reserveCapacity(Int(size))

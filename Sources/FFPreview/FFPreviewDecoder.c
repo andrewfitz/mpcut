@@ -6,6 +6,10 @@
 #include <libavformat/avformat.h>
 #include <libavutil/hwcontext_videotoolbox.h>
 #include <libavutil/display.h>
+#include <libavutil/intreadwrite.h>
+#include <libavutil/mem.h>
+#include <limits.h>
+#include <libavutil/pixdesc.h>
 #include <libswresample/swresample.h>
 #include <math.h>
 #include <float.h>
@@ -47,6 +51,34 @@ struct MPPreviewDecoder {
     bool eof;
     bool awaiting_keyframe;
     bool encoding_edge;
+    uint8_t *edge_sets;    /* Parameter sets the source holds at the edge's keyframe (mp_preview_prime_edge). */
+    int edge_sets_size;
+    int edge_length_size;
+    bool prime_pending;    /* The next video packet sent is the edge's keyframe, which brings edge_sets first. */
+    /* A MOV track can change its sample description at a keyframe. The demuxer reports the new one
+     * (AV_PKT_DATA_NEW_EXTRADATA) on the first packet it reads under it, relative to the packet it read
+     * before, whether or not that packet reached the decoder. */
+    uint8_t *description;          /* The description of the video packets read last. */
+    int description_size;
+    uint8_t *decoder_description;  /* The description the video decoder was opened with. */
+    int decoder_description_size;
+    AVPacket *held;                /* A keyframe under a new description, held while the decoder drains. */
+    bool switching;                /* The video decoder is draining before it reopens with `description`. */
+    bool video_fed;                /* A packet reached the video decoder since it was opened or flushed. */
+    bool unaligned_switch;         /* The description changed at a picture that is not a keyframe. */
+    /* The decoder was reopened mid-stream at an HEVC CRA picture. libavcodec then starts a coded sequence there and
+     * drops the CRA's RASL pictures, which predict from pictures the old decoder held. */
+    bool watch_leading;
+    int leading_count;             /* RASL pictures dropped that way since the last seek. */
+    int64_t leading_key, leading_first, leading_last;
+    char leading_notice[320];
+    bool audio_damage;             /* The audio decoder rejected a packet, which is silent. */
+    bool edge_metadata;
+    bool sequence_metadata;
+    /* Edge: presentation times of the samples sent from the first one since the keyframe with SEI an encode drops
+     * (mp_preview_sample_keeps_sei) on. A frame's own packet is known by its presentation time. */
+    int64_t *kept_sei_pts;
+    int kept_sei_count, kept_sei_capacity;
     int64_t origin;
     CMTime timeline_origin;
     MPPreviewCancelled cancelled;
@@ -86,6 +118,18 @@ static enum AVPixelFormat hardware_format(AVCodecContext *codec, const enum AVPi
                 preview->verified_session = NULL;
             }
             clear_hardware(&preview->hardware);
+            // FFmpeg's session description carries no color, so an RGB surface from it is
+            // converted with the matrix VideoToolbox guesses from the picture size. 8-bit 4:2:0
+            // stays YCbCr, and Core Animation applies the stream's own matrix, as in the
+            // native preview. Deeper pictures keep VideoToolbox's choice; a Smart Trim edge
+            // requests its own format.
+            if (!preview->encoding_edge) {
+                const AVPixFmtDescriptor *software = av_pix_fmt_desc_get(codec->sw_pix_fmt);
+                const bool plain = software && software->comp[0].depth == 8 && software->log2_chroma_w == 1 &&
+                    software->log2_chroma_h == 1 && !(software->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_ALPHA));
+                preview->hardware.cv_pix_fmt_type = !plain ? 0 : codec->color_range == AVCOL_RANGE_JPEG
+                    ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+            }
             codec->hwaccel_context = &preview->hardware;
             return *formats;
         }
@@ -126,6 +170,122 @@ static int find_stream(const AVFormatContext *format, enum AVMediaType type, int
     return -1;
 }
 
+static bool same_bytes(const uint8_t *a, int a_size, const uint8_t *b, int b_size)
+{
+    return a_size == b_size && (a_size <= 0 || !memcmp(a, b, (size_t)a_size));
+}
+
+enum { MAX_DESCRIPTION_UNITS = 64 };
+
+typedef struct {
+    int length_size, count;
+    const uint8_t *data[MAX_DESCRIPTION_UNITS];
+    int size[MAX_DESCRIPTION_UNITS];
+} DescriptionUnits;
+
+/* The parameter sets of an avcC or hvcC record, which hold no other NAL units. False for another form. */
+static bool description_units(enum AVCodecID codec, const uint8_t *p, int size, DescriptionUnits *units)
+{
+    const uint8_t *end = p + size;
+    units->count = 0;
+    if (size < (codec == AV_CODEC_ID_HEVC ? 23 : 7) || p[0] != 1)
+        return false;
+    int groups = codec == AV_CODEC_ID_HEVC ? p[22] : 2;
+    units->length_size = (p[codec == AV_CODEC_ID_HEVC ? 21 : 4] & 3) + 1;
+    p += codec == AV_CODEC_ID_HEVC ? 23 : 5;
+    for (int group = 0; group < groups; group++) {
+        int count;
+        if (codec == AV_CODEC_ID_HEVC) {
+            if (end - p < 3)
+                return false;
+            count = AV_RB16(p + 1);
+            p += 3;
+        } else {
+            if (end - p < 1)
+                return false;
+            count = group ? p[0] : p[0] & 0x1f;
+            p++;
+        }
+        for (int i = 0; i < count; i++) {
+            if (end - p < 2 || end - p - 2 < AV_RB16(p) || units->count == MAX_DESCRIPTION_UNITS)
+                return false;
+            units->data[units->count] = p + 2;
+            units->size[units->count++] = AV_RB16(p);
+            p += 2 + AV_RB16(p);
+        }
+    }
+    return true;
+}
+
+static bool holds_units(const DescriptionUnits *a, const DescriptionUnits *b)
+{
+    for (int i = 0; i < a->count; i++) {
+        bool found = false;
+        for (int j = 0; j < b->count && !found; j++)
+            found = a->size[i] == b->size[j] && !memcmp(a->data[i], b->data[j], (size_t)a->size[i]);
+        if (!found)
+            return false;
+    }
+    return true;
+}
+
+/* Whether a decoder opened with one description decodes the samples of the other alike: the same bytes, or for
+ * H.264 and HEVC the same parameter sets and NAL unit length, however they are listed. */
+static bool same_description(const MPPreviewDecoder *preview, const uint8_t *a, int a_size, const uint8_t *b, int b_size)
+{
+    if (same_bytes(a, a_size, b, b_size))
+        return true;
+    enum AVCodecID codec = preview->format->streams[preview->video.index]->codecpar->codec_id;
+    DescriptionUnits first, second;
+    return (codec == AV_CODEC_ID_H264 || codec == AV_CODEC_ID_HEVC) &&
+        description_units(codec, a, a_size, &first) && description_units(codec, b, b_size, &second) &&
+        first.length_size == second.length_size && holds_units(&first, &second) && holds_units(&second, &first);
+}
+
+static bool copy_bytes(uint8_t **destination, int *destination_size, const uint8_t *source, int size)
+{
+    uint8_t *copy = NULL;
+    if (size > 0 && !(copy = av_memdup(source, (size_t)size)))
+        return false;
+    av_free(*destination);
+    *destination = copy;
+    *destination_size = size > 0 ? size : 0;
+    return true;
+}
+
+/* Opens a video decoder for the stream with `extradata` in place of the description it was probed with. */
+static AVCodecContext *open_video_codec(MPPreviewDecoder *preview, const uint8_t *extradata, int size)
+{
+    const AVStream *source = preview->format->streams[preview->video.index];
+    const AVCodec *decoder = find_video_decoder(source->codecpar->codec_id);
+    AVCodecContext *codec = decoder ? avcodec_alloc_context3(decoder) : NULL;
+    if (!codec)
+        return NULL;
+    if (avcodec_parameters_to_context(codec, source->codecpar) < 0)
+        goto failure;
+    av_freep(&codec->extradata);
+    codec->extradata_size = 0;
+    if (size > 0) {
+        if (!(codec->extradata = av_mallocz((size_t)size + AV_INPUT_BUFFER_PADDING_SIZE)))
+            goto failure;
+        memcpy(codec->extradata, extradata, (size_t)size);
+        codec->extradata_size = size;
+    }
+    codec->pkt_timebase = source->time_base;
+    codec->thread_count = 1;
+    codec->opaque = preview;
+    codec->get_format = hardware_format;
+    if (preview->encoding_edge)
+        codec->err_recognition |= AV_EF_EXPLODE;
+    if (avcodec_open2(codec, decoder, NULL) < 0)
+        goto failure;
+    return codec;
+
+failure:
+    avcodec_free_context(&codec);
+    return NULL;
+}
+
 static bool open_stream(MPPreviewDecoder *preview, PreviewStream *stream, int index, enum AVMediaType type)
 {
     const AVCodec *decoder = NULL;
@@ -133,9 +293,16 @@ static bool open_stream(MPPreviewDecoder *preview, PreviewStream *stream, int in
     if (stream->index < 0)
         return false;
     AVStream *source = preview->format->streams[stream->index];
-    decoder = type == AVMEDIA_TYPE_VIDEO
-        ? find_video_decoder(source->codecpar->codec_id)
-        : avcodec_find_decoder(source->codecpar->codec_id);
+    if (type == AVMEDIA_TYPE_VIDEO) {
+        const AVCodecParameters *parameters = source->codecpar;
+        if (!copy_bytes(&preview->description, &preview->description_size, parameters->extradata, parameters->extradata_size) ||
+            !copy_bytes(&preview->decoder_description, &preview->decoder_description_size,
+                        parameters->extradata, parameters->extradata_size))
+            return false;
+        stream->codec = open_video_codec(preview, parameters->extradata, parameters->extradata_size);
+        return stream->codec != NULL;
+    }
+    decoder = avcodec_find_decoder(source->codecpar->codec_id);
     if (!decoder)
         return false;
     AVCodecContext *codec = avcodec_alloc_context3(decoder);
@@ -145,10 +312,6 @@ static bool open_stream(MPPreviewDecoder *preview, PreviewStream *stream, int in
         goto failure;
     codec->pkt_timebase = source->time_base;
     codec->thread_count = 1;
-    if (type == AVMEDIA_TYPE_VIDEO) {
-        codec->opaque = preview;
-        codec->get_format = hardware_format;
-    }
     if (avcodec_open2(codec, decoder, NULL) < 0)
         goto failure;
     stream->codec = codec;
@@ -157,6 +320,31 @@ static bool open_stream(MPPreviewDecoder *preview, PreviewStream *stream, int in
 failure:
     avcodec_free_context(&codec);
     return false;
+}
+
+/* Reopen the drained or flushed video decoder with the description of the packets read last. FFmpeg's
+ * VideoToolbox decoder keeps the session it made from the parameter sets it held then, and an H.264
+ * description or an HEVC one that keeps its sequence parameter set does not replace it, so the new
+ * pictures would be decoded with the old picture or sequence parameter sets. */
+static bool reopen_video(MPPreviewDecoder *preview)
+{
+    AVCodecContext *codec = open_video_codec(preview, preview->description, preview->description_size);
+    if (!codec || !copy_bytes(&preview->decoder_description, &preview->decoder_description_size,
+                              preview->description, preview->description_size)) {
+        avcodec_free_context(&codec);
+        return false;
+    }
+    avcodec_free_context(&preview->video.codec);
+    if (preview->verified_session) {
+        CFRelease(preview->verified_session);
+        preview->verified_session = NULL;
+    }
+    clear_hardware(&preview->hardware);
+    preview->video.codec = codec;
+    preview->video.drained = false;
+    preview->video_fed = false;
+    preview->switching = false;
+    return true;
 }
 
 MPPreviewDecoder *mp_preview_open(const char *path, enum MPPreviewTracks tracks, int audio_ordinal, CMTime origin,
@@ -168,9 +356,10 @@ MPPreviewDecoder *mp_preview_open(const char *path, enum MPPreviewTracks tracks,
     if (!preview)
         return NULL;
     preview->packet = av_packet_alloc();
+    preview->held = av_packet_alloc();
     preview->frame = av_frame_alloc();
     preview->format = avformat_alloc_context();
-    if (!preview->packet || !preview->frame || !preview->format)
+    if (!preview->packet || !preview->held || !preview->frame || !preview->format)
         goto failure;
     preview->cancelled = cancelled;
     preview->cancel_context = context;
@@ -286,6 +475,74 @@ const AVStream *mp_preview_prepare_edge(MPPreviewDecoder *preview)
     return stream;
 }
 
+bool mp_preview_prime_edge(MPPreviewDecoder *preview, const uint8_t *units, int size)
+{
+    if (!preview || !preview->encoding_edge || !units || size <= 0)
+        return false;
+    const AVCodecParameters *codec = preview->format->streams[preview->video.index]->codecpar;
+    int offset = codec->codec_id == AV_CODEC_ID_HEVC ? 21 : codec->codec_id == AV_CODEC_ID_H264 ? 4 : -1;
+    if (offset < 0 || codec->extradata_size <= offset || codec->extradata[0] != 1)
+        return false;
+    uint8_t *copy = av_memdup(units, (size_t)size);
+    if (!copy)
+        return false;
+    av_free(preview->edge_sets);
+    preview->edge_sets = copy;
+    preview->edge_sets_size = size;
+    preview->edge_length_size = (codec->extradata[offset] & 3) + 1;
+    return true;
+}
+
+/* Put NAL units with 4-byte lengths into a sample whose NAL units have `width`-byte lengths, after any access
+ * unit delimiter. */
+static int insert_units(const MPPreviewDecoder *preview, AVPacket *packet, const uint8_t *units, int size, int width)
+{
+    const bool hevc = preview->format->streams[preview->video.index]->codecpar->codec_id == AV_CODEC_ID_HEVC;
+    int total = 0;
+    for (int at = 0; at <= size - 4; at += 4 + (int)AV_RB32(units + at)) {
+        uint32_t length = AV_RB32(units + at);
+        if ((width < 4 && length >> (8 * width)) || length > (uint32_t)(INT_MAX / 4))
+            return AVERROR(ERANGE);
+        total += width + (int)length;
+    }
+    int offset = 0;
+    if (packet->size > width) {
+        uint32_t length = 0;
+        for (int i = 0; i < width; i++)
+            length = length << 8 | packet->data[i];
+        unsigned type = hevc ? (packet->data[width] >> 1) & 0x3f : packet->data[width] & 0x1f;
+        if ((hevc ? type == 35 : type == 9) && length <= (uint32_t)(packet->size - width))
+            offset = width + (int)length;
+    }
+    int old_size = packet->size;
+    int result = total > INT_MAX / 2 - old_size ? AVERROR(ERANGE) : av_packet_make_writable(packet);
+    if (result >= 0)
+        result = av_grow_packet(packet, total);
+    if (result < 0)
+        return result;
+    memmove(packet->data + offset + total, packet->data + offset, (size_t)(old_size - offset));
+    uint8_t *q = packet->data + offset;
+    for (int at = 0; at <= size - 4; at += 4 + (int)AV_RB32(units + at)) {
+        uint32_t length = AV_RB32(units + at);
+        for (int i = 0; i < width; i++)
+            q[i] = (uint8_t)(length >> (8 * (width - 1 - i)));
+        memcpy(q + width, units + at + 4, length);
+        q += width + length;
+    }
+    return 0;
+}
+
+/* Put edge_sets into the keyframe packet an edge starts from. Its NAL units have the lengths of the description the
+ * decoder holds, which the edge's keyframe may have just brought. */
+static int prime_packet(MPPreviewDecoder *preview, AVPacket *packet)
+{
+    const bool hevc = preview->format->streams[preview->video.index]->codecpar->codec_id == AV_CODEC_ID_HEVC;
+    const int at = hevc ? 21 : 4;
+    const int width = preview->decoder_description_size > at && preview->decoder_description[0] == 1
+        ? (preview->decoder_description[at] & 3) + 1 : preview->edge_length_size;
+    return insert_units(preview, packet, preview->edge_sets, preview->edge_sets_size, width);
+}
+
 void mp_preview_coded_size(const MPPreviewDecoder *preview, int *width, int *height)
 {
     *width = preview->video.codec ? preview->video.codec->coded_width : 0;
@@ -307,8 +564,13 @@ void mp_preview_close(MPPreviewDecoder *preview)
     clear_hardware(&preview->hardware);
     avcodec_free_context(&preview->video.codec);
     avcodec_free_context(&preview->audio.codec);
+    av_free(preview->edge_sets);
+    av_free(preview->kept_sei_pts);
+    av_free(preview->description);
+    av_free(preview->decoder_description);
     av_frame_free(&preview->frame);
     av_packet_free(&preview->packet);
+    av_packet_free(&preview->held);
     if (preview->video_description)
         CFRelease(preview->video_description);
     if (preview->audio_description)
@@ -402,6 +664,57 @@ static int seek_transport_stream(MPPreviewDecoder *preview, int64_t target, int6
     return av_seek_frame(preview->format, -1, 0, AVSEEK_FLAG_BYTE);
 }
 
+static bool note_description(MPPreviewDecoder *preview, const AVPacket *packet);
+
+/* Empty the video decoder. FFmpeg's HEVC decoder keeps the pictures it has queued for output through a flush (its
+ * output FIFO), so a picture from before a seek would be returned after it. Receive and drop them. */
+static void flush_video(MPPreviewDecoder *preview)
+{
+    avcodec_flush_buffers(preview->video.codec);
+    for (int i = 0; i < 64 && avcodec_receive_frame(preview->video.codec, preview->frame) == 0; i++)
+        av_frame_unref(preview->frame);
+}
+
+/* Seek so that decoding starts at a keyframe presented at or before `desired`. MOV and MP4 index decode times, so
+ * a backward seek can land on an HEVC CRA picture presented after the target, whose RASL pictures, the target
+ * among them, a decoder starting there drops without a word. Step back until the first picture is not late. */
+static int seek_keyframe(MPPreviewDecoder *preview, int64_t desired)
+{
+    int64_t timestamp = desired, landed = AV_NOPTS_VALUE;
+    for (int attempt = 0; attempt < 8; attempt++) {
+        int result = av_seek_frame(preview->format, preview->video.index, timestamp, AVSEEK_FLAG_BACKWARD);
+        if (result < 0)
+            return attempt ? av_seek_frame(preview->format, preview->video.index, desired, AVSEEK_FLAG_BACKWARD) : result;
+        int64_t pts = AV_NOPTS_VALUE, dts = AV_NOPTS_VALUE;
+        for (int read = 0; read < 256 && !preview_cancelled(preview) &&
+             av_read_frame(preview->format, preview->packet) >= 0; read++) {
+            bool video = preview->packet->stream_index == preview->video.index;
+            bool key = preview->packet->flags & AV_PKT_FLAG_KEY;
+            // The demuxer reports a new description relative to the packet it read last, this one included.
+            bool noted = !video || note_description(preview, preview->packet);
+            pts = preview->packet->pts;
+            dts = preview->packet->dts;
+            av_packet_unref(preview->packet);
+            if (!noted)
+                return AVERROR(ENOMEM);
+            if (video) {
+                if (!key)
+                    pts = AV_NOPTS_VALUE;
+                break;
+            }
+            pts = AV_NOPTS_VALUE;
+        }
+        if (pts == AV_NOPTS_VALUE || pts <= desired)
+            return av_seek_frame(preview->format, preview->video.index, timestamp, AVSEEK_FLAG_BACKWARD);
+        // Nothing earlier to start from (the stream's first keyframe): seek as before.
+        if (pts == landed || dts == AV_NOPTS_VALUE || dts <= INT64_MIN + 1)
+            break;
+        landed = pts;
+        timestamp = FFMIN(timestamp, dts) - 1;
+    }
+    return av_seek_frame(preview->format, preview->video.index, desired, AVSEEK_FLAG_BACKWARD);
+}
+
 static bool seek_preview(MPPreviewDecoder *preview, double seconds, bool from_timeline_origin)
 {
     if (!isfinite(seconds) || seconds < 0 || seconds * AV_TIME_BASE >= 0x1p63)
@@ -455,13 +768,12 @@ static bool seek_preview(MPPreviewDecoder *preview, double seconds, bool from_ti
         if (ticks >= 0x1p63L || (start > 0 && (int64_t)ticks > INT64_MAX - start))
             return false;
         int64_t desired = start + (int64_t)ticks;
-        result = transport_stream ? seek_transport_stream(preview, target, desired) :
-            av_seek_frame(preview->format, preview->video.index, desired, AVSEEK_FLAG_BACKWARD);
+        result = transport_stream ? seek_transport_stream(preview, target, desired) : seek_keyframe(preview, desired);
     }
     if (result < 0)
         return false;
     if (preview->video.codec)
-        avcodec_flush_buffers(preview->video.codec);
+        flush_video(preview);
     if (preview->audio.codec)
         avcodec_flush_buffers(preview->audio.codec);
     swr_free(&preview->resampler);
@@ -470,6 +782,16 @@ static bool seek_preview(MPPreviewDecoder *preview, double seconds, bool from_ti
     preview->receiving = NULL;
     preview->eof = false;
     preview->awaiting_keyframe = true;
+    preview->prime_pending = preview->edge_sets != NULL;
+    // The next keyframe reopens the flushed decoder if its description is not the one it holds.
+    av_packet_unref(preview->held);
+    preview->switching = false;
+    preview->video_fed = false;
+    preview->unaligned_switch = false;
+    preview->watch_leading = false;
+    preview->leading_count = 0;
+    preview->audio_damage = false;
+    preview->kept_sei_count = 0;
     // A damaged packet silences the rest of that pass only. A missing decoder stays unavailable.
     if (preview->audio.codec)
         preview->audio_unavailable = false;
@@ -525,6 +847,72 @@ static bool using_hardware(MPPreviewDecoder *preview)
     return hardware;
 }
 
+// The native preview shows a field a picture leaves unspecified the way VideoToolbox tags it
+// from an MP4 or MOV description (measured on macOS 27; frame export in jpeg_frames.c keeps the
+// same rule, and also names for Core Image the transfer Core Animation gives primaries recorded
+// without one). With no color recorded at all it goes by size: larger than 704x576 is BT.709,
+// smaller is BT.601 with SMPTE C primaries, or EBU Tech 3213 at exactly 704x576, with the BT.709
+// transfer. When every recorded field is BT.709 or BT.601 (SMPTE 170M), a missing matrix is
+// BT.709 for BT.709 primaries and otherwise BT.601, missing primaries follow the matrix and a
+// missing transfer is BT.709. Other recorded values leave the missing primaries and transfer
+// unspecified, and a missing matrix is BT.601, as Core Animation decodes it, also for BT.2020
+// primaries. A PQ or HLG picture with recorded primaries takes BT.2020 for BT.2020 primaries and
+// otherwise BT.709, as Core Animation decodes it and Core Image maps its SDR preview.
+static void tag_unspecified_color(CVPixelBufferRef image, const AVFrame *frame)
+{
+    enum AVColorSpace matrix = frame->colorspace;
+    enum AVColorPrimaries primaries = frame->color_primaries;
+    bool fills = true;
+    if (matrix == AVCOL_SPC_UNSPECIFIED && primaries == AVCOL_PRI_UNSPECIFIED && frame->color_trc == AVCOL_TRC_UNSPECIFIED) {
+        const bool hd = frame->width > 704 || frame->height > 576;
+        matrix = hd ? AVCOL_SPC_BT709 : AVCOL_SPC_SMPTE170M;
+        primaries = hd ? AVCOL_PRI_BT709 : frame->width == 704 && frame->height == 576 ? AVCOL_PRI_BT470BG : AVCOL_PRI_SMPTE170M;
+    } else {
+        fills = (matrix == AVCOL_SPC_UNSPECIFIED || matrix == AVCOL_SPC_BT709 || matrix == AVCOL_SPC_SMPTE170M) &&
+            (primaries == AVCOL_PRI_UNSPECIFIED || primaries == AVCOL_PRI_BT709 || primaries == AVCOL_PRI_SMPTE170M) &&
+            (frame->color_trc == AVCOL_TRC_UNSPECIFIED || frame->color_trc == AVCOL_TRC_BT709 ||
+             frame->color_trc == AVCOL_TRC_SMPTE170M);
+        const bool hdr = (frame->color_trc == AVCOL_TRC_SMPTE2084 || frame->color_trc == AVCOL_TRC_ARIB_STD_B67) &&
+            primaries != AVCOL_PRI_UNSPECIFIED;
+        if (matrix == AVCOL_SPC_UNSPECIFIED)
+            matrix = hdr && primaries == AVCOL_PRI_BT2020 ? AVCOL_SPC_BT2020_NCL :
+                hdr || (fills && primaries == AVCOL_PRI_BT709) ? AVCOL_SPC_BT709 : AVCOL_SPC_SMPTE170M;
+        if (fills && primaries == AVCOL_PRI_UNSPECIFIED)
+            primaries = matrix == AVCOL_SPC_BT709 ? AVCOL_PRI_BT709 : AVCOL_PRI_SMPTE170M;
+    }
+    bool tagged = false;
+    if (frame->colorspace == AVCOL_SPC_UNSPECIFIED) {
+        CVBufferSetAttachment(image, kCVImageBufferYCbCrMatrixKey,
+                              matrix == AVCOL_SPC_BT709 ? kCVImageBufferYCbCrMatrix_ITU_R_709_2 :
+                              matrix == AVCOL_SPC_BT2020_NCL ? kCVImageBufferYCbCrMatrix_ITU_R_2020 :
+                              kCVImageBufferYCbCrMatrix_ITU_R_601_4, kCVAttachmentMode_ShouldPropagate);
+        tagged = true;
+    }
+    if (fills && frame->color_primaries == AVCOL_PRI_UNSPECIFIED) {
+        CVBufferSetAttachment(image, kCVImageBufferColorPrimariesKey,
+                              primaries == AVCOL_PRI_BT709 ? kCVImageBufferColorPrimaries_ITU_R_709_2 :
+                              primaries == AVCOL_PRI_BT470BG ? kCVImageBufferColorPrimaries_EBU_3213 :
+                              kCVImageBufferColorPrimaries_SMPTE_C, kCVAttachmentMode_ShouldPropagate);
+        tagged = true;
+    }
+    if (fills && frame->color_trc == AVCOL_TRC_UNSPECIFIED) {
+        CVBufferSetAttachment(image, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2,
+                              kCVAttachmentMode_ShouldPropagate);
+        tagged = true;
+    }
+    if (!tagged)
+        return;
+    // Core Animation reads an RGB surface's color from its color space, not the keys alone.
+    CFDictionaryRef attachments = CVBufferCopyAttachments(image, kCVAttachmentMode_ShouldPropagate);
+    CGColorSpaceRef space = attachments ? CVImageBufferCreateColorSpaceFromAttachments(attachments) : NULL;
+    if (space) {
+        CVBufferSetAttachment(image, kCVImageBufferCGColorSpaceKey, space, kCVAttachmentMode_ShouldPropagate);
+        CGColorSpaceRelease(space);
+    }
+    if (attachments)
+        CFRelease(attachments);
+}
+
 static CVPixelBufferRef video_picture(MPPreviewDecoder *preview, CMTime *pts, CMTime *duration)
 {
     AVFrame *frame = preview->frame;
@@ -533,6 +921,9 @@ static CVPixelBufferRef video_picture(MPPreviewDecoder *preview, CMTime *pts, CM
     if (!image || !CMTIME_IS_NUMERIC(*pts))
         return NULL;
     av_vt_pixbuf_set_attachments(preview->video.codec, image, frame);
+    // A Smart Trim edge keeps the source's own (absent) color description.
+    if (!preview->encoding_edge)
+        tag_unspecified_color(image, frame);
     AVRational base = preview->video.codec->pkt_timebase;
     *duration = frame->duration > 0 ? timestamp_time(frame->duration, base) : kCMTimeInvalid;
     return image;
@@ -727,7 +1118,10 @@ finish:
 }
 
 /* Replacing a coded picture would discard these payloads. They can occur
- * inside individual access units even when the container has no track flag. */
+ * inside individual access units even when the container has no track flag.
+ * Film grain parameters are not among them: without AV_CODEC_EXPORT_DATA_FILM_GRAIN
+ * libavcodec never attaches them, and an edge that loses grain synthesis is
+ * written with a plan warning (note_grain in smart_preflight.c). */
 static bool edge_metadata_supported(const AVFrame *frame)
 {
     for (int i = 0; i < frame->nb_side_data; i++) {
@@ -741,7 +1135,8 @@ static bool edge_metadata_supported(const AVFrame *frame)
         case AV_FRAME_DATA_DOVI_RPU_BUFFER:
         case AV_FRAME_DATA_DOVI_METADATA:
         case AV_FRAME_DATA_ICC_PROFILE:
-        case AV_FRAME_DATA_FILM_GRAIN_PARAMS:
+        // An H.264 picture timing or HEVC time code SEI. The encoder writes no time code.
+        case AV_FRAME_DATA_S12M_TIMECODE:
             return false;
         default:
             break;
@@ -750,11 +1145,139 @@ static bool edge_metadata_supported(const AVFrame *frame)
     return true;
 }
 
+/* SEI payloads mp_preview_sample_keeps_sei names, in one unescaped SEI message list. Stereo and display matrices also
+ * come from the container, which the copy keeps, so the frame's side data cannot tell them apart. */
+static bool sei_kept(bool hevc, const uint8_t *rbsp, size_t size)
+{
+    size_t pos = 0;
+    while (pos + 2 <= size && !(size - pos == 1 && rbsp[pos] == 0x80)) {
+        unsigned type = 0, length = 0;
+        while (pos < size && rbsp[pos] == 0xFF)
+            type += rbsp[pos++];
+        if (pos >= size)
+            break;
+        type += rbsp[pos++];
+        while (pos < size && rbsp[pos] == 0xFF)
+            length += rbsp[pos++];
+        if (pos >= size)
+            break;
+        length += rbsp[pos++];
+        if (length > size - pos)
+            break;
+        const uint8_t *payload = rbsp + pos;
+        pos += length;
+        if (type == 45 && length > 0) {
+            // frame_packing_arrangement_id is ue(v), then frame_packing_arrangement_cancel_flag.
+            unsigned zeros = 0, bit = 0;
+            while (bit < 8 * length && !(payload[bit >> 3] >> (7 - (bit & 7)) & 1))
+                zeros++, bit++;
+            bit += zeros + 1;
+            if (bit < 8 * length && !(payload[bit >> 3] >> (7 - (bit & 7)) & 1))
+                return true;
+        } else if (type == 47 && length > 0) {
+            if (!(payload[0] & 0x80)) // display_orientation_cancel_flag
+                return true;
+        } else if ((hevc && type == 136) || type == 147) {
+            return true; // Time code; alternative transfer characteristics.
+        } else if (type == 4 && length >= 8 && payload[0] == 0xB5 && AV_RB16(payload + 1) == 0x0031) {
+            uint32_t user = AV_RB32(payload + 3);
+            if (user == MKBETAG('D', 'T', 'G', '1') || (user == MKBETAG('G', 'A', '9', '4') && payload[7] == 0x06))
+                return true; // Active format description; ATSC bar data.
+        }
+    }
+    return false;
+}
+
+bool mp_preview_sample_keeps_sei(int codec, int length_size, const uint8_t *data, int size)
+{
+    const bool hevc = codec == AV_CODEC_ID_HEVC;
+    if ((!hevc && codec != AV_CODEC_ID_H264) || length_size < 1 || length_size > 4 || !data)
+        return false;
+    for (int pos = 0; pos + length_size <= size;) {
+        uint32_t length = 0;
+        for (int i = 0; i < length_size; i++)
+            length = length << 8 | data[pos++];
+        if (length < (hevc ? 2U : 1U) || length > (uint32_t)(size - pos))
+            break;
+        const uint8_t *nal = data + pos;
+        pos += (int)length;
+        int type = hevc ? nal[0] >> 1 & 63 : nal[0] & 31;
+        if (!(hevc ? type == 39 || type == 40 : type == 6))
+            continue;
+        const int header = hevc ? 2 : 1;
+        uint8_t *rbsp = av_malloc(length);
+        if (!rbsp)
+            return true;
+        size_t count = 0, zeros = 0;
+        for (uint32_t i = (uint32_t)header; i < length; i++) {
+            if (zeros >= 2 && nal[i] == 3) {
+                zeros = 0;
+                continue;
+            }
+            zeros = nal[i] ? 0 : zeros + 1;
+            rbsp[count++] = nal[i];
+        }
+        bool kept = sei_kept(hevc, rbsp, count);
+        av_free(rbsp);
+        if (kept)
+            return true;
+    }
+    return false;
+}
+
+/* For an edge, remember the sample about to be sent if it, or a sample sent before it since the keyframe, carries
+ * SEI an encode drops. False when that cannot be recorded. */
+static bool note_kept_sei(MPPreviewDecoder *preview, const AVPacket *packet)
+{
+    if (packet->pts == AV_NOPTS_VALUE)
+        return true;
+    if (!preview->kept_sei_count) {
+        const enum AVCodecID codec = preview->format->streams[preview->video.index]->codecpar->codec_id;
+        const int at = codec == AV_CODEC_ID_HEVC ? 21 : 4;
+        if (preview->decoder_description_size <= at || preview->decoder_description[0] != 1 ||
+            !mp_preview_sample_keeps_sei(codec, (preview->decoder_description[at] & 3) + 1, packet->data, packet->size))
+            return true;
+    }
+    if (preview->kept_sei_count == preview->kept_sei_capacity) {
+        int capacity = preview->kept_sei_capacity ? 2 * preview->kept_sei_capacity : 64;
+        int64_t *grown = capacity > 0 ? av_realloc_array(preview->kept_sei_pts, (size_t)capacity, sizeof(*grown)) : NULL;
+        if (!grown)
+            return false;
+        preview->kept_sei_pts = grown;
+        preview->kept_sei_capacity = capacity;
+    }
+    preview->kept_sei_pts[preview->kept_sei_count++] = packet->pts;
+    return true;
+}
+
+/* Whether the edge picture just decoded came from a sample that note_kept_sei recorded. */
+static bool kept_sei(const MPPreviewDecoder *preview)
+{
+    const int64_t pts = preview->frame->pts != AV_NOPTS_VALUE ? preview->frame->pts : preview->frame->best_effort_timestamp;
+    for (int i = 0; i < preview->kept_sei_count; i++)
+        if (preview->kept_sei_pts[i] == pts)
+            return true;
+    // A picture whose sample time is unknown cannot be shown to precede the SEI.
+    return preview->kept_sei_count && pts == AV_NOPTS_VALUE;
+}
+
+/* Colour volume, light level and viewing environment describe a whole coded sequence. HEVC and
+ * AV1 decoders attach them to every picture of it; the H.264 decoder only to the picture whose
+ * access unit carries the SEI. */
+static bool sequence_metadata(const AVFrame *frame)
+{
+    return av_frame_get_side_data(frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA) ||
+           av_frame_get_side_data(frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL) ||
+           av_frame_get_side_data(frame, AV_FRAME_DATA_AMBIENT_VIEWING_ENVIRONMENT);
+}
+
 // The decoder drops a packet it rejects, so one damaged packet is a brief
 // dropout. About two seconds of consecutive failures is an undecodable stream.
 static bool damaged_audio_packet(MPPreviewDecoder *preview, int result)
 {
-    return result == AVERROR_INVALIDDATA && ++preview->audio_failures <= 100;
+    bool damaged = result == AVERROR_INVALIDDATA && ++preview->audio_failures <= 100;
+    preview->audio_damage |= damaged;
+    return damaged;
 }
 
 static const char *const damaged_edge_picture =
@@ -771,6 +1294,11 @@ bool mp_preview_edge_intact_before_damage(const MPPreviewDecoder *preview)
     return preview->met_damage && !preview->late_damage;
 }
 
+bool mp_preview_edge_metadata(const MPPreviewDecoder *preview)
+{
+    return preview->edge_metadata;
+}
+
 // libavcodec reports a packet it cannot parse as invalid data. VideoToolbox reports a picture
 // it cannot decode as an unknown or external error. Later pictures can be predicted from the
 // rejected one, so no further packet is sent. The decoder is drained of the pictures that
@@ -784,9 +1312,158 @@ static bool is_picture_damage(int result)
 
 static void resume_at_keyframe(MPPreviewDecoder *preview)
 {
-    avcodec_flush_buffers(preview->video.codec);
+    flush_video(preview);
     preview->recovering = false;
     preview->awaiting_keyframe = true;
+    // A keyframe held for a new description (always a keyframe) reaches the emptied decoder next.
+    preview->switching = false;
+    preview->video_fed = false;
+    preview->watch_leading = false;
+}
+
+static const char *const description_failure =
+    "FFmpeg could not reopen the preview decoder with the video's new sample description.";
+
+/* Keep the description the demuxer reports for a video packet, which the decoder may not hold. */
+static bool note_description(MPPreviewDecoder *preview, const AVPacket *packet)
+{
+    size_t size = 0;
+    const uint8_t *side = av_packet_get_side_data(packet, AV_PKT_DATA_NEW_EXTRADATA, &size);
+    if (!side || !size)
+        return true;
+    return size <= INT_MAX && copy_bytes(&preview->description, &preview->description_size, side, (int)size);
+}
+
+/* Whether the video decoder must be reopened for the description of the packets read last: 1 when it holds other
+ * parameter sets, 0 when it holds the same, -1 when that cannot be recorded. */
+static int needs_new_decoder(MPPreviewDecoder *preview)
+{
+    if (same_bytes(preview->description, preview->description_size,
+                   preview->decoder_description, preview->decoder_description_size))
+        return 0;
+    if (!same_description(preview, preview->description, preview->description_size,
+                          preview->decoder_description, preview->decoder_description_size))
+        return 1;
+    return copy_bytes(&preview->decoder_description, &preview->decoder_description_size,
+                      preview->description, preview->description_size) ? 0 : -1;
+}
+
+/* The NAL unit type of the first picture unit of an HEVC sample, or -1. */
+static int first_picture_unit(const MPPreviewDecoder *preview, const AVPacket *packet)
+{
+    if (preview->format->streams[preview->video.index]->codecpar->codec_id != AV_CODEC_ID_HEVC ||
+        preview->decoder_description_size <= 21 || preview->decoder_description[0] != 1)
+        return -1;
+    const int width = (preview->decoder_description[21] & 3) + 1;
+    for (int pos = 0; pos + width < packet->size;) {
+        uint32_t length = 0;
+        for (int i = 0; i < width; i++)
+            length = length << 8 | packet->data[pos++];
+        if (length < 2 || length > (uint32_t)(packet->size - pos))
+            return -1;
+        int type = packet->data[pos] >> 1 & 63;
+        if (type < 32)
+            return type;
+        pos += (int)length;
+    }
+    return -1;
+}
+
+/* At an HEVC CRA picture under a new description with the same NAL unit length, put every set of the new description
+ * into the sample and keep the decoder, which keeps the pictures its RASL pictures predict from. 1 when done, 0
+ * when the decoder must be reopened instead, -1 on failure. */
+static int carry_description(MPPreviewDecoder *preview, AVPacket *packet)
+{
+    DescriptionUnits now, held;
+    if (first_picture_unit(preview, packet) != 21 ||
+        !description_units(AV_CODEC_ID_HEVC, preview->description, preview->description_size, &now) ||
+        !description_units(AV_CODEC_ID_HEVC, preview->decoder_description, preview->decoder_description_size, &held) ||
+        now.length_size != held.length_size)
+        return 0;
+    int size = 0;
+    for (int i = 0; i < now.count; i++)
+        size += 4 + now.size[i];
+    uint8_t *units = av_malloc((size_t)size + 1);
+    if (!units)
+        return -1;
+    for (int i = 0, at = 0; i < now.count; at += 4 + now.size[i++]) {
+        AV_WB32(units + at, (uint32_t)now.size[i]);
+        memcpy(units + at + 4, now.data[i], (size_t)now.size[i]);
+    }
+    int result = insert_units(preview, packet, units, size, now.length_size);
+    av_free(units);
+    if (result < 0 || !copy_bytes(&preview->decoder_description, &preview->decoder_description_size,
+                                  preview->description, preview->description_size))
+        return -1;
+    return 1;
+}
+
+static double timeline_seconds(const MPPreviewDecoder *preview, int64_t pts)
+{
+    return CMTimeGetSeconds(CMTimeSubtract(timestamp_time(pts, preview->video.codec->pkt_timebase),
+                                           preview->timeline_origin));
+}
+
+/* After a reopen at a CRA picture, the samples before its first trailing picture: a RASL picture is dropped, so
+ * record it for mp_preview_notice and treat its absence as a gap, as for damage. A Smart Trim edge must not lose a
+ * picture, so it returns false there. */
+static bool note_leading(MPPreviewDecoder *preview, const AVPacket *packet)
+{
+    int type = first_picture_unit(preview, packet);
+    if (type != 8 && type != 9) { // RASL_N, RASL_R
+        // RADL pictures decode from the CRA itself. Leading pictures precede every trailing one.
+        preview->watch_leading = type == 6 || type == 7;
+        return true;
+    }
+    if (preview->encoding_edge)
+        return false;
+    preview->met_damage = true;
+    if (packet->pts != AV_NOPTS_VALUE) {
+        if (!preview->leading_count || packet->pts < preview->leading_first)
+            preview->leading_first = packet->pts;
+        if (!preview->leading_count || packet->pts > preview->leading_last)
+            preview->leading_last = packet->pts;
+    }
+    preview->leading_count++;
+    snprintf(preview->leading_notice, sizeof(preview->leading_notice),
+             "The video changes its sample description at an open keyframe at %.3f s. %d leading picture%s from "
+             "%.3f s to %.3f s predict%s from pictures before it and could not be decoded, so %s omitted.",
+             timeline_seconds(preview, preview->leading_key), preview->leading_count,
+             preview->leading_count == 1 ? "" : "s", timeline_seconds(preview, preview->leading_first),
+             timeline_seconds(preview, preview->leading_last), preview->leading_count == 1 ? "s" : "",
+             preview->leading_count == 1 ? "it is" : "they are");
+    return true;
+}
+
+int mp_preview_omission(const MPPreviewDecoder *preview)
+{
+    if (!preview)
+        return MPPreviewOmitsNothing;
+    if (preview->unaligned_switch)
+        return MPPreviewOmitsUnalignedSwitch;
+    if (preview->leading_count)
+        return MPPreviewOmitsLeadingPictures;
+    return preview->met_damage ? MPPreviewOmitsDamagedPicture : MPPreviewOmitsNothing;
+}
+
+const char *mp_preview_notice(const MPPreviewDecoder *preview)
+{
+    switch (mp_preview_omission(preview)) {
+    case MPPreviewOmitsUnalignedSwitch:
+        return "The video changes its sample description at a picture that is not a keyframe. "
+               "Preview skipped to the next keyframe.";
+    case MPPreviewOmitsLeadingPictures:
+        return preview->leading_notice;
+    case MPPreviewOmitsDamagedPicture:
+        return "A damaged picture could not be decoded. Preview skipped to the next keyframe.";
+    default:
+        return NULL;
+    }
+}
+
+bool mp_preview_met_audio_damage(const MPPreviewDecoder *preview)
+{
+    return preview && (preview->mix ? linked_mix_met_audio_damage(preview->mix) : preview->audio_damage);
 }
 
 static bool damaged_video_picture(MPPreviewDecoder *preview, int result, bool sending)
@@ -843,10 +1520,15 @@ static int next_stream_sample(MPPreviewDecoder *preview, CMSampleBufferRef *samp
                         *error = "VideoToolbox repeatedly returned damaged pictures.";
                         return MPPreviewError;
                     }
-                    if (preview->encoding_edge && !edge_metadata_supported(preview->frame)) {
-                        av_frame_unref(preview->frame);
-                        *error = "This picture carries embedded captions, colour, or grain metadata that requires copying.";
-                        return MPPreviewError;
+                    // The edge encoder refuses only its own pictures. The pictures decoded before
+                    // and after an edge are copied with their metadata, but sequence metadata
+                    // seen since the last keyframe also describes the edge's pictures.
+                    if (preview->encoding_edge) {
+                        bool sequence = sequence_metadata(preview->frame);
+                        preview->sequence_metadata = (preview->frame->flags & AV_FRAME_FLAG_KEY)
+                            ? sequence : preview->sequence_metadata || sequence;
+                        preview->edge_metadata = preview->sequence_metadata ||
+                                                 !edge_metadata_supported(preview->frame) || kept_sei(preview);
                     }
                     if (preview->frame->format != AV_PIX_FMT_VIDEOTOOLBOX || !using_hardware(preview)) {
                         av_frame_unref(preview->frame);
@@ -877,7 +1559,15 @@ static int next_stream_sample(MPPreviewDecoder *preview, CMSampleBufferRef *samp
                 continue;
             }
             preview->receiving = NULL;
-            if (result == AVERROR_EOF && stream == &preview->video && preview->recovering)
+            if (result == AVERROR_EOF && stream == &preview->video && preview->switching) {
+                // Every picture of the old description has been returned. The held keyframe is sent next.
+                if (!reopen_video(preview)) {
+                    *error = description_failure;
+                    return MPPreviewError;
+                }
+                preview->watch_leading = first_picture_unit(preview, preview->held) == 21; // CRA_NUT
+                preview->leading_key = preview->held->pts;
+            } else if (result == AVERROR_EOF && stream == &preview->video && preview->recovering)
                 resume_at_keyframe(preview);
             else if (result == AVERROR_EOF)
                 stream->drained = true;
@@ -938,25 +1628,108 @@ static int next_stream_sample(MPPreviewDecoder *preview, CMSampleBufferRef *samp
             }
             continue;
         }
-        int result = av_read_frame(preview->format, preview->packet);
-        if (result == AVERROR_EOF) {
-            preview->eof = true;
-            continue;
-        }
-        if (result == AVERROR(EAGAIN) || (result == AVERROR_EXIT && preview_cancelled(preview)))
-            return MPPreviewAgain;
-        if (result < 0) {
-            *error = "FFmpeg could not read the next preview packet.";
-            return MPPreviewError;
+        // A keyframe held for a new description follows the pictures the decoder had left.
+        const bool held = !preview->switching && (preview->held->data || preview->held->side_data_elems);
+        int result = 0;
+        if (held) {
+            av_packet_move_ref(preview->packet, preview->held);
+        } else {
+            result = av_read_frame(preview->format, preview->packet);
+            if (result == AVERROR_EOF) {
+                preview->eof = true;
+                continue;
+            }
+            if (result == AVERROR(EAGAIN) || (result == AVERROR_EXIT && preview_cancelled(preview)))
+                return MPPreviewAgain;
+            if (result < 0) {
+                *error = "FFmpeg could not read the next preview packet.";
+                return MPPreviewError;
+            }
         }
         PreviewStream *stream = NULL;
         if (!preview->audio_only && preview->packet->stream_index == preview->video.index) {
+            if (!held && !note_description(preview, preview->packet)) {
+                av_packet_unref(preview->packet);
+                *error = description_failure;
+                return MPPreviewError;
+            }
             if (!preview->awaiting_keyframe || (preview->packet->flags & AV_PKT_FLAG_KEY)) {
                 preview->awaiting_keyframe = false;
                 stream = &preview->video;
             }
         } else if (preview->packet->stream_index == preview->audio.index && mp_preview_has_audio(preview))
             stream = &preview->audio;
+        const int renew = stream == &preview->video && preview->video.codec ? needs_new_decoder(preview) : 0;
+        if (renew < 0) {
+            av_packet_unref(preview->packet);
+            *error = description_failure;
+            return MPPreviewError;
+        }
+        // A description with other parameter sets needs a decoder of its own, from a keyframe on.
+        if (renew) {
+            if (!(preview->packet->flags & AV_PKT_FLAG_KEY)) {
+                // The pictures from here to the next keyframe would be decoded with the old description.
+                av_packet_unref(preview->packet);
+                preview->unaligned_switch = true;
+                if (damaged_video_picture(preview, AVERROR_INVALIDDATA, true))
+                    continue;
+                *error = preview->encoding_edge
+                    ? "Smart Trim cannot follow a change of video sample description at a picture that is not a keyframe."
+                    : "The video changes its sample description at a picture that is not a keyframe.";
+                return MPPreviewError;
+            }
+            // A CRA picture's RASL pictures predict from pictures the decoder holds, which a reopened decoder would
+            // drop. Give this session the new sets inside the sample instead, as a copy with in-band sets does.
+            if (preview->video_fed) {
+                const int carried = carry_description(preview, preview->packet);
+                if (carried < 0) {
+                    av_packet_unref(preview->packet);
+                    *error = description_failure;
+                    return MPPreviewError;
+                }
+                if (carried)
+                    goto send;
+            }
+            if (preview->video_fed) {
+                // Return the pictures decoded under the old description before reopening.
+                av_packet_move_ref(preview->held, preview->packet);
+                preview->switching = true;
+                result = avcodec_send_packet(preview->video.codec, NULL);
+                if (result >= 0) {
+                    preview->receiving = &preview->video;
+                    continue;
+                }
+                av_packet_unref(preview->held);
+                preview->switching = false;
+                *error = "VideoToolbox could not finish the pictures before the video's new sample description.";
+                return MPPreviewError;
+            }
+            if (!reopen_video(preview)) {
+                av_packet_unref(preview->packet);
+                *error = description_failure;
+                return MPPreviewError;
+            }
+        }
+send:
+        if (stream == &preview->video && preview->watch_leading && !held && !note_leading(preview, preview->packet)) {
+            av_packet_unref(preview->packet);
+            *error = "Smart Trim cannot decode the leading pictures of an open keyframe where the video sample "
+                     "description changes.";
+            return MPPreviewError;
+        }
+        if (stream == &preview->video && preview->encoding_edge && !note_kept_sei(preview, preview->packet)) {
+            av_packet_unref(preview->packet);
+            *error = "Could not allocate the Smart Trim edge decoder.";
+            return MPPreviewError;
+        }
+        if (stream == &preview->video && preview->prime_pending) {
+            preview->prime_pending = false;
+            if (prime_packet(preview, preview->packet) < 0) {
+                av_packet_unref(preview->packet);
+                *error = "Cannot give the Smart Trim edge decoder the source's parameter sets.";
+                return MPPreviewError;
+            }
+        }
         if (stream && stream->codec)
             result = avcodec_send_packet(stream->codec, preview->packet);
         av_packet_unref(preview->packet);
@@ -980,6 +1753,7 @@ static int next_stream_sample(MPPreviewDecoder *preview, CMSampleBufferRef *samp
                 preview->audio_unavailable = true;
         } else {
             preview->receiving = stream;
+            preview->video_fed |= stream == &preview->video;
         }
     }
     return MPPreviewAgain;

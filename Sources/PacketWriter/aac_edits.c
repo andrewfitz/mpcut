@@ -932,3 +932,262 @@ int mpcut_mov_finish_chapters(const char *path, int movie_timescale, char *error
     free(replacement);
     return ok ? 0 : errorf(error, cap, "Cannot finish the chapter track in %s", path);
 }
+
+/* Check an hvcC record and, when `apply` is set, mark its arrays of video, sequence
+ * and picture parameter sets complete, as 'hvc1' requires. */
+static int complete_hvcc(uint8_t *config, size_t size, int apply) {
+    if (size < 23 || config[0] != 1)
+        return 0;
+    uint8_t *p = config + 23, *end = config + size;
+    for (unsigned array = 0; array < config[22]; array++) {
+        if (end - p < 3)
+            return 0;
+        unsigned type = p[0] & 0x3f, count = AV_RB16(p + 1);
+        if (apply && type >= 32 && type <= 34)
+            p[0] |= 0x80;
+        p += 3;
+        for (unsigned i = 0; i < count; i++) {
+            if (end - p < 2 || (size_t)(end - p - 2) < AV_RB16(p))
+                return 0;
+            p += 2 + AV_RB16(p);
+        }
+    }
+    return 1;
+}
+
+/* Turn one track's 'hev1' sample entries into 'hvc1' in place. The boxes keep their
+ * sizes, so the copy in `movie` maps byte for byte onto the file. A track with any
+ * other entry, or an unreadable hvcC, is left as the muxer wrote it. */
+static int label_hvc1(uint8_t *movie, Box trak) {
+    enum { VISUAL_SAMPLE_ENTRY = 78 };
+    Box media, information, table, descriptions;
+    if (!find_box(trak, BOX('m','d','i','a'), &media) || !find_box(media, BOX('m','i','n','f'), &information)
+        || !find_box(information, BOX('s','t','b','l'), &table)
+        || !find_box(table, BOX('s','t','s','d'), &descriptions) || descriptions.end - descriptions.payload < 8)
+        return 0;
+    const uint32_t count = AV_RB32(descriptions.payload + 4);
+    for (int apply = 0; apply < 2; apply++) { // Check every entry before changing any.
+        const uint8_t *position = descriptions.payload + 8;
+        for (uint32_t i = 0; i < count; i++) {
+            Box entry, config;
+            if (!next_box(&position, descriptions.end, &entry) || entry.type != BOX('h','e','v','1')
+                || entry.end - entry.payload < VISUAL_SAMPLE_ENTRY)
+                return 0;
+            Box fields = {entry.begin, entry.payload + VISUAL_SAMPLE_ENTRY, entry.end, entry.type};
+            if (!find_box(fields, BOX('h','v','c','C'), &config)
+                || !complete_hvcc(movie + (config.payload - movie), (size_t)(config.end - config.payload), apply))
+                return 0;
+            if (apply)
+                AV_WB32(movie + (entry.begin - movie) + 4, BOX('h','v','c','1'));
+        }
+    }
+    return count > 0;
+}
+
+int mpcut_mov_label_hvc1(const char *path, const uint32_t *track_ids, size_t count, char *error, size_t cap) {
+    if (!count)
+        return 0;
+    FILE *file = fopen(path, "r+b");
+    if (!file)
+        return errorf(error, cap, "Cannot open movie to label its HEVC sample entries: %s", path);
+    off_t offset = 0;
+    size_t size = 0;
+    uint8_t *movie = NULL;
+    int ok = locate_movie(file, 0, &offset, &size) && !fseeko(file, offset, SEEK_SET)
+        && (movie = malloc(size)) && fread(movie, 1, size, file) == size;
+    const uint8_t *position = movie;
+    Box moov = {0};
+    ok = ok && next_box(&position, movie + size, &moov);
+    size_t labeled = 0;
+    for (position = moov.payload; ok && position < moov.end;) {
+        Box child;
+        if (!next_box(&position, moov.end, &child)) {
+            ok = 0;
+        } else if (child.type == BOX('t','r','a','k')) {
+            uint32_t id = track_id(child);
+            for (size_t i = 0; i < count; i++)
+                if (track_ids[i] == id)
+                    labeled += label_hvc1(movie, child);
+        }
+    }
+    // A track left 'hev1' (an entry of another kind, or an hvcC without every set) would not play in AVFoundation
+    // or QuickTime although the copy was planned as 'hvc1', so it fails here instead of being kept unlabeled.
+    int unlabeled = ok && labeled != count;
+    if (ok && !unlabeled)
+        ok = !fseeko(file, offset, SEEK_SET) && fwrite(movie, 1, size, file) == size && !fflush(file);
+    if (fclose(file))
+        ok = 0;
+    free(movie);
+    if (unlabeled)
+        return errorf(error, cap, "Cannot describe the HEVC picture in %s as hvc1, so AVFoundation and QuickTime could "
+                      "not play the copy", path);
+    return ok ? 0 : errorf(error, cap, "Cannot label the HEVC sample entries in %s", path);
+}
+
+typedef struct {
+    size_t ancestors[5]; /* moov, trak, mdia, minf, stbl: the boxes that contain the stts box */
+    size_t stts, stts_end, mdhd_duration, mdhd_width;
+    uint64_t target;
+} ShortTrack;
+
+/* A video track that presents the planned duration in one media edit, while its
+ * sample table, and so its media header, ends before that edit does. */
+static int short_track(Box trak, const uint8_t *movie, uint32_t movie_timescale, int64_t planned, ShortTrack *found) {
+    Box media, handler, header, information, table, samples, edits, list;
+    uint32_t timescale;
+    size_t offset, width;
+    if (!find_box(trak, BOX('m','d','i','a'), &media) || !find_box(media, BOX('h','d','l','r'), &handler)
+        || handler.end - handler.payload < 12 || AV_RB32(handler.payload + 8) != BOX('v','i','d','e')
+        || !find_box(media, BOX('m','d','h','d'), &header) || !time_fields(header, 4, &timescale, &offset, &width)
+        || !timescale || !find_box(media, BOX('m','i','n','f'), &information)
+        || !find_box(information, BOX('s','t','b','l'), &table) || !find_box(table, BOX('s','t','t','s'), &samples)
+        || !find_box(trak, BOX('e','d','t','s'), &edits) || !find_box(edits, BOX('e','l','s','t'), &list)
+        || list.end - list.payload < 8)
+        return 0;
+    const int version = list.payload[0];
+    const size_t entry_size = version == 1 ? 20 : 12;
+    const uint32_t count = AV_RB32(list.payload + 4);
+    if ((version != 0 && version != 1) || (size_t)(list.end - list.payload - 8) / entry_size < count)
+        return 0;
+    uint64_t edit_end = 0, segment = 0;
+    unsigned media_edits = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t *entry = list.payload + 8 + i * entry_size;
+        uint64_t duration = version == 1 ? AV_RB64(entry) : AV_RB32(entry);
+        int64_t media_time = version == 1 ? (int64_t)AV_RB64(entry + 8) : (int32_t)AV_RB32(entry + 4);
+        if (duration > UINT64_MAX - edit_end)
+            return 0;
+        edit_end += duration;
+        if (media_time != -1) {
+            segment = duration;
+            media_edits++;
+        }
+    }
+    if (media_edits != 1 || planned < 0 || segment > INT64_MAX
+        || (edit_end > (uint64_t)planned ? edit_end - (uint64_t)planned : (uint64_t)planned - edit_end) > 1)
+        return 0;
+    uint64_t media_duration = width == 4 ? AV_RB32(header.begin + offset) : AV_RB64(header.begin + offset);
+    // FFmpeg reads a track as the shorter of its media header, its samples and its edit.
+    int64_t target = av_rescale((int64_t)segment, timescale, movie_timescale);
+    if (target <= 0 || media_duration >= (uint64_t)target || (width == 4 && target > UINT32_MAX))
+        return 0;
+    size_t entries = samples.end - samples.payload >= 8 ? AV_RB32(samples.payload + 4) : 0;
+    if (!entries || (size_t)(samples.end - samples.payload - 8) / 8 < entries)
+        return 0;
+    const uint8_t *last = samples.payload + 8 + (entries - 1) * 8;
+    uint64_t sum = 0;
+    for (const uint8_t *entry = samples.payload + 8; entry <= last; entry += 8)
+        sum += (uint64_t)AV_RB32(entry) * AV_RB32(entry + 4);
+    if (sum != media_duration || AV_RB32(last + 4) + ((uint64_t)target - media_duration) > UINT32_MAX)
+        return 0;
+    found->stts = (size_t)(samples.begin - movie);
+    found->stts_end = (size_t)(last + 8 - movie);
+    found->mdhd_duration = (size_t)(header.begin - movie) + offset;
+    found->mdhd_width = width;
+    found->target = (uint64_t)target;
+    found->ancestors[1] = (size_t)(trak.begin - movie);
+    found->ancestors[2] = (size_t)(media.begin - movie);
+    found->ancestors[3] = (size_t)(information.begin - movie);
+    found->ancestors[4] = (size_t)(table.begin - movie);
+    return 1;
+}
+
+static int grow_box(uint8_t *box, size_t growth) {
+    uint64_t size = AV_RB32(box);
+    if (size == 1) {
+        size = AV_RB64(box + 8);
+        if (size > UINT64_MAX - growth)
+            return 0;
+        AV_WB64(box + 8, size + growth);
+        return 1;
+    }
+    if (size < 8 || size > UINT32_MAX - growth)
+        return 0;
+    AV_WB32(box, (uint32_t)(size + growth));
+    return 1;
+}
+
+/* Give the last decoded sample the rest of the planned duration. */
+static int cover_track(uint8_t *movie, size_t *size, const ShortTrack *track) {
+    enum { ENTRY = 8 };
+    uint8_t *samples = movie + track->stts;
+    uint8_t *payload = samples + (AV_RB32(samples) == 1 ? 16 : 8);
+    uint32_t entries = AV_RB32(payload + 4);
+    uint8_t *last = payload + 8 + (size_t)(entries - 1) * ENTRY;
+    uint8_t *media_duration = movie + track->mdhd_duration;
+    uint64_t old = track->mdhd_width == 4 ? AV_RB32(media_duration) : AV_RB64(media_duration);
+    uint32_t delta = AV_RB32(last + 4) + (uint32_t)(track->target - old);
+    if (track->mdhd_width == 4)
+        AV_WB32(media_duration, (uint32_t)track->target);
+    else
+        AV_WB64(media_duration, track->target);
+    if (AV_RB32(last) == 1) {
+        AV_WB32(last + 4, delta);
+        return 1;
+    }
+    // Split the final run so that only the last sample takes the longer delta.
+    uint8_t *end = movie + track->stts_end;
+    memmove(end + ENTRY, end, *size - track->stts_end);
+    AV_WB32(last, AV_RB32(last) - 1);
+    AV_WB32(end, 1);
+    AV_WB32(end + 4, delta);
+    AV_WB32(payload + 4, entries + 1);
+    *size += ENTRY;
+    if (!grow_box(samples, ENTRY))
+        return 0;
+    for (int i = 0; i < 5; i++)
+        if (!grow_box(movie + track->ancestors[i], ENTRY))
+            return 0;
+    return 1;
+}
+
+int mpcut_mov_cover_edits(const char *path, MPCutTime duration, char *error, size_t cap) {
+    enum { MAX_TRACKS = 64, ENTRY = 8 };
+    FILE *file = fopen(path, "r+b");
+    if (!file)
+        return errorf(error, cap, "Cannot open movie to finish its video sample tables: %s", path);
+    off_t offset = 0;
+    size_t size = 0;
+    uint8_t *movie = NULL;
+    if (!locate_movie(file, 1, &offset, &size)) {
+        // A movie box that is not the file's last (a fragmented layout) cannot grow in place.
+        fclose(file);
+        return 0;
+    }
+    int ok = size <= UINT32_MAX - MAX_TRACKS * ENTRY
+        && !fseeko(file, offset, SEEK_SET) && (movie = malloc(size + MAX_TRACKS * ENTRY))
+        && fread(movie, 1, size, file) == size;
+    int changed = 0;
+    for (int pass = 0; ok && pass < MAX_TRACKS; pass++) {
+        const uint8_t *position = movie;
+        Box moov, movie_header;
+        uint32_t movie_timescale;
+        size_t duration_offset, duration_width;
+        if (!next_box(&position, movie + size, &moov) || moov.type != BOX('m','o','o','v')
+            || !find_box(moov, BOX('m','v','h','d'), &movie_header)
+            || !time_fields(movie_header, 4, &movie_timescale, &duration_offset, &duration_width)
+            || !movie_timescale || movie_timescale > INT_MAX) {
+            ok = 0;
+            break;
+        }
+        int64_t planned = ticks(duration, (int)movie_timescale);
+        ShortTrack track = {{0}};
+        int found = 0;
+        for (position = moov.payload; !found && position < moov.end;) {
+            Box child;
+            if (!next_box(&position, moov.end, &child))
+                break;
+            found = child.type == BOX('t','r','a','k') && short_track(child, movie, movie_timescale, planned, &track);
+        }
+        if (!found)
+            break;
+        ok = cover_track(movie, &size, &track); // ancestors[0] is the movie box at offset 0.
+        changed = 1;
+    }
+    if (ok && changed)
+        ok = !fseeko(file, offset, SEEK_SET) && fwrite(movie, 1, size, file) == size && !fflush(file);
+    if (fclose(file))
+        ok = 0;
+    free(movie);
+    return ok ? 0 : errorf(error, cap, "Cannot finish the video sample tables in %s", path);
+}

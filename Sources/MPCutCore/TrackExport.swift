@@ -139,6 +139,29 @@ extension CutEngine {
         }
     }
 
+    /// Copies of a sound codec that the muxer of the bundled helper accepts at planning but refuses when it writes: MOV takes
+    /// FLAC, Opus and TrueHD only in MP4 mode ("only supported in MP4"), and MP4 cannot finish a file of copied PCM whose
+    /// channel layout is unstated. A copy is refused here, at planning, with the containers that carry it, so a dry run and
+    /// the export agree.
+    func audioCodecContainerIssue(_ media: MediaInfo, container: String) -> String? {
+        // Picture alone copies no sound. A selected stream is the only sound copied.
+        guard tracks != .video || !media.hasVideo else { return nil }
+        for sound in media.audio where audioStream == nil || sound.stream.index == audioStream {
+            let codec = sound.stream.codec
+            let name = ExportRules.audioCodecName(codec)
+            if container == "mov" && ["flac", "opus", "truehd"].contains(codec) {
+                return "MOV cannot carry copied \(name) audio. Choose MP4 or MKV to copy it, or convert the audio."
+            }
+            // The MP4 PCM box names its speakers, so the muxer cannot finish a file whose PCM states no channel layout.
+            let layout = sound.stream.channelLayout
+            if ["mp4", "m4v"].contains(container), codec.hasPrefix("pcm_"), sound.stream.channels > 1,
+               layout.isEmpty || layout == "unknown" || layout.hasSuffix(" channels") {
+                return "MP4 cannot carry copied PCM audio without a stated channel layout. Choose MOV or MKV, or WAV or CAF for sound only, to copy it."
+            }
+        }
+        return nil
+    }
+
     func audioContainerIssue(_ media: MediaInfo, container: String) -> String? {
         if media.streams.count > 1 && ["wav", "wave", "aif", "aiff", "mp3", "flac", "aac", "caf", "ac3", "eac3"].contains(container) {
             return "Select one audio stream for \(container.uppercased()), or choose a multitrack audio container."

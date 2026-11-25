@@ -21,6 +21,8 @@ public struct StillSoundAction: Codable, Sendable {
     /// The rate of a converted AAC track, as it is encoded.
     public var bitRate: Int? = nil
     public var treatment: String? = nil
+    /// Why `auto` wrote this format, for a soundtrack that keeps its source's compressed format.
+    public var reason: String? = nil
     public let audio: ReencodeAudio
     public let originalStreams: [Int]
     public let sources: [Source]
@@ -176,12 +178,12 @@ struct StillSoundPlanner {
             func append(_ treatment: StillSoundPlan.Treatment, audio: ReencodeAudio, codec: String?,
                         rate: Int?, layout: String?, bitDepth: Int? = nil, bitRate: Int? = nil,
                         silence: [MulticamRange] = [], warnings: [String] = [],
-                        description: String? = nil) {
+                        description: String? = nil, reason: String? = nil) {
                 treatments.append(treatment)
                 actions.append(StillSoundAction(ordinal: ordinal, laneID: lane.id, label: lane.label,
                                                 colorSlot: lane.colorSlot, sourceLaneIDs: lane.id.map { [$0] }, codec: codec,
                                                 sampleRate: rate, channelLayout: layout, bitDepth: bitDepth, bitRate: bitRate,
-                                                treatment: description,
+                                                treatment: description, reason: reason,
                                                 audio: audio, originalStreams: streams, sources: sources, warnings: soundtrackWarnings + warnings,
                                                 generatedSilence: silence))
             }
@@ -193,6 +195,7 @@ struct StillSoundPlanner {
                     return Self.copiesByDefault(codec: stream.codec, format: media.format)
                 }
             var copyFailure: CutError?
+            var silenceNote: String?
             if !explicitConversion || matchingLossless || copiesLossySoundtrack || (mode == .copy && !independentAudio)
                 || (!explicitLossless && !independentAudio && mode != .encode) {
                 do {
@@ -205,6 +208,12 @@ struct StillSoundPlanner {
                     continue
                 } catch let issue as CutError where issue.code != "cancelled" && issue.code != "source_changed" {
                     copyFailure = trackIssue(issue, ordinal: ordinal, lane: lane, spans: copySpans)
+                    if issue.code == "generated_audio_required" {
+                        // When the track is converted below, its warning states that instead of asking for a conversion.
+                        silenceNote = trackIssue(CutError(code: issue.code, message: "This interval requires generated silence, so the track is converted.",
+                                                          segment: issue.segment, track: issue.track),
+                                                 ordinal: ordinal, lane: lane, spans: copySpans).message
+                    }
                 }
             }
             let conversionLane = followsMulticamRouting ? spans : try conversionSpans(spans)
@@ -231,19 +240,37 @@ struct StillSoundPlanner {
             } else if defaultSoundtrackPCM {
                 candidates = [audio, .pcm]
             } else if allowsAutomaticConversion {
-                // As in a movie re-encode: a lane whose every source is lossless is written as PCM where the container carries it.
+                // As in a movie re-encode: a lane whose every source is lossless is written as PCM where the container carries it,
+                // and otherwise in the container's lossless codec (ALAC or FLAC in MP4 and M4A) before it would become AAC.
                 let lossless = !sources.isEmpty && sources.allSatisfy { $0.codec.map(ExportRules.isLosslessAudio(codec:)) ?? false }
-                candidates = lossless ? [.pcm, .aac] : [.aac, .pcm]
+                candidates = lossless ? [.pcm, .alac, .flac, .aac] : [.aac, .pcm]
             } else {
                 candidates = [audio]
             }
-            var sound = try retained ?? resolveConversion(conversionLane, duration: timeline.duration, container: muxer,
-                                                          candidates: candidates, ordinal: ordinal, lane: lane,
-                                                          format: conversionFormat, preservePCM: independentAudio || hasSoundtrackSelection)
+            // Auto keeps the soundtrack's own compressed format where the container and the helper allow, as a movie re-encode does.
+            // A soundtrack's default lossless codec stands in for auto, so it applies there too.
+            let automatic = audio == .auto && (soundtrackDefault || allowsAutomaticConversion) || defaultSoundtrackCodec
+            let kept = retained == nil && automatic
+                ? MulticamEngine(cancelled: cancelled).sourceFormatPlan(conversionLane, duration: timeline.duration, container: muxer,
+                                                                        source: .multicam, silenceFormat: conversionFormat) { issue, index in
+                    trackIssue(issue, ordinal: ordinal, laneID: lane.id, label: lane.label, output: conversionLane[index].output)
+                }
+                : nil
+            // A PCM soundtrack stays PCM where the container carries it.
+            let sourcePCM = !sources.isEmpty && sources.allSatisfy { $0.codec?.hasPrefix("pcm_") ?? false }
+            let ordered = automatic && sourcePCM && candidates.contains(.pcm) ? [.pcm] + candidates.filter { $0 != .pcm } : candidates
+            var sound = try kept?.plan ?? retained ?? resolveConversion(conversionLane, duration: timeline.duration, container: muxer,
+                                                                        candidates: ordered, ordinal: ordinal, lane: lane,
+                                                                        format: conversionFormat, preservePCM: independentAudio || hasSoundtrackSelection)
             configureMuxer(&sound, container: muxer)
             let copyNote = copiesLossySoundtrack ? "The soundtrack packets cannot be copied, so the recording is decoded. " : ""
-            let warnings = retained == nil ? (copyFailure.map { [copyNote + $0.message] } ?? []) :
+            var warnings = retained == nil ? (copyFailure.map { [copyNote + (silenceNote ?? $0.message)] } ?? []) :
                 ["Retained PCM samples are preserved. Uncovered intervals receive digital silence."]
+            // A lossless lane that Auto writes as AAC loses samples. Say so; an explicit AAC request is a choice.
+            let losslessSources = !sources.isEmpty && sources.allSatisfy { $0.codec.map(ExportRules.isLosslessAudio(codec:)) ?? false }
+            if allowsAutomaticConversion, kept == nil, retained == nil, losslessSources, sound.action == .aac {
+                warnings.append("This lossless sound could not be written losslessly in .\(muxer), so Auto encoded it as AAC.")
+            }
             let codec = sound.writtenCodec
             let description: String?
             if sound.inputs.allSatisfy(\.silence) {
@@ -256,11 +283,27 @@ struct StillSoundPlanner {
             append(.convert(sound), audio: sound.action, codec: codec, rate: sound.sampleRate, layout: sound.layout,
                    bitDepth: sound.writtenBitDepth, bitRate: sound.writtenBitRate,
                    silence: conversionLane.filter { $0.media == nil }.map(\.output),
-                   warnings: warnings + sound.warnings, description: description)
+                   warnings: warnings + sound.warnings, description: description, reason: kept?.note)
         }
         let plan = StillSoundPlan(actions: actions, treatments: treatments, container: muxer)
         try plan.verifySources()
         return plan
+    }
+
+    /// Soundtrack copies that plan but whose written track fails the still export's read-back: Opus and ALAC in Matroska
+    /// (the final track loses its audible range, or its duration), and MP2 in MP4. Refused when planned, with the
+    /// containers that carry the copy, so a dry run and the export agree.
+    static func copyIssue(_ codec: String, container: String) -> String? {
+        switch (codec, container) {
+        case ("opus", "mkv"), ("opus", "mka"):
+            return "A copied Opus soundtrack does not keep its audible range in Matroska here. Choose MP4, or convert the audio."
+        case ("alac", "mkv"), ("alac", "mka"):
+            return "A copied ALAC soundtrack does not keep its duration in Matroska here. Choose MOV, MP4 or M4A, or convert the audio."
+        case ("mp2", "mp4"), ("mp2", "m4v"):
+            return "A copied MP2 soundtrack does not keep its audible range in MP4 here. Choose MOV or MKV, or convert the audio."
+        default:
+            return nil
+        }
     }
 
     /// The lossy soundtracks whose packets a still project copies without being asked, in place of decoding them
@@ -801,7 +844,7 @@ struct StillSoundPlanner {
                    || issue.hasPrefix("Audio track \(stream) ") || issue.hasPrefix("AAC track \(stream) ") {
                 throw CutError(code: "unsupported_tracks", message: issue, segment: index + 1, track: stream)
             }
-            if let issue = selector.muxIssue(selected, container: container) {
+            if let issue = selector.muxIssue(selected, container: container) ?? Self.copyIssue(sound.stream.codec, container: container) {
                 throw CutError(code: "unsupported_container", message: issue, segment: index + 1, track: stream)
             }
             if let reference {

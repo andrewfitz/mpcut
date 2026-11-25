@@ -107,6 +107,10 @@ public struct MulticamExportPlan: Encodable, Sendable {
     let recordingGapExport: StillExportPlan?
     let participantExport: ParticipantProjectExport?
     public let participantRender: ParticipantRenderReport?
+    /// What the program leaves out of its sources, one sentence each, as `ExportPlan.copyOmissions` does for a copy.
+    public internal(set) var copyOmissions: [String] = []
+    /// The reference angle's chapters on the program clock (MulticamProgramChapters). The final mux writes them.
+    var chapters: [ReencodeChapter] = []
     package var participantRenderTier: TierState? { participantExport?.tier(container: container) }
 
     enum CodingKeys: String, CodingKey {
@@ -256,7 +260,7 @@ public struct MulticamEngine: Sendable {
             let mapping = try snapshot.plan()
             return MulticamExportPlan(mapping: mapping, picture: [], audioLanes: [], audioOutput: audioOutput,
                                       container: output.pathExtension.lowercased(), duration: export.report.duration,
-                                      mode: mode, tracks: tracks, warnings: [export.report.picturePrivacyNotice, export.report.audioPrivacyNotice].compactMap { $0 },
+                                      mode: mode, tracks: tracks, warnings: export.notices,
                                       encodedVideoDuration: tracks == .audio ? .zero : export.report.duration,
                                       copiedVideoDuration: .zero, generatedPictureGaps: nil,
                                       pictureCopy: nil, pictureEncode: nil, sounds: [], recordingGapExport: nil,
@@ -548,7 +552,9 @@ public struct MulticamEngine: Sendable {
             ?? gapPicture?.plan.report.encodedVideoDuration ?? .zero
         let resolvedMapping = MulticamPlan(intervals: mapping.intervals, picture: mapping.picture,
                                           audioLanes: resolvedLanes, duration: mapping.duration)
-        return MulticamExportPlan(mapping: resolvedMapping, picture: picture, audioLanes: sounds.map(\.report),
+        let chapterPlan = try programChapters(mapping, project: project, sources: sources, media: bySource,
+                                              container: destinationContainer, hasPicture: wantPicture)
+        var plan = MulticamExportPlan(mapping: resolvedMapping, picture: picture, audioLanes: sounds.map(\.report),
                                   audioOutput: audioOutput, container: destinationContainer, duration: mapping.duration,
                                   mode: mode, tracks: tracks,
                                   warnings: (pictureEncode?.warnings ?? gapPicture?.plan.report.warnings ?? []) + sounds.flatMap { $0.report.warnings },
@@ -557,6 +563,13 @@ public struct MulticamEngine: Sendable {
                                   generatedPictureGaps: gapPicture == nil ? nil : pictureGaps,
                                   pictureCopy: pictureCopy, pictureEncode: pictureEncode, sounds: sounds,
                                   recordingGapExport: gapPicture?.plan, participantExport: nil, participantRender: nil)
+        plan.chapters = chapterPlan.chapters
+        // What the picture's Smart Trim edges lose, such as film grain synthesis, found while planning them, and an
+        // HEVC picture whose staged copy has to keep an 'hev1' description, which the final mux carries on.
+        plan.copyOmissions = (pictureCopy.map { CutEngine().copyOmissions($0) } ?? []) + chapterPlan.omissions
+            // The program is assembled from staged picture and sound, so no source's movie metadata reaches it.
+            + ReencodeChapter.droppedMetadata(of: bySource.keys.sorted().compactMap { bySource[$0]?.url }, by: "The program")
+        return plan
     }
 
     public func write(_ plan: MulticamExportPlan, to output: URL,
@@ -587,8 +600,10 @@ public struct MulticamEngine: Sendable {
         let picture = staging.appendingPathComponent("picture")
             .appendingPathExtension(plan.pictureCopy?.container ?? plan.pictureEncode?.edit.container ?? plan.container)
         let hasPicture = plan.pictureCopy != nil || plan.pictureEncode != nil || plan.recordingGapExport != nil
-        let needsMux = plan.sounds.count > 1 || (hasPicture && !plan.sounds.isEmpty)
-        let pictureFraction = plan.sounds.isEmpty ? 0.98 : 0.45
+        // The final mux also writes the program's chapters, so a chaptered picture-only program goes through it.
+        let chapters = hasPicture ? plan.chapters : []
+        let needsMux = plan.sounds.count > 1 || (hasPicture && (!plan.sounds.isEmpty || !chapters.isEmpty))
+        let pictureFraction = plan.sounds.isEmpty && !needsMux ? 0.98 : 0.45
         func verifySources() throws {
             for edit in [plan.pictureCopy, plan.pictureEncode?.edit].compactMap({ $0 }) {
                 for (file, identity) in edit.identities { try engine.verifyIdentity(file, identity: identity) }
@@ -631,6 +646,7 @@ public struct MulticamEngine: Sendable {
         if needsMux {
             try MulticamMux(cancelled: cancelled).export(picture: hasPicture ? picture : nil, sounds: sounds, to: destination,
                                                          container: plan.container, duration: plan.duration, audio: plan.audioLanes,
+                                                         chapters: chapters,
                                                          progress: { fraction in progress?(0.8 + fraction * 0.19); return true },
                                                          verifySources: verifySources)
         } else {

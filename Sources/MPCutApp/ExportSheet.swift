@@ -58,8 +58,11 @@ struct ExportSheetOptions: Sendable, Equatable {
     var encodeContainer = "mp4"
     var proResContainer = "mov"
     var codec: ReencodeCodec = .h264
-    var standardQuality: ReencodeQuality = .balanced
-    var proResQuality: ReencodeQuality = .prores422
+    // Any choice of quality, in the sheet or the queue, is explicit for a still-only program.
+    var standardQuality: ReencodeQuality = .balanced { didSet { qualityChosen = true } }
+    var proResQuality: ReencodeQuality = .prores422 { didSet { qualityChosen = true } }
+    /// True once the user picks a quality, so a still-only program uses it in place of the still default.
+    var qualityChosen = false
     var audio: ReencodeAudio = .auto
 
     var container: String {
@@ -85,7 +88,7 @@ struct ExportSheetOptions: Sendable, Equatable {
     /// The audio action that is requested. A container that cannot carry it is refused by the export rules with
     /// the alternatives that work. Nothing is substituted here.
     var effectiveAudio: ReencodeAudio { audio }
-    var settings: ReencodeSettings { .init(codec: codec, quality: quality, audio: effectiveAudio) }
+    var settings: ReencodeSettings { .init(codec: codec, quality: quality, audio: effectiveAudio, qualityIsExplicit: qualityChosen) }
     /// The settings of a batch, which names a conversion format through its audio action.
     var batchSettings: ReencodeSettings { convertsAudio ? ReencodeSettings(audio: audioFormat) : settings }
     var stillBatchSettings: ReencodeSettings {
@@ -101,6 +104,7 @@ struct ExportSheetOptions: Sendable, Equatable {
             current.stillVideoCodec = video.codec
             if video.codec == .prores { current.proResQuality = video.quality }
             else { current.standardQuality = video.quality }
+            current.qualityChosen = video.qualityIsExplicit
         }
         let action = alternative.requestedStillAudio ?? alternative.audio ?? (placements == .none ? .auto : audio)
         var result = current.applying(ExportRequest(clips: [], mode: alternative.mode, tracks: alternative.tracks,
@@ -121,7 +125,8 @@ extension ExportAlternative {
 
     var stillVideoSettings: ReencodeSettings? {
         guard id.hasPrefix("still-"), let codec = argument("--video").flatMap(ReencodeCodec.init(rawValue:)) else { return nil }
-        return ReencodeSettings(codec: codec, quality: argument("--quality").flatMap(ReencodeQuality.init(rawValue:)))
+        let quality = argument("--quality").flatMap(ReencodeQuality.init(rawValue:))
+        return ReencodeSettings(codec: codec, quality: quality, qualityIsExplicit: quality != nil)
     }
 
     func argument(_ flag: String) -> String? {
@@ -194,28 +199,40 @@ extension ExportPlan {
             return "Copy \(Self.seconds(edit.duration.seconds)) of \(contents) to \(edit.container.uppercased())."
         case .conversion(let plan):
             let video = "\(plan.settings.codec.displayName) · \(plan.settings.quality.displayName) · \(plan.width) × \(plan.height)"
-            // Tracks converted alike share an entry. It states what is written: the AAC bit rate or the PCM word length.
-            func format(_ track: ReencodeAudioAction) -> String {
-                if track.action == .aac, let rate = track.bitRate { return " (\(rate / 1000) kbps)" }
-                if track.action == .pcm, let depth = track.bitDepth {
-                    return " (\(depth)-bit\(track.codec?.hasPrefix("pcm_f") == true ? " float" : ""))"
-                }
-                return ""
-            }
-            let groups = Dictionary(grouping: plan.audioActions, by: \.action)
-            let audio = ReencodeAudio.allCases.flatMap { action -> [String] in
-                let tracks = groups[action] ?? []
-                let formats = tracks.map(format).reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
-                return formats.map { written in
-                    let alike = tracks.filter { format($0) == written }
-                    let label = alike.count == 1 ? "Track" : "Tracks"
-                    let numbers = alike.map { String($0.track) }.joined(separator: ", ")
-                    return "\(label) \(numbers): \(action.displayName)\(written)"
-                }
-            }
-            let audioSummary = "Audio: " + (audio.isEmpty ? "No audio tracks" : audio.joined(separator: ", "))
-            return ([video, audioSummary] + plan.warnings).joined(separator: "\n")
+            return ([video] + Self.audioRows(plan.audioActions, warnings: plan.warnings) + plan.warnings).joined(separator: "\n")
         }
+    }
+
+    /// The audio of a movie re-encode as the sheet and the queue review state it: "Audio: Track 1: PCM (16-bit)",
+    /// then the reason the engine gives for a track, such as an exact copy that could not be verified, once for
+    /// the tracks that share it. Tracks converted alike share an entry, which states what is written: the bit rate
+    /// of a lossy codec, the MP3 VBR quality, or the word length of PCM, FLAC and ALAC. A reason `warnings` already
+    /// states is not repeated.
+    static func audioRows(_ actions: [ReencodeAudioAction], warnings: [String] = []) -> [String] {
+        func format(_ track: ReencodeAudioAction) -> String {
+            if let rate = track.bitRate { return " (\(rate / 1000) kbps)" }
+            if let quality = track.quality, track.action == .mp3 { return " (VBR quality \(quality))" }
+            if let depth = track.bitDepth {
+                return " (\(depth)-bit\(track.codec?.hasPrefix("pcm_f") == true ? " float" : ""))"
+            }
+            return ""
+        }
+        func tracks(_ alike: [ReencodeAudioAction]) -> String {
+            (alike.count == 1 ? "Track " : "Tracks ") + alike.map { String($0.track) }.joined(separator: ", ")
+        }
+        let groups = Dictionary(grouping: actions, by: \.action)
+        let audio = ReencodeAudio.allCases.flatMap { action -> [String] in
+            let grouped = groups[action] ?? []
+            let formats = grouped.map(format).reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
+            return formats.map { written in
+                "\(tracks(grouped.filter { format($0) == written })): \(action.displayName)\(written)"
+            }
+        }
+        let reasons = actions.compactMap(\.reason).reduce(into: [String]()) { found, reason in
+            if !reason.isEmpty, !found.contains(reason), !warnings.contains(reason) { found.append(reason) }
+        }
+        return ["Audio: " + (audio.isEmpty ? "No audio tracks" : audio.joined(separator: ", "))]
+            + reasons.map { reason in "\(tracks(actions.filter { $0.reason == reason })): \(reason)" }
     }
 
     static func seconds(_ value: Double) -> String { ExportRules.seconds(value) }
@@ -287,12 +304,13 @@ enum ExportAvailability: Sendable {
 
     /// Asks the shared export rules for the plan, or the failure and every alternative that works.
     static func resolve(_ options: ExportSheetOptions, clips: [ClipRequest], media: [URL: MediaInfo],
-                        useSidecar: Bool = true) -> (availability: Self, failure: CutError?, offers: [ExportFallback]) {
+                        useSidecar: Bool = true) -> (availability: Self, failure: CutError?, offers: [ExportFallback], applied: ExportAlternative?) {
         let cancelled: @Sendable () -> Bool = { Task.isCancelled }
         let planner = ExportPlanner(cancelled: cancelled, useSidecar: useSidecar)
         switch planner.resolve(options.request(clips), media: media) {
-        case .ready(let plan, _, _):
-            return (.ready(plan), nil, [])
+        case .ready(let plan, _, let applied):
+            // The alternative `audio: auto` applied, which the CLI and MCP report with its warnings.
+            return (.ready(plan), nil, [], applied)
         case .unavailable(let issue, let offers):
             var review: ExportCutReview?
             // Reviewing cuts edits the timeline, which only this front end has.
@@ -308,7 +326,7 @@ enum ExportAvailability: Sendable {
                                alternative: offer.alternative,
                                clips: offer.alternative.clips == nil ? nil : offer.request.clips)
             }
-            return (.unavailable(ExportRules.describe(issue, clips: clips), review), issue, fallbacks)
+            return (.unavailable(ExportRules.describe(issue, clips: clips), review), issue, fallbacks, nil)
         }
     }
 }
@@ -621,7 +639,7 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
     private var fallbackSearch: Task<ExportFallback?, Never>?
     /// True until the current selection has its answer from the export rules.
     private(set) var isChecking = false
-    private var resolution: Task<(availability: ExportAvailability, failure: CutError?, offers: [ExportFallback]), Never>?
+    private var resolution: Task<(availability: ExportAvailability, failure: CutError?, offers: [ExportFallback], applied: ExportAlternative?), Never>?
 
     func stopChecking() {
         preflight?.cancel()
@@ -817,6 +835,7 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
         } else {
             options.standardQuality = quality
         }
+        options.qualityChosen = true
         didChange(from: options.container)
     }
 
@@ -1044,18 +1063,18 @@ func validateExportDestination(_ url: URL, container: String) throws {
 extension ExportAvailability {
     static func resolve(_ options: ExportSheetOptions, project: CutProject,
                         useSidecar: Bool, expectedSoundtrackIdentity: SourceIdentity? = nil)
-        -> (availability: Self, failure: CutError?, offers: [ExportFallback]) {
+        -> (availability: Self, failure: CutError?, offers: [ExportFallback], applied: ExportAlternative?) {
         do {
             let plan = try options.planStills(project, useSidecar: useSidecar,
                                              expectedSoundtrackIdentity: expectedSoundtrackIdentity,
                                              cancelled: { Task.isCancelled })
-            return (.stillReady(plan), nil, [])
+            return (.stillReady(plan), nil, [], nil)
         } catch {
             let issue = (error as? CutError) ?? CutError(code: "export_failed", message: error.localizedDescription)
             let offers = (issue.alternatives ?? []).map {
                 ExportFallback(title: $0.label, options: options.applying($0), alternative: $0, clips: nil)
             }
-            return (.unavailable(issue.message, nil), issue, offers)
+            return (.unavailable(issue.message, nil), issue, offers, nil)
         }
     }
 }

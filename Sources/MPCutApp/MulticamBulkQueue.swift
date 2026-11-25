@@ -40,7 +40,7 @@ struct MulticamBulkExport: Sendable {
 
         var audioDeliverySummary: String {
             switch payload {
-            case .multicam(let plan): ([plan.audioDeliverySummary] + plan.warnings).joined(separator: "\n")
+            case .multicam(let plan): ([plan.audioDeliverySummary] + plan.reportedWarnings).joined(separator: "\n")
             case .still(let plan): plan.inspectorSummary
             }
         }
@@ -412,22 +412,28 @@ extension MulticamEditorModel {
                 for item in batch.items {
                     try CutProject.validateMediaDestination(item.output, absoluteSources: protected)
                 }
+                // What writing each range changed that its plan could not show, under its file name.
+                var written: [String] = []
                 for (index, item) in batch.items.enumerated() {
                     do {
-                        try batch.write(item) { [weak self] fraction in
-                            let progress = (Double(index) + fraction) / Double(batch.items.count)
-                            Task { @MainActor [weak self] in self?.updateExportProgress(token, fraction: progress) }
-                        }
+                        let notices = try ExportWriteNotices.collecting {
+                            try batch.write(item) { [weak self] fraction in
+                                let progress = (Double(index) + fraction) / Double(batch.items.count)
+                                Task { @MainActor [weak self] in self?.updateExportProgress(token, fraction: progress) }
+                            }
+                        }.notices
+                        written += notices.map { "\(item.output.lastPathComponent) — \($0)" }
                     } catch {
                         throw CutError(code: "bulk_interrupted", message: "Wrote \(index) of \(ranges.count) files. "
                                        + "Range \(index + 1): \(error.localizedDescription)")
                     }
                 }
-                return batch.items.count
+                return (batch.items.count, written)
             }
-        } onSuccess: { count in
+        } onSuccess: { result in
+            let (count, written) = result
             let folder = organization.subfolder.isEmpty ? directory.lastPathComponent : organization.subfolder
-            self.status = "Exported \(count) \(count == 1 ? "file" : "files") to \(folder)."
+            self.status = (["Exported \(count) \(count == 1 ? "file" : "files") to \(folder)."] + written).joined(separator: " ")
         }
     }
 }

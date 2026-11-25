@@ -31,6 +31,10 @@ MPPreviewDecoder *mp_preview_open(const char *path, enum MPPreviewTracks tracks,
  * The returned stream belongs to this decoder and includes its probed configuration. */
 struct AVStream;
 const struct AVStream *mp_preview_prepare_edge(MPPreviewDecoder *preview);
+/* After mp_preview_prepare_edge and before the seek: H.264 or HEVC parameter sets (NAL units with 4-byte lengths)
+ * that the source's decoder holds at the edge's keyframe, which in-band sets earlier in the stream may have changed
+ * from the description. The keyframe each seek starts from brings them first. False when they cannot be kept. */
+bool mp_preview_prime_edge(MPPreviewDecoder *preview, const uint8_t *units, int size);
 void mp_preview_coded_size(const MPPreviewDecoder *preview, int *width, int *height);
 void mp_preview_close(MPPreviewDecoder *preview);
 /* Select picture-only scrubbing or A/V playback before the next seek. */
@@ -58,10 +62,37 @@ int mp_preview_next_picture(MPPreviewDecoder *preview, CVPixelBufferRef *image C
  * next keyframe and omits the pictures in between. A Smart Trim edge returns the intact
  * pictures decoded before the damage and then reports an error. */
 bool mp_preview_met_damage(const MPPreviewDecoder *preview);
+enum MPPreviewOmission {
+    MPPreviewOmitsNothing,
+    MPPreviewOmitsDamagedPicture,     /* Resumed at the next keyframe after a damaged picture. */
+    MPPreviewOmitsUnalignedSwitch,    /* Resumed at the next keyframe after a description change between keyframes. */
+    MPPreviewOmitsLeadingPictures     /* Reopened at an HEVC CRA picture with a new description, which drops its
+                                       * RASL pictures: they predict from pictures before it. */
+};
+/* Why the pictures returned since the last seek omit some of the source's (mp_preview_met_damage is then true),
+ * the most specific reason first. A change of description at any other keyframe omits nothing. */
+int mp_preview_omission(const MPPreviewDecoder *preview);
+/* The sentence for mp_preview_omission, naming the omitted leading pictures, or NULL. Valid until the next call
+ * on the decoder. */
+const char *mp_preview_notice(const MPPreviewDecoder *preview);
+/* Whether the audio decoder rejected a damaged packet since the last seek. Its samples are missing. */
+bool mp_preview_met_audio_damage(const MPPreviewDecoder *preview);
 /* For a Smart Trim edge that ended with a damage error: every picture returned before the
  * error was decoded from packets that precede the damaged one. */
 bool mp_preview_edge_intact_before_damage(const MPPreviewDecoder *preview);
+/* For a Smart Trim edge: the picture returned last carries captions, colour or grain
+ * metadata that re-encoding it would drop, or belongs to a coded sequence whose keyframe
+ * or earlier pictures carried colour volume, light level or viewing environment metadata,
+ * or was decoded from or after a sample with SEI mp_preview_sample_keeps_sei names, or carries
+ * an S12M time code. Pictures outside the edge are copied. */
+bool mp_preview_edge_metadata(const MPPreviewDecoder *preview);
 CGAffineTransform mp_preview_transform(const MPPreviewDecoder *preview);
+/* Whether a length-prefixed H.264 or HEVC sample (codec is an AVCodecID) carries SEI that a re-encoded Smart Trim edge
+ * would drop and libavcodec cannot hand to the encoder: frame packing, display orientation, an HEVC time code,
+ * alternative transfer characteristics, or ATSC active format description or bar data. A decoder keeps frame packing
+ * and display orientation until they are cancelled, so an edge refuses every picture decoded from the first such
+ * sample after its keyframe on (mp_preview_edge_metadata), and the Smart Trim plan (smart_preflight.c) the same. */
+bool mp_preview_sample_keeps_sei(int codec, int length_size, const uint8_t *data, int size);
 
 /* The program mixer accepts timestamped, interleaved Float PCM on the output
  * clock. When next returns Again with a lane >= 0, submit one sample buffer or

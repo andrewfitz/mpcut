@@ -6,9 +6,12 @@ struct StillVideoGenerator {
     var cancelled: (@Sendable () -> Bool)?
     var colorPolicy: StillProgramColorPolicy? = nil
     var standalone = false
+    /// The explicitly chosen --quality of a still-only program, mapped like Re-encode. Without a choice
+    /// the still default is Re-encode's High Quality.
+    var quality: ReencodeQuality? = nil
 
     func check(reference: StreamInfo, container: String, schedule: StillSampleSchedule) throws {
-        let settings = try Encoding(reference, container: container, policy: colorPolicy, standalone: standalone)
+        let settings = try Encoding(reference, container: container, policy: colorPolicy, standalone: standalone, quality: quality)
         try check(schedule, settings: settings)
         try verifyHelper(ReencodeEngine.findHelper(override: nil), settings: settings, schedule: schedule)
     }
@@ -25,7 +28,7 @@ struct StillVideoGenerator {
         let engine = CutEngine(cancelled: { Task.isCancelled || cancelled?() == true })
         try engine.checkCancellation()
         try engine.verifyIdentity(asset, identity: identity)
-        let settings = try Encoding(reference, container: container, policy: colorPolicy, standalone: standalone)
+        let settings = try Encoding(reference, container: container, policy: colorPolicy, standalone: standalone, quality: quality)
         try check(schedule, settings: settings)
         let helper = try ReencodeEngine.findHelper(override: nil)
         let parameters = CacheParameters(framing: framing, width: settings.width, height: settings.height,
@@ -203,7 +206,8 @@ struct StillVideoGenerator {
 
     private struct CacheParameters: Encodable {
         // 6: a gain-map image on an SDR program renders its SDR base.
-        let policyVersion = 6
+        // 7: a still-only program can choose HEVC Main 10, the ProRes profile and compression quality.
+        let policyVersion = 7
         let framing: StillImageFraming
         let width: Int
         let height: Int
@@ -258,11 +262,14 @@ extension StillVideoGenerator {
         let timescale: Int64
         let lossless: Bool
         let diffuseWhiteNits: Int
+        /// Set only for a standalone (still-only) program; a camera-matched still keeps the default.
+        let quality: ReencodeQuality?
 
         init(_ video: StreamInfo, container: String, lossless: Bool = false, sampleTimescale: Int64? = nil,
-             policy: StillProgramColorPolicy?, standalone: Bool = false) throws {
+             policy: StillProgramColorPolicy?, standalone: Bool = false, quality: ReencodeQuality? = nil) throws {
             self.container = container
             self.lossless = lossless
+            self.quality = standalone && !lossless ? quality : nil
             try policy?.validate()
             let hdr = ["smpte2084", "arib-std-b67"].contains(policy?.transfer ?? video.colorTransfer)
             func normalized(_ value: String, fallback: String) -> String {
@@ -333,6 +340,13 @@ extension StillVideoGenerator {
                 pixelFormat = "p210le"
                 chroma = 422
                 chromaLocation = nil
+            // A still-only program chooses its ProRes profile with --quality.
+            case ("prores", 1, _) where standalone && container == "mov" && tag == "apcs" && depth == 10,
+                 ("prores", 3, _) where standalone && container == "mov" && tag == "apch" && depth == 10:
+                profileName = video.profile == 1 ? "lt" : "hq"
+                pixelFormat = "p210le"
+                chroma = 422
+                chromaLocation = nil
             case ("h264", 100, false), ("h264", 77, false), ("h264", 66, false):
                 guard tag == "avc1", depth == 8, standalone || !video.configuration.isEmpty else {
                     throw Self.unsupported("Still generation requires an 8-bit AVC sample description with an avc1 tag.")
@@ -350,6 +364,12 @@ extension StillVideoGenerator {
             case ("hevc", 1, false) where standalone && tag == "hvc1" && depth == 8:
                 profileName = "main"
                 pixelFormat = "nv12"
+                chroma = 420
+                chromaLocation = normalized(video.chromaLocation, fallback: "left")
+            // A still-only SDR program keeps images deeper than 8 bits in Main 10.
+            case ("hevc", 2, false) where standalone && tag == "hvc1" && depth == 10:
+                profileName = "main10"
+                pixelFormat = "p010le"
                 chroma = 420
                 chromaLocation = normalized(video.chromaLocation, fallback: "left")
             default:
@@ -381,9 +401,11 @@ extension StillVideoGenerator {
             var result = ["-map", "0:v:0", "-an", "-sn", "-dn", "-vf", filters.joined(separator: ",")]
             if let profileName {
                 result += ["-c:v", "\(codec)_videotoolbox", "-allow_sw", "0", "-profile:v", profileName, "-bf", "0"]
-                if codec != "prores" { result += ["-g", "60", "-q:v", "75"] }
+                // Re-encode's Smaller File and High Quality values. Balanced cannot be told apart
+                // from no choice here, so it keeps the long-standing still default.
+                if codec != "prores" { result += ["-g", "60", "-q:v", quality == .smallerFile ? "45" : quality == .balanced ? "60" : "75"] }
             } else if codec == "mjpeg" {
-                result += ["-c:v", "mjpeg", "-q:v", "2"]
+                result += ["-c:v", "mjpeg", "-q:v", quality == .smallerFile ? "5" : quality == .balanced ? "3" : "2"]
             } else {
                 result += ["-c:v", "rawvideo"]
             }

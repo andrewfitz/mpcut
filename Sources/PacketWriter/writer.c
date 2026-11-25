@@ -2,6 +2,8 @@
 #include "MediaProbe.h"
 #include "timecode.h"
 #include "aac_edits.h"
+#include "avc_reorder.h"
+#include "hevc_sets.h"
 #include "mp3_crop.h"
 #include "smart_edge.h"
 #include "splice_headers.h"
@@ -26,6 +28,7 @@
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/opt.h>
 #include <libavutil/sha.h>
+#include <libavutil/spherical.h>
 #include <libavutil/stereo3d.h>
 
 typedef __int128 Wide;
@@ -53,6 +56,7 @@ typedef struct {
     MPCutEdgeRange plan;
     int64_t start_pts;
     int64_t end_pts;
+    int64_t decode_pts;    /* The keyframe the edge's decoder starts from. */
     size_t consumed;
     MPCutEdge *encoded;
     int64_t *source_times;
@@ -69,6 +73,7 @@ typedef struct {
     MPCutAAC *aac_edits;
     MPCutAACSource *aac_source;
     OpusTrim *opus_trim;
+    OpusTrim *opus_clock; /* Per input stream: Opus packets recounted on the sample clock for Ogg. */
     int64_t *last_dts;
     uint8_t *range_tracks;
     unsigned range_track_count;
@@ -105,7 +110,37 @@ typedef struct {
     unsigned art_streams;
     uint8_t *art;       /* Per input stream of the first source: 1 when its cover picture is written. */
     int mov_chapter_clock; /* Nonzero when the MOV chapter track still counts milliseconds on this clock. */
+    uint8_t *hvc1;         /* Per output stream: HEVC_ENTRY_* for a track the muxer labels 'hev1'. */
+    int avc_reorder;       /* Reorder depth declared in H.264 parameter sets that lack one (plan_avc_reorder). */
+    MPCutHevcSets **hevc_sets; /* Per output stream: the HEVC parameter sets active in an 'hvc1' track (check_hvc1). */
+    unsigned hevc_set_count;
+    int hevc_range_start;  /* The next retained HEVC sample is the first of a range. */
+    uint8_t **hevc_early;  /* Per segment: picture parameter sets its range starts with (plan_hevc_sets). */
+    int *hevc_early_size;
+    int *hevc_videos;      /* Per segment: the input stream plan_hevc_sets read. */
+    size_t hevc_early_count, hevc_range; /* hevc_range: the segment being written. */
+    int hevc_range_video;  /* hevc_videos of that segment. */
+    uint8_t **stream_sets; /* Per segment: the H.264/HEVC sets its source holds at the range start (plan_stream_sets). */
+    int *stream_sets_size;
+    size_t stream_set_count;
+    MPCutHevcSets *output_sets; /* The sets the output's decoder holds (repeat_stream_sets). */
+    MPCutHevcSets *description_sets; /* The sets of the sample description a reader starting at a keyframe has. */
+    int sets_range_start;  /* The next copied picture of the primary video is the first of a range. */
+    int sets_repeating;    /* The range started from repeated sets, which its later keyframes repeat too. */
+    int sets_unfollowed;   /* The output's sets cannot be followed, so none are repeated. */
+    int64_t *stream_start_pts; /* Per segment: the source packet stream_sets describe the decoder before. */
+    MPCutHevcSets *smart_sets; /* Smart Trim: the sets the source's decoder holds, from stream_start_pts on. */
+    int smart_unfollowed;  /* Smart Trim: the source's sets cannot be followed. */
+    int smart_range_first; /* Smart Trim: the next copied picture is the first of its range. */
+    int smart_repeating;   /* Smart Trim: the copied run repeats the source's sets at its keyframes (H.264). */
+    int smart_dirty;       /* Smart Trim: the output's decoder may hold sets that the source description does not. */
+    uint8_t *tail_sets;    /* Smart Trim: the sets at the tail edge's keyframe, for its decoder. */
+    int tail_sets_size;
 } Writer;
+
+enum { HEVC_ENTRY_KEEP, HEVC_ENTRY_HVC1, HEVC_ENTRY_HEV1 };
+
+static void plan_hvc1(Writer *writer, const AVStream *destination);
 
 typedef struct {
     MPCutTime source_start;
@@ -320,6 +355,39 @@ static int chapter_track(const AVStream *stream) {
         stream->discard == AVDISCARD_ALL;
 }
 
+/* Subtitle cues and timed data, such as camera telemetry, that travel beside the picture and sound of a movie.
+ * The source's first MOV timecode track and a chapter list track are written by other means. */
+static int extra_track(const AVStream *stream) {
+    enum AVMediaType type = stream->codecpar->codec_type;
+    return type == AVMEDIA_TYPE_SUBTITLE || (type == AVMEDIA_TYPE_DATA && !timecode_track(stream) && !chapter_track(stream));
+}
+
+/* Whether a copy into this container keeps an extra track whole: its packets and its sample description.
+ * MOV keeps a 3GPP text description as it is, and GoPro telemetry ('gpmd'), whose description holds nothing
+ * beyond its name. Other timed metadata, such as Apple's 'mebx', describes its keys in the sample description,
+ * which the muxer does not write again, so it is left out and named. Matroska stores text cues by codec. */
+static int carried_extra(const AVOutputFormat *format, const AVStream *stream) {
+    const AVCodecParameters *codec = stream->codecpar;
+    if (codec->codec_type == AVMEDIA_TYPE_DATA)
+        return av_match_name(format->name, "mov,mp4") && codec->codec_tag == MKTAG('g', 'p', 'm', 'd');
+    if (codec->codec_type != AVMEDIA_TYPE_SUBTITLE)
+        return 0;
+    switch (codec->codec_id) {
+        case AV_CODEC_ID_MOV_TEXT:
+            // QuickTime text ('text') keeps its own description only in a QuickTime movie.
+            return (av_match_name(format->name, "mov,mp4,ipod") && codec->codec_tag == MKTAG('t', 'x', '3', 'g')) ||
+                (!strcmp(format->name, "mov") && codec->codec_tag == MKTAG('t', 'e', 'x', 't'));
+        case AV_CODEC_ID_WEBVTT:
+            return is_matroska(format);
+        case AV_CODEC_ID_SUBRIP:
+        case AV_CODEC_ID_ASS:
+        case AV_CODEC_ID_SSA:
+            return !strcmp(format->name, "matroska");
+        default:
+            return 0;
+    }
+}
+
 static int selected_stream(const Writer *writer, const AVStream *stream) {
     switch (writer->tracks) {
         case MPCUT_TRACKS_AUDIO:
@@ -328,7 +396,13 @@ static int selected_stream(const Writer *writer, const AVStream *stream) {
         case MPCUT_TRACKS_VIDEO:
             // Timecode describes the picture, so a delivered picture-only movie can keep it.
             return primary_video(stream) || (writer->keep_timecode && timecode_track(stream));
-        default: return !chapter_track(stream);
+        default:
+            // Cover art and attached files travel as the art plan decides (plan_art, plan_files).
+            if (chapter_track(stream) || stream->codecpar->codec_type == AVMEDIA_TYPE_ATTACHMENT ||
+                (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && (stream->disposition & AV_DISPOSITION_ATTACHED_PIC)))
+                return 0;
+            return !extra_track(stream) ||
+                (writer->output && carried_extra(writer->output->oformat, stream));
     }
 }
 
@@ -340,6 +414,7 @@ static int validate_streams(Writer *writer, const AVFormatContext *input, int *t
     int mov_color = av_match_name(format->name, "mov,mp4");
     unsigned video_count = 0;
     unsigned audio_count = 0;
+    unsigned extra_count = 0;
     const AVStream *video = NULL;
     *timecode_index = -1;
 
@@ -375,6 +450,9 @@ static int validate_streams(Writer *writer, const AVFormatContext *input, int *t
                 stream->start_time != AV_NOPTS_VALUE && stream->start_time > 0) {
                 return fail(writer, "Use MP3 to preserve the encoder delay and trailing padding on track %u", index);
             }
+        } else if (extra_track(stream)) {
+            extra_count++; // carried_extra chose the container for it.
+            continue;
         } else {
             return fail(writer, "Track %u in %s cannot be carried as linked video or audio", index, input->url);
         }
@@ -392,6 +470,14 @@ static int validate_streams(Writer *writer, const AVFormatContext *input, int *t
                         format->name, index, avcodec_get_name(codec->codec_id), input->url);
         }
 
+        // FFmpeg's Matroska writer keeps only base-layer sets in CodecPrivate, and Matroska has no place for an lhvC
+        // record. A higher layer whose sets come only with the description could not be decoded from the copy.
+        const char *layers = codec->codec_id == AV_CODEC_ID_HEVC && primary_video(stream)
+            ? mpcut_hevc_layers(codec->extradata, codec->extradata_size) : NULL;
+        if (layers && is_matroska(format))
+            return fail(writer, "Choose MOV or MP4 to keep %s of track %u in %s. Matroska has no place for the "
+                        "parameter sets of an additional HEVC layer, so that layer could not be decoded from the copy.",
+                        layers, index, input->url);
         if (av_match_name("matroska", input->iformat->name) && !is_matroska(format)
             && (codec->codec_id == AV_CODEC_ID_VP8 || codec->codec_id == AV_CODEC_ID_VP9)) {
             const AVDictionaryEntry *alpha = av_dict_get(stream->metadata, "alpha_mode", NULL, 0);
@@ -445,7 +531,7 @@ static int validate_streams(Writer *writer, const AVFormatContext *input, int *t
     if (*timecode_index >= 0 && mpcut_timecode_describe(input->streams[*timecode_index], video, timecode) < 0) {
         return fail(writer, "Unsupported MOV timecode description or frame rate in %s", input->url);
     }
-    writer->selected_count = video_count + audio_count;
+    writer->selected_count = video_count + audio_count + extra_count;
     return 0;
 }
 
@@ -769,11 +855,19 @@ static int picture_size(const AVStream *stream, int *width, int *height) {
     return *width > 0 && *height > 0 && *width <= 65535 && *height <= 65535;
 }
 
-/* Cover art travels when a sound-only source is copied with every audio track. Marks the
+/* What describes the recording as a whole travels with a delivered copy of the whole recording:
+ * every audio track of a sound-only source, or the picture and sound of a movie. */
+static int whole_recording(const Writer *writer, const AVFormatContext *input) {
+    if (!writer->delivered)
+        return 0;
+    return sound_only(input) ? writer->whole_sound : writer->tracks == MPCUT_TRACKS_ALL;
+}
+
+/* Cover art travels with the whole recording (whole_recording). Marks the
  * source pictures the output stores and returns how many it cannot store. */
 static unsigned plan_art(const Writer *writer, const AVFormatContext *input, uint8_t *keep, unsigned *kept) {
     *kept = 0;
-    if (!writer->delivered || !writer->whole_sound || !sound_only(input))
+    if (!whole_recording(writer, input))
         return 0;
     const AVOutputFormat *format = writer->output->oformat;
     int form = art_form(format);
@@ -819,7 +913,7 @@ static int attached_file(const AVStream *stream) {
  * source files the output stores and returns how many it cannot store. */
 static unsigned plan_files(const Writer *writer, const AVFormatContext *input, uint8_t *keep, unsigned *kept) {
     *kept = 0;
-    if (!writer->delivered || !writer->whole_sound || !sound_only(input))
+    if (!whole_recording(writer, input))
         return 0;
     int stored = !strcmp(writer->output->oformat->name, "matroska");
     unsigned dropped = 0;
@@ -1147,6 +1241,124 @@ static int store_chapters(Writer *writer, Chapters *plan, int movie_timescale, i
     return 0;
 }
 
+/* Reads n bits, most significant first, or returns -1 past the end. */
+static int64_t vp9_bits(const uint8_t *data, int size, int *position, int n) {
+    int64_t value = 0;
+    for (int i = 0; i < n; i++, (*position)++) {
+        if (*position >= size * 8)
+            return -1;
+        value = (value << 1) | ((data[*position / 8] >> (7 - *position % 8)) & 1);
+    }
+    return value;
+}
+
+/* The picture format coded in a VP9 keyframe's uncompressed header (VP9 bitstream 6.2, 7.2). */
+static enum AVPixelFormat vp9_keyframe_format(const uint8_t *data, int size, int *profile) {
+    int at = 0;
+    if (vp9_bits(data, size, &at, 2) != 2) /* frame_marker */
+        return AV_PIX_FMT_NONE;
+    int64_t low = vp9_bits(data, size, &at, 1), high = vp9_bits(data, size, &at, 1);
+    if (low < 0 || high < 0)
+        return AV_PIX_FMT_NONE;
+    *profile = (int)(high << 1 | low);
+    if (*profile == 3 && vp9_bits(data, size, &at, 1) != 0)
+        return AV_PIX_FMT_NONE;
+    /* show_existing_frame and frame_type are zero for a keyframe; then show_frame, error_resilient_mode
+     * and the sync code. */
+    if (vp9_bits(data, size, &at, 2) != 0 || vp9_bits(data, size, &at, 2) < 0
+        || vp9_bits(data, size, &at, 24) != 0x498342)
+        return AV_PIX_FMT_NONE;
+    int depth = 8;
+    if (*profile >= 2) {
+        int64_t twelve = vp9_bits(data, size, &at, 1);
+        if (twelve < 0)
+            return AV_PIX_FMT_NONE;
+        depth = twelve ? 12 : 10;
+    }
+    int64_t space = vp9_bits(data, size, &at, 3);
+    if (space < 0)
+        return AV_PIX_FMT_NONE;
+    int rgb = space == 7, x = 1, y = 1;
+    if (!rgb && vp9_bits(data, size, &at, 1) < 0) /* color_range */
+        return AV_PIX_FMT_NONE;
+    if (*profile == 1 || *profile == 3) {
+        int64_t subsampling = rgb ? 0 : vp9_bits(data, size, &at, 2);
+        if (subsampling < 0)
+            return AV_PIX_FMT_NONE;
+        x = (int)(subsampling >> 1);
+        y = (int)(subsampling & 1);
+    } else if (rgb) {
+        return AV_PIX_FMT_NONE; /* RGB is coded in profiles 1 and 3 only. */
+    }
+    static const enum AVPixelFormat formats[3][5] = {
+        {AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUV440P, AV_PIX_FMT_YUV444P, AV_PIX_FMT_GBRP},
+        {AV_PIX_FMT_YUV420P10, AV_PIX_FMT_YUV422P10, AV_PIX_FMT_YUV440P10, AV_PIX_FMT_YUV444P10, AV_PIX_FMT_GBRP10},
+        {AV_PIX_FMT_YUV420P12, AV_PIX_FMT_YUV422P12, AV_PIX_FMT_YUV440P12, AV_PIX_FMT_YUV444P12, AV_PIX_FMT_GBRP12},
+    };
+    int layout = rgb ? 4 : x && y ? 0 : x ? 1 : y ? 2 : 3;
+    return formats[depth == 8 ? 0 : depth == 10 ? 1 : 2][layout];
+}
+
+/* The MOV muxer derives the vpcC box from the pixel format, which a MOV or Matroska source does not
+ * report without decoding a picture. Unknown, the box is written empty and FFmpeg cannot open the copy. */
+static int fill_vp_format(Writer *writer, const AVFormatContext *input, unsigned index, AVCodecParameters *codec) {
+    if (codec->format != AV_PIX_FMT_NONE || (codec->codec_id != AV_CODEC_ID_VP8 && codec->codec_id != AV_CODEC_ID_VP9))
+        return 0;
+    if (codec->codec_id == AV_CODEC_ID_VP8) {
+        codec->format = AV_PIX_FMT_YUV420P; /* VP8 codes 8-bit 4:2:0 only. */
+        return 0;
+    }
+    AVFormatContext *scan = NULL;
+    AVPacket *packet = av_packet_alloc();
+    int result = packet ? avformat_open_input(&scan, input->url, input->iformat, NULL) : AVERROR(ENOMEM);
+    enum AVPixelFormat format = AV_PIX_FMT_NONE;
+    int profile = AV_PROFILE_UNKNOWN;
+    if (result >= 0 && index < scan->nb_streams) {
+        for (unsigned i = 0; i < scan->nb_streams; i++)
+            if (i != index)
+                scan->streams[i]->discard = AVDISCARD_ALL;
+        for (int read = 0; format == AV_PIX_FMT_NONE && read < 4096 && av_read_frame(scan, packet) >= 0; read++) {
+            if (packet->stream_index == (int)index && (packet->flags & AV_PKT_FLAG_KEY))
+                format = vp9_keyframe_format(packet->data, packet->size, &profile);
+            av_packet_unref(packet);
+        }
+    }
+    avformat_close_input(&scan);
+    av_packet_free(&packet);
+    if (format == AV_PIX_FMT_NONE)
+        return fail(writer, "Cannot read the VP9 picture format of track %u in %s", index, input->url);
+    codec->format = format;
+    if (codec->profile == AV_PROFILE_UNKNOWN)
+        codec->profile = profile;
+    return 0;
+}
+
+/* Describe an HEVC track's first sample entry with the sets the source holds where its first range starts
+ * (plan_stream_sets), and add the picture parameter sets that range brings inside a picture group (plan_hevc_sets),
+ * so the samples that bring them only repeat sets from the entry. */
+static int describe_early_sets(Writer *writer, AVCodecParameters *codec, const uint8_t *stream, int stream_size,
+                               const uint8_t *early, int early_size) {
+    MPCutHevcSets *sets = mpcut_hevc_sets_create(codec->extradata, codec->extradata_size);
+    if (!sets)
+        return 0; // check_hvc1 withdraws 'hvc1' from a description it cannot read.
+    uint8_t *record = NULL;
+    int size = 0;
+    int result = stream_size ? mpcut_hevc_sets_apply_sample(sets, stream, stream_size, 4) : 0;
+    int added = result < 0 || !early_size ? 0 : mpcut_hevc_sets_apply_sample(sets, early, early_size, 4);
+    result = result < 0 ? result : added < 0 ? added : result | added;
+    if (result > 0)
+        result = mpcut_hevc_sets_record(sets, &record, &size);
+    mpcut_hevc_sets_free(sets);
+    if (result < 0)
+        return ff_error(writer, result, "Cannot describe the HEVC parameter sets of", writer->output_path);
+    if (record) {
+        av_free(codec->extradata); // The record is allocated with input padding.
+        codec->extradata = record;
+        codec->extradata_size = size;
+    }
+    return 0;
+}
+
 static int configure_output(Writer *writer, AVFormatContext *input, int whole_file,
                             int timecode_index, const MPCutTimecode *timecode, const char *initial_timecode,
                             const MPCutSegment *segment, Chapters *chapters) {
@@ -1160,6 +1372,10 @@ static int configure_output(Writer *writer, AVFormatContext *input, int whole_fi
     if (!writer->last_dts) {
         return fail(writer, "Cannot allocate output track state");
     }
+    if (is_mov(output->oformat) && !writer->generated_stills && (!(writer->hvc1 = av_calloc(output_count, 1))
+        || !(writer->hevc_sets = av_calloc(output_count, sizeof(*writer->hevc_sets)))))
+        return fail(writer, "Cannot allocate output track state");
+    writer->hevc_set_count = writer->hevc_sets ? output_count : 0;
 
     int result = av_dict_copy(&output->metadata, input->metadata, 0);
     if (result < 0) {
@@ -1181,17 +1397,34 @@ static int configure_output(Writer *writer, AVFormatContext *input, int whole_fi
         if (result < 0) {
             return ff_error(writer, result, "Cannot copy stream configuration from", input->url);
         }
+        if (is_mov(output->oformat) && (result = fill_vp_format(writer, input, index, destination->codecpar)))
+            return result;
+        if (writer->avc_reorder > 0 && primary_video(source) && source->codecpar->codec_id == AV_CODEC_ID_H264) {
+            uint8_t *config = NULL;
+            int size = 0;
+            result = mpcut_avcc_declare_reorder(destination->codecpar->extradata, destination->codecpar->extradata_size,
+                                                writer->avc_reorder, &config, &size);
+            if (result < 0)
+                return ff_error(writer, result, "Cannot declare the picture reorder depth for", input->url);
+            if (result) {
+                av_free(destination->codecpar->extradata);
+                destination->codecpar->extradata = config;
+                destination->codecpar->extradata_size = size;
+            }
+        }
         if (writer->generated_stills && destination->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
             result = set_still_hdr(writer, destination->codecpar);
             if (result)
                 return result;
         }
-        // The MP4 muxer writes the Dolby Vision configuration box only at this
-        // compliance level. Without it, the base-layer pictures survive but the
-        // muxer quietly drops the display configuration.
+        // The MP4 muxer writes the Dolby Vision configuration box, and the sv3d and vexu boxes of 360° video,
+        // only at this compliance level. Without it, the pictures survive but the muxer quietly drops the
+        // display configuration or the projection.
         if (strcmp(output->oformat->name, "mp4") == 0 &&
-            av_packet_side_data_get(source->codecpar->coded_side_data, source->codecpar->nb_coded_side_data,
-                                    AV_PKT_DATA_DOVI_CONF))
+            (av_packet_side_data_get(source->codecpar->coded_side_data, source->codecpar->nb_coded_side_data,
+                                     AV_PKT_DATA_DOVI_CONF) ||
+             av_packet_side_data_get(source->codecpar->coded_side_data, source->codecpar->nb_coded_side_data,
+                                     AV_PKT_DATA_SPHERICAL)))
             output->strict_std_compliance = FF_COMPLIANCE_UNOFFICIAL;
         if (index < segment->opus_track_count && segment->opus_pre_skip[index] >= 0 && is_matroska(output->oformat)) {
             AVCodecParameters *codec = destination->codecpar;
@@ -1207,8 +1440,10 @@ static int configure_output(Writer *writer, AVFormatContext *input, int whole_fi
             mpcut_normalize_flac_streaminfo(destination->codecpar->extradata,
                                             destination->codecpar->extradata_size);
         /* MOV sample entries carry semantics such as ProRes profile and HEVC parameter-set placement. */
-        if (!is_mov(output->oformat) || !output->oformat->codec_tag
-            || av_codec_get_id(output->oformat->codec_tag, source->codecpar->codec_tag) != source->codecpar->codec_id) {
+        // A carried data track is known by its sample entry name alone (carried_extra).
+        if ((!is_mov(output->oformat) || !output->oformat->codec_tag
+             || av_codec_get_id(output->oformat->codec_tag, source->codecpar->codec_tag) != source->codecpar->codec_id)
+            && !(source->codecpar->codec_type == AVMEDIA_TYPE_DATA && extra_track(source))) {
             destination->codecpar->codec_tag = 0;
         }
         if (writer->smart_trim && is_mov(output->oformat)) {
@@ -1217,6 +1452,14 @@ static int configure_output(Writer *writer, AVFormatContext *input, int whole_fi
             else if (source->codecpar->codec_id == AV_CODEC_ID_HEVC)
                 destination->codecpar->codec_tag = MKTAG('h', 'v', 'c', '1');
         }
+        plan_hvc1(writer, destination);
+        int early = writer->hevc_early_count && writer->hevc_early_size[0] > 0 && (int)index == writer->hevc_videos[0];
+        int stream = writer->stream_set_count && writer->stream_sets_size[0] > 0 && primary_video(source);
+        if ((early || stream) && writer->hvc1 && writer->hvc1[destination->index] == HEVC_ENTRY_HVC1
+            && (result = describe_early_sets(writer, destination->codecpar,
+                                             stream ? writer->stream_sets[0] : NULL, stream ? writer->stream_sets_size[0] : 0,
+                                             early ? writer->hevc_early[0] : NULL, early ? writer->hevc_early_size[0] : 0)))
+            return result;
         destination->id = destination->index + 1;
         destination->time_base = source->time_base;
         destination->avg_frame_rate = source->avg_frame_rate;
@@ -1228,6 +1471,20 @@ static int configure_output(Writer *writer, AVFormatContext *input, int whole_fi
             destination->sample_aspect_ratio = destination->codecpar->sample_aspect_ratio = sar;
         }
         destination->disposition = source->disposition;
+        // FFmpeg's hvcC writer keeps the sets of a higher layer only when it reads them from Annex B, so the sets of
+        // the alpha layer that Apple's HEVC with alpha holds in hvcC would be dropped and AVFoundation could not read
+        // the copy at all. A track marked multilayer gets them in an lhvC box, as an MV-HEVC view's come, which
+        // AVFoundation reads for alpha too (with the alpha mode the stream's own alpha information gives).
+        if (is_mov(output->oformat) && destination->codecpar->codec_id == AV_CODEC_ID_HEVC
+            && mpcut_hevc_layers(destination->codecpar->extradata, destination->codecpar->extradata_size))
+            destination->disposition |= AV_DISPOSITION_MULTILAYER;
+        // The MP4 muxer writes the video extension (vexu) and field of view (hfov) boxes of stereo video, which say
+        // which view is which eye, the camera baseline and the disparity adjustment, only at this compliance level,
+        // as it does the Dolby Vision box. MOV always gets them.
+        if (strcmp(output->oformat->name, "mp4") == 0
+            && av_packet_side_data_get(source->codecpar->coded_side_data, source->codecpar->nb_coded_side_data,
+                                       AV_PKT_DATA_STEREO3D))
+            output->strict_std_compliance = FF_COMPLIANCE_UNOFFICIAL;
 
         result = av_dict_copy(&destination->metadata, source->metadata, 0);
         if (result >= 0)
@@ -1273,9 +1530,12 @@ static int configure_output(Writer *writer, AVFormatContext *input, int whole_fi
             if (base.num == 1 && base.den > 0 && movie_timescale % base.den != 0)
                 output_movie_timescale = base.den;
         }
-        av_opt_set_int(output->priv_data, "movie_timescale", output_movie_timescale, 0);
-        av_opt_set_int(output->priv_data, "use_editlist", 1, 0);
-        av_opt_set_int(output->priv_data, "use_stream_ids_as_track_ids", 1, 0);
+        // A muxer without one of these options would round the edit, drop the edit lists, renumber the tracks or
+        // leave out the colour box. Stop rather than write that copy.
+        if ((result = av_opt_set_int(output->priv_data, "movie_timescale", output_movie_timescale, 0)) < 0
+            || (result = av_opt_set_int(output->priv_data, "use_editlist", 1, 0)) < 0
+            || (result = av_opt_set_int(output->priv_data, "use_stream_ids_as_track_ids", 1, 0)) < 0)
+            return ff_error(writer, result, "Cannot configure the movie clock and track IDs for", input->url);
         for (unsigned index = 0; index < output->nb_streams; index++) {
             const AVCodecParameters *codec = output->streams[index]->codecpar;
             if (codec->codec_type == AVMEDIA_TYPE_VIDEO
@@ -1283,7 +1543,8 @@ static int configure_output(Writer *writer, AVFormatContext *input, int whole_fi
                     || codec->color_trc != AVCOL_TRC_UNSPECIFIED
                     || codec->color_space != AVCOL_SPC_UNSPECIFIED
                     || codec->color_range != AVCOL_RANGE_UNSPECIFIED)) {
-                av_opt_set(output->priv_data, "movflags", "+write_colr+prefer_icc", 0);
+                if ((result = av_opt_set(output->priv_data, "movflags", "+write_colr+prefer_icc", 0)) < 0)
+                    return ff_error(writer, result, "Cannot configure the colour description for", input->url);
                 break;
             }
         }
@@ -1552,6 +1813,59 @@ static int pcm_frame_size(const AVCodecParameters *codec) {
     return channels * (bits / 8);
 }
 
+/* Samples one AC-3 or E-AC-3 packet decodes to: 1536 for an AC-3 frame, or 256 for each audio
+ * block of the independent E-AC-3 frames of the first program. 0 when it is not understood. */
+static int64_t dolby_packet_samples(const uint8_t *data, int size) {
+    static const int blocks_for_code[] = {1, 2, 3, 6};
+    int64_t samples = 0;
+    while (size >= 6 && data[0] == 0x0b && data[1] == 0x77) {
+        int bsid = data[5] >> 3;
+        if (bsid <= 10)
+            return samples + 1536;
+        if (bsid > 16)
+            return 0;
+        int bytes = (((data[2] & 7) << 8 | data[3]) + 1) * 2;
+        int blocks = data[4] >> 6 == 3 ? 6 : blocks_for_code[(data[4] >> 4) & 3];
+        if ((data[2] >> 6) != 1 && !((data[2] >> 3) & 7))
+            samples += 256 * blocks;
+        if (bytes > size)
+            return 0;
+        data += bytes;
+        size -= bytes;
+    }
+    return size ? 0 : samples;
+}
+
+/* The demuxer marks the encoder padding after the last audible AC-3 or E-AC-3 sample on the final
+ * packet. The MOV muxer honours that mark only for a stream that states its frame size, so the copy
+ * would play the padding. End this sample, and with it the track's edit, at the last audible sample. */
+static int trim_dolby_tail(Writer *writer, const AVStream *input_track, int64_t mapped_pts, int64_t *mapped_end) {
+    const AVPacket *packet = writer->packet;
+    size_t size = 0;
+    const uint8_t *side = av_packet_get_side_data(packet, AV_PKT_DATA_SKIP_SAMPLES, &size);
+    uint32_t discard = side && size >= 10 ? AV_RL32(side + 4) : 0;
+    if (!discard)
+        return 0;
+    const AVStream *track = writer->output->streams[packet->stream_index];
+    AVRational samples = {1, input_track->codecpar->sample_rate};
+    if (samples.den <= 0)
+        return 0;
+    // A frame this does not read is measured by the packet's own length, so its padding is still cut.
+    int64_t coded = dolby_packet_samples(packet->data, packet->size);
+    int64_t full = coded > 0 ? av_rescale_q(coded, samples, track->time_base) : 0;
+    // A Matroska block can already be shortened to its audible part, on a millisecond clock.
+    if (*mapped_end - mapped_pts > full)
+        full = *mapped_end - mapped_pts;
+    if (full <= 0)
+        return fail(writer, "The final Dolby audio packet on track %d has no length to end its audible samples",
+                    packet->stream_index);
+    int64_t audible = full - av_rescale_q(discard, samples, track->time_base);
+    if (audible <= 0)
+        return fail(writer, "The final Dolby audio packet on track %d has no audible samples", packet->stream_index);
+    *mapped_end = mapped_pts + audible;
+    return 0;
+}
+
 static int remux_packet(Writer *writer, const AVStream *input_track, const Range *range, int video,
                         int mov_video_timing) {
     AVPacket *packet = writer->packet;
@@ -1621,6 +1935,12 @@ static int remux_packet(Writer *writer, const AVStream *input_track, const Range
             return fail(writer, "Cannot represent a Smart Trim decode slot on the output clock");
     }
     int64_t mapped_end = time_round(packet_end, track->time_base);
+    if (!video && is_mov(writer->output->oformat) && mapped_end != AV_NOPTS_VALUE && mapped_pts != AV_NOPTS_VALUE
+        && (input_track->codecpar->codec_id == AV_CODEC_ID_AC3 || input_track->codecpar->codec_id == AV_CODEC_ID_EAC3)) {
+        int result = trim_dolby_tail(writer, input_track, mapped_pts, &mapped_end);
+        if (result)
+            return result;
+    }
     if (mapped_pts == AV_NOPTS_VALUE || (packet->dts != AV_NOPTS_VALUE && mapped_dts == AV_NOPTS_VALUE)
         || (packet->duration > 0 && (mapped_end == AV_NOPTS_VALUE || mapped_end <= mapped_pts
                                     || (Wide)mapped_end - mapped_pts > INT64_MAX))) {
@@ -1644,6 +1964,69 @@ static int remux_packet(Writer *writer, const AVStream *input_track, const Range
     packet->dts = mapped_dts;
     packet->duration = packet->duration > 0 ? mapped_end - mapped_pts : 0;
     return 0;
+}
+
+/* Place a subtitle cue or a data sample of an extra track (extra_track) on the output timeline.
+ * A cue that runs across a cut is shortened to the kept range; its text is not touched. A data sample
+ * spreads its readings over its own duration, so it is kept only when it lies wholly inside the range.
+ * A packet with no duration is kept when it starts inside the range. */
+static int remux_extra(Writer *writer, const AVStream *input_track, const Range *range) {
+    AVPacket *packet = writer->packet;
+    AVStream *track = writer->output->streams[packet->stream_index];
+    MPCutTime start = time_ticks(packet->pts != AV_NOPTS_VALUE ? packet->pts : packet->dts, input_track->time_base);
+    if (!start.denominator)
+        return fail(writer, "Missing timestamp on track %d", packet->stream_index);
+    int timed = packet->duration > 0;
+    MPCutTime end = timed ? time_add(start, time_ticks(packet->duration, input_track->time_base), 1) : start;
+    if (!end.denominator)
+        return fail(writer, "Output clock cannot represent a packet on track %d", packet->stream_index);
+    if (!range->whole_file) {
+        int subtitle = input_track->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE;
+        int keep = !timed ? time_compare(start, range->source_start) >= 0 && time_compare(start, range->source_end) < 0
+            : subtitle ? time_compare(end, range->source_start) > 0 && time_compare(start, range->source_end) < 0
+            : time_compare(start, range->source_start) >= 0 && time_compare(end, range->source_end) <= 0;
+        if (!keep) {
+            packet->size = 0;
+            return 0;
+        }
+        if (time_compare(start, range->source_start) < 0)
+            start = range->source_start;
+        if (time_compare(end, range->source_end) > 0)
+            end = range->source_end;
+    }
+    int64_t mapped = time_round(time_add(start, range->shift, 1), track->time_base);
+    int64_t mapped_end = time_round(time_add(end, range->shift, 1), track->time_base);
+    if (mapped == AV_NOPTS_VALUE || mapped_end == AV_NOPTS_VALUE || mapped_end < mapped)
+        return fail(writer, "Output clock cannot represent a packet on track %d", packet->stream_index);
+    if (timed && mapped_end == mapped) {
+        packet->size = 0; // What is left of the cue is shorter than one tick of the output clock.
+        return 0;
+    }
+    packet->pts = packet->dts = mapped;
+    packet->duration = timed ? mapped_end - mapped : 0;
+    return 0;
+}
+
+/* Muxers store a cue among the other tracks' packets near its start time; FFmpeg's default
+ * interleaving window is 10 seconds. Once the picture and sound have passed the range, a sparse
+ * track whose next cue lies far beyond it would otherwise be read to the end of the file.
+ * Returns how many tracks this finishes. */
+static unsigned finish_extras(Writer *writer, const AVFormatContext *input, const Range *range, MPCutTime read) {
+    MPCutTime limit = time_add(range->source_end, (MPCutTime){10, 1}, 1);
+    if (!read.denominator || !limit.denominator || time_compare(read, limit) < 0)
+        return 0;
+    unsigned open = 0;
+    for (unsigned i = 0; i < input->nb_streams; i++) {
+        if (writer->stream_map[i] < 0 || writer->range_tracks[i])
+            continue;
+        if (!extra_track(input->streams[i]))
+            return 0;
+        open++;
+    }
+    for (unsigned i = 0; open && i < input->nb_streams; i++)
+        if (writer->stream_map[i] >= 0 && !writer->range_tracks[i])
+            writer->range_tracks[i] = 1;
+    return open;
 }
 
 /* Count samples on the original decoder clock. OpusHead hides the retained
@@ -1731,6 +2114,524 @@ static int trim_opus_packet(Writer *writer, const AVStream *stream, const Range 
     Range packet_range = *range;
     packet_range.whole_file = 1;
     return remux_packet(writer, stream, &packet_range, 0, 0);
+}
+
+/* Matroska rounds each Opus block to its millisecond clock, so a copied
+ * timestamp can sit up to half a millisecond (24 samples) off its sample, and
+ * the final block's duration is rounded too. Ogg derives every granule position
+ * from a packet's timestamp, its duration and the pre-skip, so the rounded
+ * clock moved the start and end of a copied stream and changed how many
+ * samples it decodes. Count the packets on the sample clock instead: the first
+ * audible sample sits on the source's millisecond, as in trim_opus_packet, each
+ * packet follows the previous one, and the final duration leaves out the
+ * block's discard padding. A jump of more than a millisecond is a real gap in
+ * the source, and the count restarts from that block's timestamp.
+ * Call before remux_packet; *exact receives the source sample, or INT64_MIN. */
+static int opus_sample_clock(Writer *writer, const AVStream *stream, OpusTrim *state, int64_t *exact) {
+    AVPacket *packet = writer->packet;
+    const AVRational sample_base = {1, 48000};
+    *exact = INT64_MIN;
+    int duration = mpcut_opus_samples(packet->data, packet->size);
+    int64_t pts = time_round(time_ticks(packet->pts, stream->time_base), sample_base);
+    if (stream->time_base.num != 1 || stream->time_base.den != 1000 || stream->codecpar->sample_rate != 48000
+        || stream->codecpar->initial_padding < 0 || pts == AV_NOPTS_VALUE || duration <= 0)
+        return 0; // A sample clock or an unreadable packet keeps the muxer's own timing.
+    Wide first = (Wide)pts;
+    if (!state->started) {
+        int skip = stream->codecpar->initial_padding;
+        first += ((Wide)(skip + 24) / 48) * 48 - skip;
+    } else if ((Wide)pts - state->next_sample >= -48 && (Wide)pts - state->next_sample <= 48) {
+        first = state->next_sample;
+    }
+    if (first + duration > INT64_MAX || first <= INT64_MIN)
+        return fail(writer, "Opus track %d has timestamps out of range", packet->stream_index);
+    state->started = 1;
+    state->next_sample = (int64_t)(first + duration);
+    *exact = (int64_t)first;
+    return 0;
+}
+
+/* Apply opus_sample_clock's count to the remuxed packet on the Ogg sample clock. */
+static int place_opus_samples(Writer *writer, const Range *range, int64_t exact) {
+    AVPacket *packet = writer->packet;
+    const AVStream *track = writer->output->streams[packet->stream_index];
+    if (exact == INT64_MIN || packet->size <= 0 || track->time_base.num != 1 || track->time_base.den != 48000)
+        return 0;
+    int duration = mpcut_opus_samples(packet->data, packet->size);
+    size_t size = 0;
+    const uint8_t *side = av_packet_get_side_data(packet, AV_PKT_DATA_SKIP_SAMPLES, &size);
+    unsigned discard = side && size >= 10 ? AV_RL32(side + 4) : 0;
+    MPCutTime start = time_add(time_ticks(exact, track->time_base), range->shift, 1);
+    int64_t pts = time_round(start, track->time_base);
+    if (duration <= 0 || discard >= (unsigned)duration || pts == AV_NOPTS_VALUE)
+        return fail(writer, "Opus track %d cannot be placed on the Ogg sample clock", packet->stream_index);
+    packet->pts = packet->dts = pts;
+    packet->duration = duration - (int)discard; // Ogg ends the stream at the last audible sample.
+    return 0;
+}
+
+/* Find `nal` among the hvcC parameter-set arrays. Returns -1 for a malformed
+ * configuration, else whether it was found; *types collects bit 0, 1 and 2 for
+ * a present video, sequence and picture parameter set. */
+static int hvcc_find(const uint8_t *config, int size, const uint8_t *nal, size_t nal_size, unsigned *types) {
+    if (!config || size < 23 || config[0] != 1)
+        return -1;
+    int found = 0;
+    const uint8_t *p = config + 23, *end = config + size;
+    for (unsigned array = 0; array < config[22]; array++) {
+        if (end - p < 3)
+            return -1;
+        unsigned type = p[0] & 0x3f, count = AV_RB16(p + 1);
+        p += 3;
+        for (unsigned i = 0; i < count; i++) {
+            if (end - p < 2 || (size_t)(end - p - 2) < AV_RB16(p))
+                return -1;
+            size_t length = AV_RB16(p);
+            p += 2;
+            if (length && type >= 32 && type <= 34)
+                *types |= 1u << (type - 32);
+            found |= nal && length == nal_size && !memcmp(p, nal, length);
+            p += length;
+        }
+    }
+    return found;
+}
+
+/* FFmpeg labels HEVC without a MOV sample entry of its own (from Matroska, for
+ * example) 'hev1', which allows parameter sets that appear only in the samples.
+ * Apple's readers do not decode 'hev1'. 'hvc1' carries every parameter set in
+ * the sample entry, and a copied sample may still repeat one byte for byte.
+ * Choose 'hvc1' for a track whose sample entry holds video, sequence and
+ * picture parameter sets in hvcC form. check_hvc1 follows the sets a decoder
+ * holds through the copy (follow_hevc_sets), each range starting from the sets
+ * its source holds there (plan_stream_sets). Where they change at a keyframe,
+ * that sample starts a new sample entry holding every set then active, so the
+ * samples still only repeat sets from their entry. A picture parameter set that
+ * a range brings inside a picture group under an ID no set holds is put in the
+ * entry the range starts with (plan_hevc_sets). Any other change at a sample
+ * that is not a keyframe withdraws 'hvc1', and mpcut_copy_omissions reports it. */
+static void plan_hvc1(Writer *writer, const AVStream *destination) {
+    unsigned types = 0;
+    const AVCodecParameters *codec = destination->codecpar;
+    if (writer->hvc1 && destination->index < (int)writer->selected_count && codec->codec_id == AV_CODEC_ID_HEVC && !codec->codec_tag
+        && hvcc_find(codec->extradata, codec->extradata_size, NULL, 0, &types) >= 0 && types == 7)
+        writer->hvc1[destination->index] = HEVC_ENTRY_HVC1;
+}
+
+enum { HEVC_SETS_SAME, HEVC_SETS_NEW_ENTRY, HEVC_SETS_UNREADABLE, HEVC_SETS_GROUP_CHANGE };
+
+/* Follow the parameter sets of an 'hvc1' track (`initial` is its first sample entry) through one copied sample
+ * of `source`. `range_start` marks the first sample of a range, which starts from the sets its source holds there:
+ * `stream` (plan_stream_sets) or else its source's description, and then from `early` (length-prefixed picture
+ * parameter sets, plan_hevc_sets). Returns whether the sample keeps its entry, starts a new one, or cannot be
+ * described by an 'hvc1' entry. */
+static int follow_hevc_sets(MPCutHevcSets **sets, const AVCodecParameters *initial, const AVCodecParameters *source,
+                            int *range_start, const uint8_t *stream, int stream_size, const uint8_t *early, int early_size,
+                            const AVPacket *packet) {
+    size_t extra = 0;
+    // A MOV source's own change of description is its sample entry, which the muxer does not relabel here.
+    if (av_packet_get_side_data(packet, AV_PKT_DATA_NEW_EXTRADATA, &extra)
+        || (!*sets && !(*sets = mpcut_hevc_sets_create(initial->extradata, initial->extradata_size))))
+        return HEVC_SETS_UNREADABLE;
+    int changed = 0;
+    if (*range_start) {
+        *range_start = 0;
+        // `stream` holds every set of the description too, as the samples before the range left them.
+        changed = stream_size ? mpcut_hevc_sets_apply_sample(*sets, stream, stream_size, 4)
+                              : mpcut_hevc_sets_apply_config(*sets, source->extradata, source->extradata_size);
+        int added = changed < 0 || !early_size ? 0 : mpcut_hevc_sets_apply_sample(*sets, early, early_size, 4);
+        changed = changed < 0 ? changed : added < 0 ? added : changed | added;
+    }
+    int sample = changed < 0 ? changed
+        : mpcut_hevc_sets_apply_sample(*sets, packet->data, packet->size, (initial->extradata[21] & 3) + 1);
+    if (sample < 0)
+        return HEVC_SETS_UNREADABLE;
+    if ((changed |= sample) && !(packet->flags & AV_PKT_FLAG_KEY))
+        return HEVC_SETS_GROUP_CHANGE;
+    return changed ? HEVC_SETS_NEW_ENTRY : HEVC_SETS_SAME;
+}
+
+static int check_hvc1(Writer *writer, const AVStream *input_track) {
+    AVPacket *packet = writer->packet;
+    const int index = packet->stream_index;
+    uint8_t *state = writer->hvc1 ? &writer->hvc1[index] : NULL;
+    if (!state || *state != HEVC_ENTRY_HVC1)
+        return 0;
+    const AVCodecParameters *codec = writer->output->streams[index]->codecpar;
+    MPCutHevcSets **sets = &writer->hevc_sets[index];
+    // The picture plan_hevc_sets read also starts each range from the sets it brings inside its picture groups.
+    int scanned = writer->hevc_early && input_track->index == writer->hevc_range_video && writer->hevc_range < writer->hevc_early_count;
+    int stream = writer->stream_sets && primary_video(input_track) && writer->hevc_range < writer->stream_set_count;
+    int followed = follow_hevc_sets(sets, codec, input_track->codecpar, &writer->hevc_range_start,
+                                    stream ? writer->stream_sets[writer->hevc_range] : NULL,
+                                    stream ? writer->stream_sets_size[writer->hevc_range] : 0,
+                                    scanned ? writer->hevc_early[writer->hevc_range] : NULL,
+                                    scanned ? writer->hevc_early_size[writer->hevc_range] : 0, packet);
+    if (followed == HEVC_SETS_UNREADABLE || followed == HEVC_SETS_GROUP_CHANGE) {
+        *state = HEVC_ENTRY_HEV1;
+        return 0;
+    }
+    if (followed == HEVC_SETS_SAME)
+        return 0;
+    // The muxer starts a new sample entry for a description it has not written, or returns to one it has.
+    uint8_t *record = NULL;
+    int size = 0;
+    int result = mpcut_hevc_sets_initial(*sets) ? 0 : mpcut_hevc_sets_record(*sets, &record, &size);
+    if (result < 0)
+        return ff_error(writer, result, "Cannot describe the HEVC parameter sets of", writer->output_path);
+    const uint8_t *description = record ? record : codec->extradata;
+    size = record ? size : codec->extradata_size;
+    uint8_t *side = av_packet_new_side_data(packet, AV_PKT_DATA_NEW_EXTRADATA, (size_t)size);
+    if (side)
+        memcpy(side, description, (size_t)size);
+    av_free(record);
+    return side ? 0 : fail(writer, "Cannot attach an HEVC sample description");
+}
+
+static int label_hvc1(Writer *writer) {
+    uint32_t ids[64];
+    size_t count = 0;
+    for (unsigned i = 0; writer->hvc1 && i < writer->selected_count && count < 64; i++)
+        if (writer->hvc1[i] == HEVC_ENTRY_HVC1)
+            ids[count++] = (uint32_t)writer->output->streams[i]->id;
+    return mpcut_mov_label_hvc1(writer->output_path, ids, count, writer->error, writer->error_capacity);
+}
+
+/* The parameter sets of an H.264 or HEVC track's avcC or hvcC description, or NULL. */
+static MPCutHevcSets *stream_sets_create(const AVCodecParameters *codec) {
+    if (codec->codec_id == AV_CODEC_ID_HEVC)
+        return mpcut_hevc_sets_create(codec->extradata, codec->extradata_size);
+    return codec->codec_id == AV_CODEC_ID_H264 ? mpcut_avc_sets_create(codec->extradata, codec->extradata_size) : NULL;
+}
+
+/* The NAL unit length size of the samples of a track that stream_sets_create reads. */
+static int sample_length_size(const AVCodecParameters *codec) {
+    return (codec->extradata[codec->codec_id == AV_CODEC_ID_HEVC ? 21 : 4] & 3) + 1;
+}
+
+/* A keyframe that a source's encoder offers as a start may follow a change of parameter sets that its samples
+ * bring in-band and later keyframes do not repeat: decoded from the start, it uses the changed sets, while a copy
+ * that starts there would use those of the description. For each range, find the sets a decoder reading its source
+ * from the first packet holds when it reaches the range's first copied picture (the first video packet presented at
+ * or after the range start): those of the description, replaced or joined by every set the samples before it bring.
+ * Where they are not the description's, stream_sets[i] receives every one of them as NAL units with 4-byte lengths,
+ * which describe the range (check_hvc1) or are repeated in its first sample (repeat_stream_sets). Reads each source
+ * once, from its first packet to its latest range start, for H.264 and HEVC with avcC or hvcC descriptions. A source
+ * whose sets cannot be followed, or a range that a generated still or several sample descriptions handle, gets
+ * nothing. With `start_pts`, a range with Smart Trim edges is planned too, at its head edge's keyframe if it has one,
+ * and start_pts[i] receives the time of the packet its sets describe the decoder before (smart_following); without,
+ * such a range gets nothing. Returns 0, or -2 when the progress callback cancels. */
+static int plan_stream_sets(Writer *writer, const MPCutSegment *segments, size_t count, uint8_t **stream_sets, int *sizes,
+                            int64_t *start_pts) {
+    AVPacket *packet = av_packet_alloc();
+    size_t *order = av_malloc_array(count, sizeof(*order));
+    MPCutTime *starts = av_malloc_array(count, sizeof(*starts));
+    int result = packet && order && starts ? 0 : -1;
+    for (size_t first = 0; !result && first < count; first++) {
+        size_t seen = 0;
+        while (strcmp(segments[seen].path, segments[first].path))
+            seen++;
+        AVFormatContext *input = NULL;
+        if (seen != first || input_open(writer, &input, segments[first].path)) {
+            avformat_close_input(&input);
+            continue; // Each source is read once, where it first appears.
+        }
+        unsigned index = 0;
+        while (index < input->nb_streams && !primary_video(input->streams[index]))
+            index++;
+        const AVStream *track = index < input->nb_streams ? input->streams[index] : NULL;
+        MPCutHevcSets *sets = track ? stream_sets_create(track->codecpar) : NULL;
+        size_t pending = 0;
+        for (size_t i = first; sets && i < count; i++) {
+            const MPCutSegment *segment = &segments[i];
+            int edges = segment->head_edge.frame_count || segment->tail_edge.frame_count;
+            if (strcmp(segment->path, segments[first].path) || segment->multiple_descriptions || segment->generated_still
+                || (edges && !start_pts) || (!edges && count == 1 && segment->start.numerator == 0 && segment->reaches_end))
+                continue;
+            MPCutTime origin = segment->source_origin.denominator > 0 ? segment->source_origin
+                : track->start_time != AV_NOPTS_VALUE ? time_ticks(track->start_time, track->time_base)
+                : (MPCutTime){0, 1};
+            // A head edge's decoder, and the source's, start at the edge's keyframe.
+            MPCutTime start = time_add(origin, segment->head_edge.frame_count ? segment->head_edge.decode_from
+                                                                               : segment->start, 1);
+            if (!start.denominator)
+                continue;
+            size_t at = pending++;
+            for (; at && time_compare(starts[at - 1], start) > 0; at--) {
+                starts[at] = starts[at - 1];
+                order[at] = order[at - 1];
+            }
+            starts[at] = start;
+            order[at] = i;
+        }
+        for (unsigned j = 0; j < input->nb_streams; j++)
+            input->streams[j]->discard = j == index ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
+        int length_size = pending ? sample_length_size(track->codecpar) : 0;
+        size_t next = 0;
+        for (unsigned read = 1; !result && next < pending && av_read_frame(input, packet) >= 0; read++) {
+            if (!(read % 1024) && progress_at(writer, writer->fraction))
+                result = -2; // Cancelled.
+            MPCutTime pts = packet->pts == AV_NOPTS_VALUE ? (MPCutTime){0, 0} : time_ticks(packet->pts, track->time_base);
+            if ((unsigned)packet->stream_index == index && packet->size > 0) {
+                for (; pts.denominator && next < pending && time_compare(pts, starts[next]) >= 0; next++) {
+                    if (start_pts)
+                        start_pts[order[next]] = packet->pts;
+                    if (!mpcut_hevc_sets_initial(sets)
+                        && mpcut_hevc_sets_units(sets, &stream_sets[order[next]], &sizes[order[next]]) < 0)
+                        result = -1;
+                }
+                // A source whose sets cannot be followed further leaves its later ranges as they were.
+                if (av_packet_get_side_data(packet, AV_PKT_DATA_NEW_EXTRADATA, NULL)
+                    || mpcut_hevc_sets_apply_sample(sets, packet->data, packet->size, length_size) < 0)
+                    next = pending;
+            }
+            av_packet_unref(packet);
+        }
+        mpcut_hevc_sets_free(sets);
+        avformat_close_input(&input);
+    }
+    av_free(starts);
+    av_free(order);
+    av_packet_free(&packet);
+    return result == -2 ? -2 : 0;
+}
+
+/* Put parameter sets (NAL units with 4-byte lengths) into a sample whose NAL units have `length_size`-byte lengths,
+ * after a leading access unit delimiter. */
+static int insert_parameter_sets(AVPacket *packet, int length_size, int hevc, const uint8_t *units, int size) {
+    int total = 0;
+    for (int at = 0; at <= size - 4; at += 4 + (int)AV_RB32(units + at)) {
+        uint32_t length = AV_RB32(units + at);
+        if ((length_size < 4 && length >> (8 * length_size)) || length > (uint32_t)(INT_MAX / 2 - total - length_size))
+            return AVERROR(ERANGE);
+        total += length_size + (int)length;
+    }
+    int offset = 0;
+    if (packet->size > length_size) {
+        uint32_t length = 0;
+        for (int i = 0; i < length_size; i++)
+            length = length << 8 | packet->data[i];
+        unsigned type = hevc ? (packet->data[length_size] >> 1) & 0x3f : packet->data[length_size] & 0x1f;
+        if ((hevc ? type == 35 : type == 9) && length <= (uint32_t)(packet->size - length_size))
+            offset = length_size + (int)length;
+    }
+    int old_size = packet->size;
+    int result = total > INT_MAX / 2 - old_size ? AVERROR(ERANGE) : av_packet_make_writable(packet);
+    if (result >= 0)
+        result = av_grow_packet(packet, total);
+    if (result < 0)
+        return result;
+    memmove(packet->data + offset + total, packet->data + offset, (size_t)(old_size - offset));
+    uint8_t *q = packet->data + offset;
+    for (int at = 0; at <= size - 4; at += 4 + (int)AV_RB32(units + at)) {
+        uint32_t length = AV_RB32(units + at);
+        for (int i = 0; i < length_size; i++)
+            q[i] = (uint8_t)(length >> (8 * (length_size - 1 - i)));
+        memcpy(q + length_size, units + at + 4, length);
+        q += length_size + length;
+    }
+    return 0;
+}
+
+/* Give the output's decoder, at the first copied picture of each range, the sets the source's decoder holds there
+ * (plan_stream_sets), if the sets it holds from the description and the samples copied before, with those this
+ * keyframe brings itself, lack any of them. This also covers a join whose earlier range left changed sets in the
+ * decoder. A range that starts this way repeats them at each later keyframe whose description and own sets lack
+ * them, so a reader can start there too. The sets go into the keyframe's sample, after any access unit delimiter,
+ * which hev1, avc1 and Matroska allow. An 'hvc1' track gets sample entries instead (check_hvc1). Follows every
+ * copied sample of the primary picture; one whose sets cannot be followed ends the repetition for the copy. */
+static int repeat_stream_sets(Writer *writer, const AVStream *input_track) {
+    AVPacket *packet = writer->packet;
+    const AVCodecParameters *codec = input_track->codecpar;
+    int range_start = writer->sets_range_start;
+    writer->sets_range_start = 0;
+    if (writer->sets_unfollowed || writer->smart_trim || writer->generated_stills || writer->track_video_config)
+        return 0;
+    // The output's description is the first range's source's (configure_output), before plan_avc_reorder's depth.
+    if (!writer->output_sets) {
+        writer->output_sets = stream_sets_create(codec);
+        writer->description_sets = stream_sets_create(codec);
+        if (!writer->output_sets || !writer->description_sets) {
+            writer->sets_unfollowed = 1;
+            return 0;
+        }
+    }
+    int length_size = sample_length_size(codec);
+    int described = writer->hvc1 && writer->hvc1[packet->stream_index] == HEVC_ENTRY_HVC1;
+    if (range_start)
+        writer->sets_repeating = 0;
+    if (!described && (packet->flags & AV_PKT_FLAG_KEY) && (range_start || writer->sets_repeating)) {
+        // What a decoder must end up with, and what it has: at a range start, the source's sets and the output
+        // decoder's; at a later keyframe, the output decoder's and a reader's that starts there with the description.
+        int stream = range_start && writer->stream_sets && writer->hevc_range < writer->stream_set_count
+            && writer->stream_sets_size[writer->hevc_range] > 0;
+        MPCutHevcSets *want = range_start ? stream_sets_create(codec) : mpcut_hevc_sets_copy(writer->output_sets);
+        MPCutHevcSets *have = mpcut_hevc_sets_copy(range_start ? writer->output_sets : writer->description_sets);
+        uint8_t *units = NULL;
+        int size = 0;
+        int result = !want || !have ? AVERROR(ENOMEM)
+            : stream ? mpcut_hevc_sets_apply_sample(want, writer->stream_sets[writer->hevc_range],
+                                                  writer->stream_sets_size[writer->hevc_range], 4) : 0;
+        if (result >= 0)
+            result = mpcut_hevc_sets_units(want, &units, &size);
+        // Compare them once this keyframe's own sets are applied.
+        if (result >= 0)
+            result = mpcut_hevc_sets_apply_sample(want, packet->data, packet->size, length_size);
+        if (result >= 0)
+            result = mpcut_hevc_sets_apply_sample(have, packet->data, packet->size, length_size);
+        int lacking = result >= 0 && !mpcut_hevc_sets_holds(have, want);
+        mpcut_hevc_sets_free(want);
+        mpcut_hevc_sets_free(have);
+        if (lacking) {
+            result = insert_parameter_sets(packet, length_size, codec->codec_id == AV_CODEC_ID_HEVC, units, size);
+            writer->sets_repeating = 1;
+        }
+        av_free(units);
+        if (result == AVERROR(ENOMEM))
+            return fail(writer, "Cannot repeat the parameter sets of %s", writer->output_path);
+        if (result < 0)
+            writer->sets_unfollowed = 1;
+    }
+    if (!writer->sets_unfollowed && mpcut_hevc_sets_apply_sample(writer->output_sets, packet->data, packet->size, length_size) < 0)
+        writer->sets_unfollowed = 1;
+    return 0;
+}
+
+/* One pass of plan_hevc_sets over the copied samples of the first video stream of each range, in order. With
+ * `collect`, a sample inside a picture group that only brings picture parameter sets with IDs no set holds adds
+ * them to early[i] of its range i instead of ending the pass. `video` receives the stream read in each range. */
+static int scan_hevc_sets(Writer *writer, const MPCutSegment *segments, size_t count, uint8_t *const *stream,
+                          const int *stream_size, uint8_t **early, int *early_size, int *video, int collect, size_t *found) {
+    AVPacket *packet = av_packet_alloc();
+    AVCodecParameters *initial = avcodec_parameters_alloc();
+    MPCutHevcSets *sets = NULL;
+    int verdict = packet && initial ? HEVC_SETS_SAME : -1; // -1: the samples could not be read
+    for (size_t i = 0; i < count && verdict == HEVC_SETS_SAME; i++) {
+        const MPCutSegment *segment = &segments[i];
+        AVFormatContext *input = NULL;
+        if (input_open(writer, &input, segment->path)) {
+            avformat_close_input(&input);
+            verdict = -1;
+            break;
+        }
+        unsigned index = 0;
+        while (index < input->nb_streams && !primary_video(input->streams[index]))
+            index++;
+        const AVStream *track = index < input->nb_streams ? input->streams[index] : NULL;
+        const AVCodecParameters *codec = track ? track->codecpar : NULL;
+        if (i == 0 && codec && avcodec_parameters_copy(initial, codec) < 0)
+            codec = NULL;
+        MPCutTime origin = segment->source_origin.denominator > 0 ? segment->source_origin
+            : track && track->start_time != AV_NOPTS_VALUE ? time_ticks(track->start_time, track->time_base)
+            : (MPCutTime){0, 1};
+        MPCutTime start = time_add(origin, segment->start, 1), end = time_add(origin, segment->end, 1);
+        int whole = count == 1 && segment->start.numerator == 0 && segment->reaches_end;
+        if (!codec || codec->codec_id != AV_CODEC_ID_HEVC || !start.denominator || !end.denominator) {
+            avformat_close_input(&input);
+            verdict = -1;
+            break;
+        }
+        video[i] = (int)index;
+        for (unsigned j = 0; j < input->nb_streams; j++)
+            input->streams[j]->discard = j == index ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
+        // A range starts at a keyframe, which is decoded before every picture presented from it on.
+        int64_t target = time_round(start, track->time_base);
+        if (!whole && target != AV_NOPTS_VALUE)
+            av_seek_frame(input, (int)index, target, AVSEEK_FLAG_BACKWARD);
+        int range_start = 1;
+        for (unsigned read = 1; verdict == HEVC_SETS_SAME && av_read_frame(input, packet) >= 0; read++) {
+            if (!(read % 1024) && progress_at(writer, writer->fraction)) {
+                verdict = -2; // Cancelled.
+                av_packet_unref(packet);
+                break;
+            }
+            MPCutTime pts = time_ticks(packet->pts, track->time_base);
+            if ((unsigned)packet->stream_index == index && packet->size > 0 && pts.denominator) {
+                if (!whole && time_compare(pts, end) >= 0) {
+                    av_packet_unref(packet);
+                    break;
+                }
+                // The same samples remux_packet keeps.
+                if (whole || time_compare(pts, start) >= 0) {
+                    uint8_t *added = NULL;
+                    int added_size = 0, only_added = 0;
+                    if (collect && sets && !range_start && !(packet->flags & AV_PKT_FLAG_KEY))
+                        only_added = mpcut_hevc_sets_new_pictures(sets, packet->data, packet->size,
+                                                                  (initial->extradata[21] & 3) + 1, &added, &added_size);
+                    verdict = follow_hevc_sets(&sets, initial, codec, &range_start, stream ? stream[i] : NULL,
+                                               stream ? stream_size[i] : 0, early[i], early_size[i], packet);
+                    if (verdict == HEVC_SETS_GROUP_CHANGE && only_added == 1 && added_size > 0
+                        && early_size[i] <= INT_MAX - added_size) {
+                        uint8_t *grown = av_realloc(early[i], (size_t)(early_size[i] + added_size));
+                        if (grown) {
+                            memcpy(grown + early_size[i], added, (size_t)added_size);
+                            early[i] = grown;
+                            early_size[i] += added_size;
+                            verdict = HEVC_SETS_SAME;
+                        }
+                    }
+                    av_free(added);
+                    if (verdict == HEVC_SETS_NEW_ENTRY)
+                        verdict = HEVC_SETS_SAME;
+                    *found = i;
+                }
+            }
+            av_packet_unref(packet);
+        }
+        avformat_close_input(&input);
+    }
+    mpcut_hevc_sets_free(sets);
+    avcodec_parameters_free(&initial);
+    av_packet_free(&packet);
+    return verdict;
+}
+
+/* Plan the 'hvc1' description of an HEVC picture copied into a MOV-family file, by following the parameter sets
+ * of every copied sample with the writer's own rule (follow_hevc_sets) before anything is written. A new sample
+ * entry may start only at a keyframe. A picture parameter set that a range brings inside a picture group with an
+ * ID no set holds can still be described: the range starts with it (early[i]), so the entry in use holds it and
+ * the sample only repeats it. A set that replaces another inside a group, or a video or sequence parameter set
+ * there, withdraws 'hvc1' (check_hvc1). Reads only a picture that plan_hvc1 would describe as 'hvc1', and only
+ * the packets of the copied ranges. Returns HEVC_SETS_SAME, the reason the copy keeps 'hev1' with the segment
+ * where it is found, -1 when the samples cannot be read, or -2 when the progress callback cancels; early[] is
+ * left empty unless HEVC_SETS_SAME. Each range starts from stream[i] (plan_stream_sets), which with `read_stream`
+ * this plans first, only for a picture it reads. */
+static int plan_hevc_sets(Writer *writer, const MPCutSegment *segments, size_t count, const AVFormatContext *first,
+                          uint8_t **stream, int *stream_size, int read_stream,
+                          uint8_t **early, int *early_size, int *video, size_t *found) {
+    if (!is_mov(writer->output->oformat) || writer->tracks == MPCUT_TRACKS_AUDIO || !count)
+        return HEVC_SETS_SAME;
+    for (size_t i = 0; i < count; i++) {
+        // Generated stills keep their own entries, and Smart Trim names its HEVC entry 'hvc1' itself.
+        if (segments[i].generated_still || segments[i].head_edge.frame_count || segments[i].tail_edge.frame_count)
+            return HEVC_SETS_SAME;
+    }
+    // The entry configure_output and plan_hvc1 give the picture copied from the first source (open as `first`).
+    unsigned index = 0, types = 0;
+    while (index < first->nb_streams && !primary_video(first->streams[index]))
+        index++;
+    const AVCodecParameters *codec = index < first->nb_streams ? first->streams[index]->codecpar : NULL;
+    if (!codec || codec->codec_id != AV_CODEC_ID_HEVC
+        || (writer->output->oformat->codec_tag
+            && av_codec_get_id(writer->output->oformat->codec_tag, codec->codec_tag) == codec->codec_id)
+        || hvcc_find(codec->extradata, codec->extradata_size, NULL, 0, &types) < 0 || types != 7)
+        return HEVC_SETS_SAME;
+    if (read_stream && stream && plan_stream_sets(writer, segments, count, stream, stream_size, NULL) == -2)
+        return -2;
+    int verdict = scan_hevc_sets(writer, segments, count, stream, stream_size, early, early_size, video, 1, found);
+    int collected = 0;
+    for (size_t i = 0; i < count; i++)
+        collected |= early_size[i] > 0;
+    // With every range starting from what it collected, no sample may still change a set inside a group.
+    if (verdict == HEVC_SETS_SAME && collected)
+        verdict = scan_hevc_sets(writer, segments, count, stream, stream_size, early, early_size, video, 0, found);
+    if (verdict != HEVC_SETS_SAME) {
+        for (size_t i = 0; i < count; i++) {
+            av_freep(&early[i]);
+            early_size[i] = 0;
+        }
+    }
+    return verdict;
 }
 
 /* A zero-size packet marks a packet outside the selected range. */
@@ -2199,6 +3100,7 @@ static int prepare_patches(Writer *writer, const AVStream *video, const MPCutSeg
             return fail(writer, "This video codec and container cannot carry a Smart Trim edge");
         patch->start_pts = time_round(time_add(origin, plan[i].from, 1), video->time_base);
         patch->end_pts = time_round(time_add(origin, plan[i].to, 1), video->time_base);
+        patch->decode_pts = time_round(time_add(origin, plan[i].decode_from, 1), video->time_base);
         if (writer->video_origin_pts == AV_NOPTS_VALUE || patch->start_pts == AV_NOPTS_VALUE ||
             patch->end_pts == AV_NOPTS_VALUE || patch->end_pts <= patch->start_pts)
             return fail(writer, "The video clock cannot represent a Smart Trim edge in %s", segment->path);
@@ -2227,6 +3129,89 @@ static int pending_patches(const Writer *writer) {
     return 0;
 }
 
+/* Smart Trim follows the sets a decoder of the source holds (plan_stream_sets) through every source picture it
+ * reads, copied, replaced by an edge or outside the range, as the source's decoder would. Returns whether it does. */
+static int smart_following(Writer *writer, const AVStream *video, int64_t pts) {
+    enum AVCodecID codec = video->codecpar->codec_id;
+    if (!writer->smart_trim || writer->smart_unfollowed || (codec != AV_CODEC_ID_H264 && codec != AV_CODEC_ID_HEVC))
+        return 0;
+    if (!writer->smart_sets && writer->stream_start_pts && writer->hevc_range < writer->stream_set_count
+        && pts == writer->stream_start_pts[writer->hevc_range]) {
+        // The packet the planned sets describe the decoder before: the range's first picture or its head edge's keyframe.
+        const uint8_t *units = writer->stream_sets[writer->hevc_range];
+        writer->smart_sets = stream_sets_create(video->codecpar);
+        if (!writer->smart_sets || (units && mpcut_hevc_sets_apply_sample(writer->smart_sets, units,
+                                                                         writer->stream_sets_size[writer->hevc_range], 4) < 0))
+            writer->smart_unfollowed = 1;
+    }
+    return !writer->smart_unfollowed && writer->smart_sets;
+}
+
+/* Apply the sets of the source picture just read, the original of one an edge replaces included. Returns whether
+ * they changed what the decoder holds. */
+static int smart_follow(Writer *writer, const AVStream *video, const AVPacket *packet) {
+    int changed = mpcut_hevc_sets_apply_sample(writer->smart_sets, packet->data, packet->size,
+                                               sample_length_size(video->codecpar));
+    writer->smart_unfollowed |= changed < 0;
+    return changed > 0;
+}
+
+/* The source's sets where the output switches back from an encoded edge, or from another range, to copied pictures:
+ * an 'hvc1' sample entry of their own, or for H.264 the source's entry with the sets repeated in the sample. The
+ * edge's entry holds only its encoder's sets, and the description's may be stale. */
+static int smart_restore(Writer *writer, const AVFormatContext *input, const AVStream *video, const uint8_t *extra, int size) {
+    AVPacket *packet = writer->packet;
+    const AVCodecParameters *codec = video->codecpar;
+    int following = smart_following(writer, video, packet->pts);
+    int changed = following && !mpcut_hevc_sets_initial(writer->smart_sets);
+    uint8_t *record = NULL, *units = NULL;
+    int record_size = 0, units_size = 0, code = 0;
+    // Where an earlier switch left other sets in the decoder, the description's entry alone may not be a switch at all.
+    if (changed || (following && writer->smart_dirty))
+        code = codec->codec_id == AV_CODEC_ID_HEVC ? mpcut_hevc_sets_record(writer->smart_sets, &record, &record_size)
+                                                    : mpcut_hevc_sets_units(writer->smart_sets, &units, &units_size);
+    if (code >= 0)
+        code = mpcut_splice_restore(packet, codec, record ? record : extra, record ? record_size : size);
+    if (code >= 0 && units)
+        code = insert_parameter_sets(packet, sample_length_size(codec), 0, units, units_size);
+    int repeated = units != NULL;
+    av_free(record);
+    av_free(units);
+    if (code == AVERROR_INVALIDDATA && codec->codec_id == AV_CODEC_ID_AV1)
+        return fail(writer, "The copied AV1 sequence in %s needs a key packet and a recoverable sequence header", input->url);
+    if (code < 0)
+        return ff_error(writer, code, "Cannot restore source decoder configuration at the Smart Trim splice in", input->url);
+    writer->smart_repeating = repeated;
+    writer->smart_dirty = changed;
+    writer->restore_video_config = 0;
+    return 0;
+}
+
+/* A later keyframe of an H.264 run that smart_restore repeated the source's sets in, if the source's entry and the
+ * keyframe's own sets lack them: so a reader can start there too. */
+static int smart_repeat(Writer *writer, const AVStream *video) {
+    AVPacket *packet = writer->packet;
+    const AVCodecParameters *codec = video->codecpar;
+    MPCutHevcSets *have = stream_sets_create(codec), *want = mpcut_hevc_sets_copy(writer->smart_sets);
+    int length_size = sample_length_size(codec);
+    uint8_t *units = NULL;
+    int size = 0;
+    int code = have && want ? mpcut_hevc_sets_units(want, &units, &size) : AVERROR(ENOMEM);
+    if (code >= 0)
+        code = mpcut_hevc_sets_apply_sample(have, packet->data, packet->size, length_size);
+    if (code >= 0)
+        code = mpcut_hevc_sets_apply_sample(want, packet->data, packet->size, length_size);
+    if (code >= 0 && !mpcut_hevc_sets_holds(have, want))
+        code = insert_parameter_sets(packet, length_size, 0, units, size);
+    mpcut_hevc_sets_free(have);
+    mpcut_hevc_sets_free(want);
+    av_free(units);
+    if (code == AVERROR(ENOMEM))
+        return fail(writer, "Cannot repeat the parameter sets of %s", writer->output_path);
+    writer->smart_unfollowed |= code < 0;
+    return 0;
+}
+
 /* Map display-ordered replacement pictures onto the retained source decode slots.
  * The source index proves that copied runs start and end outside the patched GOPs.
  * Keeping the original DTS slots preserves decode order on either side of a patch. */
@@ -2235,6 +3220,12 @@ static int splice_video(Writer *writer, const AVFormatContext *input, const AVSt
     const int64_t pts = packet->pts;
     if (pts == AV_NOPTS_VALUE)
         return fail(writer, "A Smart Trim video packet has no presentation timestamp");
+    int following = smart_following(writer, video, pts);
+    EdgePatch *tail = &writer->patches[1];
+    if (following && tail->plan.frame_count && !tail->encoded && !tail->consumed && pts == tail->decode_pts
+        && !writer->tail_sets && !mpcut_hevc_sets_initial(writer->smart_sets)
+        && mpcut_hevc_sets_units(writer->smart_sets, &writer->tail_sets, &writer->tail_sets_size) < 0)
+        return fail(writer, "Cannot keep the parameter sets of the Smart Trim edge in %s", input->url);
     if (writer->track_video_config) {
         size_t size = 0;
         const uint8_t *extra = av_packet_get_side_data(packet, AV_PKT_DATA_NEW_EXTRADATA, &size);
@@ -2261,14 +3252,21 @@ static int splice_video(Writer *writer, const AVFormatContext *input, const AVSt
             patch->encoded_times = av_malloc_array(patch->plan.frame_count, sizeof(int64_t));
             if (!patch->source_times || !patch->encoded_times)
                 return fail(writer, "Cannot verify the presentation times of the Smart Trim edge");
+            // The edge's decoder starts at its keyframe with the sets the source's decoder holds there.
+            const uint8_t *sets = i ? writer->tail_sets : writer->stream_sets && writer->hevc_range < writer->stream_set_count
+                ? writer->stream_sets[writer->hevc_range] : NULL;
+            int sets_size = !sets || writer->smart_unfollowed ? 0
+                : i ? writer->tail_sets_size : writer->stream_sets_size[writer->hevc_range];
             patch->encoded = mpcut_edge_open(input->url, video, writer->video_origin_pts, patch->plan.decode_from,
-                patch->plan.from, patch->plan.to, patch->plan.frame_count, patch->plan.target_bit_rate, edge_progress,
-                writer, writer->fraction, writer->error, writer->error_capacity);
+                patch->plan.from, patch->plan.to, patch->plan.frame_count, sets, sets_size, patch->plan.target_bit_rate,
+                edge_progress, writer, writer->fraction, writer->error, writer->error_capacity);
             if (!patch->encoded)
                 return writer->edge_cancelled ? 2 : 1;
         }
         int index = packet->stream_index;
         int64_t dts = packet->dts;
+        if (following)
+            smart_follow(writer, video, packet);
         av_packet_unref(packet);
         if (mpcut_edge_next(patch->encoded, packet) != 0)
             return fail(writer, "The Smart Trim encoder did not produce the indexed pictures");
@@ -2297,8 +3295,16 @@ static int splice_video(Writer *writer, const AVFormatContext *input, const AVSt
         return 0;
     }
     MPCutTime time = time_ticks(pts, video->time_base);
-    if (!range->whole_file && (time_compare(time, range->source_start) < 0 || time_compare(time, range->source_end) >= 0))
+    if (!range->whole_file && (time_compare(time, range->source_start) < 0 || time_compare(time, range->source_end) >= 0)) {
+        if (following)
+            smart_follow(writer, video, packet);
         return 0;
+    }
+    // A range that starts from sets another range or the description does not hold switches to them.
+    if (following && writer->smart_range_first && !writer->restore_video_config
+        && (writer->smart_dirty || !mpcut_hevc_sets_initial(writer->smart_sets)))
+        writer->restore_video_config = 1;
+    writer->smart_range_first = 0;
     const uint8_t *extra = writer->active_config ? writer->active_config : video->codecpar->extradata;
     int size = writer->active_config ? (int)writer->active_config_size : video->codecpar->extradata_size;
     if (writer->smart_trim || writer->generated_stills) {
@@ -2315,14 +3321,15 @@ static int splice_video(Writer *writer, const AVFormatContext *input, const AVSt
         if (code < 0)
             return ff_error(writer, code, "Cannot verify HEVC sample metadata in", input->url);
     }
-    if (writer->restore_video_config) {
-        int code = mpcut_splice_restore(packet, video->codecpar, extra, size);
-        if (code == AVERROR_INVALIDDATA && video->codecpar->codec_id == AV_CODEC_ID_AV1)
-            return fail(writer, "The copied AV1 sequence in %s needs a key packet and a recoverable sequence header", input->url);
-        if (code < 0)
-            return ff_error(writer, code, "Cannot restore source decoder configuration at the Smart Trim splice in", input->url);
-        writer->restore_video_config = 0;
-    }
+    int result = 0;
+    if (writer->restore_video_config)
+        result = smart_restore(writer, input, video, extra, size);
+    else if (following && writer->smart_repeating && (packet->flags & AV_PKT_FLAG_KEY))
+        result = smart_repeat(writer, video);
+    if (result)
+        return result;
+    if (smart_following(writer, video, pts) && smart_follow(writer, video, packet))
+        writer->smart_dirty = !mpcut_hevc_sets_initial(writer->smart_sets);
     return 0;
 }
 
@@ -2334,11 +3341,24 @@ static int write_range(Writer *writer, AVFormatContext *input, const Range *rang
     int written_video = 0;
     int result;
     unsigned remaining = writer->selected_count;
-    int mov_video_timing = av_match_name("mov", input->iformat->name)
+    /* Neither source gives a held picture its presentation width: a MOV sample's duration is a
+     * decode interval, and a Matroska block usually takes its track's default duration. The
+     * index widens each picture to the next one, so the last picture of a range runs to its end. */
+    int mov_video_timing = (av_match_name("mov", input->iformat->name) || av_match_name("matroska", input->iformat->name))
         && (is_mov(writer->output->oformat) || is_matroska(writer->output->oformat));
     double progress_shift = time_seconds(range->output_start) - time_seconds(range->source_start);
     double progress_end = time_seconds(range->output_end);
     memset(writer->range_tracks, 0, input->nb_streams);
+    writer->hevc_range_start = 1;
+    writer->sets_range_start = 1;
+    // Smart Trim follows each range's source from the packet plan_stream_sets planned it at.
+    mpcut_hevc_sets_free(writer->smart_sets);
+    writer->smart_sets = NULL;
+    writer->smart_unfollowed = 0;
+    writer->smart_range_first = 1;
+    writer->smart_repeating = 0;
+    av_freep(&writer->tail_sets);
+    writer->tail_sets_size = 0;
     if (writer->aac_source) {
         result = write_aac_source(writer, input, range, &remaining);
         if (result) {
@@ -2352,6 +3372,12 @@ static int write_range(Writer *writer, AVFormatContext *input, const Range *rang
         if (!writer->opus_trim) {
             return fail(writer, "Cannot allocate Opus trim state");
         }
+    }
+    if (av_match_name(writer->output->oformat->name, "ogg,oga,opus")) {
+        av_freep(&writer->opus_clock);
+        writer->opus_clock = av_calloc(input->nb_streams, sizeof(*writer->opus_clock));
+        if (!writer->opus_clock)
+            return fail(writer, "Cannot allocate Opus sample clock");
     }
 
     for (unsigned index = 0; writer->aac_edits && index < input->nb_streams; index++) {
@@ -2427,8 +3453,17 @@ static int write_range(Writer *writer, AVFormatContext *input, const Range *rang
             AVRational output_base = writer->output->streams[packet->stream_index]->time_base;
             result = mpcut_aac_packet(writer->aac_edits, packet, input_track->time_base,
                                      output_base, 0, writer->error, writer->error_capacity);
+        } else if (extra_track(input_track)) {
+            result = remux_extra(writer, input_track, range);
         } else if (writer->opus_trim && input_track->codecpar->codec_id == AV_CODEC_ID_OPUS) {
             result = trim_opus_packet(writer, input_track, range, &writer->opus_trim[input_index]);
+        } else if (writer->opus_clock && input_track->codecpar->codec_id == AV_CODEC_ID_OPUS) {
+            int64_t exact;
+            result = opus_sample_clock(writer, input_track, &writer->opus_clock[input_index], &exact);
+            if (!result)
+                result = remux_packet(writer, input_track, range, 0, 0);
+            if (!result)
+                result = place_opus_samples(writer, range, exact);
         } else {
             int frame_size = range->whole_file ? 0 : pcm_frame_size(input_track->codecpar);
             result = frame_size ? slice_pcm(writer, input_track, range, frame_size)
@@ -2438,8 +3473,34 @@ static int write_range(Writer *writer, AVFormatContext *input, const Range *rang
             return result;
         }
         int retained = packet->size > 0;
+        enum AVCodecID codec_id = input_track->codecpar->codec_id;
+        if (retained && video && (codec_id == AV_CODEC_ID_H264 || codec_id == AV_CODEC_ID_HEVC)
+            && (result = repeat_stream_sets(writer, input_track)))
+            return result;
+        if (retained && video && writer->avc_reorder > 0 && input_track->codecpar->codec_id == AV_CODEC_ID_H264
+            && input_track->codecpar->extradata_size >= 5 && input_track->codecpar->extradata[0] == 1) {
+            // A parameter set repeated in a sample declares the same depth as the track's (plan_avc_reorder).
+            result = mpcut_avc_packet_declare_reorder(packet, (input_track->codecpar->extradata[4] & 3) + 1,
+                                                      writer->avc_reorder);
+            if (result < 0)
+                return ff_error(writer, result, "Cannot declare the picture reorder depth in a sample from", input->url);
+        }
         if (retained) {
             written_video |= video;
+            if (input_track->codecpar->codec_id == AV_CODEC_ID_HEVC && (result = check_hvc1(writer, input_track)))
+                return result;
+            size_t entry_size = 0;
+            const uint8_t *entry = video && writer->output_sets && !writer->sets_unfollowed
+                ? av_packet_get_side_data(packet, AV_PKT_DATA_NEW_EXTRADATA, &entry_size) : NULL;
+            // A new sample entry (check_hvc1) gives the decoder its sets too, and is what a reader starting later has.
+            if (entry) {
+                int read = entry_size <= INT_MAX
+                    && mpcut_hevc_sets_apply_config(writer->output_sets, entry, (int)entry_size) >= 0;
+                mpcut_hevc_sets_free(writer->description_sets);
+                writer->description_sets = !read ? NULL : codec_id == AV_CODEC_ID_HEVC
+                    ? mpcut_hevc_sets_create(entry, (int)entry_size) : mpcut_avc_sets_create(entry, (int)entry_size);
+                writer->sets_unfollowed |= !writer->description_sets;
+            }
             result = write_packet(writer, input->url);
             if (result) {
                 return result;
@@ -2458,6 +3519,8 @@ static int write_range(Writer *writer, AVFormatContext *input, const Range *rang
                 remaining--;
             }
         }
+        if (!range->whole_file && !range->keep_audio_end)
+            remaining -= finish_extras(writer, input, range, time_ticks(source_pts, input_track->time_base));
         av_packet_unref(packet);
         if (!remaining) {
             result = AVERROR_EOF;
@@ -2568,6 +3631,99 @@ static int load_aac_source(Writer *writer, const AVFormatContext *input, const c
     writer->aac_source = cache->source;
     if (writer->aac_source && !is_mov(writer->output->oformat))
         return fail(writer, "Multiple AAC media edits in %s require MOV or MP4 output", path);
+    return 0;
+}
+
+/* The reorder depth of the H.264 pictures one source can contribute. A MOV source states it for
+ * the whole track in the composition offsets of its movie box (mov_estimate_video_delay). Other sources are read up
+ * to `limit`, the furthest planned end, or to their end when it is invalid: write_range finishes a
+ * video track at its first unretained packet presented at or after a range's end. */
+static int source_reorder(Writer *writer, const char *path, MPCutTime limit, int *depth) {
+    AVFormatContext *source = NULL;
+    int result = input_open(writer, &source, path);
+    if (result)
+        return result;
+    unsigned video = 0;
+    while (video < source->nb_streams && !primary_video(source->streams[video]))
+        video++;
+    if (video == source->nb_streams || source->streams[video]->codecpar->codec_id != AV_CODEC_ID_H264) {
+        avformat_close_input(&source);
+        return 0; // validate_layout reports a source that does not match the first.
+    }
+    // Fragments are not in that estimate, so a MOV source that shows no reordering is read like any other.
+    int delay = source->streams[video]->codecpar->video_delay;
+    if (av_match_name("mov", source->iformat->name) && delay > 0) {
+        *depth = delay > 16 ? 16 : delay;
+        avformat_close_input(&source);
+        return 0;
+    }
+    for (unsigned i = 0; i < source->nb_streams; i++)
+        source->streams[i]->discard = i == video ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
+    AVRational base = source->streams[video]->time_base;
+    AVPacket *packet = av_packet_alloc();
+    MPCutReorderScan scan = {0};
+    int code = packet ? 0 : AVERROR(ENOMEM);
+    while (!code && (code = av_read_frame(source, packet)) >= 0) {
+        code = 0;
+        if ((unsigned)packet->stream_index == video && packet->pts != AV_NOPTS_VALUE) {
+            if (limit.denominator > 0 && time_compare(time_ticks(packet->pts, base), limit) >= 0)
+                code = AVERROR_EOF;
+            else
+                mpcut_reorder_scan_add(&scan, packet->pts);
+        }
+        av_packet_unref(packet);
+        if (!code && (result = progress_at(writer, writer->fraction)))
+            break;
+    }
+    av_packet_free(&packet);
+    avformat_close_input(&source);
+    if (result)
+        return result;
+    if (code != AVERROR_EOF)
+        return ff_error(writer, code, "Cannot read the picture order of", path);
+    *depth = scan.depth;
+    return 0;
+}
+
+/* Matroska keeps no composition offsets. A reader of an H.264 track whose sequence parameter set
+ * does not declare its reorder depth guesses it from the first pictures, and libavcodec drops a
+ * picture where a later range reorders deeper. Find the depth that the copied pictures can need,
+ * so that configure_output and write_range declare it in those parameter sets. */
+static int plan_avc_reorder(Writer *writer, const MPCutSegment *segments, size_t count, const AVStream *video,
+                            MPCutTime origin) {
+    writer->avc_reorder = 0;
+    const AVCodecParameters *codec = video->codecpar;
+    if (!is_matroska(writer->output->oformat) || writer->tracks == MPCUT_TRACKS_AUDIO || !primary_video(video)
+        || codec->codec_id != AV_CODEC_ID_H264 || !mpcut_avcc_needs_reorder(codec->extradata, codec->extradata_size))
+        return 0;
+    int depth = 0;
+    for (size_t i = 0; i < count; i++) {
+        size_t first = 0;
+        while (strcmp(segments[first].path, segments[i].path))
+            first++;
+        if (first != i)
+            continue; // Each source is read once, up to the furthest of its ends.
+        MPCutTime limit = {0, 0};
+        for (size_t j = i; j < count; j++) {
+            if (strcmp(segments[j].path, segments[i].path))
+                continue;
+            MPCutTime start = !strcmp(segments[j].path, segments[0].path) ? origin : segments[j].source_origin;
+            MPCutTime end = start.denominator > 0 ? time_add(start, segments[j].end, 1) : (MPCutTime){0, 0};
+            if (segments[j].reaches_end || !end.denominator) {
+                limit = (MPCutTime){0, 0};
+                break;
+            }
+            if (!limit.denominator || time_compare(end, limit) > 0)
+                limit = end;
+        }
+        int source_depth = 0;
+        int result = source_reorder(writer, segments[i].path, limit, &source_depth);
+        if (result)
+            return result;
+        if (source_depth > depth)
+            depth = source_depth;
+    }
+    writer->avc_reorder = depth;
     return 0;
 }
 
@@ -2682,6 +3838,47 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
         result = map_streams(&writer, input, timecode_index);
         if (result)
             goto cleanup;
+        if (!index && (result = plan_avc_reorder(&writer, segments, count, input->streams[video_index], origin)))
+            goto cleanup;
+        if (!index && tracks != MPCUT_TRACKS_AUDIO && !writer.generated_stills) {
+            writer.stream_sets = av_calloc(count, sizeof(*writer.stream_sets));
+            writer.stream_sets_size = av_calloc(count, sizeof(*writer.stream_sets_size));
+            writer.stream_start_pts = av_malloc_array(count, sizeof(*writer.stream_start_pts));
+            if (!writer.stream_sets || !writer.stream_sets_size || !writer.stream_start_pts) {
+                result = fail(&writer, "Cannot allocate output track state");
+                goto cleanup;
+            }
+            for (size_t i = 0; i < count; i++)
+                writer.stream_start_pts[i] = AV_NOPTS_VALUE;
+            writer.stream_set_count = count;
+            // A source that cannot be read here adds no sets; the copy reports its own failure to read it.
+            if (plan_stream_sets(&writer, segments, count, writer.stream_sets, writer.stream_sets_size,
+                                 writer.smart_trim ? writer.stream_start_pts : NULL) == -2) {
+                result = 2;
+                goto cleanup;
+            }
+            if (writer.error && writer.error_capacity)
+                writer.error[0] = '\0';
+        }
+        if (!index && is_mov(writer.output->oformat) && tracks != MPCUT_TRACKS_AUDIO) {
+            writer.hevc_early = av_calloc(count, sizeof(*writer.hevc_early));
+            writer.hevc_early_size = av_calloc(count, sizeof(*writer.hevc_early_size));
+            writer.hevc_videos = av_calloc(count, sizeof(*writer.hevc_videos));
+            if (!writer.hevc_early || !writer.hevc_early_size || !writer.hevc_videos) {
+                result = fail(&writer, "Cannot allocate output track state");
+                goto cleanup;
+            }
+            writer.hevc_early_count = count;
+            size_t found = 0;
+            // A read that fails adds no sets, and each sample still meets check_hvc1's own rule.
+            if (plan_hevc_sets(&writer, segments, count, input, writer.stream_sets, writer.stream_sets_size, 0,
+                               writer.hevc_early, writer.hevc_early_size, writer.hevc_videos, &found) == -2) {
+                result = 2;
+                goto cleanup;
+            }
+            if (writer.error && writer.error_capacity)
+                writer.error[0] = '\0';
+        }
         Range range = {
             .matroska_input = av_match_name("matroska", input->iformat->name),
             .source_start = time_add(origin, segment->start, 1),
@@ -2782,6 +3979,8 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
                                           &writer.mp3_skip, &writer.mp3_end_discard, error, error_capacity);
             writer.mp3_header = MP3_HEADER_GAPLESS;
         } else {
+            writer.hevc_range = index;
+            writer.hevc_range_video = writer.hevc_videos ? writer.hevc_videos[index] : -1;
             result = write_range(&writer, input, &range, time_seconds(total));
         }
         if (result) {
@@ -2827,6 +4026,12 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
             goto cleanup;
         }
     }
+    // After every pass that rewrites the movie box, so that it is still the file's last box.
+    if (is_mov(writer.output->oformat) && tracks != MPCUT_TRACKS_AUDIO &&
+        (result = mpcut_mov_cover_edits(output_path, total, error, error_capacity)))
+        goto cleanup;
+    if (writer.hvc1 && (result = label_hvc1(&writer)))
+        goto cleanup;
     if (writer.picture_hash && (result = verify_picture(&writer, total)))
         goto cleanup;
     result = progress_at(&writer, 1);
@@ -2847,6 +4052,25 @@ cleanup:
     mpcut_aac_free(writer.aac_edits);
     av_free(writer.last_dts);
     av_free(writer.opus_trim);
+    av_free(writer.opus_clock);
+    for (unsigned i = 0; writer.hevc_sets && i < writer.hevc_set_count; i++)
+        mpcut_hevc_sets_free(writer.hevc_sets[i]);
+    av_free(writer.hevc_sets);
+    for (size_t i = 0; writer.hevc_early && i < writer.hevc_early_count; i++)
+        av_free(writer.hevc_early[i]);
+    av_free(writer.hevc_early);
+    av_free(writer.hevc_early_size);
+    av_free(writer.hevc_videos);
+    for (size_t i = 0; writer.stream_sets && i < writer.stream_set_count; i++)
+        av_free(writer.stream_sets[i]);
+    av_free(writer.stream_sets);
+    av_free(writer.stream_sets_size);
+    mpcut_hevc_sets_free(writer.output_sets);
+    mpcut_hevc_sets_free(writer.description_sets);
+    av_free(writer.stream_start_pts);
+    mpcut_hevc_sets_free(writer.smart_sets);
+    av_free(writer.tail_sets);
+    av_free(writer.hvc1);
     av_free(writer.range_tracks);
     av_free(writer.stream_map);
     av_free(writer.art);
@@ -2896,6 +4120,391 @@ static unsigned unmatched(const AVFormatContext *first, const AVFormatContext *l
     return count;
 }
 
+/* Say when an HEVC picture copied into MOV or MP4 keeps an 'hev1' description (plan_hevc_sets), with the ranges
+ * starting from the sets their sources hold there as the copy does (plan_stream_sets). */
+/* What a copy into MOV or MP4 does not keep of a source's timecode: breaks inside a kept range, which the single
+   output sample counts over; the 24-hour wrap and negative flags, which the muxer cannot set; a count per field pair,
+   which becomes a count per frame; and a timecode tag of a source without a timecode track, for which no track is
+   written. Readings inside the kept ranges stay the same except across a break. */
+static void note_timecode(const Writer *writer, const MPCutSegment *segments, size_t count, int tracks,
+                          const char *container, char *notes, size_t capacity) {
+    if (!av_match_name(writer->output->oformat->name, "mov,mp4") || (tracks != MPCUT_TRACKS_ALL && !writer->keep_timecode))
+        return;
+    unsigned breaks = 0, flags = 0, pairs = 0, tags = 0;
+    for (size_t at = 0; at < count; at++) {
+        AVFormatContext *input = NULL;
+        if (avformat_open_input(&input, segments[at].path, NULL, NULL) < 0)
+            continue;
+        const AVStream *video = NULL, *track = NULL;
+        for (unsigned i = 0; i < input->nb_streams; i++) {
+            if (!video && input->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && !attached_picture(input->streams[i]))
+                video = input->streams[i];
+            if (!track && timecode_track(input->streams[i]))
+                track = input->streams[i];
+        }
+        // The MOV header states the picture rate the timecode is described with, as the writer reads it.
+        MPCutTimecode timecode;
+        if (track && video && av_match_name("mov", input->iformat->name) && !mpcut_timecode_describe(track, video, &timecode)) {
+            MPCutTime origin = segments[at].source_origin.denominator > 0 ? segments[at].source_origin : (MPCutTime){0, 1};
+            breaks += mpcut_timecode_breaks(segments[at].path, (unsigned)track->index, &timecode,
+                                            time_add(origin, segments[at].start, 1), time_add(origin, segments[at].end, 1));
+            flags += (timecode.flags & (AV_TIMECODE_FLAG_24HOURSMAX | AV_TIMECODE_FLAG_ALLOWNEGATIVE)) != 0;
+            pairs += timecode.frames_per_count > 1;
+        } else if (!track && (av_dict_get(input->metadata, "timecode", NULL, 0)
+                              || (video && av_dict_get(video->metadata, "timecode", NULL, 0)))) {
+            tags++;
+        }
+        avformat_close_input(&input);
+    }
+    if (breaks)
+        add_note(notes, capacity, "The source timecode has %u break%s inside the kept range%s. The copied timecode track "
+                 "counts on from each range start and does not keep %s.", breaks, breaks == 1 ? "" : "s",
+                 count == 1 ? "" : "s", breaks == 1 ? "it" : "them");
+    if (flags)
+        add_note(notes, capacity, "%s timecode cannot state the source's 24-hour wrap or negative-time flag, which is not copied.",
+                 container);
+    if (pairs)
+        add_note(notes, capacity, "The source timecode counts once per field pair. The copy counts once per frame and shows the same readings.");
+    if (tags)
+        add_note(notes, capacity, "The source's timecode tag has no timecode track to come from, so %s keeps no timecode for it.",
+                 container);
+}
+
+/* Matroska carries HDR10+ and SMPTE 2094 dynamic metadata, LCEVC enhancement data and other block additions with each
+   picture. Only a Matroska copy writes them, so another container leaves them out. */
+static void note_block_data(const Writer *writer, const AVFormatContext *input, const char *container,
+                            char *notes, size_t capacity) {
+    if (writer->tracks == MPCUT_TRACKS_AUDIO || is_matroska(writer->output->oformat)
+        || !av_match_name("matroska", input->iformat->name))
+        return;
+    AVFormatContext *reader = NULL;
+    AVPacket *packet = av_packet_alloc();
+    if (!packet || avformat_open_input(&reader, input->url, NULL, NULL) < 0) {
+        av_packet_free(&packet);
+        return;
+    }
+    static const struct { enum AVPacketSideDataType type; const char *name; } kinds[] = {
+        {AV_PKT_DATA_DYNAMIC_HDR10_PLUS, "HDR10+ dynamic metadata"},
+        {AV_PKT_DATA_DYNAMIC_HDR_SMPTE_2094_APP5, "SMPTE 2094 dynamic HDR metadata"},
+        {AV_PKT_DATA_LCEVC, "LCEVC enhancement data"},
+        {AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL, "Matroska block additions"},
+    };
+    unsigned found[sizeof(kinds) / sizeof(kinds[0])] = {0};
+    int track[sizeof(kinds) / sizeof(kinds[0])] = {0};
+    unsigned pictures = 0;
+    // The first pictures show whether a stream carries them.
+    while (pictures < 48 && av_read_frame(reader, packet) >= 0) {
+        const AVStream *stream = reader->streams[packet->stream_index];
+        if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && !attached_picture(stream)) {
+            pictures++;
+            for (size_t k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++) {
+                if (!found[k] && av_packet_side_data_get(packet->side_data, packet->side_data_elems, kinds[k].type)) {
+                    found[k] = 1;
+                    track[k] = packet->stream_index;
+                }
+            }
+        }
+        av_packet_unref(packet);
+    }
+    for (size_t k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++) {
+        if (found[k])
+            add_note(notes, capacity, "%s cannot carry the %s of track %d, which %s not copied.", container, kinds[k].name,
+                     track[k], k == 3 ? "are" : "is");
+    }
+    av_packet_free(&packet);
+    avformat_close_input(&reader);
+}
+
+/* A QuickTime movie describes a 360° projection only in its vexu box, which has no cube map or tiled
+   equirectangular form, so the muxer leaves such a projection out with only a log line. MP4 and Matroska keep it. */
+static void note_projection(const Writer *writer, const AVFormatContext *input, const char *container,
+                            char *notes, size_t capacity) {
+    if (writer->tracks == MPCUT_TRACKS_AUDIO || strcmp(writer->output->oformat->name, "mov") != 0)
+        return;
+    for (unsigned i = 0; i < input->nb_streams; i++) {
+        const AVCodecParameters *codec = input->streams[i]->codecpar;
+        const AVPacketSideData *side = av_packet_side_data_get(codec->coded_side_data, codec->nb_coded_side_data,
+                                                               AV_PKT_DATA_SPHERICAL);
+        if (codec->codec_type != AVMEDIA_TYPE_VIDEO || !side)
+            continue;
+        const AVSphericalMapping *mapping = (const AVSphericalMapping *)side->data;
+        if (mapping->projection == AV_SPHERICAL_CUBEMAP || mapping->projection == AV_SPHERICAL_EQUIRECTANGULAR_TILE)
+            add_note(notes, capacity, "%s cannot describe the 360° projection of track %u, which is not copied. "
+                     "Choose MP4 or MKV to keep it.", container, i);
+    }
+}
+
+/* A QuickTime or MP4 colour box holds one description. With an ICC profile the copy writes the profile, and the
+   primaries, transfer and matrix tags beside it are left out of the container (the coded stream keeps its own). */
+static void note_color_box(const Writer *writer, const AVFormatContext *input, const char *container,
+                           char *notes, size_t capacity) {
+    if (writer->tracks == MPCUT_TRACKS_AUDIO || !av_match_name(writer->output->oformat->name, "mov,mp4,ipod"))
+        return;
+    for (unsigned i = 0; i < input->nb_streams; i++) {
+        const AVCodecParameters *codec = input->streams[i]->codecpar;
+        if (codec->codec_type != AVMEDIA_TYPE_VIDEO || attached_picture(input->streams[i]))
+            continue;
+        if (!av_packet_side_data_get(codec->coded_side_data, codec->nb_coded_side_data, AV_PKT_DATA_ICC_PROFILE))
+            continue;
+        if (codec->color_primaries == AVCOL_PRI_UNSPECIFIED && codec->color_trc == AVCOL_TRC_UNSPECIFIED
+            && codec->color_space == AVCOL_SPC_UNSPECIFIED)
+            continue;
+        add_note(notes, capacity, "%s keeps one colour description for track %u: its ICC profile is copied and its "
+                 "primaries, transfer and matrix tags are not.", container, i);
+    }
+    // A QuickTime nclc box has no range byte. H.264, HEVC and JPEG pictures state their range themselves.
+    if (strcmp(writer->output->oformat->name, "mov") != 0)
+        return;
+    for (unsigned i = 0; i < input->nb_streams; i++) {
+        const AVCodecParameters *codec = input->streams[i]->codecpar;
+        if (codec->codec_type != AVMEDIA_TYPE_VIDEO || attached_picture(input->streams[i])
+            || codec->color_range != AVCOL_RANGE_JPEG || codec->codec_id == AV_CODEC_ID_H264
+            || codec->codec_id == AV_CODEC_ID_HEVC || codec->codec_id == AV_CODEC_ID_MJPEG)
+            continue;
+        add_note(notes, capacity, "%s colour tags have no range, so the full-range flag of track %u is not copied.",
+                 container, i);
+    }
+}
+
+/* Movie metadata the MOV or MP4 muxer has no field for. Without the mdta form, a QuickTime movie keeps only the
+   classic user-data keys and an MP4 only the iTunes list, so camera keys such as com.apple.quicktime.make are left
+   out even of a copy into the same container. Keys the muxer writes itself (brands, creation time, the writing
+   tool) are not named. */
+static void note_metadata(const Writer *writer, const AVFormatContext *input, const char *container,
+                          char *notes, size_t capacity) {
+    static const char *const managed[] = {"major_brand", "minor_version", "compatible_brands", "creation_time",
+                                          "encoder", "encoding_tool", "software", "timecode", NULL};
+    static const char *const mov_keys[] = {"artist", "title", "author", "album", "date", "comment", "genre", "copyright",
+                                           "make", "model", "location", "keywords", "xmp", NULL};
+    static const char *const mp4_keys[] = {"title", "artist", "album_artist", "composer", "album", "date", "encoding_tool",
+                                           "comment", "genre", "copyright", "grouping", "lyrics", "description", "synopsis",
+                                           "show", "episode_id", "network", "keywords", "episode_sort", "season_number",
+                                           "media_type", "hd_video", "gapless_playback", "compilation", "track", "disc",
+                                           "tmpo", "disc_subtitle", "location", NULL};
+    const char *name = writer->output->oformat->name;
+    const char *const *kept = !strcmp(name, "mov") ? mov_keys : (!strcmp(name, "mp4") || !strcmp(name, "ipod")) ? mp4_keys : NULL;
+    if (!kept)
+        return;
+    char omitted[512] = "";
+    unsigned count = 0;
+    const AVDictionaryEntry *entry = NULL;
+    while ((entry = av_dict_iterate(input->metadata, entry))) {
+        char key[128];
+        snprintf(key, sizeof(key), "%s", entry->key);
+        // A language variant ("title-eng") is written with its key.
+        size_t length = strlen(key);
+        if (length > 4 && key[length - 4] == '-')
+            key[length - 4] = '\0';
+        int known = 0;
+        for (const char *const *item = managed; *item && !known; item++)
+            known = !av_strcasecmp(key, *item);
+        for (const char *const *item = kept; *item && !known; item++)
+            known = !av_strcasecmp(key, *item);
+        if (known)
+            continue;
+        if (count < 6)
+            av_strlcatf(omitted, sizeof(omitted), "%s%s", count ? ", " : "", entry->key);
+        count++;
+    }
+    if (count > 6)
+        av_strlcatf(omitted, sizeof(omitted), " and %u more", count - 6);
+    if (count)
+        add_note(notes, capacity, "%s cannot hold the movie metadata %s, which %s not copied.",
+                 container, omitted, count == 1 ? "is" : "are");
+}
+
+static void note_hevc_entry(Writer *writer, const MPCutSegment *segments, size_t count, const AVFormatContext *input,
+                            char *notes, size_t capacity) {
+    size_t at = 0;
+    uint8_t **early = av_calloc(count, sizeof(*early)), **stream = av_calloc(count, sizeof(*stream));
+    int *early_size = av_calloc(count, sizeof(*early_size)), *videos = av_calloc(count, sizeof(*videos));
+    int *stream_size = av_calloc(count, sizeof(*stream_size));
+    int fallback = early && early_size && videos && stream && stream_size
+        ? plan_hevc_sets(writer, segments, count, input, stream, stream_size, 1, early, early_size, videos, &at)
+        : HEVC_SETS_SAME;
+    for (size_t i = 0; i < count; i++) {
+        av_free(early ? early[i] : NULL);
+        av_free(stream ? stream[i] : NULL);
+    }
+    av_free(early);
+    av_free(early_size);
+    av_free(videos);
+    av_free(stream);
+    av_free(stream_size);
+    if (fallback == HEVC_SETS_GROUP_CHANGE || fallback == HEVC_SETS_UNREADABLE) {
+        const char *name = strrchr(segments[at].path, '/');
+        name = name ? name + 1 : segments[at].path;
+        if (fallback == HEVC_SETS_GROUP_CHANGE)
+            add_note(notes, capacity, "HEVC parameter sets change mid-picture-group in %s, so the copy uses an hev1 "
+                     "description that AVFoundation and QuickTime cannot play; FFmpeg-based players can.", name);
+        else
+            add_note(notes, capacity, "The HEVC parameter sets in the samples of %s cannot be followed, so the copy uses an "
+                     "hev1 description that AVFoundation and QuickTime cannot play; FFmpeg-based players can.", name);
+    } else if (fallback == -1) {
+        // The copy reads the same samples with the same rule (check_hvc1); here they could not be read at all.
+        add_note(notes, capacity, "The HEVC samples could not be read to check their parameter sets before writing, so "
+                 "the copy may use an hev1 description that AVFoundation and QuickTime cannot play.");
+    }
+}
+
+/* Whether a sample with `length_size`-byte NAL lengths carries a parameter set (`sets`), or a NAL unit of a picture
+ * layer above the base layer: for HEVC one with a nonzero layer ID, for H.264 a sequence parameter set extension, a
+ * subset sequence parameter set, a prefix unit, an auxiliary picture or an MVC/SVC slice. */
+static int sample_carries(const AVCodecParameters *codec, const AVPacket *packet, int length_size, int sets) {
+    int hevc = codec->codec_id == AV_CODEC_ID_HEVC;
+    for (int i = 0; i + length_size < packet->size;) {
+        uint32_t length = 0;
+        for (int k = 0; k < length_size; k++)
+            length = length << 8 | packet->data[i + k];
+        i += length_size;
+        if (!length || length > (uint32_t)(packet->size - i))
+            return 0;
+        const uint8_t *nal = packet->data + i;
+        unsigned type = hevc ? (nal[0] >> 1) & 0x3f : nal[0] & 0x1f;
+        if (sets ? (hevc ? type >= 32 && type <= 34 : type == 7 || type == 8 || type == 13 || type == 15)
+                 : (hevc ? length >= 2 && ((nal[0] & 1) << 5 | nal[1] >> 3) != 0
+                         : type == 13 || type == 14 || type == 15 || type == 19 || type == 20 || type == 21))
+            return 1;
+        i += (int)length;
+    }
+    return 0;
+}
+
+/* Whether an avcC record of a high profile lists sequence parameter set extensions after its picture parameter
+ * sets, which describe an auxiliary picture. */
+static int avcc_extensions(const uint8_t *config, int size) {
+    if (!config || size < 7 || config[0] != 1 || config[1] == 66 || config[1] == 77 || config[1] == 88)
+        return 0;
+    const uint8_t *p = config + 5, *end = config + size;
+    for (int kind = 0; kind < 2; kind++) {
+        if (end - p < 1)
+            return 0;
+        unsigned count = kind ? p[0] : p[0] & 0x1f;
+        p++;
+        for (unsigned i = 0; i < count; i++) {
+            if (end - p < 2 || end - p - 2 < AV_RB16(p))
+                return 0;
+            p += 2 + AV_RB16(p);
+        }
+    }
+    return end - p >= 7 && p[3] > 0 && (p[6] & 0x1f) == 13;
+}
+
+/* Say when the parameter sets of an H.264 or HEVC picture cannot be followed through the samples the copy reads
+ * (plan_stream_sets, repeat_stream_sets), which then start each range from its source's description and stop
+ * repeating sets at later keyframes. Reads on only for a source whose sets could need following: one whose
+ * description the tracker cannot read, whose first sample carries parameter sets, or whose description or first
+ * sample shows another layer (HEVC with the sets of a higher layer, such as an MV-HEVC view or an alpha layer, or
+ * H.264 with auxiliary pictures, MVC or SVC). Its video packets are read up to the latest range end, and the note
+ * is given only when a sample there carries a parameter set that is not followed. A single copy of a whole file
+ * starts nothing mid-stream and is not read. */
+static void note_unfollowed_sets(const MPCutSegment *segments, size_t count, char *notes, size_t capacity) {
+    AVPacket *packet = av_packet_alloc();
+    for (size_t first = 0; packet && first < count; first++) {
+        size_t seen = 0;
+        while (strcmp(segments[seen].path, segments[first].path))
+            seen++;
+        if (seen != first || (count == 1 && segments[0].start.numerator == 0 && segments[0].reaches_end))
+            continue;
+        // The file header gives each track's description; a plan reads no more of an ordinary source than its first
+        // video packet.
+        AVFormatContext *input = NULL;
+        if (avformat_open_input(&input, segments[first].path, NULL, NULL) < 0)
+            continue;
+        unsigned index = 0;
+        while (index < input->nb_streams && !primary_video(input->streams[index]))
+            index++;
+        const AVStream *track = index < input->nb_streams ? input->streams[index] : NULL;
+        const AVCodecParameters *codec = track ? track->codecpar : NULL;
+        int hevc = codec && codec->codec_id == AV_CODEC_ID_HEVC;
+        if (!codec || (!hevc && codec->codec_id != AV_CODEC_ID_H264) || codec->extradata_size < (hevc ? 23 : 7)
+            || codec->extradata[0] != 1) {
+            avformat_close_input(&input);
+            continue;
+        }
+        for (unsigned j = 0; j < input->nb_streams; j++)
+            input->streams[j]->discard = j == index ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
+        MPCutTime end = {0, 0};
+        for (size_t i = first; i < count; i++) {
+            if (strcmp(segments[i].path, segments[first].path) || segments[i].generated_still)
+                continue;
+            MPCutTime origin = segments[i].source_origin.denominator > 0 ? segments[i].source_origin
+                : track->start_time != AV_NOPTS_VALUE ? time_ticks(track->start_time, track->time_base)
+                : (MPCutTime){0, 1};
+            MPCutTime range_end = time_add(origin, segments[i].end, 1);
+            if (range_end.denominator && (!end.denominator || time_compare(range_end, end) > 0))
+                end = range_end;
+        }
+        int length_size = sample_length_size(codec);
+        const char *layers = hevc ? mpcut_hevc_layers(codec->extradata, codec->extradata_size) : NULL;
+        int layered = layers || (!hevc && avcc_extensions(codec->extradata, codec->extradata_size));
+        MPCutHevcSets *sets = stream_sets_create(codec);
+        int unfollowed = 0, followed = layered || !sets;
+        for (int read = 0; end.denominator && !unfollowed && av_read_frame(input, packet) >= 0; read++) {
+            MPCutTime pts = packet->pts == AV_NOPTS_VALUE ? (MPCutTime){0, 0} : time_ticks(packet->pts, track->time_base);
+            if ((unsigned)packet->stream_index == index && packet->size > 0) {
+                if (!read && !followed) {
+                    layered = sample_carries(codec, packet, length_size, 0);
+                    followed = layered || sample_carries(codec, packet, length_size, 1);
+                }
+                if (!followed) {
+                    av_packet_unref(packet);
+                    break;
+                }
+                if (pts.denominator && time_compare(pts, end) >= 0) {
+                    av_packet_unref(packet);
+                    break;
+                }
+                unfollowed = sets ? mpcut_hevc_sets_apply_sample(sets, packet->data, packet->size, length_size) < 0
+                                  : sample_carries(codec, packet, length_size, 1);
+            }
+            av_packet_unref(packet);
+        }
+        mpcut_hevc_sets_free(sets);
+        avformat_close_input(&input);
+        if (unfollowed) {
+            const char *name = strrchr(segments[first].path, '/');
+            const char *what = layers ? layers : !layered ? NULL
+                : hevc ? "its additional picture layers" : "its auxiliary, MVC or SVC pictures";
+            add_note(notes, capacity, "MPCut cannot follow the parameter sets that the samples of %s carry%s%s, so a "
+                     "range that starts after the source changes them starts from the sets of its description instead, "
+                     "and its first pictures may not decode.", name ? name + 1 : segments[first].path,
+                     what ? " for " : "", what ? what : "");
+        }
+    }
+    av_packet_free(&packet);
+}
+
+/* Say when a Matroska copy of H.264 with reordered pictures cannot declare their reorder depth (plan_avc_reorder),
+ * because a sequence parameter set of the description leaves it undeclared in a form that cannot be rewritten. A
+ * Matroska reader then guesses the depth from the first pictures and can drop one where a later group reorders
+ * deeper. Reads the file headers only. */
+static void note_avc_reorder(const char *output_format, const MPCutSegment *segments, size_t count, char *notes,
+                             size_t capacity) {
+    if (!av_match_name(output_format, "matroska,webm"))
+        return;
+    for (size_t first = 0; first < count; first++) {
+        size_t seen = 0;
+        while (strcmp(segments[seen].path, segments[first].path))
+            seen++;
+        AVFormatContext *input = NULL;
+        if (seen != first || avformat_open_input(&input, segments[first].path, NULL, NULL) < 0)
+            continue;
+        for (unsigned i = 0; i < input->nb_streams; i++) {
+            const AVCodecParameters *codec = input->streams[i]->codecpar;
+            if (!primary_video(input->streams[i]) || codec->codec_id != AV_CODEC_ID_H264 || codec->video_delay <= 0
+                || !mpcut_avcc_reorder_unknown(codec->extradata, codec->extradata_size))
+                continue;
+            const char *name = strrchr(segments[first].path, '/');
+            add_note(notes, capacity, "The H.264 picture of %s reorders pictures without declaring how deeply, in a form "
+                     "MPCut cannot add the declaration to, so a Matroska reader may drop a picture where a later group "
+                     "reorders deeper. MOV and MP4 keep every picture.", name ? name + 1 : segments[first].path);
+            break;
+        }
+        avformat_close_input(&input);
+    }
+}
+
 int mpcut_copy_omissions(const MPCutSegment *segments, size_t count, const char *output_path,
                          int tracks, int audio_stream, char *notes, size_t capacity) {
     if (!notes || !capacity)
@@ -2911,8 +4520,21 @@ int mpcut_copy_omissions(const MPCutSegment *segments, size_t count, const char 
         if (segments[i].audio_stream_override)
             writer.whole_sound = 0;
     }
-    if (!writer.delivered)
+    if (!writer.delivered && writer.tracks != MPCUT_TRACKS_VIDEO)
         return 0;
+    if (!writer.delivered) {
+        // A staged picture (a multicam program's lane) carries neither chapters nor art, but its copied HEVC samples
+        // and their description go on into the delivered file.
+        AVFormatContext *input = NULL;
+        int result = prepare_output(&writer) || avformat_open_input(&input, segments[0].path, NULL, NULL) < 0;
+        if (!result) {
+            note_hevc_entry(&writer, segments, count, input, notes, capacity);
+            note_unfollowed_sets(segments, count, notes, capacity);
+        }
+        avformat_close_input(&input);
+        avformat_free_context(writer.output);
+        return result;
+    }
 
     AVFormatContext *input = NULL;
     Chapters chapters = {0};
@@ -2930,23 +4552,52 @@ int mpcut_copy_omissions(const MPCutSegment *segments, size_t count, const char 
         unsigned dropped = plan_art(&writer, input, NULL, &kept);
         unsigned dropped_files = plan_files(&writer, input, NULL, &kept_files);
         unsigned later = 0, later_files = 0;
-        if (!writer.whole_sound || !sound_only(input)) {
+        int movie = !sound_only(input);
+        if (!whole_recording(&writer, input)) {
             // One chosen audio track, or the picture or the sound of a movie, is copied on its own.
-            unsigned pictures = 0, files = 0;
+            unsigned pictures = 0, files = 0, extras = 0;
             for (unsigned i = 0; i < input->nb_streams; i++) {
                 pictures += attached_picture(input->streams[i]);
                 files += attached_file(input->streams[i]);
+                extras += movie && extra_track(input->streams[i]);
             }
+            const char *whole = movie ? "both the picture and the sound of a movie" : "all the audio tracks of a sound-only file";
             if (pictures) {
-                add_note(notes, capacity, "Cover art is copied only with all the audio tracks of a sound-only file. "
-                         "%u embedded picture%s not copied.", pictures, pictures == 1 ? " is" : "s are");
+                add_note(notes, capacity, "Cover art is copied only with %s. "
+                         "%u embedded picture%s not copied.", whole, pictures, pictures == 1 ? " is" : "s are");
             }
             if (files) {
-                add_note(notes, capacity, "Attached files are copied only with all the audio tracks of a sound-only file. "
-                         "%u attached file%s not copied.", files, files == 1 ? " is" : "s are");
+                add_note(notes, capacity, "Attached files are copied only with %s. "
+                         "%u attached file%s not copied.", whole, files, files == 1 ? " is" : "s are");
+            }
+            if (extras) {
+                add_note(notes, capacity, "Subtitle and data tracks are copied only with %s. "
+                         "%u track%s not copied.", whole, extras, extras == 1 ? " is" : "s are");
+            }
+        } else if (movie) {
+            // Name each subtitle or data track that this container, or the copy, cannot keep whole (carried_extra).
+            int whole = count == 1 && segments[0].start.numerator == 0 && segments[0].reaches_end;
+            for (unsigned i = 0; i < input->nb_streams; i++) {
+                const AVStream *stream = input->streams[i];
+                if (!extra_track(stream))
+                    continue;
+                const AVCodecParameters *codec = stream->codecpar;
+                int data = codec->codec_type == AVMEDIA_TYPE_DATA;
+                char name[AV_FOURCC_MAX_STRING_SIZE];
+                if (data && codec->codec_tag)
+                    av_fourcc_make_string(name, codec->codec_tag);
+                else
+                    snprintf(name, sizeof(name), "%s", avcodec_get_name(codec->codec_id));
+                if (!carried_extra(writer.output->oformat, stream)) {
+                    add_note(notes, capacity, "%s track %u (%s) cannot be copied to %s and is left out.",
+                             data ? "Data" : "Subtitle", i, name, container);
+                } else if (data && !whole) {
+                    add_note(notes, capacity, "Data track %u (%s) keeps only the samples that lie wholly inside the kept ranges.",
+                             i, name);
+                }
             }
         }
-        if (writer.whole_sound && sound_only(input)) {
+        if (whole_recording(&writer, input)) {
             for (size_t at = 1; at < count; at++) {
                 size_t source = 0;
                 while (strcmp(segments[source].path, segments[at].path))
@@ -2956,7 +4607,7 @@ int mpcut_copy_omissions(const MPCutSegment *segments, size_t count, const char 
                 AVFormatContext *other = NULL;
                 if (avformat_open_input(&other, segments[at].path, NULL, NULL) < 0)
                     continue;
-                if (sound_only(other)) {
+                if (sound_only(other) == !movie) {
                     later += unmatched(input, other, 0);
                     later_files += unmatched(input, other, 1);
                 }
@@ -2985,6 +4636,13 @@ int mpcut_copy_omissions(const MPCutSegment *segments, size_t count, const char 
             add_note(notes, capacity, "Attached files come from the first clip. %u different file%s in later clips %s not copied.",
                      later_files, later_files == 1 ? "" : "s", later_files == 1 ? "is" : "are");
         }
+
+        note_hevc_entry(&writer, segments, count, input, notes, capacity);
+        note_metadata(&writer, input, container, notes, capacity);
+        note_color_box(&writer, input, container, notes, capacity);
+        note_projection(&writer, input, container, notes, capacity);
+        note_block_data(&writer, input, container, notes, capacity);
+        note_timecode(&writer, segments, count, tracks, container, notes, capacity);
 
         // A join writes one timecode track, which counts on from the first range.
         if (count > 1 && (tracks == MPCUT_TRACKS_ALL || writer.keep_timecode) &&
@@ -3023,6 +4681,11 @@ int mpcut_copy_omissions(const MPCutSegment *segments, size_t count, const char 
                 add_note(notes, capacity, "%s chapters follow one another without a gap, so %u chapter%s on to the start of the next.",
                          container, chapters.closed_gaps, chapters.closed_gaps == 1 ? " runs" : "s run");
             }
+        }
+        // What the copy's parameter-set planning cannot keep (layered pictures, sets it cannot follow, reorder depth).
+        if (writer.tracks != MPCUT_TRACKS_AUDIO) {
+            note_unfollowed_sets(segments, count, notes, capacity);
+            note_avc_reorder(writer.output->oformat->name, segments, count, notes, capacity);
         }
     }
     free_chapters(&chapters);

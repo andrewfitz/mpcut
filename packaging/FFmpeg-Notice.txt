@@ -28,7 +28,10 @@ enabled for Smart Trim are h264_videotoolbox, hevc_videotoolbox and libsvtav1.
 Re-encode uses the FFmpeg executable in Contents/Helpers/ffmpeg with the
 h264_videotoolbox, hevc_videotoolbox and prores_videotoolbox video encoders
 and native AAC and PCM audio encoders. Audio conversion also uses the
-libmp3lame MP3 encoder, the libopus Opus encoder and the native FLAC encoder.
+libmp3lame MP3 encoder, the libopus Opus encoder and the native FLAC encoder. The
+native mov_text, srt, subrip, ass, ssa and webvtt subtitle encoders are enabled,
+and use no external library; a movie re-encode converts text subtitles with
+mov_text and srt.
 
 To rebuild the executable and libraries on Apple Silicon with Xcode, CMake and pkg-config, create a build
 directory with scripts/, packaging/, and .build/mpcut-ffmpeg/ subdirectories.

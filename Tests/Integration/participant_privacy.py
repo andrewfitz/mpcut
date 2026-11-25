@@ -5,6 +5,7 @@ import argparse
 from fractions import Fraction
 import json
 from pathlib import Path
+import subprocess
 
 import participant_e2e as fixture
 from participant_e2e_fixture import ffmpeg
@@ -67,6 +68,18 @@ def verify_rotated_vfr(harness):
         harness.assert_color(frame, 180, 90, host_y, fixture.HOST, f"rotated host at {time}")
 
 
+def analysis_available(harness):
+    """Whether this build links the detector, judged by scanning a recording with no rotation."""
+    result = subprocess.run([str(fixture.CLI), "participants", "scan", "--file", str(harness.gallery),
+                             "--backend", "cpu-only", "--sampling", "sparse", "--no-sidecar", "--json"],
+                            capture_output=True, text=True, timeout=180)
+    report = json.loads(result.stdout)
+    if result.returncode == 0:
+        return True
+    harness.assertEqual(report["error"]["code"], "participant_analysis_unavailable", report)
+    return False
+
+
 def verify_bitstream_rotation_refuses_scanned_geometry(harness):
     source = harness.folder / "orientation-sei.mp4"
     ffmpeg("-i", harness.gallery, "-an", "-c:v", "libx264", "-g", "8", "-bf", "0",
@@ -91,8 +104,11 @@ def verify_bitstream_rotation_refuses_scanned_geometry(harness):
     harness.assertEqual(report["error"]["code"], "participant_display_transform_changed")
     report = harness.cli("participants", "scan", "--file", str(source), "--backend", "cpu-only",
                          "--sampling", "sparse", ok=False)
-    # The detector library is optional. The output-side mismatch check above runs in either build.
-    harness.assertIn(report["error"]["code"], ("unsupported_display_transform", "participant_analysis_unavailable"))
+    # The detector library is optional. The scan finds the bitstream rotation only while decoding
+    # for analysis, so a build without the library refuses every scan before reading a picture.
+    # The output-side mismatch check above runs in either build.
+    expected = "unsupported_display_transform" if analysis_available(harness) else "participant_analysis_unavailable"
+    harness.assertEqual(report["error"]["code"], expected)
 
     geometry.pop("analysis_identity")
     for appearance in geometry["appearances"]:

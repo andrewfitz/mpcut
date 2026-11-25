@@ -262,6 +262,11 @@ private struct ExportResult: Encodable {
     var requestedAudio: ReencodeAudio?
     /// Cover art, chapters or timecode that a packet copy leaves behind. Reported under `warnings`.
     var copyOmissions: [String] = []
+    /// What each Smart Trim edge cost as written. Only an export reports it, outside `segments`.
+    var encodedEdgeResults: [EncodedEdgeResult] = []
+    /// What writing changed that the plan could not know, such as pictures decoded in software. Only an export
+    /// reports it, as `written_warnings`, so a dry run and the export keep the same `warnings`.
+    var writtenWarnings: [String] = []
 
     /// A plan from the shared export rules.
     init(dryRun: Bool, output: String, plan: ExportPlan, requested: ExportRequest, applied: ExportAlternative?,
@@ -342,6 +347,7 @@ private struct ExportResult: Encodable {
     private enum CodingKeys: String, CodingKey {
         case ok, dryRun, output, segments, duration, container, mode, copiedDuration, encodedDuration, order, cutMap
         case video, quality, audio, audioActions, width, height, warnings, silence, tracks, audioStream, applied, tier, canvas
+        case encodedEdgeResults, writtenWarnings
     }
 
     func encode(to encoder: Encoder) throws {
@@ -362,6 +368,8 @@ private struct ExportResult: Encodable {
         try fields.encode(encodedDuration, forKey: .encodedDuration)
         try fields.encode(copiedDuration, forKey: .copiedDuration)
         try fields.encodeIfPresent(order, forKey: .order)
+        if !encodedEdgeResults.isEmpty { try fields.encode(encodedEdgeResults, forKey: .encodedEdgeResults) }
+        if !writtenWarnings.isEmpty { try fields.encode(writtenWarnings, forKey: .writtenWarnings) }
         try fields.encodeIfPresent(silence, forKey: .silence)
         if let conversion {
             try fields.encode(conversion.settings.codec, forKey: .video)
@@ -439,11 +447,13 @@ private struct MulticamExportResponse: Encodable {
     var applied: ExportAlternative?
     /// The tier of the program, whatever mode was asked for.
     var tier: TierSummary?
+    /// What writing changed that the plan could not know. Only an export reports it.
+    var writtenWarnings: [String] = []
 
     private enum CodingKeys: String, CodingKey {
         case ok, dryRun, output, order, sources, plan, mode, tracks, container, duration, warnings
         case picture, audioLanes, audioOutput, copiedVideoDuration, encodedVideoDuration, generatedPictureGaps, applied, tier, cutMap
-        case participantRender
+        case participantRender, writtenWarnings
     }
 
     func encode(to encoder: Encoder) throws {
@@ -479,7 +489,8 @@ private struct MulticamExportResponse: Encodable {
         try fields.encode(preflight.tracks, forKey: .tracks)
         try fields.encode(preflight.container, forKey: .container)
         try fields.encode(preflight.duration, forKey: .duration)
-        try fields.encode(preflight.warnings, forKey: .warnings)
+        try fields.encode(preflight.warnings + preflight.copyOmissions, forKey: .warnings)
+        if !writtenWarnings.isEmpty { try fields.encode(writtenWarnings, forKey: .writtenWarnings) }
         try fields.encode(preflight.copiedVideoDuration, forKey: .copiedVideoDuration)
         try fields.encode(preflight.encodedVideoDuration, forKey: .encodedVideoDuration)
         try fields.encodeIfPresent(preflight.generatedPictureGaps, forKey: .generatedPictureGaps)
@@ -917,7 +928,11 @@ private func runBatch(_ batch: BulkExport, indexedMedia: [URL: MediaInfo], dryRu
             // A dry run and the export it plans report the same fields, the tier among them.
             result.tier = tiers.summary(item.request.clips, media: tierMedia, cancelled: { !interruption.isActive })
             if !dryRun {
-                try batch.write(item) { _ = progress.report((Double(index) + $0) / Double(batch.items.count)) }
+                SmartTrimEdgeResults.reset()
+                result.writtenWarnings = try ExportWriteNotices.collecting {
+                    try batch.write(item) { _ = progress.report((Double(index) + $0) / Double(batch.items.count)) }
+                }.notices
+                result.encodedEdgeResults = SmartTrimEdgeResults.take(for: result.edit)
             }
             outputs.append(result)
         } catch {
@@ -1313,7 +1328,12 @@ private func runSilence(_ options: SilenceOptions, arguments: Arguments, request
     try interruption.check()
     if !options.dryRun {
         let progress = ExportProgress(interruption: interruption)
-        try planner.write(plan, to: output) { progress.report($0) }
+        // What each Smart Trim edge cost as written, as `mpcut export` reports it.
+        SmartTrimEdgeResults.reset()
+        result.writtenWarnings = try ExportWriteNotices.collecting {
+            try planner.write(plan, to: output) { progress.report($0) }
+        }.notices
+        result.encodedEdgeResults = SmartTrimEdgeResults.take(for: result.edit)
     }
     try writeJSON(result, pretty: !json, checkCancellation: options.dryRun)
 }
@@ -1380,7 +1400,11 @@ private func runProjectSilence(_ options: SilenceOptions, loaded: LoadedProject<
                 switch engine.resolution(retainedProject, relativeTo: location, output: output, mode: mode,
                                          indexedSources: report.indexedSources, audioOutput: audioOutput,
                                          audioAction: options.audio) {
-                case .ready(let plan, _): report.preflight = plan
+                case .ready(let plan, _):
+                    report.preflight = plan
+                    // The plan's warnings and what a copy leaves behind, as `mpcut export` lists them.
+                    let warnings = plan.warnings + plan.copyOmissions.filter { !plan.warnings.contains($0) }
+                    report.warnings = warnings.isEmpty ? nil : warnings
                 case .unavailable(var issue, let offers):
                     let requestable = offers.map(\.alternative).filter { entry.modes.contains($0.mode) }
                     if !requestable.isEmpty { issue.alternatives = requestable }
@@ -1395,11 +1419,14 @@ private func runProjectSilence(_ options: SilenceOptions, loaded: LoadedProject<
         try report.checkSources(cancelled: cancelled)
         if let output, !options.dryRun {
             let progress = ExportProgress(interruption: interruption)
-            if let stillPlan {
-                try stillPlanner.write(stillPlan, to: output, progress: progress.report)
-                report.outputBytes = ExportOutputSize.bytes(at: output)
-            }
-            if let preflight = report.preflight { try engine.write(preflight, to: output) { _ = progress.report($0) } }
+            let written = try ExportWriteNotices.collecting {
+                if let stillPlan {
+                    try stillPlanner.write(stillPlan, to: output, progress: progress.report)
+                    report.outputBytes = ExportOutputSize.bytes(at: output)
+                }
+                if let preflight = report.preflight { try engine.write(preflight, to: output) { _ = progress.report($0) } }
+            }.notices
+            report.writtenWarnings = written.isEmpty ? nil : written
         }
         try writeJSON(report, pretty: !json, checkCancellation: options.outProject == nil && (output == nil || options.dryRun))
     }
@@ -1704,7 +1731,7 @@ private func runStillExport(_ project: CutProject, location: URL?, output: URL, 
         throw CLIError("invalid_arguments", "Use Smart Trim or Re-encode when converting sound.")
     }
     let settings = ReencodeSettings(codec: options.video ?? project.stillFormat?.codec ?? ExportRules.defaultCodec,
-                                    quality: options.quality, audio: options.audio ?? .auto)
+                                    quality: options.quality, audio: options.audio ?? .auto, qualityIsExplicit: options.quality != nil)
     let planner = StillExportPlanner(useSidecar: useSidecar, cancelled: { !interruption.isActive },
                                      replacementReferenceAngles: replacementReferenceAngles,
                                      expectedSoundtrackIdentity: expectedSoundtrackIdentity)
@@ -1724,17 +1751,21 @@ private func runStillExport(_ project: CutProject, location: URL?, output: URL, 
         issue.alternatives = replayable?.isEmpty == false ? replayable : nil
         throw issue
     }
+    var written: [String] = []
     if !dryRun {
         let progress = ExportProgress(interruption: interruption)
-        try planner.write(plan, to: output, progress: progress.report)
+        written = try ExportWriteNotices.collecting {
+            try planner.write(plan, to: output, progress: progress.report)
+        }.notices
     }
     let outputBytes = dryRun ? nil : ExportOutputSize.bytes(at: output)
     if json || dryRun {
         try writeJSON(StillCLIExportReport(dryRun: dryRun, output: output.path, outputBytes: outputBytes, report: plan.report,
-                                           audioStream: options.audioStream), pretty: !json,
+                                           audioStream: options.audioStream, writtenWarnings: written), pretty: !json,
                       checkCancellation: dryRun)
     } else {
         try interruption.beginResponse(checkCancellation: false)
+        for warning in written { errorOutput("mpcut: " + warning) }
         let size = outputBytes.map { " (\($0) bytes)" } ?? ""
         try writeOutput("Exported " + output.path + size)
     }
@@ -1773,7 +1804,7 @@ private func runMulticamExport(project loaded: LoadedProject<MulticamProject>? =
         try validate(options, mode: mode, multicam: true)
     }
     let settings = ReencodeSettings(codec: options.video ?? ExportRules.defaultCodec, quality: options.quality,
-                                    audio: options.audio ?? .auto)
+                                    audio: options.audio ?? .auto, qualityIsExplicit: options.quality != nil)
     var applied: ExportAlternative?
     let exclusions = loaded?.excludedSidecarSources ?? AnalysisSidecar.excludedSources.union(mixed?.excludedSidecarSources ?? [])
     try MixedProjectInput.withSidecarContext(mixed, exclusions: exclusions) {
@@ -1892,19 +1923,22 @@ private func runMulticamExport(project loaded: LoadedProject<MulticamProject>? =
             throw CutError(code: "camera_copy_required", message: "The selected export would encode camera picture.")
         }
         try interruption.check()
+        var written: [String] = []
         if !dryRun {
             let progress = ExportProgress(interruption: interruption)
-            try engine.write(plan, to: output) { _ = progress.report($0) }
+            written = try ExportWriteNotices.collecting {
+                try engine.write(plan, to: output) { _ = progress.report($0) }
+            }.notices
         }
         if json || dryRun {
             try writeJSON(MulticamExportResponse(dryRun: dryRun, output: output.path, order: order,
                                                 sources: sources.mapValues(\.path), preflight: plan, extraRangeInputs: extraRangeInputs,
-                                                isMixedJoin: mixed != nil, applied: applied, tier: tier),
+                                                isMixedJoin: mixed != nil, applied: applied, tier: tier, writtenWarnings: written),
                           pretty: !json, checkCancellation: dryRun)
         } else {
             try interruption.beginResponse(checkCancellation: false)
             if let applied { errorOutput("mpcut: \(applied.label)") }
-            for warning in plan.warnings { errorOutput("mpcut: \(warning)") }
+            for warning in plan.warnings + plan.copyOmissions + written { errorOutput("mpcut: \(warning)") }
             try writeOutput("Exported \(output.path)")
         }
     }
@@ -1974,15 +2008,16 @@ private func renderLoadedProject(_ loaded: LoadedProject<CutProject>, output: UR
                 throw ParticipantProjectExport.unsupported("Selecting a source audio stream")
             }
             let settings = ReencodeSettings(codec: options.video ?? .h264, quality: options.quality,
-                                            audio: options.audio ?? .auto)
+                                            audio: options.audio ?? .auto, qualityIsExplicit: options.quality != nil)
             let cancelled: @Sendable () -> Bool = { !interruption.isActive }
+            var written: [String] = []
             let export = try AnalysisSidecar.$excludedSources.withValue(loaded.excludedSidecarSources) {
                 let export = try ParticipantProjectExport(loaded.project, relativeTo: loaded.location, output: output, mode: mode,
                                                           tracks: tracks, settings: settings, audioStream: options.audioStream,
                                                           cancelled: cancelled)
                 if !dryRun {
                     let progress = ExportProgress(interruption: interruption)
-                    try export.write(to: output, cancelled: cancelled) { progress.report($0) }
+                    written = try export.write(to: output, cancelled: cancelled) { progress.report($0) }
                 }
                 return export
             }
@@ -1999,17 +2034,20 @@ private func renderLoadedProject(_ loaded: LoadedProject<CutProject>, output: UR
                     let copiedVideoDuration = RationalTime.zero
                     let tier: TierSummary?
                     let participantRender: ParticipantRenderReport
+                    let warnings: [String]
+                    let writtenWarnings: [String]?
                 }
                 let container = output.pathExtension.lowercased()
                 try writeJSON(Result(output: output.path, dryRun: dryRun, mode: mode, tracks: tracks,
                                      container: container, duration: export.report.duration,
                                      encodedVideoDuration: tracks == .audio ? .zero : export.report.duration,
                                      tier: export.tier(container: container).summary(source: .movie),
-                                     participantRender: export.report),
+                                     participantRender: export.report, warnings: export.notices,
+                                     writtenWarnings: written.isEmpty ? nil : written),
                               pretty: !arguments.json, checkCancellation: dryRun)
             } else {
                 try interruption.beginResponse(checkCancellation: false)
-                for warning in [export.report.picturePrivacyNotice, export.report.audioPrivacyNotice].compactMap({ $0 }) {
+                for warning in export.notices + written {
                     errorOutput("mpcut: " + warning)
                 }
                 try writeOutput("Exported " + output.path)
@@ -2487,7 +2525,8 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
                                  to: timestamp(range.to, segment: index + 1, boundary: "to"))]
             }
         }
-        let settings = ReencodeSettings(codec: options.video ?? .h264, quality: options.quality, audio: options.audio ?? .auto)
+        let settings = ReencodeSettings(codec: options.video ?? .h264, quality: options.quality, audio: options.audio ?? .auto,
+                                        qualityIsExplicit: options.quality != nil)
         let batch = try BulkExport(groups: groups, directory: directory, organization: options.organization, mode: mode, tracks: options.tracks ?? .all, audioStream: options.audioStream, container: input.container,
                                    snap: options.snap ?? .exact, settings: settings, media: cachedMedia, cancelled: { !interruption.isActive })
         if batch.items.contains(where: { $0.audio != nil }), options.video != nil || options.quality != nil {
@@ -2577,9 +2616,9 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
                 source = try? replacementTarget(clip, number: index + 1)
                 if source.map(selectedFiles.contains) != true {
                     if globalFile != nil && !selected.contains(1) {
-                        options.replaceAudio = nil
-                        options.replaceTrack = nil
-                        options.replacementStream = nil
+                        // Dropping the replacement here would also change the mode it asks for, without a word.
+                        throw CLIError("invalid_arguments", "--replace-audio applies to the source of clip 1, which --order leaves out. "
+                                       + "Include clip 1 or a clip of the same source, or bind the soundtrack to a selected clip.")
                     }
                     continue
                 }
@@ -2799,7 +2838,11 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
             }
             try interruption.check()
             if !dryRun {
-                try planner.write(plan, to: output) { progress.report($0) }
+                SmartTrimEdgeResults.reset()
+                result.writtenWarnings = try ExportWriteNotices.collecting {
+                    try planner.write(plan, to: output) { progress.report($0) }
+                }.notices
+                result.encodedEdgeResults = SmartTrimEdgeResults.take(for: result.edit)
             }
         case .unavailable(let error, let offers):
             // The engine numbers clips by playback position. Report the caller's clip number,
@@ -2843,7 +2886,7 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
             try interruption.beginResponse(checkCancellation: false)
             if let applied = result.applied { errorOutput("mpcut: \(applied.label)") }
             for warning in (result.conversion?.warnings ?? result.audioExport?.warnings ?? result.applied?.warnings ?? [])
-                + result.copyOmissions {
+                + result.copyOmissions + result.writtenWarnings {
                 errorOutput("mpcut: \(warning)")
             }
             try writeOutput("Exported \(output.path)")

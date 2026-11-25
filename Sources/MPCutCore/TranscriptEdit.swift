@@ -172,6 +172,7 @@ public struct TranscriptEditBoundary: Codable, Sendable {
         case copySafeAlternatives = "copy_safe_alternatives"
         case affectedWordIDs = "affected_word_ids"
         case attachmentID = "attachment_id"
+        case unindexed
     }
     public let space: TranscriptSpace
     public let requested: RationalTime
@@ -179,6 +180,9 @@ public struct TranscriptEditBoundary: Codable, Sendable {
     public let copySafeAlternatives: [RationalTime]
     public var affectedWordIDs: [String] = []
     public var attachmentID: String? = nil
+    /// True when the recording could not be indexed, so `resolved` keeps the requested time instead of landing on
+    /// a frame or audio boundary. Absent otherwise.
+    public var unindexed: Bool? = nil
 }
 
 public struct TranscriptEditCommit: Sendable {

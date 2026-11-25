@@ -73,6 +73,13 @@ private struct IndexHeader: Codable {
         case sourceStartSafe = "source_start_safe"
     }
 
+    // Revision 11 lets VP8, VP9 and AV1 end where no hidden picture is kept, lets MOV-family
+    // reordered H.264 and HEVC with varying picture durations end inside a picture group, and
+    // stops refusing to copy a movie because of subtitle, data or attached-picture tracks.
+    // Every earlier index of a file with any track other than sound is rebuilt.
+    // Revision 12 lets reordered H.264 and HEVC in Matroska end at every partition point even when
+    // picture durations vary, since copies now run the last picture to the planned end. Every earlier
+    // index of H.264 or HEVC in Matroska is rebuilt; other revision-11 indexes remain usable.
     // Revision 10 lets reordered H.264 and HEVC with one picture duration end wherever
     // the decode order is split by presentation time, not only before a keyframe. Every
     // earlier H.264 or HEVC index is rebuilt, since it can hold the keyframe-only end points.
@@ -82,7 +89,11 @@ private struct IndexHeader: Codable {
     // the old end points or that refusal. Revision 8 adds independent JPEG entry points
     // and decoded packet counts for lossless audio. Other indexes from revisions 7, 8
     // and 9 remain usable.
-    private static let currentProbeRevision = 10
+    // Revision 13 marks H.264 with auxiliary (alpha) pictures, MVC or SVC as having additional
+    // layers, which Smart Trim and Re-encode would drop, and lets MV-HEVC start at keyframes
+    // whose second view begins with CRA. Every earlier H.264 index, and every index of HEVC
+    // with additional layers (whose copy containers changed too), is rebuilt.
+    private static let currentProbeRevision = 13
     let probeRevision: Int
     let identity: SourceIdentity
     let sourceExtension: String
@@ -173,9 +184,16 @@ private struct IndexHeader: Codable {
     var isUsable: Bool {
         let descriptions = streams.map(\.value)
         let needsNewIndex = descriptions.contains { ["mjpeg", "alac", "flac"].contains($0.codec) }
-        let needsRevision10 = descriptions.contains { ["h264", "hevc"].contains($0.codec) }
+        let needsRevision13 = descriptions.contains { $0.codec == "h264" || ($0.codec == "hevc" && $0.hasAdditionalVideoLayers) }
+        let needsRevision12 = needsRevision13 || format.split(separator: ",").contains("matroska")
+            && descriptions.contains { ["h264", "hevc"].contains($0.codec) }
+        let needsRevision11 = needsRevision12 || descriptions.contains { $0.kind != "audio" }
+        let needsRevision10 = needsRevision11 || descriptions.contains { ["h264", "hevc"].contains($0.codec) }
         let needsRevision9 = format.split(separator: ",").contains("mov") || needsRevision10
-        guard probeRevision == Self.currentProbeRevision || (probeRevision == 9 && !needsRevision10)
+        guard probeRevision == Self.currentProbeRevision || (probeRevision == 12 && !needsRevision13)
+                || (probeRevision == 11 && !needsRevision12)
+                || (probeRevision == 10 && !needsRevision11)
+                || (probeRevision == 9 && !needsRevision10)
                 || (!needsRevision9 && (probeRevision == 8 || (probeRevision == 7 && !needsNewIndex))) else { return false }
         guard duration > .zero, descriptions.enumerated().allSatisfy({ $0.offset == $0.element.index }),
               audio.map(\.index) == descriptions.filter({ $0.kind == "audio" }).map(\.index),

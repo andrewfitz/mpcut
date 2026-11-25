@@ -1,10 +1,12 @@
 #include "smart_edge.h"
 #include "FFPreviewDecoder.h"
+#include "layered_edge.h"
 
 #include <CoreVideo/CoreVideo.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/mem.h>
 #include <libavutil/opt.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -273,8 +275,54 @@ static int encode(EdgeEncoder *work, AVFrame *frame)
     return (frame && result == AVERROR(EAGAIN)) || (!frame && result == AVERROR_EOF) ? 0 : result;
 }
 
+/* One picture from the layered edge encoder (layered_edge.m), in presentation order, spooled as encode() spools. */
+static int spool_layered(void *opaque, const uint8_t *data, int size, int key, int64_t pts)
+{
+    EdgeEncoder *work = opaque;
+    MPCutEdge *edge = work->edge;
+    if (work->encoded >= edge->count || size <= 0 || (work->encoded == 0 ? pts != edge->times[0] || !key
+                                                                       : pts <= edge->times[work->encoded - 1])
+        || pts >= edge->times[edge->count])
+        return -1;
+    edge->times[work->encoded] = pts;
+    PacketHeader header = {size, key ? AV_PKT_FLAG_KEY : 0};
+    if (fwrite(&header, sizeof(header), 1, edge->packets) != 1 || fwrite(data, size, 1, edge->packets) != 1)
+        return -1;
+    edge->payload_bytes += size;
+    work->encoded++;
+    work->submitted = work->encoded;
+    return 0;
+}
+
+/* HEVC with an alpha layer or a second view: AVFoundation decodes every layer and VideoToolbox encodes them again,
+ * where FFmpeg's decoder and encoder would keep only the base picture. The edge's packets are Annex B with every
+ * layer's parameter sets before each keyframe, which the splice moves into the edge's sample entry. */
+static MPCutEdge *encode_layered_edge(EdgeEncoder *work, const char *path, const AVStream *video, int64_t origin_pts,
+                                      int64_t first, int64_t end, int64_t target_bit_rate, char *error, size_t capacity)
+{
+    const char *message = NULL;
+    int64_t offset = origin_pts != AV_NOPTS_VALUE && video->start_time != AV_NOPTS_VALUE ? video->start_time - origin_pts : 0;
+    work->edge->times[0] = first; // The first picture the index expects, which the encoder must give first.
+    int result = mpcut_layered_edge_encode(path, video, offset, first, end, target_bit_rate, spool_layered, work,
+                                           is_cancelled, work, &message);
+    if (!result && work->encoded != work->edge->count) {
+        result = AVERROR_INVALIDDATA;
+        message = "The encoded Smart Trim range differs from the frame index";
+    }
+    if (!result && fseeko(work->edge->packets, 0, SEEK_SET) != 0)
+        result = AVERROR(errno);
+    if (result < 0) {
+        if (error && capacity)
+            snprintf(error, capacity, "%s", result == AVERROR_EXIT ? "Cancelled" : message ? message : av_err2str(result));
+        mpcut_edge_free(work->edge);
+        work->edge = NULL;
+        return NULL;
+    }
+    return work->edge;
+}
+
 static MPCutEdge *encode_edge(const char *path, const AVStream *video, int64_t origin_pts, MPCutTime decode_from,
-                              MPCutTime from, MPCutTime to, size_t expected_frames,
+                              MPCutTime from, MPCutTime to, size_t expected_frames, const uint8_t *sets, int sets_size,
                               int64_t target_bit_rate, int max_qp, MPCutProgress progress,
                               void *context, double fraction, char *error, size_t capacity)
 {
@@ -319,6 +367,11 @@ static MPCutEdge *encode_edge(const char *path, const AVStream *video, int64_t o
         result = AVERROR(errno);
         goto done;
     }
+    if (mpcut_layered_edge_supported(video->codecpar)) {
+        av_frame_free(&frame);
+        av_packet_free(&work.packet);
+        return encode_layered_edge(&work, path, video, origin_pts, first, end, target_bit_rate, error, capacity);
+    }
     result = AVERROR_EXTERNAL;
     decoder = mp_preview_open(path, MPPreviewPictureOnly, -1, timeline, is_cancelled, &work, &message);
     if (!decoder)
@@ -334,6 +387,11 @@ static MPCutEdge *encode_edge(const char *path, const AVStream *video, int64_t o
     result = configure_encoder(&work, probed, target_bit_rate, max_qp);
     if (result < 0)
         goto done;
+    message = "Cannot give the Smart Trim edge decoder the source's parameter sets";
+    if (sets_size > 0 && !mp_preview_prime_edge(decoder, sets, sets_size)) {
+        result = AVERROR(ENOTSUP);
+        goto done;
+    }
     result = AVERROR_EXTERNAL;
     message = "Cannot seek to the Smart Trim edge";
     if (!mp_preview_seek(decoder, seek))
@@ -368,6 +426,14 @@ static MPCutEdge *encode_edge(const char *path, const AVStream *video, int64_t o
             if (pts >= end)
                 break;
             continue;
+        }
+        if (mp_preview_edge_metadata(decoder)) {
+            CFRelease(sample);
+            result = AVERROR(ENOTSUP);
+            message = "This picture carries embedded captions or colour metadata, or stereo, orientation, time code or "
+                      "active format signalling, that requires copying.";
+            complete_message = true;
+            goto done;
         }
         if (work.submitted >= expected_frames || (work.submitted == 0 ? pts != first :
             pts <= work.edge->times[work.submitted - 1])) {
@@ -428,24 +494,69 @@ done:
     return work.edge;
 }
 
+/* What each encoded edge cost, for the export's report. Edges are encoded on the writer's
+ * thread in output order. A short ring keeps the most recent edges of any export. */
+enum { EDGE_RESULT_CAPACITY = 256 };
+static MPCutEdgeResult edge_results[EDGE_RESULT_CAPACITY];
+static size_t edge_result_count; /* Total recorded since the last reset. */
+static pthread_mutex_t edge_result_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void record_edge(MPCutTime from, MPCutTime to, size_t frames, uint64_t bytes, uint64_t target,
+                        uint64_t first_attempt, int retried, int max_qp)
+{
+    pthread_mutex_lock(&edge_result_lock);
+    edge_results[edge_result_count++ % EDGE_RESULT_CAPACITY] = (MPCutEdgeResult){
+        .from = from, .to = to, .frame_count = frames, .bytes = bytes, .target_bytes = target,
+        .first_attempt_bytes = first_attempt, .retried = retried, .max_qp = max_qp};
+    pthread_mutex_unlock(&edge_result_lock);
+}
+
+void mpcut_edge_results_reset(void)
+{
+    pthread_mutex_lock(&edge_result_lock);
+    edge_result_count = 0;
+    pthread_mutex_unlock(&edge_result_lock);
+}
+
+size_t mpcut_edge_results_take(MPCutEdgeResult *results, size_t capacity)
+{
+    pthread_mutex_lock(&edge_result_lock);
+    size_t kept = edge_result_count < EDGE_RESULT_CAPACITY ? edge_result_count : EDGE_RESULT_CAPACITY;
+    size_t first = edge_result_count - kept;
+    size_t count = kept < capacity ? kept : capacity;
+    for (size_t i = 0; i < count; i++)
+        results[i] = edge_results[(first + i) % EDGE_RESULT_CAPACITY];
+    edge_result_count = 0;
+    pthread_mutex_unlock(&edge_result_lock);
+    return count;
+}
+
 MPCutEdge *mpcut_edge_open(const char *path, const AVStream *video, int64_t origin_pts, MPCutTime decode_from,
-                           MPCutTime from, MPCutTime to, size_t expected_frames,
+                           MPCutTime from, MPCutTime to, size_t expected_frames, const uint8_t *sets, int sets_size,
                            int64_t target_bit_rate, MPCutProgress progress, void *context,
                            double fraction, char *error, size_t capacity)
 {
-    // Protect the quality of the first few AV1 pictures after a cut. If this
-    // costs over 25% more than the local byte budget, let SVT use its full QP
-    // range for one retry. Keep whichever result consumes fewer video bytes.
-    MPCutEdge *edge = encode_edge(path, video, origin_pts, decode_from, from, to, expected_frames,
-                                  target_bit_rate, 44, progress, context, fraction, error, capacity);
-    if (!edge || video->codecpar->codec_id != AV_CODEC_ID_AV1)
-        return edge;
-
+    // Protect the quality of the first few AV1 pictures after a cut with a QP ceiling of 44.
+    // When that costs over 25% more than the edge's byte budget, one retry lets SVT raise the
+    // inter-picture QP to 56. The ceiling does not bind an edge's keyframe, so a one-picture
+    // edge is not retried. The retry is kept only when it saves a tenth of the bytes: measured
+    // on still, zooming, textured, noisy and low-rate AV1, the former full-range retry (QP 63,
+    // smaller result kept) cost 0.6-3.7 dB for savings as small as 1%.
     long double seconds = (long double)to.numerator / to.denominator - (long double)from.numerator / from.denominator;
-    if (edge->payload_bytes <= seconds * target_bit_rate / 8 * 1.25L)
+    long double budget = seconds * target_bit_rate / 8;
+    uint64_t target = budget > 0 && budget < (long double)UINT64_MAX ? (uint64_t)budget : 0;
+    MPCutEdge *edge = encode_edge(path, video, origin_pts, decode_from, from, to, expected_frames, sets, sets_size,
+                                  target_bit_rate, 44, progress, context, fraction, error, capacity);
+    if (!edge)
+        return NULL;
+    bool av1 = video->codecpar->codec_id == AV_CODEC_ID_AV1;
+    if (!av1 || expected_frames < 2 || edge->payload_bytes <= budget * 1.25L) {
+        record_edge(from, to, expected_frames, edge->payload_bytes, target, edge->payload_bytes, 0, av1 ? 44 : 0);
         return edge;
-    MPCutEdge *retry = encode_edge(path, video, origin_pts, decode_from, from, to, expected_frames,
-                                   target_bit_rate, 63, progress, context, fraction, error, capacity);
+    }
+    uint64_t first = edge->payload_bytes;
+    MPCutEdge *retry = encode_edge(path, video, origin_pts, decode_from, from, to, expected_frames, sets, sets_size,
+                                   target_bit_rate, 56, progress, context, fraction, error, capacity);
     if (!retry) {
         // The first encode is still valid. Only a cancellation discards it.
         if (progress && progress(context, fraction)) {
@@ -454,13 +565,16 @@ MPCutEdge *mpcut_edge_open(const char *path, const AVStream *video, int64_t orig
         }
         if (error && capacity)
             error[0] = '\0';
+        record_edge(from, to, expected_frames, first, target, first, 1, 44);
         return edge;
     }
-    if (edge->payload_bytes <= retry->payload_bytes) {
+    if (retry->payload_bytes * 10 > first * 9) {
         mpcut_edge_free(retry);
+        record_edge(from, to, expected_frames, first, target, first, 1, 44);
         return edge;
     }
     mpcut_edge_free(edge);
+    record_edge(from, to, expected_frames, retry->payload_bytes, target, first, 1, 56);
     return retry;
 }
 

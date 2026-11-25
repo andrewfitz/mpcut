@@ -30,12 +30,16 @@ extension MulticamEditorModel {
             catch { self.fail(error.localizedDescription); return }
             let checkingVolumes = self.interchangeCheckingVolumes
             self.run("Exporting Resolve timeline…", exporting: true) { token, useSidecar in
-                try ProjectMediaVolume.$checking.withValue(checkingVolumes) {
+                // What the timeline gives up in FCPXML: rounded cuts, replaced name characters, narrowed sound.
+                let warnings = try ProjectMediaVolume.$checking.withValue(checkingVolumes) {
                     try ResolveExport.write(project, relativeTo: location, to: output, useSidecar: useSidecar, matching: imported,
                                             cancelled: { token.isCancelled })
                 }
                 if open { try ResolveExport.openInResolve(output, cancelled: { token.isCancelled }) }
-            } onSuccess: { self.status = "Exported \(output.lastPathComponent)." }
+                return warnings
+            } onSuccess: { warnings in
+                self.status = (["Exported \(output.lastPathComponent)."] + warnings).joined(separator: " ")
+            }
         }
     }
 }

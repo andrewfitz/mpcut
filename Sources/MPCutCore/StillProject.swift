@@ -81,8 +81,15 @@ public struct StillProgramColorPolicy: Codable, Hashable, Sendable {
     public var diffuseWhiteNits: Int
     public var renditionPolicyVersion: Int
 
+    /// The rules MPCut renders still images by. 2: a gain-map image on an SDR program shows its
+    /// SDR base; 1 showed its HDR rendition tone-mapped to SDR. A project saved under policy 1
+    /// opens under the current policy, which changes only gain-map images on SDR programs, and is
+    /// saved with it. A later policy is rejected rather than rendered by these rules.
+    public static let currentRenditionPolicyVersion = 2
+
     public init(version: Int = 1, transfer: String, primaries: String, matrix: String, range: String,
-                viewingConditions: String, diffuseWhiteNits: Int, renditionPolicyVersion: Int = 1) {
+                viewingConditions: String, diffuseWhiteNits: Int,
+                renditionPolicyVersion: Int = StillProgramColorPolicy.currentRenditionPolicyVersion) {
         self.version = version
         self.transfer = transfer
         self.primaries = primaries
@@ -103,15 +110,20 @@ public struct StillProgramColorPolicy: Codable, Hashable, Sendable {
     public init(from decoder: Decoder) throws {
         try ProjectField.rejectUnknown(CodingKeys.self, in: decoder)
         let v = try decoder.container(keyedBy: CodingKeys.self)
+        let rendition = try v.decode(Int.self, forKey: .renditionPolicyVersion)
         try self.init(version: v.decode(Int.self, forKey: .version), transfer: v.decode(String.self, forKey: .transfer),
                       primaries: v.decode(String.self, forKey: .primaries), matrix: v.decode(String.self, forKey: .matrix),
                       range: v.decode(String.self, forKey: .range), viewingConditions: v.decode(String.self, forKey: .viewingConditions),
                       diffuseWhiteNits: v.decode(Int.self, forKey: .diffuseWhiteNits),
-                      renditionPolicyVersion: v.decode(Int.self, forKey: .renditionPolicyVersion))
+                      renditionPolicyVersion: (1...Self.currentRenditionPolicyVersion).contains(rendition)
+                          ? Self.currentRenditionPolicyVersion : rendition)
     }
 
     func validate() throws {
-        guard version == 1, renditionPolicyVersion == 1, diffuseWhiteNits > 0,
+        guard renditionPolicyVersion == Self.currentRenditionPolicyVersion else {
+            throw stillError("The program color policy uses still rendition policy \(renditionPolicyVersion), which this version of MPCut cannot render")
+        }
+        guard version == 1, diffuseWhiteNits > 0,
               [transfer, primaries, matrix, range, viewingConditions].allSatisfy(validStillID) else {
             throw stillError("Invalid program color policy")
         }
