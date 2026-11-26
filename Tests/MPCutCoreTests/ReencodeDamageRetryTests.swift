@@ -98,9 +98,20 @@ final class ReencodeDamageRetryTests: XCTestCase {
         XCTAssertEqual(renders.first?.contains(" -ss 3000000us "), true)
     }
 
-    func testDamageInTheSoundWarmUpRendersOnceMoreFromTheNearestRestartPoint() throws {
-        // The single input seeks to keyframe 25 and meets picture 40. Keyframe 75 precedes the range.
+    func testCopiedSoundNeedsNoWarmUpSoDamageBeforeTheRangeIsNeverDecoded() throws {
+        // Auto copies the AAC of a single MP4 trim, so the render seeks to keyframe 75 and never meets picture 40.
         let (folder, output) = try export(80..<95)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path), ["out.mp4"])
+        let written = try CutEngine().inspect(output, keyframes: true)
+        XCTAssertEqual(written.frames.count, 15)
+        XCTAssertEqual(written.audio.count, 1)
+        XCTAssertEqual(renders.count, 1)
+    }
+
+    func testDamageInTheSoundWarmUpRendersOnceMoreFromTheNearestRestartPoint() throws {
+        // Converted sound decodes from a warm-up before the range: the single input seeks to keyframe 25 and meets
+        // picture 40. Keyframe 75 precedes the range.
+        let (folder, output) = try export(80..<95, audio: .aac)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path), ["out.mp4"])
         let written = try CutEngine().inspect(output, keyframes: true)
         XCTAssertEqual(written.frames.count, 15)
@@ -108,6 +119,7 @@ final class ReencodeDamageRetryTests: XCTestCase {
 
         let runs = renders
         XCTAssertEqual(runs.count, 2)
+        guard runs.count == 2 else { return }
         func inputs(_ run: String) -> Int { run.components(separatedBy: " -i \(source.path)").count - 1 }
         XCTAssertEqual(inputs(runs[0]), 1)
         XCTAssertFalse(runs[0].contains(" -vn "))
@@ -120,8 +132,9 @@ final class ReencodeDamageRetryTests: XCTestCase {
     }
 
     func testDamageThatTheRangeNeedsReportsTheFirstFailureAfterTheSecondRender() throws {
-        // Keyframe 25 is the restart point before picture 45, and picture 40 follows it.
-        XCTAssertThrowsError(try export(45..<60)) {
+        // Keyframe 25 is the restart point before picture 45, and picture 40 follows it. The sound is converted, so
+        // the first render starts at its warm-up and a second one starts at the restart point.
+        XCTAssertThrowsError(try export(45..<60, audio: .aac)) {
             let error = $0 as? CutError
             XCTAssertEqual(error?.code, "encode_failed")
             XCTAssertTrue(error?.message.hasPrefix("A picture in damaged.mp4 is damaged") == true, "\($0)")
@@ -129,6 +142,16 @@ final class ReencodeDamageRetryTests: XCTestCase {
         let runs = renders
         XCTAssertEqual(runs.count, 2)
         XCTAssertTrue(runs.allSatisfy { $0.contains(" -hwaccel videotoolbox") })
+    }
+
+    func testDamageThatTheRangeNeedsRendersOnceWhenTheSoundIsCopied() throws {
+        // With copied sound the first render already starts at keyframe 25, so another would decode the same pictures.
+        XCTAssertThrowsError(try export(45..<60)) {
+            let error = $0 as? CutError
+            XCTAssertEqual(error?.code, "encode_failed")
+            XCTAssertTrue(error?.message.hasPrefix("A picture in damaged.mp4 is damaged") == true, "\($0)")
+        }
+        XCTAssertEqual(renders.count, 1)
     }
 
     func testARangeBeforeAnyLaterRestartPointRendersOnce() throws {
@@ -147,7 +170,8 @@ final class ReencodeDamageRetryTests: XCTestCase {
             guard let failed = lines.firstIndex(where: { $0.hasPrefix("render-exit") }) else { return false }
             return lines[failed...].contains { $0 == "other-exit 0" }
         }
-        XCTAssertThrowsError(try export(80..<95, cancelled: cancelled)) {
+        // Converted sound, so the first render meets the damage in its warm-up.
+        XCTAssertThrowsError(try export(80..<95, audio: .aac, cancelled: cancelled)) {
             XCTAssertEqual(($0 as? CutError)?.code, "cancelled")
         }
         XCTAssertEqual(renders.count, 1)
