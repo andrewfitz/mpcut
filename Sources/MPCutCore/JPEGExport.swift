@@ -12,7 +12,8 @@ public enum JPEGSample: String, CaseIterable, Sendable, Encodable { case first, 
 /// review request can bind another value around its own render, which reads it on the calling thread.
 package enum JPEGReviewSize {
     package static let defaultEdge = 640
-    package static let edges = 160...1920
+    /// Up to a 4K frame at its own size.
+    package static let edges = 160...3840
     @TaskLocal package static var maxEdge = defaultEdge
     /// The part of the picture to return, in fractions of its width and height measured from the top left.
     /// A crop keeps the picture's own pixels up to `maxEdge`, so small detail in a large picture stays legible.
@@ -37,10 +38,11 @@ package enum JPEGReviewSize {
         return (crop, max(1, (crop.width * scale).rounded()), max(1, (crop.height * scale).rounded()))
     }
 
-    /// Encodes at the review quality, then lower, until the picture fits the inline limit.
+    /// Encodes at the review quality, then lower, until the picture fits the inline limit. What a reader
+    /// can make out depends on the picture's size far more than its quality, so quality gives way first.
     static func encode(_ make: (Double) throws -> Data?) throws -> Data {
         var smallest: Data?
-        for quality in [0.62, 0.45, 0.3] {
+        for quality in [0.62, 0.45, 0.3, 0.2] {
             guard let data = try make(quality) else { break }
             smallest = data
             if data.count <= byteLimit { break }

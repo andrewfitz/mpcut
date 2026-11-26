@@ -14,7 +14,7 @@ import (
 const (
 	// A review JPEG is at most 1 MiB, and the request chooses its longest edge up to this many pixels.
 	maxReviewBytes = 1 << 20
-	maxReviewEdge  = 1920
+	maxReviewEdge  = 3840
 	// One reply holds at most this many pictures.
 	maxReviewFrames = 12
 )

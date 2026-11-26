@@ -105,7 +105,7 @@ func TestReviewFrameBatchLabelsEachImage(t *testing.T) {
 			t.Errorf("accepted an invalid batch: %s", invalid)
 		}
 	}
-	oversized, _ := json.Marshal(map[string]any{"jpeg": encode(2000), "width": 2000, "height": 4})
+	oversized, _ := json.Marshal(map[string]any{"jpeg": encode(4000), "width": 4000, "height": 4})
 	if _, err := reviewFrameResult(oversized); err == nil {
 		t.Fatal("accepted a picture wider than the largest review edge")
 	}

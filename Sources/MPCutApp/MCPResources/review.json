@@ -1,7 +1,7 @@
 [
   {
     "name": "review_editor_frame_read",
-    "description": "Return JPEGs inline from the open project: the playhead, one time, or up to 12 times in one call. Sequence, group and assembly times read the current edit; Output applies tile layouts and feed treatments and Source shows the untreated recording. The source clock reads any time in one recording by source_id or file, including material the edit no longer uses, for example what plays just before a cut. Start with the default 640-pixel picture, which is enough to identify a shot. When the result reports native_width and native_height, the picture was reduced: if you cannot make out what you need, such as on-screen text, ask again with a larger max_edge, or with region to see part of the frame at its own pixels. A region shows more detail than a larger whole frame, at a fraction of the cost.",
+    "description": "Return JPEGs inline from the open project: the playhead, one time, or up to 12 times in one call. Sequence, group and assembly times read the current edit; Output applies tile layouts and feed treatments and Source shows the untreated recording. The source clock reads any time in one recording by source_id or file, including material the edit no longer uses, for example what plays just before a cut. Start with the default 640-pixel picture, which is enough to identify a shot. Text is reliable only when it is about 8 pixels or taller in the returned picture, and smaller text can be misread without looking wrong. When the result reports native_width and native_height, the picture was reduced: to read on-screen text or other fine detail, ask again with region for that part of the frame at its own pixels, or with a larger max_edge for the whole frame. A region costs far fewer tokens than a large whole frame.",
     "annotations": {
       "readOnlyHint": true,
       "openWorldHint": false
@@ -66,8 +66,8 @@
         "max_edge": {
           "type": "integer",
           "minimum": 160,
-          "maximum": 1920,
-          "description": "Longest image edge in pixels. Defaults to 640. Raise it for more detail in the whole frame; lower it for a cheap contact sheet of many times."
+          "maximum": 3840,
+          "description": "Longest image edge in pixels. Defaults to 640. 1280 reads most on-screen text in HD footage, and 1920 to 2576 in 4K. Token cost grows with the area, so prefer region for detail and lower this to 320 for a contact sheet of many times."
         },
         "region": {
           "type": "object",
