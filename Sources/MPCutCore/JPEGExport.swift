@@ -20,6 +20,44 @@ package enum JPEGReviewSize {
     @TaskLocal package static var region: CGRect?
     static let byteLimit = 1_048_576
     static let tooLarge = "The review JPEG exceeds 1 MiB."
+    /// One reply carries several pictures within these limits.
+    package static let batchFrames = 12
+    package static let batchBytes = 2 << 20
+
+    /// A requested long edge, or the default.
+    package static func edge(_ requested: Int?) throws -> Int {
+        guard let requested else { return defaultEdge }
+        guard edges.contains(requested) else {
+            throw CutError(code: "invalid_arguments",
+                           message: "Choose a max_edge from \(edges.lowerBound) through \(edges.upperBound) pixels.")
+        }
+        return requested
+    }
+
+    /// A crop given as fractions of the picture from its top left.
+    package static func region(x: Double, y: Double, width: Double, height: Double) throws -> CGRect {
+        guard x >= 0, y >= 0, width >= 0.01, height >= 0.01, x + width <= 1.000001, y + height <= 1.000001 else {
+            throw CutError(code: "invalid_arguments",
+                           message: "Give region as x, y, width and height in fractions of the picture from its top left: each side at least 0.01, and the box inside the picture.")
+        }
+        return CGRect(x: x, y: y, width: min(width, 1 - x), height: min(height, 1 - y))
+    }
+
+    /// A recording's upright display size.
+    package static func nativeSize(of media: MediaInfo) -> (width: Int, height: Int) {
+        let video = media.video, rotated = !video.rotation.isMultiple(of: 180)
+        return (video.displayWidth > 0 ? video.displayWidth : rotated ? video.height : video.width,
+                video.displayHeight > 0 ? video.displayHeight : rotated ? video.width : video.height)
+    }
+
+    /// The whole picture's size when the returned one is smaller or is a crop of it, the same way round as
+    /// the returned picture. Nil when the reader already has every pixel.
+    package static func reduced(from full: (width: Int, height: Int), to width: Int, _ height: Int) -> (width: Int, height: Int)? {
+        var native = full
+        let landscape = Double(width) / Double(region?.width ?? 1) >= Double(height) / Double(region?.height ?? 1)
+        if native.width != native.height, (native.width > native.height) != landscape { native = (native.height, native.width) }
+        return region != nil || width != native.width || height != native.height ? native : nil
+    }
 
     /// The decoder may hand back a smaller picture. With a crop it must keep enough pixels for the cropped part.
     static var decodeEdge: Int32 {
@@ -885,7 +923,7 @@ extension JPEGRenderer {
     func sourcePicture(at pts: Int64, seekDTS: Int64, preset: JPEGPreset) throws -> (image: CIImage, profile: CGColorSpace) {
         var buffer: CVPixelBuffer?
         var error = [CChar](repeating: 0, count: 256)
-        guard mp_jpeg_frame(reader, pts, seekDTS, preset == .review ? Int32(JPEGReviewSize.maxEdge) : 0, &buffer, &error, error.count) >= 0,
+        guard mp_jpeg_frame(reader, pts, seekDTS, preset == .review ? JPEGReviewSize.decodeEdge : 0, &buffer, &error, error.count) >= 0,
               let buffer else {
             try control.check()
             throw CutError(code: "frame_export_failed", message: "Could not decode source picture at PTS \(pts): " + String(cString: error))
@@ -911,12 +949,12 @@ extension JPEGRenderer {
         if !placement.isIdentity { image = image.transformed(by: placement) }
         let extent = image.extent
         guard extent.width.isFinite, extent.height.isFinite, extent.width >= 0.5, extent.height >= 0.5 else { throw Self.failure }
-        let scale = preset == .review ? min(1, CGFloat(JPEGReviewSize.maxEdge) / max(extent.width, extent.height)) : 1
-        let width = max(1, (extent.width * scale).rounded()), height = max(1, (extent.height * scale).rounded())
+        let (crop, width, height) = preset == .review ? JPEGReviewSize.fit(extent, flipped: true)
+            : (extent, max(1, extent.width.rounded()), max(1, extent.height.rounded()))
         guard width <= 65535, height <= 65535 else { throw Self.failure }
         let rect = CGRect(x: 0, y: 0, width: width, height: height)
-        let fit = CGAffineTransform(translationX: -extent.minX, y: -extent.minY)
-            .concatenating(CGAffineTransform(scaleX: width / extent.width, y: height / extent.height))
+        let fit = CGAffineTransform(translationX: -crop.minX, y: -crop.minY)
+            .concatenating(CGAffineTransform(scaleX: width / crop.width, y: height / crop.height))
         if !fit.isIdentity { image = image.transformed(by: fit, highQualityDownsample: true) }
         return (image.cropped(to: rect), profile)
     }

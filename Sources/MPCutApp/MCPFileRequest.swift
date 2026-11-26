@@ -452,6 +452,7 @@ struct MCPFileRequest {
         for name in ["plan_token", "format", "sample", "preset", "group_by", "audio", "audio_output", "mode", "video", "quality", "tracks", "snap", "still_timing"] {
             if let value = try a.string(name) { arguments += [a.flag(name), value] }
         }
+        if command == "frames" { arguments += try a.reviewSize() }
         if command == "scenes" {
             let rangePresent = fields["source_from"] != nil || fields["source_to"] != nil
             let selectedScopes = ["clip_id", "camera_id"].filter { fields[$0] != nil }.count
@@ -652,6 +653,19 @@ struct MCPFileRequest {
             guard let value = try string(key) else { return nil }
             guard value.hasPrefix("/") else { throw invalid("Use an absolute path for " + key + ".") }
             return value
+        }
+
+        /// The long edge and crop of review pictures, as the frame commands take them.
+        func reviewSize() throws -> [String] {
+            var arguments: [String] = []
+            if values["max_edge"] != nil { arguments += ["--max-edge", try number("max_edge", integer: true)] }
+            if let region = values["region"] {
+                guard let box = region as? [String: Any],
+                      let parts = Optional(["x", "y", "width", "height"].compactMap { (box[$0] as? NSNumber)?.stringValue }),
+                      parts.count == 4 else { throw invalid("region requires x, y, width and height.") }
+                arguments += ["--region", parts.joined(separator: ",")]
+            }
+            return arguments
         }
 
         func bool(_ key: String) throws -> Bool {

@@ -9,8 +9,13 @@ struct FrameExportOptions {
     let source: Source
     let output: String
     let mcpImage: Bool
+    /// An inline review answers with a list of frames, as a request for several times does.
+    let batch: Bool
     let preset: JPEGPreset
     let format: FrameImageFormat
+    /// The long edge and crop of review-preset pictures.
+    let maxEdge: Int
+    let region: CGRect?
 
     init(_ arguments: [String]) throws {
         var file: String?, output: String?, mode: String?, sample: JPEGSample?, preset: JPEGPreset?
@@ -22,7 +27,8 @@ struct FrameExportOptions {
         var iterator = arguments.makeIterator()
         var seen = Set<String>()
         var positional = false
-        var mcpImage = false
+        var mcpImage = false, batch = false
+        var maxEdge: Int?, region: CGRect?
         func invalid(_ text: String) -> CLIError { CLIError("invalid_arguments", text) }
         func value(_ flag: String) throws -> String {
             guard let next = iterator.next(), !next.isEmpty, !next.hasPrefix("--") else { throw invalid("Missing value for \(flag).") }
@@ -39,6 +45,16 @@ struct FrameExportOptions {
             case "--": positional = true
             case "--json": break
             case "--mcp-image": mcpImage = true
+            case "--batch": batch = true
+            case "--max-edge":
+                guard let edge = Int(try value(flag)) else { throw invalid("Use a whole number of pixels for --max-edge.") }
+                maxEdge = try JPEGReviewSize.edge(edge)
+            case "--region":
+                let parts = try value(flag).split(separator: ",", omittingEmptySubsequences: false).map { Double($0) }
+                guard parts.count == 4, let x = parts[0], let y = parts[1], let width = parts[2], let height = parts[3] else {
+                    throw invalid("Give --region as X,Y,WIDTH,HEIGHT in fractions of the picture from its top left, such as 0.5,0,0.5,0.5.")
+                }
+                region = try JPEGReviewSize.region(x: x, y: y, width: width, height: height)
             case "--output": output = try value(flag)
             case "--project": project = try value(flag)
             case "--clock":
@@ -83,11 +99,12 @@ struct FrameExportOptions {
             }
         }
         if mcpImage {
-            guard output == nil, times.count == 1, times[0] >= .zero, preset == nil, format == nil,
+            guard output == nil, (1...JPEGReviewSize.batchFrames).contains(times.count), times.allSatisfy({ $0 >= .zero }),
+                  preset == nil, format == nil,
                   mode == nil, sample == nil, limit == nil, stream == nil, threshold == nil, minimum == nil,
                   let jobDirectory = ProcessInfo.processInfo.environment["MPCUT_REVIEW_JOB_DIRECTORY"],
                   jobDirectory.hasPrefix("/") else {
-                throw invalid("Supply one nonnegative --at time for a review image job.")
+                throw invalid("Supply 1 through \(JPEGReviewSize.batchFrames) nonnegative --at times for a review image job.")
             }
             output = URL(fileURLWithPath: jobDirectory, isDirectory: true).appendingPathComponent("frames").path
         }
@@ -96,8 +113,15 @@ struct FrameExportOptions {
         }
         self.output = output
         self.mcpImage = mcpImage
+        self.batch = batch || (mcpImage && times.count > 1)
         self.preset = preset ?? .review
         self.format = format ?? .jpeg
+        guard !batch || mcpImage else { throw invalid("--batch applies to --mcp-image.") }
+        guard self.preset == .review || (maxEdge == nil && region == nil) else {
+            throw invalid("--max-edge and --region size the review preset. Omit --preset full.")
+        }
+        self.maxEdge = maxEdge ?? JPEGReviewSize.defaultEdge
+        self.region = region
         if let project {
             guard !times.isEmpty, mode == nil, sample == nil, limit == nil,
                   stream == nil, threshold == nil, minimum == nil else {

@@ -1,35 +1,179 @@
 [
   {
     "name": "review_file_frame_read",
-    "description": "Start a job to read one exact frame from a source video or a saved project's program as a bounded review JPEG. Poll file_job_status_read and then call review_file_frame_result_read with the returned job_id.",
-    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "description": "Start a job to read exact frames from a source video or a saved project's program as review JPEGs: one time with at, or up to 12 with times. The default 640-pixel picture is enough to identify a shot. Text is reliable only when it is about 8 pixels or taller in the returned picture. To read fine detail, pass region for that part of the frame at its own pixels, or a larger max_edge. Poll file_job_status_read and then call review_file_frame_result_read with the returned job_id.",
+    "annotations": {
+      "readOnlyHint": true,
+      "openWorldHint": false
+    },
     "inputSchema": {
       "type": "object",
       "properties": {
-        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct job. Reuse for identical retries."},
-        "file": {"type": "string", "pattern": "^/", "description": "Absolute path to source video. Reads the source clock."},
-        "project_path": {"type": "string", "pattern": "^/", "description": "Absolute path to a saved project."},
-        "at": {"type": "string", "minLength": 1, "description": "Time in seconds, timecode, or exact rational seconds such as 1001/30000."},
-        "clock": {"type": "string", "enum": ["sequence", "group", "assembly"], "description": "Saved-project clock. Defaults to sequence for a sequence project and assembly for a multicam project. Group reads the group switch lane."}
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Reuse for identical retries."
+        },
+        "file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to source video. Reads the source clock."
+        },
+        "project_path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a saved project."
+        },
+        "at": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Time in seconds, timecode, or exact rational seconds such as 1001/30000."
+        },
+        "clock": {
+          "type": "string",
+          "enum": [
+            "sequence",
+            "group",
+            "assembly"
+          ],
+          "description": "Saved-project clock. Defaults to sequence for a sequence project and assembly for a multicam project. Group reads the group switch lane."
+        },
+        "times": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 12,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "Several frame times in the same formats as at. The result holds frames in request order and one image per frame. Together the images can total 2 MiB."
+        },
+        "max_edge": {
+          "type": "integer",
+          "minimum": 160,
+          "maximum": 3840,
+          "description": "Longest image edge in pixels. Defaults to 640. 1920 to 2576 reads small on-screen text in 4K footage. Token cost grows with the area, so prefer region for detail."
+        },
+        "region": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "x",
+            "y",
+            "width",
+            "height"
+          ],
+          "description": "Return only this part of the picture, keeping its own pixels up to max_edge. Fractions of the picture from its top left: x 0.5, y 0, width 0.5, height 0.5 is the top right quarter.",
+          "properties": {
+            "x": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "Left edge."
+            },
+            "y": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "Top edge."
+            },
+            "width": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "At least 0.01."
+            },
+            "height": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "At least 0.01."
+            }
+          }
+        }
       },
-      "required": ["operation_id", "at"],
-      "oneOf": [
-        {"required": ["file"], "allOf": [{"not": {"required": ["project_path"]}}, {"not": {"required": ["clock"]}}]},
-        {"required": ["project_path"], "not": {"required": ["file"]}}
+      "required": [
+        "operation_id"
       ],
-      "additionalProperties": false
+      "oneOf": [
+        {
+          "required": [
+            "file"
+          ],
+          "allOf": [
+            {
+              "not": {
+                "required": [
+                  "project_path"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "clock"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "required": [
+            "project_path"
+          ],
+          "not": {
+            "required": [
+              "file"
+            ]
+          }
+        }
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "not": {
+              "required": [
+                "times"
+              ]
+            }
+          },
+          "then": {
+            "required": [
+              "at"
+            ]
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "at",
+              "times"
+            ]
+          }
+        }
+      ]
     }
   },
   {
     "name": "review_file_frame_result_read",
-    "description": "Read the JPEG and frame metadata for a successful review_file_frame_read job. Returns one image/jpeg content block. The image is at most 640 pixels on either axis and 1 MiB before base64 encoding.",
-    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "description": "Read the JPEGs and frame metadata for a successful review_file_frame_read job. Returns one image/jpeg content block per frame, each after a frame label when the job asked for times. native_width and native_height appear when a picture was reduced or cropped. Each image is at most 1 MiB before base64 encoding.",
+    "annotations": {
+      "readOnlyHint": true,
+      "openWorldHint": false
+    },
     "inputSchema": {
       "type": "object",
       "properties": {
-        "job_id": {"type": "string", "format": "uuid", "description": "Job ID returned by review_file_frame_read."}
+        "job_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Job ID returned by review_file_frame_read."
+        }
       },
-      "required": ["job_id"],
+      "required": [
+        "job_id"
+      ],
       "additionalProperties": false
     }
   }

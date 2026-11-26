@@ -38,58 +38,44 @@ private enum ReviewPicture: Sendable {
     var nativeSize: (width: Int, height: Int) {
         switch self {
         case .still(let frame): return (frame.width, frame.height)
-        case .video(let media, _, _):
-            let video = media.video, rotated = !video.rotation.isMultiple(of: 180)
-            return (video.displayWidth > 0 ? video.displayWidth : rotated ? video.height : video.width,
-                    video.displayHeight > 0 ? video.displayHeight : rotated ? video.width : video.height)
+        case .video(let media, _, _): return JPEGReviewSize.nativeSize(of: media)
         }
     }
 }
 
 /// How much of the picture a review returns: its longest edge and an optional crop.
-private struct ReviewFraming: Sendable {
+struct ReviewFraming: Sendable {
     let edge: Int
     let region: CGRect?
 
     init(_ arguments: [String: Any]) throws {
-        edge = arguments["max_edge"].flatMap(mcpInteger) ?? JPEGReviewSize.defaultEdge
-        guard JPEGReviewSize.edges.contains(edge) else {
-            throw MCPCommandError("invalid_arguments", "Choose a max_edge from \(JPEGReviewSize.edges.lowerBound) through \(JPEGReviewSize.edges.upperBound) pixels.")
+        do {
+            edge = try JPEGReviewSize.edge(arguments["max_edge"].flatMap(mcpInteger))
+            guard let fields = arguments["region"] as? [String: Any] else {
+                region = nil
+                return
+            }
+            func value(_ key: String) -> Double { (fields[key] as? NSNumber)?.doubleValue ?? -1 }
+            region = try JPEGReviewSize.region(x: value("x"), y: value("y"), width: value("width"), height: value("height"))
+        } catch let error as CutError {
+            throw MCPCommandError(error.code, error.message)
         }
-        guard let fields = arguments["region"] as? [String: Any] else {
-            region = nil
-            return
-        }
-        func value(_ key: String) -> Double? { (fields[key] as? NSNumber)?.doubleValue }
-        guard let x = value("x"), let y = value("y"), let width = value("width"), let height = value("height"),
-              x >= 0, y >= 0, width >= 0.01, height >= 0.01, x + width <= 1.000001, y + height <= 1.000001 else {
-            throw MCPCommandError("invalid_arguments", "Give region as x, y, width and height in fractions of the picture from its top left: each side at least 0.01, and the box inside the picture.")
-        }
-        region = CGRect(x: x, y: y, width: min(width, 1 - x), height: min(height, 1 - y))
     }
 
     func render<T>(_ work: () throws -> T) rethrows -> T {
         try JPEGReviewSize.$maxEdge.withValue(edge) { try JPEGReviewSize.$region.withValue(region, operation: work) }
     }
 
-    /// Says what the returned picture left out, so a reader can ask for more of it.
-    func describe(_ row: inout [String: Any], native size: (width: Int, height: Int)) {
-        var native = size
-        // The returned picture is upright. Report the whole picture the same way round.
-        if let width = row["width"] as? Int, let height = row["height"] as? Int {
-            let landscape = Double(width) / Double(region?.width ?? 1) >= Double(height) / Double(region?.height ?? 1)
-            if native.width != native.height, (native.width > native.height) != landscape {
-                native = (native.height, native.width)
-            }
-        }
+    /// Says what the returned picture left out, so a reader can ask for more of it. Call inside `render`.
+    func describe(_ row: inout [String: Any], native: (width: Int, height: Int)) {
         if let region {
             row["region"] = ["x": Double(region.minX), "y": Double(region.minY),
                              "width": Double(region.width), "height": Double(region.height)]
         }
-        if region != nil || row["width"] as? Int != native.width || row["height"] as? Int != native.height {
-            row["native_width"] = native.width
-            row["native_height"] = native.height
-        }
+        guard let width = row["width"] as? Int, let height = row["height"] as? Int,
+              let whole = render({ JPEGReviewSize.reduced(from: native, to: width, height) }) else { return }
+        row["native_width"] = whole.width
+        row["native_height"] = whole.height
     }
 }
 
@@ -183,8 +169,8 @@ private struct ReviewPlans {
 
 extension ProjectSessions {
     /// One reply carries every picture, base64-encoded, inside the 4 MiB socket frame.
-    private static let reviewBatchFrames = 12
-    private static let reviewBatchBytes = 2 << 20
+    private static let reviewBatchFrames = JPEGReviewSize.batchFrames
+    private static let reviewBatchBytes = JPEGReviewSize.batchBytes
 
     func mcpReviewFrame(arguments: [String: Any], session: ProjectSession,
                         checkAccess: @escaping @MainActor () throws -> Void) async throws -> [String: Any] {

@@ -626,6 +626,20 @@ func writeJSON<T: Encodable>(_ result: T, pretty: Bool = false, checkCancellatio
     try writeOutput(data)
 }
 
+/// Writes a result after reshaping its JSON, with the same formatting as every other reply.
+func writeJSON<T: Encodable>(_ result: T, pretty: Bool, reshaping: ([String: Any]) -> [String: Any]) throws {
+    let encoded = try jsonEncoder(pretty: false).encode(result)
+    guard let object = try JSONSerialization.jsonObject(with: encoded) as? [String: Any] else {
+        throw CLIError("invalid_result", "The result is not a JSON object.")
+    }
+    var options: JSONSerialization.WritingOptions = [.sortedKeys, .withoutEscapingSlashes]
+    if pretty { options.insert(.prettyPrinted) }
+    var data = try JSONSerialization.data(withJSONObject: reshaping(object), options: options)
+    data.append(0x0A)
+    try interruption.beginResponse(checkCancellation: true)
+    try writeOutput(data)
+}
+
 /// A failed write to standard output. A closed pipe (`EPIPE`) ends the command quietly.
 private struct OutputError: Error {
     let code: Int32
@@ -2408,15 +2422,16 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
         try writeJSON(authorProject(data: data, creating: creating, interruption: interruption), pretty: !arguments.json, checkCancellation: false)
     case let .frames(options):
         let output = try fileURL(options.output, label: "Output directory", directory: true)
+        // The renderers read the review size on this thread.
+        try JPEGReviewSize.$maxEdge.withValue(options.maxEdge) { try JPEGReviewSize.$region.withValue(options.region) {
         switch options.source {
         case let .video(file, selection, sample, limit):
             let media = try CutEngine(cancelled: { !interruption.isActive }).inspect(
                 fileURL(file, label: "Input"), keyframes: true)
             guard media.hasVideo else { throw CutError(code: "no_video", message: "JPEG export requires a video stream.") }
-            if options.mcpImage, case let .times(times) = selection, let time = times.first {
-                let (jpeg, frame) = try JPEGExport.reviewFrame(media, at: time, exclusiveEnd: false,
-                                                              cancelled: { !interruption.isActive })
-                try writeJSON(FileReviewImage(source: media.url, time: time, frame: frame, jpeg: jpeg))
+            if options.mcpImage, case let .times(times) = selection {
+                let images = try fileSourceReviewImages(media, times: times, cancelled: { !interruption.isActive })
+                if options.batch { try writeJSON(FileReviewImage.Batch(frames: images)) } else { try writeJSON(images[0]) }
                 return
             }
             let result = try JPEGExport.write(media, to: output, selection: selection, sample: sample,
@@ -2427,12 +2442,12 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
             let identity = isStandardInput(file) ? nil : (try? SourceIdentity(fileURL(file, label: "Project")))
             let loaded = try loadDocument(file, interruption: interruption)
             try AnalysisSidecar.$excludedSources.withValue(loaded.excludedSidecarSources) {
-                if options.mcpImage, let time = times.first {
-                    let result = try fileProgramReviewImage(loaded.project, media: loaded.media, projectPath: loaded.path,
-                                                            location: loaded.location, time: time, clock: clock, output: output,
-                                                            documentIdentity: identity, useSidecar: arguments.useSidecar,
-                                                            cancelled: { !interruption.isActive })
-                    try writeJSON(result)
+                if options.mcpImage {
+                    let images = try fileProgramReviewImages(loaded.project, media: loaded.media, projectPath: loaded.path,
+                                                             location: loaded.location, times: times, clock: clock, output: output,
+                                                             documentIdentity: identity, useSidecar: arguments.useSidecar,
+                                                             cancelled: { !interruption.isActive })
+                    if options.batch { try writeJSON(FileReviewImage.Batch(frames: images)) } else { try writeJSON(images[0]) }
                 } else if !loaded.project.requiresPictureProcessing, case .multicam(let multicam) = loaded.project, clock == nil || clock == .group {
                     let result = try JPEGExport.writeMulticam(multicam, document: loaded.file, at: times, to: output,
                                                               preset: options.preset, format: options.format,
@@ -2451,6 +2466,7 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
                 }
             }
         }
+        } }
     case .printDocument(let source):
         let document = try isStandardInput(source)
             ? CutProject.readableDocument(saved: readStandardInput(interruption))

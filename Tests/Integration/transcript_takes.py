@@ -57,6 +57,12 @@ def word_selection(first, last):
 def exercise(cli, directory):
     def call(*args, request=None, fail=None):
         cmd = [cli, *map(str, args), "--json"]
+        # Word records are compact by default. These checks read the full records.
+        if " ".join(map(str, args[1:3])) in ("words read", "words search", "words locate", "words compare", "words suggest", "script align"):
+            if request is None:
+                cmd.append("--verbose")
+            else:
+                request = {"verbose": True} | request
         if request is not None:
             cmd.append("--stdin")
         proc = subprocess.run(cmd, cwd=directory, text=True, capture_output=True, timeout=90,

@@ -67,7 +67,7 @@
           "type": "integer",
           "minimum": 160,
           "maximum": 3840,
-          "description": "Longest image edge in pixels. Defaults to 640. 1280 reads most on-screen text in HD footage, and 1920 to 2576 in 4K. Token cost grows with the area, so prefer region for detail and lower this to 320 for a contact sheet of many times."
+          "description": "Longest image edge in pixels. Defaults to 640. 1920 to 2576 reads small on-screen text in 4K footage. Token cost grows with the area, so prefer region for detail and lower this to 320 for a contact sheet of many times."
         },
         "region": {
           "type": "object",

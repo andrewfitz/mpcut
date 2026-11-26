@@ -928,6 +928,49 @@
           "type": "integer",
           "description": "Optional maximum frame count for scene or non-silent sampling.",
           "minimum": 1
+        },
+        "max_edge": {
+          "type": "integer",
+          "minimum": 160,
+          "maximum": 3840,
+          "description": "Longest edge of review-preset images in pixels. Defaults to 640. Selects the review preset. Not with preset full."
+        },
+        "region": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "x",
+            "y",
+            "width",
+            "height"
+          ],
+          "description": "Write only this part of each review-preset picture, keeping its own pixels up to max_edge. Fractions of the picture from its top left. Selects the review preset. Not with preset full.",
+          "properties": {
+            "x": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "Left edge."
+            },
+            "y": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "Top edge."
+            },
+            "width": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "At least 0.01."
+            },
+            "height": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "At least 0.01."
+            }
+          }
         }
       },
       "required": [

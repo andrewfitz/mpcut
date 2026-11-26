@@ -118,4 +118,44 @@ func TestFileReviewFrames(t *testing.T) {
 			}
 		})
 	}
+
+	// Several times in one job, cropped to the right half of the 160 by 90 fixture.
+	t.Run("batch with a region", func(t *testing.T) {
+		reply := call(t, "review_file_frame_read", object{"operation_id": fileOperationID(), "file": media,
+			"times": []string{"0", "1001/30000"}, "region": object{"x": 0.5, "y": 0, "width": 0.5, "height": 1}})
+		jobID, ok := reply.StructuredContent.(object)["job_id"].(string)
+		if reply.IsError || !ok {
+			t.Fatalf("frame batch submission: %+v", reply.StructuredContent)
+		}
+		eventually(t, "review frame batch job", func() bool {
+			body, _ := call(t, "file_job_status_read", object{"job_id": jobID}).StructuredContent.(object)
+			switch body["state"] {
+			case "running", "cancelling":
+				return false
+			case "succeeded":
+				return true
+			default:
+				t.Fatalf("frame batch job failed: %+v", body)
+				return false
+			}
+		})
+		result := call(t, "review_file_frame_result_read", object{"job_id": jobID})
+		metadata, _ := result.StructuredContent.(object)
+		frames, _ := metadata["frames"].([]any)
+		if result.IsError || len(frames) != 2 || len(result.Content) != 5 {
+			t.Fatalf("expected two frames and their images: %+v with %d content blocks", metadata, len(result.Content))
+		}
+		for i, want := range []string{"frame 1: source 0", "frame 2: source 1001/30000"} {
+			frame := frames[i].(object)
+			label, isText := result.Content[1+2*i].(*mcp.TextContent)
+			_, isImage := result.Content[2+2*i].(*mcp.ImageContent)
+			if !isText || !isImage || label.Text != want {
+				t.Fatalf("frame %d is not labelled %q and followed by its image: %+v", i+1, want, result.Content[1+2*i])
+			}
+			if frame["width"] != float64(80) || frame["height"] != float64(90) || frame["native_width"] != float64(160) ||
+				frame["region"] == nil || frame["jpeg"] != nil {
+				t.Fatalf("unexpected frame metadata: %v", frame)
+			}
+		}
+	})
 }

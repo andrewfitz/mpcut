@@ -235,7 +235,9 @@ def exercise(cli, root, duration, ffmpeg, runs, editor_loader, progress):
             return response
 
         def transcript_call(name, action, **request):
-            return measure(name, ["transcript", *action.split()], {"project_path": str(project)} | request)
+            # Word records are compact by default. The checks below read the full records.
+            full = {"verbose": True} if action in ("words read", "words search", "words locate", "words compare", "words suggest", "script align") else {}
+            return measure(name, ["transcript", *action.split()], {"project_path": str(project)} | full | request)
 
         def project_open(name, path):
             return measure(name, ["project", "inspect", "--project", path])
@@ -282,7 +284,7 @@ def exercise(cli, root, duration, ffmpeg, runs, editor_loader, progress):
 
         if run == 0:
             source, _ = call(cli, ["transcript", "words", "read"], {
-                "project_path": str(project), "space": "source", "track_id": "guest", "limit": PAGE_SIZE,
+                "project_path": str(project), "space": "source", "track_id": "guest", "limit": PAGE_SIZE, "verbose": True,
             })
             require(source["total"] == len(guest) and
                     [row["word_id"] for row in source["items"]] == guest[:PAGE_SIZE] and

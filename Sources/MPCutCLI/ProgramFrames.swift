@@ -16,6 +16,16 @@ struct ProgramFrameManifest: Encodable {
         var frameTime: RationalTime?
         var generatedGap: Bool?
         var privacyIssues: [ParticipantPrivacyIssue]?
+        /// The whole picture's size, when this one is smaller or a crop of it.
+        var nativeWidth, nativeHeight: Int?
+
+        func describing(native: (width: Int, height: Int)) -> Frame {
+            guard let whole = JPEGReviewSize.reduced(from: native, to: width, height) else { return self }
+            var frame = self
+            frame.nativeWidth = whole.width
+            frame.nativeHeight = whole.height
+            return frame
+        }
     }
 
     let ok = true
@@ -72,6 +82,7 @@ func writeProgramFrames(_ project: CutProject, media: CutProjectMedia, projectPa
                                                   file: name, width: frame.width, height: frame.height,
                                                   frameTime: try frame.frameTime.adding(origin),
                                                   privacyIssues: frame.privacyIssues.isEmpty ? nil : frame.privacyIssues)
+                    .describing(native: (Int(renderer.nativeSize.width), Int(renderer.nativeSize.height)))
             }
             return ProgramFrameManifest(clock: (clock ?? requiredClock).rawValue, projectPath: projectPath,
                                         outputDirectory: output.path, duration: renderer.timeline.duration, preset: preset, frames: frames)
@@ -144,7 +155,7 @@ func writeProgramFrames(_ project: CutProject, media: CutProjectMedia, projectPa
         }
         var sourceBatchIndices: [URL: Int] = [:]
         var sourceBatches: [(media: MediaInfo, requests: [CameraRequest])] = []
-        var renderedStills: [String: (url: URL, asset: String, width: Int, height: Int)] = [:]
+        var renderedStills: [String: (url: URL, asset: String, width: Int, height: Int, native: (width: Int, height: Int))] = [:]
         var renderedGap: (url: URL, width: Int, height: Int)?
         var recordingGaps: [MulticamRange]?
         var frames = try times.enumerated().map { ordinal, time -> ProgramFrameManifest.Frame? in
@@ -161,16 +172,18 @@ func writeProgramFrames(_ project: CutProject, media: CutProjectMedia, projectPa
                     return ProgramFrameManifest.Frame(requestNumber: ordinal + 1, requestedTime: time, outputRange: span.output,
                                                       file: name, width: rendered.width, height: rendered.height,
                                                       placementID: placement, assetID: rendered.asset)
+                        .describing(native: rendered.native)
                 }
                 let frame = try project.stillReviewFrame(placementID: placement, interval: span.output, document: location,
                                                          canvas: project.stillFormat == nil ? reference() : nil)
                 let jpeg = try frame.encoded(preset: preset, format: format, cancelled: cancelled)
                 try jpeg.data.write(to: destination, options: .withoutOverwriting)
-                renderedStills[placement] = (destination, frame.asset.id, jpeg.width, jpeg.height)
+                renderedStills[placement] = (destination, frame.asset.id, jpeg.width, jpeg.height, (frame.width, frame.height))
                 try record(frame.identity, at: frame.url)
                 return ProgramFrameManifest.Frame(requestNumber: ordinal + 1, requestedTime: time, outputRange: span.output,
                                                   file: name, width: jpeg.width, height: jpeg.height,
                                                   placementID: placement, assetID: frame.asset.id)
+                    .describing(native: (frame.width, frame.height))
             }
             let local = try time.subtracting(span.output.from)
             let sourceID: String
@@ -263,6 +276,7 @@ func writeProgramFrames(_ project: CutProject, media: CutProjectMedia, projectPa
                     requestNumber: request.ordinal + 1, requestedTime: request.requestedTime, outputRange: request.outputRange,
                     file: request.name, width: frame.width, height: frame.height, source: request.sourceID,
                     sourceTime: request.sourceTime, frameTime: request.frameTime)
+                    .describing(native: JPEGReviewSize.nativeSize(of: media))
             }
         }
         return ProgramFrameManifest(clock: requiredClock.rawValue, projectPath: projectPath, outputDirectory: output.path,

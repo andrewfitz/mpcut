@@ -61,8 +61,15 @@ def exercise(cli, directory):
                         "MPCUT_TRANSCRIBERRR_HELPER": str(directory / "provider"),
                         "MPCUT_TRANSCRIPT_CLAIMS_HOME": str(directory / "claims")}
 
-    def call(verb, *args, request=None, fail=None):
+    def call(verb, *args, request=None, fail=None, compact=False):
         cmd = [cli, "transcript", *verb.split(), "--json", *map(str, args)]
+        # Word records are compact by default. These checks read the full records unless they ask otherwise.
+        if verb in ("words read", "words search", "words locate", "words compare", "words suggest", "script align") \
+                and not compact and "--input" not in args:
+            if request is None:
+                cmd.append("--verbose")
+            else:
+                request = {"verbose": True} | request
         if request is not None:
             cmd.append("--stdin")
         proc = subprocess.run(cmd, cwd=directory, text=True, capture_output=True, timeout=90,
@@ -114,7 +121,7 @@ def exercise(cli, directory):
     assert project.read_bytes() == before_replay
 
     query = {"project_path": str(project), "space": "current_cut", "query": "EXPECTED, BENEFIT", "limit": 1}
-    (directory / "search.json").write_text(json.dumps(query))
+    (directory / "search.json").write_text(json.dumps(query | {"verbose": True}))
     call("words search", request=query | {"project": str(project)}, fail="invalid_json")
     call("words search", "--project-path", project, "--query", "line", fail="invalid_arguments")
     match = call("words search", "--input", "search.json")
@@ -122,6 +129,22 @@ def exercise(cli, directory):
     second_page = call("words search", request=query | {"offset": 1})
     first_words = match["items"][0]["words"]
     assert [w["word_id"] for w in first_words] == ["word-0", "word-1"]
+    # Without --verbose a match is one row that a selection can take as it is, and a read can group lines.
+    row = call("words search", request=query, compact=True)["items"][0]
+    assert (row["words"], row["first_word_id"], row["last_word_id"]) == (2, "word-0", "word-1"), row
+    assert row["first_occurrence_id"] == first_words[0]["id"] and row["last_occurrence_id"] == first_words[1]["id"], row
+    assert "range" not in row and isinstance(row["text"], str) and row["from"] == first_words[0]["range"]["from"], row
+    compact_page = call("words read", "--project", project, "--limit", 2, compact=True)
+    full_page = call("words read", "--project", project, "--limit", 2)
+    shared = compact_page.get("shared", {})
+    for small, full in zip(compact_page["items"], full_page["items"]):
+        assert (small["id"], small["word_id"], small["text"]) == (full["id"], full["word_id"], full["text"]), small
+        assert (small["from"], small["to"]) == (full["range"]["from"], full["range"]["to"]) and "range" not in small, small
+        assert (small | shared).get("attachment_id") == full.get("attachment_id"), (small, shared)
+    lines = call("words read", "--project", project, "--lines", compact=True)
+    assert lines["words"] == min(lines["total"], 100) and sum(line["words"] for line in lines["items"]) == lines["words"], lines
+    assert all(line["first_word_id"] and line["last_occurrence_id"] and line["text"] for line in lines["items"]), lines
+    call("words read", "--project", project, "--lines", "--verbose", compact=True, fail="invalid_arguments")
     assert second_page["items"][0]["words"][0]["clip_id"] == "repeat"
     assert call("words locate", "--project", project, "--word-id", "word-0")["total"] == 2
     assert call("words compare", "--project", project, "--query", "expected benefit")["total"] == 2

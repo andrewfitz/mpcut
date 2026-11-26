@@ -43,7 +43,7 @@ Open **Help → MPCut Agent Guide** to read these instructions offline. Hosts wi
 
 ### Advertise fewer tools
 
-The catalog has 325 tools and about 480 KB of schema. A host that loads tools on demand pays for the ones it uses. A host that puts every schema in the model’s context pays for all of them on each request, which is over 100,000 tokens. For such a host, pass helper arguments to advertise part of the catalog:
+The catalog has 325 tools and about 490 KB of schema. A host that loads tools on demand pays for the ones it uses. A host that puts every schema in the model’s context pays for all of them on each request, which is over 100,000 tokens. For such a host, pass helper arguments to advertise part of the catalog:
 
 - `--live-only` leaves out the saved-file tools, about 45% of the catalog. Use it when the agent only edits open projects.
 - `--toolsets GROUP,GROUP` advertises the named groups. Project discovery is always included with live tools, and the `file_job_*` receipts with file tools. An unknown name stops the helper with the list of valid ones.
@@ -53,15 +53,15 @@ The catalog has 325 tools and about 480 KB of schema. A host that loads tools on
 | --- | --- | ---: | ---: |
 | `projects`, `lifecycle` | Windows, open, save, close, drafts, preferences | 30 KB | |
 | `sequence`, `source_ranges`, `timeline_review` | Sequence edits, history, selects, range mapping | 19 KB | |
-| `review`, `file_frame`, `file_review` | Inline frames; saved-file frames and frame export | 3 KB | 8 KB |
-| `transcript` | Reading, searching, editing and recognition | 84 KB | 37 KB |
+| `review`, `file_frame`, `file_review` | Inline frames; saved-file frames and frame export | 4 KB | 10 KB |
+| `transcript` | Reading, searching, editing and recognition | 84 KB | 39 KB |
 | `multicam`, `sync` | Cameras, switches, assembly, sync | 20 KB | |
-| `outputs`, `output_settings` | Exports, the queue and their job status | 30 KB | 2 KB |
+| `outputs`, `output_settings` | Exports, the queue and their job status | 31 KB | 2 KB |
 | `analysis`, `cache` | Scenes, silence, waveforms, sidecars | 14 KB | 3 KB |
 | `stills`, `media`, `file_media` | Still placements; project media and relinking | 21 KB | 10 KB |
 | `presentation` | Window layout and monitors | 5 KB | |
 | `tiles`, `participants` | Tiles, feeds and ISO delivery | 47 KB | 68 KB |
-| `file` | Saved-file editing, inspection and jobs | | 79 KB |
+| `file` | Saved-file editing, inspection and jobs | | 80 KB |
 
 For transcript-led editing of an open sequence, `--live-only --toolsets lifecycle,sequence,timeline_review,review,transcript,outputs` advertises about 160 KB. A group’s job tools travel with it: live exports and transcript exports are polled with `export_editor_job_status_read` in `outputs`, and scans with `analysis_job_status_read` in `analysis`.
 

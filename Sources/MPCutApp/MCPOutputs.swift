@@ -270,7 +270,18 @@ extension ProjectSessions {
             guard editor.mcpRevision != revision else { throw MCPCommandError("unavailable", "The native editor could not apply this review.") }
             return ["action": "Apply Reviewed Cuts", "revision": editor.mcpRevision, "review": review.detail]
         case "export_queue_plan", "export_queue_render": work = try mcpQueueExport(session: session, output: output, args: arguments, dryRun: tool == "export_queue_plan")
-        case "review_editor_frames_export": work = try mcpFrames(session: session, output: output, args: arguments)
+        case "review_editor_frames_export":
+            // The long edge and crop size review-preset pictures, as they do for an inline frame.
+            let framing = try ReviewFraming(arguments)
+            var sized = arguments
+            if arguments["max_edge"] != nil || arguments["region"] != nil {
+                guard arguments["preset"] as? String != "full" else {
+                    throw MCPCommandError("invalid_arguments", "max_edge and region size the review preset. Omit preset full.")
+                }
+                sized["preset"] = "review"
+            }
+            let frames = try mcpFrames(session: session, output: output, args: sized)
+            work = { progress in try framing.render { try frames(progress) } }
         case "export_editor_project_plan", "export_editor_project_render": work = try mcpRender(session: session, output: output, args: arguments, dryRun: tool == "export_editor_project_plan")
         default:
             work = try mcpInterchange(session: session, output: output, args: arguments, resolve: ["project_editor_resolve_export", "project_editor_resolve_import"].contains(tool), open: tool == "project_editor_resolve_import")

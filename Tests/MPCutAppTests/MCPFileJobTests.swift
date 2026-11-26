@@ -101,6 +101,25 @@ final class MCPFileJobTests: XCTestCase {
                                                  "select": "non_silent", "silence_audio_stream_index": 2])
         XCTAssertEqual(frames.arguments, ["review", "frames", "export", "--json", "--stream", "2", "--select",
                                           "non-silent", "--output", "/tmp/pictures", "--", "/tmp/source.mov"])
+        // The saved-file frame tools pass the review size and crop the live tool takes.
+        let sized = try MCPFileRequest(tool: "review_file_frames_export",
+                                       fields: ["operation_id": id, "file": "/tmp/source.mov", "output": "/tmp/pictures", "at": ["0"],
+                                                "max_edge": 1920, "region": ["x": 0.5, "y": 0, "width": 0.5, "height": 0.5]])
+        XCTAssertTrue(sized.arguments.contains("--max-edge") && sized.arguments.contains("1920"), "\(sized.arguments)")
+        XCTAssertEqual(sized.arguments.firstIndex(of: "--region").map { sized.arguments[$0 + 1] }, "0.5,0,0.5,0.5")
+        let batch = try MCPFileRequest(tool: "review_file_frame_read",
+                                       fields: ["operation_id": id, "file": "/tmp/source.mov", "times": ["0", "19:01"], "max_edge": 320])
+        XCTAssertEqual(batch.arguments, ["review", "frames", "export", "--json", "--mcp-image", "--batch", "--at", "0", "--at", "19:01",
+                                         "--max-edge", "320", "--", "/tmp/source.mov"])
+        let one = try MCPFileRequest(tool: "review_file_frame_read", fields: ["operation_id": id, "file": "/tmp/source.mov", "at": "3/2"])
+        XCTAssertEqual(one.arguments, ["review", "frames", "export", "--json", "--mcp-image", "--at", "3/2", "--", "/tmp/source.mov"])
+        XCTAssertNoThrow(try schemas.validate(tool: "review_file_frame_read",
+                                              arguments: ["operation_id": id, "file": "/tmp/source.mov", "times": ["0"], "max_edge": 3840]))
+        for rejected: [String: Any] in [["file": "/tmp/source.mov"], ["file": "/tmp/source.mov", "at": "0", "times": ["0"]],
+                                        ["file": "/tmp/source.mov", "at": "0", "max_edge": 5000]] {
+            XCTAssertThrowsError(try schemas.validate(tool: "review_file_frame_read",
+                                                       arguments: rejected.merging(["operation_id": id]) { old, _ in old }), "\(rejected)")
+        }
         let inspect = try MCPFileRequest(tool: "media_file_inspect",
                                          fields: ["operation_id": id, "file": "/tmp/source.mov", "detail": "audio_packets",
                                                   "source_from": "1/2", "source_to": "2", "packet_audio_stream_index": 1])

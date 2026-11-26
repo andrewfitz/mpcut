@@ -142,6 +142,28 @@ final class MCPOutputTests: XCTestCase {
         XCTAssertEqual(generated["state"] as? String, "succeeded", String(describing: generated))
         let manifest = try JSONSerialization.jsonObject(with: Data(contentsOf: frames.appendingPathComponent("manifest.json"))) as? [String: Any]
         XCTAssertEqual((manifest?["frames"] as? [[String: Any]])?.count, 2)
+        // A region writes that part of the 160 by 90 picture at its own pixels.
+        let cropped = directory.appendingPathComponent("cropped")
+        let cropJob = try await sessions.mcpOutputs(tool: "review_editor_frames_export", arguments: [
+            "project_handle": session.mcpHandle, "output": cropped.path, "selection": "times", "times": ["0"],
+            "region": ["x": 0.5, "y": 0, "width": 0.5, "height": 1],
+        ], session: session, checkAccess: {})
+        let croppedResult = try await finished(XCTUnwrap(cropJob), owner: session.mcpHandle, in: sessions.mcpOutputJobs)
+        XCTAssertEqual(croppedResult["state"] as? String, "succeeded", String(describing: croppedResult))
+        let croppedManifest = try JSONSerialization.jsonObject(with: Data(contentsOf: cropped.appendingPathComponent("manifest.json"))) as? [String: Any]
+        let croppedFrame = try XCTUnwrap((croppedManifest?["frames"] as? [[String: Any]])?.first)
+        XCTAssertEqual(croppedFrame["width"] as? Int, 80)
+        XCTAssertEqual(croppedFrame["height"] as? Int, 90)
+        XCTAssertEqual(croppedManifest?["preset"] as? String, "review")
+        do {
+            _ = try await sessions.mcpOutputs(tool: "review_editor_frames_export", arguments: [
+                "project_handle": session.mcpHandle, "output": directory.appendingPathComponent("full").path,
+                "selection": "times", "times": ["0"], "preset": "full", "max_edge": 320,
+            ], session: session, checkAccess: {})
+            XCTFail("A full-size export has no review edge.")
+        } catch let error as MCPCommandError {
+            XCTAssertEqual(error.code, "invalid_arguments")
+        }
 
         let editor = session.editor
         let entry = try XCTUnwrap(editor.queuedRanges.first)

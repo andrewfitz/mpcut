@@ -122,7 +122,7 @@ func checkTranscriptMCP(t *testing.T, call func(string, object, string) object, 
 	}
 	call("project_save", object{"project_handle": project, "expected_revision": imported["revision"], "operation_id": "save-transcript-mcp"}, "")
 	fileArgs := object{"operation_id": fileOperationID(),
-		"request": object{"project_path": path, "query": "the same quote", "space": "current_cut", "offset": 4, "limit": 1}}
+		"request": object{"project_path": path, "query": "the same quote", "space": "current_cut", "offset": 4, "limit": 1, "verbose": true}}
 	fileJob := call("transcript_file_words_search", fileArgs, "")
 	if replay := call("transcript_file_words_search", fileArgs, ""); replay["job_id"] != fileJob["job_id"] {
 		t.Fatalf("saved-file transcript replay returned another job: %v %v", fileJob, replay)
@@ -461,7 +461,7 @@ func checkTranscriptProjectMCP(t *testing.T, call func(string, object, string) o
 		return job["state"] == "succeeded"
 	})
 	fileJob := call("transcript_file_words_read", object{"operation_id": fileOperationID(),
-		"request": object{"project_path": path, "space": "current_cut", "offset": 3, "limit": 1}}, "")
+		"request": object{"project_path": path, "space": "current_cut", "offset": 3, "limit": 1, "verbose": true}}, "")
 	eventually(t, "saved project-wide read", func() bool {
 		result := call("file_job_status_read", object{"job_id": fileJob["job_id"]}, "")
 		if result["state"] == "failed" {

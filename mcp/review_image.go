@@ -52,10 +52,7 @@ func reviewFrameResult(raw json.RawMessage) (*mcp.CallToolResult, error) {
 		if err != nil {
 			return nil, err
 		}
-		var space, time string
-		_ = json.Unmarshal(frame["space"], &space)
-		_ = json.Unmarshal(frame["time"], &time)
-		pictures = append(pictures, &mcp.TextContent{Text: fmt.Sprintf("frame %d: %s %s", i+1, space, time)},
+		pictures = append(pictures, &mcp.TextContent{Text: fmt.Sprintf("frame %d: %s", i+1, frameLabel(frame))},
 			&mcp.ImageContent{MIMEType: "image/jpeg", Data: image})
 	}
 	stripped, err := json.Marshal(frames)
@@ -70,6 +67,28 @@ func reviewFrameResult(raw json.RawMessage) (*mcp.CallToolResult, error) {
 	result := toolResult(metadata, false)
 	result.Content = append(result.Content, pictures...)
 	return result, nil
+}
+
+// frameLabel names a frame's clock and requested time. The live editor reports them as
+// space and a time string, and a saved-file job as clock and an exact requested_time.
+func frameLabel(frame map[string]json.RawMessage) string {
+	var clock, time string
+	if json.Unmarshal(frame["space"], &clock) != nil {
+		_ = json.Unmarshal(frame["clock"], &clock)
+	}
+	if json.Unmarshal(frame["time"], &time) != nil {
+		var exact struct {
+			Numerator   json.Number `json:"numerator"`
+			Denominator json.Number `json:"denominator"`
+		}
+		if json.Unmarshal(frame["requested_time"], &exact) == nil && exact.Numerator != "" {
+			time = exact.Numerator.String()
+			if exact.Denominator != "" && exact.Denominator != "1" {
+				time += "/" + exact.Denominator.String()
+			}
+		}
+	}
+	return clock + " " + time
 }
 
 // reviewImage validates one frame's JPEG against its metadata and removes it from the fields.

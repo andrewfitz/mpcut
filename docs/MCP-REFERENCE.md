@@ -1305,6 +1305,12 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 | `at_file` | optional | string, pattern `^/` | Absolute path to a native CLI input/list file. |
 | `clock` | optional | `sequence` / `assembly` / `group` | Project timebase. Sequence projects use sequence time. Multicam defaults to group time for angle comparisons. Select assembly for the edited program. Project frame exports require at or at_file. |
 | `format` | optional | `jpeg` / `png` / `tiff` | Image format. Lossless PNG and TIFF require a supported source. Defaults to JPEG. |
+| `max_edge` | optional | integer, minimum `160`, maximum `3840` | Longest edge of review-preset images in pixels. Defaults to 640. Not with preset full. |
+| `region` | optional | object | Write only this part of each review-preset picture, keeping its own pixels up to max_edge. Fractions of the picture from its top left. Not with preset full. |
+| `region.x` | required | number, minimum `0`, maximum `1` | Left edge. |
+| `region.y` | required | number, minimum `0`, maximum `1` | Top edge. |
+| `region.width` | required | number, minimum `0`, maximum `1` | At least 0.01. |
+| `region.height` | required | number, minimum `0`, maximum `1` | At least 0.01. |
 
 Additional schema rules
 
@@ -2397,7 +2403,7 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 
 ### `review_file_frame_read`
 
-Start a job to read one exact frame from a source video or a saved project's program as a bounded review JPEG. Poll file_job_status_read and then call review_file_frame_result_read with the returned job_id.
+Start a job to read exact frames from a source video or a saved project's program as review JPEGs: one time with at, or up to 12 with times. The default 640-pixel picture is enough to identify a shot. Text is reliable only when it is about 8 pixels or taller in the returned picture. To read fine detail, pass region for that part of the frame at its own pixels, or a larger max_edge. Poll file_job_status_read and then call review_file_frame_result_read with the returned job_id.
 
 Returns a file job receipt. Poll `file_job_status_read` to check completion, then call `review_file_frame_result_read` with the same `job_id`.
 
@@ -2406,8 +2412,15 @@ Returns a file job receipt. Poll `file_job_status_read` to check completion, the
 | `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Reuse for identical retries. |
 | `file` | optional | string, pattern `^/` | Absolute path to source video. Reads the source clock. |
 | `project_path` | optional | string, pattern `^/` | Absolute path to a saved project. |
-| `at` | required | string, minimum length `1` | Time in seconds, timecode, or exact rational seconds such as 1001/30000. |
+| `at` | optional | string, minimum length `1` | Time in seconds, timecode, or exact rational seconds such as 1001/30000. |
 | `clock` | optional | `sequence` / `group` / `assembly` | Saved-project clock. Defaults to sequence for a sequence project and assembly for a multicam project. Group reads the group switch lane. |
+| `times` | optional | array of string, minimum length `1`, minimum items `1`, maximum items `12` | Several frame times in the same formats as at. The result holds frames in request order and one image per frame. Together the images can total 2 MiB. |
+| `max_edge` | optional | integer, minimum `160`, maximum `3840` | Longest image edge in pixels. Defaults to 640. 1920 to 2576 reads small on-screen text in 4K footage. Token cost grows with the area, so prefer region for detail. |
+| `region` | optional | object | Return only this part of the picture, keeping its own pixels up to max_edge. Fractions of the picture from its top left: x 0.5, y 0, width 0.5, height 0.5 is the top right quarter. |
+| `region.x` | required | number, minimum `0`, maximum `1` | Left edge. |
+| `region.y` | required | number, minimum `0`, maximum `1` | Top edge. |
+| `region.width` | required | number, minimum `0`, maximum `1` | At least 0.01. |
+| `region.height` | required | number, minimum `0`, maximum `1` | At least 0.01. |
 
 Additional schema rules
 
@@ -2445,15 +2458,39 @@ Additional schema rules
         ]
       }
     }
+  ],
+  "allOf": [
+    {
+      "if": {
+        "not": {
+          "required": [
+            "times"
+          ]
+        }
+      },
+      "then": {
+        "required": [
+          "at"
+        ]
+      }
+    },
+    {
+      "not": {
+        "required": [
+          "at",
+          "times"
+        ]
+      }
+    }
   ]
 }
 ```
 
 ### `review_file_frame_result_read`
 
-Read the JPEG and frame metadata for a successful review_file_frame_read job. Returns one image/jpeg content block. The image is at most 640 pixels on either axis and 1 MiB before base64 encoding.
+Read the JPEGs and frame metadata for a successful review_file_frame_read job. Returns one image/jpeg content block per frame, each after a frame label when the job asked for times. native_width and native_height appear when a picture was reduced or cropped. Each image is at most 1 MiB before base64 encoding.
 
-Returns one JPEG image block in MCP `content` and the requested clock and time, dimensions, and available frame metadata in `structuredContent`. Camera renders can identify the source, while still and generated gap renders identify their placements or generated picture. Rendered participant and Tiles frames report `privacy_issue_count` and a bounded `privacy_issues` preview when issues affect the frame. The JPEG is bounded to 640 pixels per axis and 1 MiB.
+Returns one JPEG image block in MCP `content` and the requested clock and time, dimensions, and available frame metadata in `structuredContent`. Camera renders can identify the source, while still and generated gap renders identify their placements or generated picture. Rendered participant and Tiles frames report `privacy_issue_count` and a bounded `privacy_issues` preview when issues affect the frame. Each JPEG is 640 pixels on the long edge unless the job set `max_edge`, and at most 1 MiB. A job started with `times` returns `frames[]` in request order, with one `frame N: clock time` label and one image per frame in `content`. `native_width` and `native_height` appear when a picture is smaller than the whole one or is a `region` of it.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -6007,6 +6044,12 @@ Returns a live job receipt for `export_editor_job_status_read`. A still produces
 | `preset` | optional | `review` / `full` |  |
 | `sample` | optional | `first` / `midpoint` |  |
 | `limit` | optional | integer, minimum `1` | Optional maximum frame count for scene or non-silent sampling. |
+| `max_edge` | optional | integer, minimum `160`, maximum `3840` | Longest edge of review-preset images in pixels. Defaults to 640. Selects the review preset. Not with preset full. |
+| `region` | optional | object | Write only this part of each review-preset picture, keeping its own pixels up to max_edge. Fractions of the picture from its top left. Selects the review preset. Not with preset full. |
+| `region.x` | required | number, minimum `0`, maximum `1` | Left edge. |
+| `region.y` | required | number, minimum `0`, maximum `1` | Top edge. |
+| `region.width` | required | number, minimum `0`, maximum `1` | At least 0.01. |
+| `region.height` | required | number, minimum `0`, maximum `1` | At least 0.01. |
 
 Additional schema rules
 
@@ -6594,7 +6637,7 @@ Returns a JPEG image block in MCP `content` and timing metadata in `structuredCo
 | `file` | optional | string, minimum length `1` | With space source: absolute path of a recording the project uses or keeps in its undo history. |
 | `view` | optional | `output` / `source` | Output shows the rendered program. Source shows the untreated recording for correction and review. |
 | `angle_id` | optional | string, minimum length `1` | A multicam camera ID for Source review. Omit to use the camera selected at that time. |
-| `max_edge` | optional | integer, minimum `160`, maximum `3840` | Longest image edge in pixels. Defaults to 640. 1280 reads most on-screen text in HD footage, and 1920 to 2576 in 4K. Token cost grows with the area, so prefer region for detail and lower this to 320 for a contact sheet of many times. |
+| `max_edge` | optional | integer, minimum `160`, maximum `3840` | Longest image edge in pixels. Defaults to 640. 1920 to 2576 reads small on-screen text in 4K footage. Token cost grows with the area, so prefer region for detail and lower this to 320 for a contact sheet of many times. |
 | `region` | optional | object | Return only this part of the picture, keeping its own pixels up to max_edge. Use it to read small detail in 4K or larger footage. Fractions of the picture from its top left: x 0.5, y 0, width 0.5, height 0.5 is the top right quarter. |
 | `region.x` | required | number, minimum `0`, maximum `1` | Left edge. |
 | `region.y` | required | number, minimum `0`, maximum `1` | Top edge. |
@@ -10810,7 +10853,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 
 ### `transcript_file_edits_suggest`
 
-Run transcript words suggest on saved inputs through the bundled CLI.
+Find proposed transcript edits in a saved project through the bundled CLI. Takes are compact rows unless request.verbose is set.
 
 Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page large payloads with `file_job_result_read`.
 
@@ -10832,6 +10875,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.space` | optional | `source` / `group` / `current_cut` |  |
 | `request.speaker_id` | optional | string |  |
 | `request.track_id` | optional | string |  |
+| `request.verbose` | optional | boolean | Return full word records with binding, lane, routing and evidence fields, about 2 KB per word. Omit for compact rows. |
 | `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
 
@@ -11027,7 +11071,7 @@ Poll the returned file job to discover durable recognition jobs for the saved pr
 
 ### `transcript_file_occurrences_locate`
 
-Run transcript words locate on saved inputs through the bundled CLI.
+Locate occurrences in a saved project by word ID through the bundled CLI. Rows are compact unless request.verbose is set.
 
 Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page large payloads with `file_job_result_read`.
 
@@ -11050,6 +11094,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.speaker_id` | optional | string |  |
 | `request.track_id` | optional | string |  |
 | `request.word_id` | optional | string |  |
+| `request.verbose` | optional | boolean | Return full word records with binding, lane, routing and evidence fields, about 2 KB per word. Omit for compact rows. |
 | `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
 
@@ -11067,7 +11112,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 
 ### `transcript_file_script_align`
 
-Run transcript script align on saved inputs through the bundled CLI.
+Align a script to a saved project's transcript through the bundled CLI. Candidate takes are compact rows unless request.verbose is set.
 
 Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page large payloads with `file_job_result_read`.
 
@@ -11090,6 +11135,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.space` | optional | `source` / `group` / `current_cut` |  |
 | `request.speaker_id` | optional | string |  |
 | `request.track_id` | optional | string |  |
+| `request.verbose` | optional | boolean | Return full word records with binding, lane, routing and evidence fields, about 2 KB per word. Omit for compact rows. |
 | `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
 
@@ -11125,7 +11171,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 
 ### `transcript_file_takes_compare`
 
-Run transcript words compare on saved inputs through the bundled CLI.
+Compare takes matching a phrase in a saved project through the bundled CLI. Takes are compact rows unless request.verbose is set.
 
 Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page large payloads with `file_job_result_read`.
 
@@ -11148,6 +11194,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.space` | optional | `source` / `group` / `current_cut` |  |
 | `request.speaker_id` | optional | string |  |
 | `request.track_id` | optional | string |  |
+| `request.verbose` | optional | boolean | Return full word records with binding, lane, routing and evidence fields, about 2 KB per word. Omit for compact rows. |
 | `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
 
@@ -11205,7 +11252,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 
 ### `transcript_file_words_read`
 
-Run transcript words read on saved inputs through the bundled CLI.
+Read a page of words from a saved project through the bundled CLI. Rows are compact, as transcript_editor_words_read returns them. Set request.lines for one row per utterance, or request.verbose for full word records.
 
 Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page large payloads with `file_job_result_read`.
 
@@ -11227,12 +11274,14 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.space` | optional | `source` / `group` / `current_cut` |  |
 | `request.speaker_id` | optional | string |  |
 | `request.track_id` | optional | string |  |
+| `request.verbose` | optional | boolean | Return full word records with binding, lane, routing and evidence fields, about 2 KB per word. Omit for compact rows. |
+| `request.lines` | optional | boolean | Group this page's words into dialogue lines: text, from, to, speaker, a word count, and the first and last word and occurrence IDs a selection takes. Not with verbose. |
 | `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
 
 ### `transcript_file_words_search`
 
-Run transcript words search on saved inputs through the bundled CLI.
+Find a phrase in a saved project through the bundled CLI. Each match is one compact row with the identifiers a selection takes. Set request.verbose for full word records.
 
 Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page large payloads with `file_job_result_read`.
 
@@ -11254,6 +11303,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `request.space` | optional | `source` / `group` / `current_cut` |  |
 | `request.speaker_id` | optional | string |  |
 | `request.track_id` | optional | string |  |
+| `request.verbose` | optional | boolean | Return full word records with binding, lane, routing and evidence fields, about 2 KB per word. Omit for compact rows. |
 | `operation_id` | required | string, minimum length `1`, maximum length `36`, format `uuid` | A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained. |
 | `working_directory` | optional | string, minimum length `1`, maximum length `4096`, pattern `^/` | Absolute local path. |
 

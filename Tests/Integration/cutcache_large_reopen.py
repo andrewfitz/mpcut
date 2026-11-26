@@ -89,7 +89,7 @@ def run(products, folder):
 
     with closing(Client(helpers / "mpcut-mcp", "--files-only", env=env)) as file_client:
         assert_word(file_job(file_client, "transcript_file_occurrences_locate",
-                             request={"project_path": str(saved), "space": "source", "word_id": word["i"]}))
+                             request={"project_path": str(saved), "space": "source", "word_id": word["i"], "verbose": True}))
 
     with hidden_editor(desktop, base, folder) as display, closing(client(display)) as live:
         handle = live.call("project_open", project_path=str(saved), operation_id=operation())["project_handle"]

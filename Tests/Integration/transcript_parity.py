@@ -16,6 +16,9 @@ def run_suite(cli, directory):
     environment = dict(os.environ, MPCUT_TRANSCRIBERRR_HELPER=str(directory / "missing-helper"))
 
     def transcript(operation, error=None, **request):
+        # Word records are compact by default. These checks read the full records.
+        if operation in ("words read", "words search", "words locate", "words compare", "words suggest", "script align"):
+            request = {"verbose": True} | request
         result = subprocess.run(
             [cli, "transcript", *operation.split(), "--json", "--stdin"],
             input=json.dumps(request), capture_output=True, text=True,

@@ -100,6 +100,23 @@ func TestReviewFrameBatchLabelsEachImage(t *testing.T) {
 			t.Fatalf("label %q, want %q", label.Text, want)
 		}
 	}
+	// A saved-file job names the clock and gives the requested time exactly.
+	saved, err := json.Marshal(map[string]any{"frames": []map[string]any{
+		{"jpeg": first, "width": 8, "height": 4, "clock": "source", "requested_time": map[string]int{"numerator": 1001, "denominator": 30000}},
+		{"jpeg": first, "width": 8, "height": 4, "clock": "sequence", "requested_time": map[string]int{"numerator": 3, "denominator": 1}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromFile, err := reviewFrameResult(saved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []string{"frame 1: source 1001/30000", "frame 2: sequence 3"} {
+		if label := fromFile.Content[1+2*i].(*mcp.TextContent).Text; label != want {
+			t.Fatalf("saved-file label %q, want %q", label, want)
+		}
+	}
 	for _, invalid := range []string{`{"frames":[]}`, `{"frames":[{"jpeg":"broken","width":8,"height":4}]}`} {
 		if _, err := reviewFrameResult(json.RawMessage(invalid)); err == nil {
 			t.Errorf("accepted an invalid batch: %s", invalid)

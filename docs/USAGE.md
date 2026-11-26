@@ -842,9 +842,16 @@ mpcut review frames export --json --select non-silent --min-pause-seconds 2 --sa
 mpcut review frames export --json --at 15/2 --at 9 --preset full --output detail interview.mov
 ```
 
-The review preset outputs sRGB JPEGs up to 640 pixels on the long edge at quality 0.62. Full outputs display-resolution JPEGs at quality 0.95 and honors orientation and pixel aspect ratio. The scene midpoint is the default. `--sample first` returns the picture on screen at the start of the range. `--limit` spreads a bounded selection over the available scenes or audio ranges, preserving their original numbers. An explicit `--at` can be repeated and works with variable frame rates. If two pictures have the same presentation timestamp, requesting that timestamp returns `ambiguous_frame`. Other, uniquely timed pictures in that file can still be exported.
+The review preset outputs sRGB JPEGs up to 640 pixels on the long edge at quality 0.62, or up to `--max-edge`. Full outputs display-resolution JPEGs at quality 0.95 and honors orientation and pixel aspect ratio. The scene midpoint is the default. `--sample first` returns the picture on screen at the start of the range. `--limit` spreads a bounded selection over the available scenes or audio ranges, preserving their original numbers. An explicit `--at` can be repeated and works with variable frame rates. If two pictures have the same presentation timestamp, requesting that timestamp returns `ambiguous_frame`. Other, uniquely timed pictures in that file can still be exported.
 
-`--mcp-image` serves the MCP `review_file_frame_read` job. It requires `MPCUT_REVIEW_JOB_DIRECTORY` set to an absolute job directory and one nonnegative `--at` time, and takes no `--output`, `--preset`, `--format` or selection options. It returns one review JPEG of at most 640 pixels and 1 MiB inline, without writing a frame folder.
+`--mcp-image` serves the MCP `review_file_frame_read` job. It requires `MPCUT_REVIEW_JOB_DIRECTORY` set to an absolute job directory and 1 to 12 nonnegative `--at` times, and takes no `--output`, `--preset`, `--format` or selection options. It returns each review JPEG inline, at most 1 MiB each and 2 MiB together, without writing a frame folder. One time returns one picture. Several times, or `--batch`, return them under `frames`. It accepts `--max-edge` and `--region`.
+
+`--max-edge PIXELS` sets the long edge of review-preset pictures from 160 to 3840. `--region X,Y,WIDTH,HEIGHT` keeps only part of each picture at its own pixels up to that edge, as fractions of the picture from its top left: `0.5,0,0.5,0.5` is the top right quarter. A reader, human or model, can rely on text only when it is about 8 pixels or taller in the picture. 1920 to 2576 reads small on-screen text in 4K footage, and a region reads the same text from a much smaller file. Neither option applies to `--preset full`. A review JPEG that would pass 1 MiB is encoded at a lower quality.
+
+```sh
+mpcut review frames export --json --at 19:01 --max-edge 1920 --output detail interview.mov
+mpcut review frames export --json --at 19:01 --region 0,0.5,0.5,0.5 --max-edge 1280 --output slide-text interview.mov
+```
 
 For an agent cutting an interview, start with the small scene overview to identify framings and subjects. Use non-silent ranges to locate takes and listen to promising dialogue. Request full-resolution frames only where a detail matters. Each manifest record includes the actual picture timestamp (`frame_time`, `frame_pts`) and frame-aligned bounds (`clip_from`, `clip_to`). These bounds can go directly into an ordered Smart Trim plan. This example chooses the third image, then the first, from an overview containing at least three images.
 

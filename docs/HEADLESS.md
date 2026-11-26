@@ -34,7 +34,7 @@ For example, call `review_file_frames_export` with the following arguments to se
 }
 ```
 
-The successful job returns a manifest of exported frames. To view pixels directly over MCP, start `review_file_frame_read` for one time, poll the job, then request `review_file_frame_result_read`. The JPEG is bounded to 640 pixels on either axis and one MiB.
+The successful job returns a manifest of exported frames. To view pixels directly over MCP, start `review_file_frame_read` with `at` for one time or `times` for up to 12, poll the job, then request `review_file_frame_result_read`. Each JPEG is 640 pixels on the long edge and at most one MiB. Text is reliable only when it is about 8 pixels or taller in the picture, so pass `region` to read part of the frame at its own pixels, or `max_edge` up to 3840 for the whole frame. `review_file_frames_export` takes the same two options for review-preset files.
 
 For an approved movie export, call `export_file_project_render` with a saved `project_path` and `dry_run: true`. Keep the returned `plan_token`. Render using that token and the same destination and options. If a project, media identity, executable build or output setting changed, `stale_render_plan` requires a fresh preflight. Conversions that invoke Resolve, Premiere, or Final Cut still require the corresponding external integration.
 

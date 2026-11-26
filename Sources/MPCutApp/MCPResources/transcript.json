@@ -893,7 +893,7 @@
   },
   {
     "name": "transcript_file_words_read",
-    "description": "Run transcript words read on saved inputs through the bundled CLI.",
+    "description": "Read a page of words from a saved project through the bundled CLI. Rows are compact, as transcript_editor_words_read returns them. Set request.lines for one row per utterance, or request.verbose for full word records.",
     "annotations": {
       "readOnlyHint": false,
       "openWorldHint": false
@@ -965,6 +965,14 @@
             },
             "track_id": {
               "type": "string"
+            },
+            "verbose": {
+              "type": "boolean",
+              "description": "Return full word records with binding, lane, routing and evidence fields, about 2 KB per word. Omit for compact rows."
+            },
+            "lines": {
+              "type": "boolean",
+              "description": "Group this page's words into dialogue lines: text, from, to, speaker, a word count, and the first and last word and occurrence IDs a selection takes. Not with verbose."
             }
           },
           "additionalProperties": false,
@@ -996,7 +1004,7 @@
   },
   {
     "name": "transcript_file_words_search",
-    "description": "Run transcript words search on saved inputs through the bundled CLI.",
+    "description": "Find a phrase in a saved project through the bundled CLI. Each match is one compact row with the identifiers a selection takes. Set request.verbose for full word records.",
     "annotations": {
       "readOnlyHint": false,
       "openWorldHint": false
@@ -1068,6 +1076,10 @@
             },
             "track_id": {
               "type": "string"
+            },
+            "verbose": {
+              "type": "boolean",
+              "description": "Return full word records with binding, lane, routing and evidence fields, about 2 KB per word. Omit for compact rows."
             }
           },
           "additionalProperties": false,
@@ -1100,7 +1112,7 @@
   },
   {
     "name": "transcript_file_occurrences_locate",
-    "description": "Run transcript words locate on saved inputs through the bundled CLI.",
+    "description": "Locate occurrences in a saved project by word ID through the bundled CLI. Rows are compact unless request.verbose is set.",
     "annotations": {
       "readOnlyHint": false,
       "openWorldHint": false
@@ -1175,6 +1187,10 @@
             },
             "word_id": {
               "type": "string"
+            },
+            "verbose": {
+              "type": "boolean",
+              "description": "Return full word records with binding, lane, routing and evidence fields, about 2 KB per word. Omit for compact rows."
             }
           },
           "additionalProperties": false,
@@ -1206,7 +1222,7 @@
   },
   {
     "name": "transcript_file_takes_compare",
-    "description": "Run transcript words compare on saved inputs through the bundled CLI.",
+    "description": "Compare takes matching a phrase in a saved project through the bundled CLI. Takes are compact rows unless request.verbose is set.",
     "annotations": {
       "readOnlyHint": false,
       "openWorldHint": false
@@ -1282,6 +1298,10 @@
             },
             "track_id": {
               "type": "string"
+            },
+            "verbose": {
+              "type": "boolean",
+              "description": "Return full word records with binding, lane, routing and evidence fields, about 2 KB per word. Omit for compact rows."
             }
           },
           "additionalProperties": false,
@@ -1314,7 +1334,7 @@
   },
   {
     "name": "transcript_file_edits_suggest",
-    "description": "Run transcript words suggest on saved inputs through the bundled CLI.",
+    "description": "Find proposed transcript edits in a saved project through the bundled CLI. Takes are compact rows unless request.verbose is set.",
     "annotations": {
       "readOnlyHint": false,
       "openWorldHint": false
@@ -1389,6 +1409,10 @@
             },
             "track_id": {
               "type": "string"
+            },
+            "verbose": {
+              "type": "boolean",
+              "description": "Return full word records with binding, lane, routing and evidence fields, about 2 KB per word. Omit for compact rows."
             }
           },
           "additionalProperties": false,
@@ -1703,7 +1727,7 @@
   },
   {
     "name": "transcript_file_script_align",
-    "description": "Run transcript script align on saved inputs through the bundled CLI.",
+    "description": "Align a script to a saved project's transcript through the bundled CLI. Candidate takes are compact rows unless request.verbose is set.",
     "annotations": {
       "readOnlyHint": false,
       "openWorldHint": false
@@ -1780,6 +1804,10 @@
             },
             "track_id": {
               "type": "string"
+            },
+            "verbose": {
+              "type": "boolean",
+              "description": "Return full word records with binding, lane, routing and evidence fields, about 2 KB per word. Omit for compact rows."
             }
           },
           "additionalProperties": false,

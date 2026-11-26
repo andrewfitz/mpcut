@@ -107,6 +107,9 @@ package final class ParticipantOutputPicture {
                                                              options: [quality: level])
         }
         let data = try preset == .review ? JPEGReviewSize.encode(make) : make(0.95) ?? { throw JPEGRenderer.failure }()
+        guard preset != .review || data.count <= JPEGReviewSize.byteLimit else {
+            throw CutError(code: "image_too_large", message: JPEGReviewSize.tooLarge)
+        }
         return (data, Int(picture.extent.width), Int(picture.extent.height))
     }
 

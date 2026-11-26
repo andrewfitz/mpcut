@@ -36,13 +36,13 @@ struct TranscriptCLI {
             case .bind: return attachment.union(destination).union(["bindings", "source_id", "file", "audio_stream_index",
                                                                     "channel", "track_id", "origin"])
             case .detach: return attachment.union(destination)
-            case .read: return display.union(page).union(["occurrence_id"])
-            case .search: return display.union(page).union(["query"])
-            case .locate: return display.union(page).union(["word_id", "occurrence_id"])
+            case .read: return display.union(page).union(["occurrence_id", "verbose", "lines"])
+            case .search: return display.union(page).union(["query", "verbose"])
+            case .locate: return display.union(page).union(["word_id", "occurrence_id", "verbose"])
             case .export: return display.union(["format", "output", "captions"])
-            case .compare: return display.union(page).union(["query", "context_words"])
-            case .alignScript: return display.union(page).union(["script", "script_file"])
-            case .suggest: return display.union(page).union(["filler_terms"])
+            case .compare: return display.union(page).union(["query", "context_words", "verbose"])
+            case .alignScript: return display.union(page).union(["script", "script_file", "verbose"])
+            case .suggest: return display.union(page).union(["filler_terms", "verbose"])
             case .correct: return attachment.union(destination).union(
                 ["record", "record_id", "change", "selection", "space", "first_word_id", "last_word_id", "first_occurrence_id",
                  "last_occurrence_id", "kind", "leading_padding", "trailing_padding", "selections", "revision"])
@@ -60,7 +60,8 @@ struct TranscriptCLI {
     let operation: Operation
     private let requestSource: String?
     private let commandRequest: [String: Any]
-    private static let boolFields: Set<String> = ["in_place", "include_inferred", "diarization", "download", "captions"]
+    private static let boolFields: Set<String> = ["in_place", "include_inferred", "diarization", "download", "captions",
+                                                   "verbose", "lines"]
     private static let intFields: Set<String> = ["expected_speakers", "audio_stream_index", "channel", "assembly_index",
                                                   "offset", "limit", "context_words", "start_frame_nudge", "end_frame_nudge"]
     private static let arrayFields: Set<String> = ["selected_tracks", "filler_terms"]
@@ -978,6 +979,17 @@ extension TranscriptCLI {
         }
     }
 
+    /// Word records are compact unless the request asks for all of them, as in the live editor's tools.
+    private func writeRows<T: Encodable>(_ value: T, request: TranscriptCLIRequest, json: Bool) throws {
+        let verbose = try request.optional("verbose", Bool.self) ?? false
+        let lines = try request.optional("lines", Bool.self) ?? false
+        guard !lines || !verbose else {
+            throw CLIError("invalid_arguments", "--lines groups a compact words read. Omit --verbose.")
+        }
+        guard !verbose else { return try writeJSON(value, pretty: !json) }
+        try writeJSON(value, pretty: !json) { TranscriptRows.project($0, verbose: false, lines: lines) }
+    }
+
     private func runRead(_ request: TranscriptCLIRequest, loaded: TranscriptCLIProject, attachmentID: String?,
                          json: Bool, interruption: Interruption) throws {
         let attachments = try attachmentID.map { [try loaded.attachment($0)] } ?? loaded.project.transcripts.attachments
@@ -1039,12 +1051,12 @@ extension TranscriptCLI {
                                            coverageGaps: TranscriptCLIPage(gaps, page: page),
                                            inputCoverage: inputCoverage,
                                            authoring: TranscriptCLIPage(indexes.flatMap(\.authoredReview), page: page))
-            try writeJSON(result, pretty: !json)
+            try writeRows(result, request: request, json: json)
         case .search:
             let query = try request.required("query", String.self)
             let response = index.search(query, filter: filter, offset: page.offset, limit: page.limit)
-            try writeJSON(TranscriptCLIPage(items: response.items, total: response.total, nextOffset: response.nextOffset,
-                                            attachmentResults: index.attachmentResults), pretty: !json)
+            try writeRows(TranscriptCLIPage(items: response.items, total: response.total, nextOffset: response.nextOffset,
+                                            attachmentResults: index.attachmentResults), request: request, json: json)
         case .locate:
             let wordID = try request.optional("word_id", String.self)
             let locations: [TranscriptOccurrence]
@@ -1057,7 +1069,7 @@ extension TranscriptCLI {
             } else {
                 throw CLIError("invalid_arguments", "Specify --word ID or --occurrence ID.")
             }
-            try writeJSON(TranscriptCLIPage(locations, page: page, attachmentResults: index.attachmentResults), pretty: !json)
+            try writeRows(TranscriptCLIPage(locations, page: page, attachmentResults: index.attachmentResults), request: request, json: json)
         default:
             try runEditorial(request, project: loaded, indexes: indexes, words: index.readAll(filter: filter),
                              space: space, filter: filter, page: page, json: json, interruption: interruption)
@@ -1763,7 +1775,7 @@ private extension TranscriptCLI {
                 throw CLIError("invalid_arguments", "Specify between 0 and 100 context words.")
             }
             let takes = TranscriptEditorial.compare(phrase, words: words, contextWords: context)
-            try writeJSON(TranscriptCLIPage(takes, page: page), pretty: !json)
+            try writeRows(TranscriptCLIPage(takes, page: page), request: request, json: json)
         case .alignScript:
             let file = try request.optional("script_file", String.self)
             let inline = try request.optional("script", String.self)
@@ -1779,11 +1791,11 @@ private extension TranscriptCLI {
                 script = text
             } else { script = inline ?? "" }
             let beats = TranscriptEditorial.alignScript(script, words: words)
-            try writeJSON(TranscriptCLIPage(beats, page: page), pretty: !json)
+            try writeRows(TranscriptCLIPage(beats, page: page), request: request, json: json)
         case .suggest:
             let fillers = try request.optional("filler_terms", [String].self) ?? []
             let suggestions = TranscriptEditorial.suggest(words: words, fillerTerms: fillers)
-            try writeJSON(TranscriptCLIPage(suggestions, page: page), pretty: !json)
+            try writeRows(TranscriptCLIPage(suggestions, page: page), request: request, json: json)
         default: preconditionFailure()
         }
     }

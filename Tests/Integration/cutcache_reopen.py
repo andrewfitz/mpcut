@@ -121,7 +121,7 @@ def run(products, folder):
     assert not cli("analysis", "sidecar", "inspect", media).get("write_location")
     for path, expected in [(project, "Original"), (copy, "Edited")]:
         assert word_in(cli("transcript", "words", "locate", "--project", path, "--space", "source",
-                           "--word-id", "w1", "--no-sidecar")) == expected
+                           "--word-id", "w1", "--no-sidecar", "--verbose")) == expected
         document = cli("project", "document", "print", path)
         if path == copy:
             threshold, = document["analysis_annotations"]["silence"]
@@ -136,7 +136,7 @@ def run(products, folder):
     client = Client(helper, "--files-only", env=env, poll_interval=0.05)
     try:
         page = file_job(client, "transcript_file_occurrences_locate",
-                        request={"project_path": str(copy), "space": "source", "word_id": "w1"})
+                        request={"project_path": str(copy), "space": "source", "word_id": "w1", "verbose": True})
         assert word_in(page) == "Edited"
     finally:
         client.close()
