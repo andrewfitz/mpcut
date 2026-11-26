@@ -61,9 +61,18 @@ final class FallbackNoticeTests: XCTestCase {
         XCTAssertTrue(warning.contains("HEVC"), warning)
         XCTAssertTrue(warning.contains(String(format: "%.1f Mbps", Double(rate) / 1_000_000)), warning)
 
-        // ProRes and JPEG have no constant-quality setting to refuse.
+        // The average-rate fallback is only valid for the VideoToolbox interframe encoders.
         let prores: [String: Any] = [AVVideoCodecKey: AVVideoCodecType.proRes422]
         XCTAssertNil(ParticipantPictureWriter.acceptedSettings(prores, canvas: canvas, settings: .init(codec: .prores)) { _ in false }.warning)
+        let jpeg: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.jpeg,
+            AVVideoCompressionPropertiesKey: [AVVideoQualityKey: 0.90]
+        ]
+        let refusedJPEG = ParticipantPictureWriter.acceptedSettings(jpeg, canvas: canvas, settings: .init(codec: .jpeg)) { _ in false }
+        let jpegCompression = try XCTUnwrap(refusedJPEG.settings[AVVideoCompressionPropertiesKey] as? [String: Any])
+        XCTAssertNil(refusedJPEG.warning)
+        XCTAssertNil(jpegCompression[AVVideoAverageBitRateKey])
+        XCTAssertEqual(jpegCompression[AVVideoQualityKey] as? Double, 0.90)
     }
 
     func testPlannedPictureLossesAreWarnings() throws {

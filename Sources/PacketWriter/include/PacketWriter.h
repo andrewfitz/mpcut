@@ -214,10 +214,13 @@ typedef struct {
  * VideoToolbox encodes them, keeping the alpha mode, or the layer IDs and eyes. 0 for one layer or another kind. */
 int mpcut_smart_trim_keeps_layers(const uint8_t *config, size_t size);
 
-/* Edges are recorded process-wide in encode order. Reset before mpcut_write and take after it;
- * take returns up to capacity of the most recent results and clears them. */
-void mpcut_edge_results_reset(void);
-size_t mpcut_edge_results_take(MPCutEdgeResult *results, size_t capacity);
+typedef struct {
+    void (*record)(void *context, const MPCutEdgeResult *result);
+    void *context;
+} MPCutEdgeReporter;
+
+/* Installs a reporter for the synchronous writer on this thread and returns the previous reporter. */
+MPCutEdgeReporter mpcut_edge_reporter_swap(MPCutEdgeReporter reporter);
 
 /* Checks, before writing, the Smart Trim refusals mpcut_write meets only while it writes: copied
  * avc3/hev1 samples that carry parameter sets, and edge pictures whose decoded frames would carry

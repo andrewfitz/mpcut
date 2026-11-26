@@ -241,6 +241,35 @@ class CopyEdges(unittest.TestCase):
         self.assertEqual(time(result["duration"]), presented * Fraction(original["time_base"]))
         self.assertEqual(hashes(output, "a:0"), hashes(movie, "a:0"))
 
+    def test_matroska_aac_edge_copy_sets_container_duration_to_audible_end(self):
+        source = self.root / "short-movie.mkv"
+        output = self.root / "short-movie-cut.mkv"
+        # 32 kHz AAC frames are 32 ms. Four 125 fps pictures make a cut exactly on
+        # that frame boundary while the copied priming packet still starts earlier.
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=192x96:r=125:d=1",
+               "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=32000:duration=1",
+               "-t", "1", "-c:v", "libx264", "-bf", "0", "-g", "25",
+               "-c:a", "aac", "-b:a", "96k", source)
+        report = self.run_cli("export", "clips", "join", "--clip", source,
+                              "--from", "0", "--to", "4/125", "--output", output)
+        self.assertEqual(time(report["duration"]), Fraction(4, 125))
+        self.assertEqual(Fraction(probe(output, "-show_entries", "format=duration")["format"]["duration"]),
+                         Fraction(4, 125))
+
+    def test_matroska_aac_bridge_sets_duration_after_a_multi_range_join(self):
+        source = self.root / "joined-source.mp4"
+        output = self.root / "joined-cut.mkv"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=320x192:r=25:d=5",
+               "-f", "lavfi", "-i", "sine=frequency=930:sample_rate=48000:duration=5",
+               "-t", "5", "-c:v", "libx264", "-threads", "1",
+               "-x264-params", "keyint=25:min-keyint=25:scenecut=0:open-gop=0:bframes=3:b-adapt=0",
+               "-c:a", "aac", "-aac_pns", "0", source)
+        report = self.run_cli("export", "clips", "join", "--clip", source,
+                              "--from", "0", "--to", "2", "--clip", source,
+                              "--from", "3", "--to", "5", "--output", output)
+        self.assertEqual(time(report["duration"]), Fraction(4))
+        self.assertEqual(Fraction(probe(output, "-show_entries", "format=duration")["format"]["duration"]), Fraction(4))
+
     def test_one_opus_packet_with_both_trims_keeps_its_audible_extent(self):
         source = self.root / "short.opus"
         ffmpeg("-f", "lavfi", "-i", "sine=sample_rate=48000:duration=0.005", "-c:a", "libopus", source)

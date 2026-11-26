@@ -92,7 +92,7 @@ extension ParticipantRenderer {
                                       cancelled: isCancelled, sharedInputs: inputs)
             session.blankSourceRanges = blankSourceRanges
             let sound = try ParticipantRenderSound.resolve(project, document: document, timeline: session.timeline.timeline,
-                                                           audio: session.plan.audio, cancelled: isCancelled)
+                                                           audio: session.plan.audio, cancelled: isCancelled, action: .auto)
             try session.requirePublishable(sound: sound)
             try session.verifySources()
             try sound.verifySources()

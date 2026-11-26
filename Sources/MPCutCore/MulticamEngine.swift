@@ -101,7 +101,7 @@ public struct MulticamExportPlan: Encodable, Sendable {
     public let copiedVideoDuration: RationalTime
     public let generatedPictureGaps: [MulticamRange]?
 
-    let pictureCopy: ResolvedEdit?
+    public let pictureCopy: ResolvedEdit?
     let pictureEncode: ReencodePlan?
     let sounds: [MulticamExportSound]
     let recordingGapExport: StillExportPlan?
@@ -565,10 +565,16 @@ public struct MulticamEngine: Sendable {
                                   recordingGapExport: gapPicture?.plan, participantExport: nil, participantRender: nil)
         plan.chapters = chapterPlan.chapters
         // What the picture's Smart Trim edges lose, such as film grain synthesis, found while planning them, and an
-        // HEVC picture whose staged copy has to keep an 'hev1' description, which the final mux carries on.
+        // HEVC picture whose staged copy has to keep an 'hev1' description, which the final mux carries on. The
+        // staged picture also retains the first camera's movie metadata. The MOV/FFmpeg mux carries that metadata
+        // through. Other camera metadata cannot be merged into one output header, so report only those secondary
+        // sources as omissions. A picture-free program has no camera metadata to carry.
+        let primaryPictureSource = mapping.picture.first?.source
+        let secondaryMetadataFiles = primaryPictureSource.map { primary in
+            bySource.filter { $0.key != primary }.compactMap { $0.value.url }
+        } ?? []
         plan.copyOmissions = (pictureCopy.map { CutEngine().copyOmissions($0) } ?? []) + chapterPlan.omissions
-            // The program is assembled from staged picture and sound, so no source's movie metadata reaches it.
-            + ReencodeChapter.droppedMetadata(of: bySource.keys.sorted().compactMap { bySource[$0]?.url }, by: "The program")
+            + ReencodeChapter.droppedMetadata(of: secondaryMetadataFiles, by: "The program")
         return plan
     }
 

@@ -379,7 +379,7 @@ public enum ParticipantMulticam {
             }
             soundtrack = .multicam(multicam)
             return try ParticipantRenderSound.resolve(soundtrack, document: document, timeline: timeline,
-                                                      audio: .init(mode: .program), cancelled: cancelled)
+                                                      audio: .init(mode: .program), cancelled: cancelled, action: .auto)
         case .sequence, .stillSequence:
             guard binding == nil || (binding?.selection != nil && binding?.laneID == nil) else {
                 throw invalid("A sequence mix needs a source and stream binding.")
@@ -405,7 +405,7 @@ public enum ParticipantMulticam {
             participants.people.append(.init(id: id, name: "Meeting mix", audio: .init(selection: selection)))
             soundtrack.participants = participants
             return try ParticipantRenderSound.resolve(soundtrack, document: document, timeline: timeline,
-                                                      audio: .init(mode: .iso, ids: [id]), cancelled: cancelled)
+                                                      audio: .init(mode: .iso, ids: [id]), cancelled: cancelled, action: .auto)
         }
     }
 

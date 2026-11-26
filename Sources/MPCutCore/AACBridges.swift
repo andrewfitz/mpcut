@@ -45,14 +45,51 @@ struct AACBridgePlan: Sendable {
 
 extension AudioIndex {
     /// The sample (on the source clock, from its origin) where the track's first packet starts. Matroska keeps
-    /// packet times in milliseconds, so there the codec delay places the first packet, which precedes the origin by it.
+    /// packet times in milliseconds. Undo the rounded codec delay before subtracting the exact number of samples.
     func aacFrameGrid(matroska: Bool) -> Int64? {
         let rate = stream.sampleRate
-        guard rate > 0, let first = packets.first, let sample = try? first.time.roundedToSamples(rate) else { return nil }
-        if matroska, stream.initialPadding > 0, abs(sample + Int64(stream.initialPadding)) <= Int64(rate / 1_000 + 1) {
-            return -Int64(stream.initialPadding)
+        guard rate > 0, let first = packets.first else { return nil }
+        if matroska, stream.initialPadding > 0 {
+            let padding = Int64(stream.initialPadding)
+            let delay = RationalTime(numerator: (padding * 1000 + Int64(rate) / 2) / max(1, Int64(rate)),
+                                    denominator: 1000)
+            guard let start = try? first.time.adding(delay).roundedToSamples(rate) else { return nil }
+            let grid = start.subtractingReportingOverflow(padding)
+            return grid.overflow ? nil : grid.partialValue
         }
-        return sample
+        return try? first.time.roundedToSamples(rate)
+    }
+}
+
+/// A Matroska track can have a shortened block inside the file, including a previous Smart Trim join.
+/// Count coded samples less DiscardPadding, and check every block against the reconstructed clock.
+private struct AACMatroskaClock {
+    let starts: [Int64]
+    let ends: [Int64]
+
+    init?(_ audio: AudioIndex, grid: Int64, checkCancellation: () throws -> Void) rethrows {
+        let rate = audio.stream.sampleRate
+        guard audio.stream.timeBase == RationalTime(numerator: 1, denominator: 1_000) else { return nil }
+        let tolerance = Int64(rate / 1_000 + 1)
+        var starts: [Int64] = []
+        var ends: [Int64] = []
+        starts.reserveCapacity(audio.packets.count)
+        ends.reserveCapacity(audio.packets.count)
+        var next = grid
+        for (index, packet) in audio.packets.enumerated() {
+            if index.isMultiple(of: 1_024) { try checkCancellation() }
+            guard let stamp = try? packet.time.roundedToSamples(rate), packet.dts == packet.time,
+                  packet.skipSamples == (index == 0 ? audio.stream.initialPadding : 0),
+                  (0..<1_024).contains(packet.discardSamples) else { return nil }
+            let delta = stamp.subtractingReportingOverflow(next)
+            let end = next.addingReportingOverflow(1_024 - Int64(packet.discardSamples))
+            guard !delta.overflow, (-tolerance...tolerance).contains(delta.partialValue), !end.overflow else { return nil }
+            starts.append(next)
+            next = end.partialValue
+            ends.append(next)
+        }
+        self.starts = starts
+        self.ends = ends
     }
 }
 
@@ -65,8 +102,9 @@ func aacConfigurationIssue(_ configuration: Data) -> String? {
     let channels = (bytes[1] >> 3) & 15
     if object == 5 || object == 29 { return "it uses HE-AAC (spectral band replication or parametric stereo)" }
     if object != 2 { return "it is not AAC Low Complexity" }
-    if rateIndex == 15 { return "its sample rate is not a standard AAC rate" }
+    if rateIndex >= 13 { return "its sample rate is not a standard AAC rate" }
     if channels == 0 || channels > 7 { return "its channel layout is described by a program configuration element" }
+    if bytes[1] & 4 != 0 { return "it uses 960-sample AAC frames" }
     if bytes.count >= 5 {
         let bits = UInt32(bytes[2]) << 16 | UInt32(bytes[3]) << 8 | UInt32(bytes[4])
         if bits >> 13 == 0x2b7 && (bits >> 8) & 31 == 5 && (bits >> 7) & 1 == 1 {
@@ -82,7 +120,7 @@ extension CutEngine {
 
     /// Why the frames of this AAC track cannot be encoded again at a join, or nil when they can. The decoded check
     /// for implicitly signalled HE-AAC happens when the bridge is planned.
-    func aacBridgeIssue(_ audio: AudioIndex) -> String? {
+    private func aacEdgeIssue(_ audio: AudioIndex) -> String? {
         let track = audio.stream
         guard track.codec == "aac" else { return "it is not AAC" }
         if let issue = aacConfigurationIssue(track.configuration) { return issue }
@@ -91,16 +129,24 @@ extension CutEngine {
         return nil
     }
 
+    func aacBridgeIssue(_ audio: AudioIndex) -> String? {
+        if let issue = aacEdgeIssue(audio) { return issue }
+        if audio.packets.dropLast().contains(where: { $0.discardSamples > 0 }) {
+            return "an earlier edit changed its AAC frame clock"
+        }
+        return nil
+    }
+
     /// True when Smart Trim joins this track's ranges in this container with encoded AAC frames.
     func bridgesAAC(_ audio: AudioIndex, container: String) -> Bool {
-        smartTrim && trimsAAC(audio, container: container)
+        smartTrim && trimsAAC(audio, container: container) && aacBridgeIssue(audio) == nil
     }
 
     /// True when a movie copy into this container can start and end this AAC track inside a frame: a codec delay
     /// hides the start, with the frame before it decoded for its overlap, and DiscardPadding the end. The copied frames
     /// stay byte-identical, as with a MOV edit list, so Lossless Copy and Smart Trim both do it.
     func trimsAAC(_ audio: AudioIndex, container: String) -> Bool {
-        tracks == .all && Self.aacBridgeContainers.contains(container) && aacBridgeIssue(audio) == nil
+        tracks == .all && Self.aacBridgeContainers.contains(container) && aacEdgeIssue(audio) == nil
     }
 
     /// The sentence a refusal gives at an interior AAC join into Matroska: why Smart Trim cannot encode it, or that it can.
@@ -152,24 +198,49 @@ extension CutEngine {
     private func planAACEdgeTrims(_ segments: inout [ResolvedSegment], media: [MediaInfo], matroska: [Bool],
                                   container: String) throws {
         let frame: Int64 = 1024
+        var clocks: [URL: [Int: AACMatroskaClock]] = [:]
         for (index, edge) in [(0, true), (segments.count - 1, false)] {
             var trims: [AACEdgeTrim] = []
             for track in segments[index].tracks where track.kind == "audio" {
                 guard let sound = media[index].audio.first(where: { $0.stream.index == track.index }),
                       trimsAAC(sound, container: container), let grid = sound.aacFrameGrid(matroska: matroska[index]) else { continue }
+                // A copy from the original beginning keeps the source's own priming.
+                guard edge ? segments[index].from > .zero : track.sourceEnd < sound.end else { continue }
                 let rate = sound.stream.sampleRate
                 let origin = segments[index].sourceOrigin ?? media[index].origin
+                let cut = try (edge ? track.sourceStart : track.sourceEnd).roundedToSamples(rate)
+                if matroska[index] {
+                    let url = media[index].url
+                    let refusal = CutError(code: "unsafe_boundary",
+                        message: "AAC track \(track.index) has no continuous sample clock at this cut.",
+                        segment: (segments[index].sourceClipIndex ?? index) + 1, boundary: edge ? "from" : "to",
+                        track: track.index).because(.cutAACCoverage)
+                    let clock: AACMatroskaClock
+                    if let cached = clocks[url]?[track.index] {
+                        clock = cached
+                    } else {
+                        guard let indexed = try AACMatroskaClock(sound, grid: grid, checkCancellation: checkCancellation) else {
+                            throw refusal
+                        }
+                        clocks[url, default: [:]][track.index] = indexed
+                        clock = indexed
+                    }
+                    let position = clock.starts.lowerBound { edge ? $0 > cut : $0 >= cut } - 1
+                    guard position >= 0, edge ? cut < clock.ends[position] : cut <= clock.ends[position] else {
+                        throw refusal
+                    }
+                    let first = max(0, position - 1)
+                    let copy = edge ? clock.starts[first] : clock.ends[position]
+                    let padding = edge ? cut - copy : 0
+                    trims.append(AACEdgeTrim(stream: track.index, origin: origin, grid: grid, cut: cut, copy: copy, padding: padding))
+                    continue
+                }
                 if edge {
-                    // A copy from the source's first audible sample keeps the source's own priming.
-                    guard track.sourceStart > max(.zero, sound.start) else { continue }
-                    let cut = try track.sourceStart.roundedToSamples(rate)
                     let offset = cut - grid
                     let frameStart = grid + (offset >= 0 ? offset / frame : -((-offset + frame - 1) / frame)) * frame
                     let copy = frameStart - frame >= grid ? frameStart - frame : frameStart
                     trims.append(AACEdgeTrim(stream: track.index, origin: origin, grid: grid, cut: cut, copy: copy, padding: cut - copy))
                 } else {
-                    guard track.sourceEnd < sound.end else { continue }
-                    let cut = try track.sourceEnd.roundedToSamples(rate)
                     let offset = cut - grid
                     let below = grid + (offset >= 0 ? offset / frame : -((-offset + frame - 1) / frame)) * frame
                     trims.append(AACEdgeTrim(stream: track.index, origin: origin, grid: grid, cut: cut,

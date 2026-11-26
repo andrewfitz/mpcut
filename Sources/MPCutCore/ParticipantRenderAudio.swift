@@ -60,11 +60,8 @@ enum ParticipantRenderSound {
                 guard let selection = binding?.selection else {
                     throw missing("A sequence ISO needs a source and stream binding.")
                 }
-                guard mode != .copy else {
-                    throw CutError(code: "unsupported_audio", message: "Choose Convert Audio to deliver an isolated sequence microphone.")
-                }
                 return try resolveSequenceISO(project, document: document, timeline: timeline,
-                                              selection: selection, cancelled: cancelled, action: action,
+                                              selection: selection, cancelled: cancelled, action: action, mode: mode,
                                               container: container)
             case .lanes, .follow:
                 throw missing("Lane and camera audio routing require a multicam project.")
@@ -76,14 +73,9 @@ enum ParticipantRenderSound {
 
     private static func resolveSequenceISO(_ project: CutProject, document: URL, timeline: StillTimelinePlan,
                                            selection: MulticamAudioSelection,
-                                           cancelled: (@Sendable () -> Bool)?, action: ReencodeAudio, container: String) throws -> StillSoundPlan {
-        let action = action == .auto ? (ExportRules.allows(stillAudio: .pcm, in: container) ? .pcm : .aac) : action
-        guard action == .pcm || action == .aac else {
-            throw missing("A sequence ISO needs PCM or AAC sound.")
-        }
-        guard ExportRules.allows(stillAudio: action, in: container) else {
-            throw CutError(code: "unsupported_audio", message: "Choose a container supported by the selected audio codec.")
-        }
+                                           cancelled: (@Sendable () -> Bool)?, action: ReencodeAudio,
+                                           mode: ExportMode, container: String) throws -> StillSoundPlan {
+        let container = ExportRules.multicamMuxContainer(container)
         let clips = Dictionary(uniqueKeysWithValues: (project.sequenceClips ?? []).map { ($0.id, $0) })
         let file = try CutProject.checkedMediaURL(selection.source, relativeTo: document)
         let media = try CutEngine(cancelled: cancelled).inspect(file)
@@ -122,17 +114,52 @@ enum ParticipantRenderSound {
             spans.append(.init(media: media, stream: selection.stream, input: .init(from: from, to: to), output: output))
             appendSilence(from: output.to, to: span.output.to)
         }
-        let plan = try MulticamEngine(cancelled: cancelled).resolveConvertedSound(
-            spans, duration: timeline.duration, container: container, action: action, allowsSilence: true,
-            silenceFormat: .init(media: media, audio: index)) { error, _ in error }
+        let planner = StillSoundPlanner(cancelled: cancelled)
+        let source = index.stream
+        let sources: [StillSoundAction.Source] = spans.compactMap { span in
+            guard span.media != nil else { return nil }
+            return .init(file: file, stream: selection.stream, input: span.input, output: span.output, codec: source.codec)
+        }
+        let silence = spans.filter { $0.media == nil }.map(\.output)
+        let copyRequired = mode == .copy || action == .copyOriginal
+        var warnings: [String] = []
+        if copyRequired || action == .auto {
+            do {
+                let lane = try planner.coalesce(spans, duration: timeline.duration)
+                let copy = try planner.resolveCopy(lane, duration: timeline.duration, container: container,
+                                                   allowsSourceExtent: false)
+                let report = StillSoundAction(ordinal: 0, laneID: MulticamPlan.programAudioLaneID, label: "Participant ISO",
+                    codec: source.codec, sampleRate: source.sampleRate, channelLayout: source.canonicalChannelLayout,
+                    bitDepth: AudioExportEngine.integerDepth(source), treatment: "copied packets", audio: .copyOriginal,
+                    originalStreams: [source.index], sources: sources, warnings: copy.edit.audioJoinNotes, generatedSilence: [])
+                return .init(actions: [report], treatments: [copy], container: container)
+            } catch let issue as CutError where !copyRequired && issue.code != "cancelled" && issue.code != "source_changed" {
+                warnings.append(issue.code == "generated_audio_required"
+                    ? "This microphone requires generated silence."
+                    : "This microphone could not be copied and was decoded. \(issue.message)")
+            }
+        }
+        let format = ConvertedSoundFormat(media: media, audio: index)
+        let conversion = action == .auto ? (ExportRules.allows(stillAudio: .pcm, in: container) ? .pcm : .aac) : action
+        guard conversion == .pcm || conversion == .aac else {
+            throw missing("A sequence ISO needs PCM or AAC sound.")
+        }
+        guard ExportRules.allows(stillAudio: conversion, in: container) else {
+            throw CutError(code: "unsupported_audio", message: "Choose a container supported by the selected audio codec.")
+        }
+        let retained = action == .auto ? try planner.resolveRetainedPCM(spans, duration: timeline.duration,
+                                                                       container: container, format: format) : nil
+        let plan = try retained ?? MulticamEngine(cancelled: cancelled).resolveConvertedSound(
+            spans, duration: timeline.duration, container: container, action: conversion, allowsSilence: true,
+            silenceFormat: format) { error, _ in error }
+        if retained != nil { warnings.append("Retained PCM samples are preserved. Uncovered intervals receive digital silence.") }
         let soundAction = StillSoundAction(ordinal: 0, laneID: MulticamPlan.programAudioLaneID, label: "Participant ISO",
                                       codec: plan.writtenCodec,
                                       sampleRate: plan.sampleRate, channelLayout: plan.layout,
-                                      bitDepth: plan.writtenBitDepth, audio: plan.action,
-                                      originalStreams: [selection.stream], sources: spans.compactMap { span in
-                                          guard span.media != nil else { return nil }
-                                          return .init(file: file, stream: selection.stream, input: span.input, output: span.output)
-                                      }, warnings: plan.warnings, generatedSilence: spans.filter { $0.media == nil }.map(\.output))
+                                      bitDepth: plan.writtenBitDepth,
+                                      treatment: retained == nil ? nil : "retained PCM samples + generated silence",
+                                      audio: plan.action, originalStreams: [source.index], sources: sources,
+                                      warnings: warnings + plan.warnings, generatedSilence: silence)
         return .init(actions: [soundAction], treatments: [.convert(plan)], container: container)
     }
 

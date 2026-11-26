@@ -6,6 +6,18 @@ import MPCutCore
 // the engine's own, the ones `mpcut export` lists under `warnings`.
 
 extension ExportPlan {
+    func checkCameraCopy() throws {
+        switch self {
+        case .conversion:
+            throw CutError(code: "camera_copy_required", message: "Re-encode changes retained camera picture.")
+        case .packets(let edit, .smart, let tracks) where tracks != .audio:
+            if try edit.encodedVideoDuration(for: .smart) > .zero {
+                throw CutError(code: "camera_copy_required", message: "This range has a camera edge that must be encoded.")
+            }
+        default: break
+        }
+    }
+
     /// The export sheet summary, then what a packet copy leaves behind: cover art, chapters or timecode the chosen
     /// container or track selection cannot hold. `omissions` is `copyOmissions`, which reads file headers, so take it
     /// off the main thread and pass it here.
@@ -108,16 +120,13 @@ enum ExportNotices {
 
 extension ExportPlan {
     /// Runs `write`, which writes this plan, and returns what each Smart Trim edge it encoded cost, as
-    /// `mpcut export` reports it under `encoded_edge_results`. Empty for any plan but Smart Trim. The edge encoder
-    /// keeps one record for the whole process, so an export that runs at the same time can leave edges out.
+    /// `mpcut export` reports it under `encoded_edge_results`. Empty for any plan but Smart Trim.
     func writingEncodedEdges(_ write: () throws -> Void) rethrows -> [EncodedEdgeResult] {
         guard case .packets(let edit, .smart, _) = self else {
             try write()
             return []
         }
-        SmartTrimEdgeResults.reset()
-        try write()
-        return SmartTrimEdgeResults.take(for: edit)
+        return try SmartTrimEdgeResults.collecting(for: edit, write).edges
     }
 }
 
@@ -147,8 +156,7 @@ extension SequenceQueuePlan.Item {
 
 extension SequenceQueuePlan {
     /// Writes one range and returns what each Smart Trim edge of an ordinary range cost, as `mpcut export ranges separate`
-    /// reports it under `encoded_edge_results`. The edge encoder keeps one record for the whole process, so the edges are
-    /// taken right after this range's write, before the next range starts. Empty for a still or picture range.
+    /// reports it under `encoded_edge_results`. Empty for a still or picture range.
     func writeReportingEdges(_ item: Item, progress: @escaping @Sendable (Double) -> Bool) throws -> [EncodedEdgeResult] {
         guard case .ordinary(let planned) = item.payload else {
             try write(item, progress: progress)

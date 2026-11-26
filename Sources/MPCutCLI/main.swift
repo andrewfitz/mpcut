@@ -937,11 +937,13 @@ private func runBatch(_ batch: BulkExport, indexedMedia: [URL: MediaInfo], dryRu
             // A dry run and the export it plans report the same fields, the tier among them.
             result.tier = tiers.summary(item.request.clips, media: tierMedia, cancelled: { !interruption.isActive })
             if !dryRun {
-                SmartTrimEdgeResults.reset()
-                result.writtenWarnings = try ExportWriteNotices.collecting {
-                    try batch.write(item) { _ = progress.report((Double(index) + $0) / Double(batch.items.count)) }
-                }.notices
-                result.encodedEdgeResults = SmartTrimEdgeResults.take(for: result.edit)
+                let (notices, edges) = try SmartTrimEdgeResults.collecting(for: result.edit) {
+                    try ExportWriteNotices.collecting {
+                        try batch.write(item) { _ = progress.report((Double(index) + $0) / Double(batch.items.count)) }
+                    }.notices
+                }
+                result.writtenWarnings = notices
+                result.encodedEdgeResults = edges
             }
             outputs.append(result)
         } catch {
@@ -1347,11 +1349,13 @@ private func runSilence(_ options: SilenceOptions, arguments: Arguments, request
     if !options.dryRun {
         let progress = ExportProgress(interruption: interruption)
         // What each Smart Trim edge cost as written, as `mpcut export` reports it.
-        SmartTrimEdgeResults.reset()
-        result.writtenWarnings = try ExportWriteNotices.collecting {
-            try planner.write(plan, to: output) { progress.report($0) }
-        }.notices
-        result.encodedEdgeResults = SmartTrimEdgeResults.take(for: result.edit)
+        let (notices, edges) = try SmartTrimEdgeResults.collecting(for: result.edit) {
+            try ExportWriteNotices.collecting {
+                try planner.write(plan, to: output) { progress.report($0) }
+            }.notices
+        }
+        result.writtenWarnings = notices
+        result.encodedEdgeResults = edges
     }
     try writeJSON(result, pretty: !json, checkCancellation: options.dryRun)
 }
@@ -3041,11 +3045,13 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
             }
             try interruption.check()
             if !dryRun {
-                SmartTrimEdgeResults.reset()
-                result.writtenWarnings = try ExportWriteNotices.collecting {
-                    try planner.write(plan, to: output) { progress.report($0) }
-                }.notices
-                result.encodedEdgeResults = SmartTrimEdgeResults.take(for: result.edit)
+                let (notices, edges) = try SmartTrimEdgeResults.collecting(for: result.edit) {
+                    try ExportWriteNotices.collecting {
+                        try planner.write(plan, to: output) { progress.report($0) }
+                    }.notices
+                }
+                result.writtenWarnings = notices
+                result.encodedEdgeResults = edges
             }
         case .unavailable(let error, let offers):
             // The engine numbers clips by playback position. Report the caller's clip number,

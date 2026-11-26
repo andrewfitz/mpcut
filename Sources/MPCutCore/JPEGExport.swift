@@ -92,6 +92,7 @@ public struct MulticamJPEGAngle: Encodable, Sendable {
     public let origin, timeBase: RationalTime?
     public let videoStream: Int?
     public let error: CutError?
+    public var warnings: [String]? = nil
     public var additionalRecordings: [MulticamJPEGAngle]? = nil
 }
 
@@ -408,6 +409,7 @@ public enum JPEGExport {
                     }
                     var rendered: [Int: JPEGFrame] = [:]
                     if let media, !availableIndices.isEmpty {
+                        metadata[metadata.count - 1].warnings = JPEGManifest.frameWarnings(media, format: format)
                         let plan = try plan(media, .times(availableIndices.map { sourceTimes[$0] }),
                                             useSidecar: useSidecar, cancelled: cancelled)
                         let frames = try render(media, ranges: plan.ranges, sample: .first, preset: preset,

@@ -25,15 +25,28 @@ public struct EncodedEdgeResult: Encodable, Sendable {
     public let maxQp: Int?
 }
 
-/// The cost of the edges an export writes, read from the edge encoder after `mpcut_write`.
+/// The cost of the edges a synchronous export writes.
 public enum SmartTrimEdgeResults {
-    public static func reset() { mpcut_edge_results_reset() }
+    private final class Collector {
+        var results: [MPCutEdgeResult] = []
+    }
 
-    /// The edges written since `reset`, matched to the edit's encoded edges in output order.
-    public static func take(for edit: ResolvedEdit) -> [EncodedEdgeResult] {
-        var native = [MPCutEdgeResult](repeating: MPCutEdgeResult(), count: 256)
-        let count = native.withUnsafeMutableBufferPointer { mpcut_edge_results_take($0.baseAddress, $0.count) }
-        var written = native.prefix(count).map { result in
+    /// Runs the writer and matches the edges it recorded to the edit in output order.
+    public static func collecting<Value>(for edit: ResolvedEdit, _ write: () throws -> Value) rethrows
+        -> (value: Value, edges: [EncodedEdgeResult]) {
+        let collector = Collector()
+        let reporter = MPCutEdgeReporter(record: { context, result in
+            guard let context, let result else { return }
+            Unmanaged<Collector>.fromOpaque(context).takeUnretainedValue().results.append(result.pointee)
+        }, context: Unmanaged.passUnretained(collector).toOpaque())
+        let previous = mpcut_edge_reporter_swap(reporter)
+        defer { _ = mpcut_edge_reporter_swap(previous) }
+        let value = try write()
+        return (value, match(collector.results, to: edit))
+    }
+
+    private static func match(_ native: [MPCutEdgeResult], to edit: ResolvedEdit) -> [EncodedEdgeResult] {
+        var written = native.map { result in
             (from: RationalTime(numerator: result.from.numerator, denominator: max(1, result.from.denominator)),
              to: RationalTime(numerator: result.to.numerator, denominator: max(1, result.to.denominator)), result: result)
         }

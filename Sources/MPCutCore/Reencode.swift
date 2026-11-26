@@ -461,7 +461,7 @@ public struct ReencodeEngine: Sendable {
                         throw CutError(code: "unsupported_audio", message: "The trimmed Opus preroll cannot be preserved by the re-encode muxer.")
                     }
                 }
-                let copy = try engine.resolve(clips, media: media, container: container)
+                let copy = try audioPacketCopy(clips, pictures: segments, media: media, engine: engine, container: container)
                 guard Self.audioCopyGroups(copy.segments, pictures: segments) != nil else {
                     throw CutError(code: "unsupported_audio", message: "The source’s picture and sound start at different presentation origins.")
                 }
@@ -544,6 +544,27 @@ public struct ReencodeEngine: Sendable {
             }
             return written
         }, nil, exactPCM)
+    }
+
+    private func audioPacketCopy(_ clips: [ClipRequest], pictures: [ResolvedSegment],
+                                 media: [URL: MediaInfo], engine: CutEngine, container: String) throws -> ResolvedEdit {
+        // A single MOV/MP4 trim can mux the staged audio's continuous presentation
+        // window directly. Its cut doesn't have to be safe for copying the picture.
+        // Whole exports use the linked movie clock to keep audio beyond either picture edge.
+        if ["mov", "mp4"].contains(container), pictures.count == 1, let picture = pictures.first,
+           picture.from != .zero || !picture.reachesEnd {
+            do {
+                let audio = try CutEngine(cancelled: cancelled, tracks: .audio)
+                    .resolve(clips, media: media, container: container)
+                if let trim = audio.segments.first,
+                   trim.from == picture.from && trim.to == picture.to {
+                    return audio
+                }
+            } catch let issue as CutError where issue.code != "cancelled" && issue.code != "source_changed" {
+                // Linked movie copy can also express boundaries rounded to the audio sample clock.
+            }
+        }
+        return try engine.resolve(clips, media: media, container: container)
     }
 
     private func exactPCMAction(_ track: Int) -> ReencodeAudioAction {

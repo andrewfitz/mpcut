@@ -761,7 +761,7 @@ struct StillSoundPlanner {
         }
     }
 
-    private func coalesce(_ lane: [ConvertedSoundSpan], duration: RationalTime) throws -> [ConvertedSoundSpan] {
+    func coalesce(_ lane: [ConvertedSoundSpan], duration: RationalTime) throws -> [ConvertedSoundSpan] {
         var result: [ConvertedSoundSpan] = []
         var end = RationalTime.zero
         for span in lane {
@@ -815,8 +815,8 @@ struct StillSoundPlanner {
         return result
     }
 
-    private func resolveCopy(_ lane: [ConvertedSoundSpan], duration: RationalTime,
-                             container: String, allowsSourceExtent: Bool) throws -> StillSoundPlan.Treatment {
+    func resolveCopy(_ lane: [ConvertedSoundSpan], duration: RationalTime,
+                     container: String, allowsSourceExtent: Bool) throws -> StillSoundPlan.Treatment {
         let engine = CutEngine(cancelled: cancelled, tracks: .audio)
         let multicam = MulticamEngine(cancelled: cancelled)
         var reference: MediaInfo?

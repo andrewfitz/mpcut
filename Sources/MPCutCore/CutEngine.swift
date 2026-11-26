@@ -553,7 +553,9 @@ public struct CutEngine: Sendable {
         var layerNotes: [String] = []
         var lastVideoDTS: RationalTime?
         let needsMatroskaDTS = uniqueMedia.contains { $0.video.reconstructedDTS }
-        let canScheduleVideo = needsMatroskaDTS || (smartTrim && ["mov", "mp4", "m4v"].contains(container)
+        // A reordered, variable-rate source can have overlapping decode times at a safe join.
+        // MOV can schedule those packets on a new decode clock without encoding their pictures.
+        let canScheduleVideo = needsMatroskaDTS || (["mov", "mp4", "m4v"].contains(container)
             && ["h264", "hevc"].contains(sequence[0].video.codec))
         var videoFrameRanges: [Range<Int>] = []
         if canScheduleVideo { videoFrameRanges.reserveCapacity(effective.count) }
@@ -801,11 +803,15 @@ public struct CutEngine: Sendable {
         if result != 0 {
             throw CutError(code: "write_failed", message: String(cString: diagnostic))
         }
-        if edit.segments.count == 1, let tracks = edit.segments.first?.tracks,
-           tracks.contains(where: { $0.opusPreSkip != nil }) {
+        if let segment = edit.segments.last,
+           edit.segments.contains(where: { segment in
+               segment.tracks.contains(where: { $0.opusPreSkip != nil })
+                   || segment.aacHeads != nil || segment.aacTails != nil || segment.aacBridges != nil
+           }) {
+            let tracks = segment.tracks
             let ends = try tracks.filter { !audioOnly || $0.kind == "audio" }.sorted { $0.index < $1.index }.map { try $0.outputEnd.roundedToSamples(1_000_000_000) }
             guard mpcut_set_matroska_durations(partial.path, ends, ends.count) == 0 else {
-                throw CutError(code: "write_failed", message: "Could not finalize the Opus trim’s presentation duration.")
+                throw CutError(code: "write_failed", message: "Could not finalize the Matroska presentation duration.")
             }
         }
         try checkCancellation()

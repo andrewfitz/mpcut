@@ -212,7 +212,7 @@ struct SequenceQueuePlan: Sendable {
                                        useSidecar: useSidecar, cancelled: cancelled)
             items = try batch.items.enumerated().map { index, planned in
                 do {
-                    try Self.checkCameraCopy(planned.plan, options: options)
+                    if options.requireCameraCopy { try planned.plan.checkCameraCopy() }
                     return Item(output: planned.output, payload: .ordinary(planned))
                 } catch let issue as CutError {
                     throw Self.rangeError(issue, index: index)
@@ -263,7 +263,7 @@ struct SequenceQueuePlan: Sendable {
                                                container: container, settings: options.batchSettings, media: range.media,
                                                useSidecar: useSidecar, cancelled: cancelled)
                     let planned = batch.items[0]
-                    try Self.checkCameraCopy(planned.plan, options: options)
+                    if options.requireCameraCopy { try planned.plan.checkCameraCopy() }
                     result.append(.init(output: planned.output, payload: .ordinary(planned)))
                 }
             } catch let issue as CutError {
@@ -271,19 +271,6 @@ struct SequenceQueuePlan: Sendable {
             }
         }
         items = result
-    }
-
-    private static func checkCameraCopy(_ plan: ExportPlan, options: ExportSheetOptions) throws {
-        guard options.requireCameraCopy, options.tracks != .audio else { return }
-        switch plan {
-        case .conversion:
-            throw CutError(code: "camera_copy_required", message: "Re-encode changes retained camera picture.")
-        case .packets(let edit, .smart, _):
-            if try edit.encodedVideoDuration(for: .smart) > .zero {
-                throw CutError(code: "camera_copy_required", message: "This range has a camera edge that must be encoded.")
-            }
-        default: break
-        }
     }
 
     private static func rangeError(_ issue: CutError, index: Int) -> CutError {

@@ -1966,10 +1966,10 @@ static int remux_packet(Writer *writer, const AVStream *input_track, const Range
     int64_t mapped_dts = time_round(dts, track->time_base);
     if (video && writer->video_dts) {
         if (writer->video_dts_used >= writer->video_dts_count)
-            return fail(writer, "More video samples than indexed in the Smart Trim edit");
+            return fail(writer, "More video samples than indexed in the edit");
         mapped_dts = time_round(writer->video_dts[writer->video_dts_used++], track->time_base);
         if (mapped_dts == AV_NOPTS_VALUE || mapped_dts > mapped_pts)
-            return fail(writer, "Cannot represent a Smart Trim decode slot on the output clock");
+            return fail(writer, "Cannot represent a video decode slot on the output clock");
     }
     int64_t mapped_end = time_round(packet_end, track->time_base);
     if (!video && is_mov(writer->output->oformat) && mapped_end != AV_NOPTS_VALUE && mapped_pts != AV_NOPTS_VALUE
@@ -4185,7 +4185,7 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
         }
 
         if (tracks != MPCUT_TRACKS_AUDIO && writer.video_dts_used != writer.video_dts_count) {
-            result = fail(&writer, "Fewer video samples than indexed in the Smart Trim edit");
+            result = fail(&writer, "Fewer video samples than indexed in the edit");
             goto cleanup;
         }
 

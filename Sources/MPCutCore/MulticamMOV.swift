@@ -187,7 +187,12 @@ enum MulticamMOV {
         if let chapters {
             guard nextID == chapterID else { throw invalidMovie }
             let track = try chapters.track.trak(id: chapterID, movieRate: rate, offset: chapters.offset)
-            duration = max(duration, track.duration)
+            // Chapter media is written on a millisecond clock. For a program whose
+            // picture uses a finer clock, the final chapter sample can round up by a
+            // fraction of a millisecond. Letting that text track determine `mvhd`
+            // duration would make the published movie longer than its picture and
+            // sound. The media track remains available for chapter lookup, while the
+            // program duration stays the maximum of its actual picture/sound lanes.
             tracks.append(track.data)
             nextID += 1
         }

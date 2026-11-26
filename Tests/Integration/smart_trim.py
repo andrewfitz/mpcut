@@ -672,6 +672,40 @@ class SmartTrimTests(unittest.TestCase):
                 self.assertEqual(dict(timestamped_hashes(output)), expected)
                 self.assertEqual(picture_ids(output), bytes(range(25, 75)))
 
+    def test_lossless_copy_reschedules_decode_times_at_a_variable_rate_join(self):
+        source = self.root / "reordered-vfr.mp4"
+        output = self.root / "joined-vfr.mp4"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=320x192:r=25", "-frames:v", "75",
+               "-vf", "settb=1/25,setpts='N+10*floor(N/7)'", "-fps_mode", "passthrough",
+               "-enc_time_base", "1/25", "-c:v", "libx264", "-threads", "1",
+               "-x264-params", "keyint=10:min-keyint=10:scenecut=0:open-gop=0:bframes=3:b-adapt=0", source)
+
+        ranges = [(source, 0, 1), (source, 120, 175)]
+        dry = self.export(output, ranges, smart=False, dry=True)
+        report = self.export(output, ranges, smart=False)
+        self.assertEqual(report["segments"], dry["segments"])
+        self.assertEqual(report["tier"]["id"], "true_lossless")
+        self.assertEqual(ratio(report["encoded_duration"]), 0)
+        self.assertEqual(report["copied_duration"], report["duration"])
+        self.assertEqual(ratio(report["duration"]), Fraction(56, 25))
+
+        source_packets = timestamped_hashes(source)
+        expected = source_packets[:1] + [(time - Fraction(119, 25), digest)
+                                        for time, digest in source_packets if time >= Fraction(24, 5)]
+        self.assertEqual(timestamped_hashes(output), expected)
+        source_frames = frames(source)
+        self.assertEqual(frames(output), source_frames[:1] + source_frames[50:])
+        source_hardware = hardware_frames(source)
+        self.assertEqual(hardware_frames(output), source_hardware[:1] + source_hardware[50:])
+        self.assertEqual(Fraction(probe(output, "-show_format")["format"]["duration"]), Fraction(56, 25))
+
+        smart_output = self.root / "joined-vfr-smart.mp4"
+        smart = self.export(smart_output, ranges)
+        self.assertEqual(smart["tier"]["id"], "true_lossless")
+        self.assertEqual(ratio(smart["encoded_duration"]), 0)
+        self.assertEqual(timestamped_hashes(smart_output), expected)
+        self.assertEqual(frames(smart_output), source_frames[:1] + source_frames[50:])
+
     def test_variable_frame_durations_survive_splice(self):
         source = self.root / "vfr.mp4"
         output = self.root / "vfr-trim.mp4"

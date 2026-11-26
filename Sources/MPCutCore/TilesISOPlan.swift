@@ -296,7 +296,7 @@ public enum TilesISODelivery {
         if let mix, !mix.actions.isEmpty, !redactions.isEmpty || !withheld.isEmpty {
             issues.append(.init(code: "shared_mix", message: "The shared audio can carry voices from treated or withheld feeds.", blocking: false))
         }
-        let renderRevision = 3
+        let renderRevision = 4
         let mixFingerprint = try mix.flatMap { sound in
             sound.actions.isEmpty ? nil : try digest(SoundInput(renderRevision: renderRevision, duration: duration,
                 actions: sound.actions, identities: identities(for: sound.actions)))
@@ -333,7 +333,8 @@ public enum TilesISODelivery {
             ])], audio: sound, redactions: redactions,
                 unresolvedPrivacy: blankUncertain ? .cover : privacyPolicy)
             let report = staleSource ? nil
-                : try renderer.report(excerpt.project, document: document, plan: renderPlan, sharedInputs: sharedPicture)
+                : try renderer.report(excerpt.project, document: document, plan: renderPlan,
+                                      settings: .init(audio: .auto), sharedInputs: sharedPicture)
             let actions = report?.audioActions ?? []
             let actualSources = try identities(for: actions)
             usedAudio.formUnion(actualSources.keys.map { URL(fileURLWithPath: $0) })

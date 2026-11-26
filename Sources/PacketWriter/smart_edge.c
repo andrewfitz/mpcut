@@ -6,7 +6,6 @@
 #include <libavcodec/avcodec.h>
 #include <libavutil/mem.h>
 #include <libavutil/opt.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -494,41 +493,25 @@ done:
     return work.edge;
 }
 
-/* What each encoded edge cost, for the export's report. Edges are encoded on the writer's
- * thread in output order. A short ring keeps the most recent edges of any export. */
-enum { EDGE_RESULT_CAPACITY = 256 };
-static MPCutEdgeResult edge_results[EDGE_RESULT_CAPACITY];
-static size_t edge_result_count; /* Total recorded since the last reset. */
-static pthread_mutex_t edge_result_lock = PTHREAD_MUTEX_INITIALIZER;
+/* The synchronous writer records each edge on its calling thread. */
+static _Thread_local MPCutEdgeReporter edge_reporter;
+
+MPCutEdgeReporter mpcut_edge_reporter_swap(MPCutEdgeReporter reporter)
+{
+    MPCutEdgeReporter previous = edge_reporter;
+    edge_reporter = reporter;
+    return previous;
+}
 
 static void record_edge(MPCutTime from, MPCutTime to, size_t frames, uint64_t bytes, uint64_t target,
                         uint64_t first_attempt, int retried, int max_qp)
 {
-    pthread_mutex_lock(&edge_result_lock);
-    edge_results[edge_result_count++ % EDGE_RESULT_CAPACITY] = (MPCutEdgeResult){
+    if (!edge_reporter.record)
+        return;
+    MPCutEdgeResult result = {
         .from = from, .to = to, .frame_count = frames, .bytes = bytes, .target_bytes = target,
         .first_attempt_bytes = first_attempt, .retried = retried, .max_qp = max_qp};
-    pthread_mutex_unlock(&edge_result_lock);
-}
-
-void mpcut_edge_results_reset(void)
-{
-    pthread_mutex_lock(&edge_result_lock);
-    edge_result_count = 0;
-    pthread_mutex_unlock(&edge_result_lock);
-}
-
-size_t mpcut_edge_results_take(MPCutEdgeResult *results, size_t capacity)
-{
-    pthread_mutex_lock(&edge_result_lock);
-    size_t kept = edge_result_count < EDGE_RESULT_CAPACITY ? edge_result_count : EDGE_RESULT_CAPACITY;
-    size_t first = edge_result_count - kept;
-    size_t count = kept < capacity ? kept : capacity;
-    for (size_t i = 0; i < count; i++)
-        results[i] = edge_results[(first + i) % EDGE_RESULT_CAPACITY];
-    edge_result_count = 0;
-    pthread_mutex_unlock(&edge_result_lock);
-    return count;
+    edge_reporter.record(edge_reporter.context, &result);
 }
 
 MPCutEdge *mpcut_edge_open(const char *path, const AVStream *video, int64_t origin_pts, MPCutTime decode_from,

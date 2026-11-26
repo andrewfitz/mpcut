@@ -118,7 +118,8 @@ final class ParticipantPictureWriter {
     /// `canApply` is the writer's check of the settings.
     static func acceptedSettings(_ outputSettings: [String: Any], canvas: ParticipantCanvas, settings: ReencodeSettings,
                                  canApply: ([String: Any]) -> Bool) -> (settings: [String: Any], warning: String?) {
-        guard var compression = outputSettings[AVVideoCompressionPropertiesKey] as? [String: Any],
+        guard settings.codec == .h264 || settings.codec == .hevc,
+              var compression = outputSettings[AVVideoCompressionPropertiesKey] as? [String: Any],
               compression[AVVideoQualityKey] != nil, !canApply(outputSettings) else { return (outputSettings, nil) }
         let rate = bitRate(canvas, quality: settings.quality)
         compression[AVVideoQualityKey] = nil
