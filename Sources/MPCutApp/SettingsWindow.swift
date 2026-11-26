@@ -201,9 +201,9 @@ private struct SettingsResultButton: View {
         .buttonStyle(.plain)
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(isChosen ? [.isButton, .isSelected] : .isButton)
-        .accessibilityHint("Opens \(row.page.title) settings")
+        .accessibilityHint("Opens \(row.page.title) settings.")
         .accessibilityIdentifier("settings.result." + row.id)
-        .help("Open \(row.title) in \(row.page.title)")
+        .help("Open “\(row.title)” in \(row.page.title).")
     }
 }
 
@@ -216,7 +216,7 @@ extension SettingsWindow {
 
     @MainActor static func register(_ action: OpenSettingsAction) { opener = action }
 
-    /// The one deep link into Settings: menus, help, error text and tests open a named page through it.
+    /// The one deep link into Settings, opening it on a named page. The MCP `show_settings` action uses it.
     @MainActor static func open(_ page: SettingsPage, preferences: EditorPreferences, using action: OpenSettingsAction? = nil) {
         preferences.settingsPage = page
         if let action = action ?? opener {
@@ -235,17 +235,27 @@ struct SettingsRestoreDefaults: View {
     @State private var confirming = false
 
     var body: some View {
-        Section {
+        let unchanged = preferences.hasFactoryValues(on: page)
+        // A section with no rows and the button as its footer: the button sits below the last group, not alone in a box.
+        Section {} footer: {
             HStack {
                 Spacer()
+                // A click here leaves a typed number alone (see `SettingsWindowHooks.handle`): Restore drops it.
                 Button("Restore Defaults…") { confirming = true }
-                    .disabled(preferences.hasFactoryValues(on: page))
+                    .background(SettingsDropsTypedText())
+                    .disabled(unchanged)
                     .accessibilityIdentifier("settings.restore." + page.rawValue)
-                    .help("Restore this page's factory values")
+                    .help(unchanged ? "Every setting on this page already has its factory value."
+                                    : "Restore this page’s settings to their factory values. MPCut asks first.")
             }
         }
         .confirmationDialog(SettingsRestoreSummary.title(for: page), isPresented: $confirming) {
-            Button("Restore Defaults", role: .destructive) { Self.restore(page, preferences: preferences) }
+            // The restore runs on the next turn of the run loop, after the dialog has closed, outside the button's
+            // action. (The reentrant-layout fault a reset switch logged came from the switch's animation, not from
+            // here: see `settingsRow`.)
+            Button("Restore Defaults", role: .destructive) {
+                DispatchQueue.main.async { Self.restore(page, preferences: preferences) }
+            }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(SettingsRestoreSummary.message(for: page, preferences: preferences))
@@ -274,6 +284,8 @@ struct SettingsForm<Content: View>: View {
             }
         }
         .formStyle(.grouped)
+        // Every toggle is a switch, also one inside a `SettingsLabeledControl`, where a form would draw a checkbox.
+        .toggleStyle(.switch)
         .accessibilityIdentifier("settings.form." + page.rawValue)
         // Range notices float above the sections, which clip what a row draws outside them. The layer comes after the
         // form's identifier, so a notice keeps its own.

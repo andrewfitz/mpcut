@@ -313,12 +313,15 @@ final class SettingsMulticamWiringTests: XCTestCase {
     @MainActor
     func testEveryExportKeepsTheMacAwakeUntilItFinishesFailsOrIsCancelled() async throws {
         final class Activities: ActivityProviding, @unchecked Sendable {
-            var begun = 0, ended = 0
+            private let lock = NSLock()
+            private var counts = (begun: 0, ended: 0)
+            var begun: Int { lock.withLock { counts.begun } }
+            var ended: Int { lock.withLock { counts.ended } }
             func beginActivity(options: ProcessInfo.ActivityOptions, reason: String) -> NSObjectProtocol {
-                begun += 1
+                lock.withLock { counts.begun += 1 }
                 return NSObject()
             }
-            func endActivity(_ activity: NSObjectProtocol) { ended += 1 }
+            func endActivity(_ activity: NSObjectProtocol) { lock.withLock { counts.ended += 1 } }
         }
         let model = MulticamEditorModel(preferences: EditorPreferences())
         let activities = Activities()

@@ -44,7 +44,7 @@ extension SettingsRow {
     static let exportMessage = SettingsRow("settings.general.export-message", .general,
         "Show “Exported …” after a project export with no warnings", keywords: ["warnings", "interchange", "message"])
     static let resetWarnings = SettingsRow("settings.general.reset-warnings", .general, "Reset All Warnings",
-        keywords: ["don't ask again", "alerts", "suppressed"])
+        keywords: ["don’t ask again", "don't ask again", "alerts", "suppressed"])
 
     // Editing
     static let snapTarget = SettingsRow("settings.editing.snap-target", .editing, "Snap to",
@@ -123,7 +123,7 @@ extension SettingsRow {
     static let helperLocation = SettingsRow("settings.transcripts.helper", .transcripts, "Helper location",
         keywords: ["transcriberrr", "path", "automatic"])
     static let engine = SettingsRow("settings.transcripts.engine", .transcripts, "Preferred engine",
-        keywords: ["transcription", "qwen3", "model"])
+        keywords: ["transcription", "qwen3", "parakeet", "apple speech", "model"])
     static let speakers = SettingsRow("settings.transcripts.speakers", .transcripts, "Identify speakers in mixed audio",
         keywords: ["diarization", "transcription"])
     static let downloads = SettingsRow("settings.transcripts.downloads", .transcripts, "Download missing models",
@@ -155,7 +155,8 @@ extension SettingsRow {
     static let jpegPreset = SettingsRow("settings.export.jpeg-preset", .export, "Default JPEG preset", keywords: ["frames", "stills"])
     static let reencodeCodec = SettingsRow("settings.export.codec", .export, "Re-encode video",
         keywords: ["codec", "h.264", "hevc", "prores"])
-    static let reencodeQuality = SettingsRow("settings.export.quality", .export, "Quality", keywords: ["re-encode", "bitrate"])
+    static let reencodeQuality = SettingsRow("settings.export.quality", .export, "Quality",
+        keywords: ["re-encode", "bitrate", "smaller", "balanced", "high"])
     static let proresQuality = SettingsRow("settings.export.prores-quality", .export, "ProRes quality", keywords: ["422", "hq", "lt"])
     static let container = SettingsRow("settings.export.container", .export, "H.264 and HEVC container",
         keywords: ["file type"] + ExportRules.reencodeContainers(.h264))
@@ -165,7 +166,7 @@ extension SettingsRow {
     static let resolveOpen = SettingsRow("settings.export.resolve-open", .export, "Open the timeline in Resolve after sending",
         keywords: ["davinci"])
     static let startFolder = SettingsRow("settings.export.start-folder", .export, "Start export panels in",
-        keywords: ["folder", "save panel", "destination"])
+        keywords: ["folder", "save panel", "destination", "chosen folder"])
     static let finishedReveal = SettingsRow("settings.export.finished-reveal", .export, "Show in Finder",
         keywords: ["when an export finishes", "completion"])
     static let finishedNotify = SettingsRow("settings.export.finished-notify", .export, "Notify",
@@ -176,21 +177,21 @@ extension SettingsRow {
     // Storage
     static let reuseAnalysis = SettingsRow("settings.storage.reuse-analysis", .storage, "Save and reuse analysis",
         keywords: ["cutcache", "sidecar", "cache"])
-    static let cutcacheLocation = SettingsRow("sidecars.storage-location", .storage, "Save new cutcaches",
-        keywords: ["cutcache", "cache", "folder", "disk", "sidecar"])
+    static let cutcacheLocation = SettingsRow("settings.storage.cutcache-location", .storage, "Save new cutcaches",
+        keywords: ["cutcache", "cache", "folder", "disk", "sidecar", "shared cache folder", "next to media", "project folder"])
     static let clearCutcaches = SettingsRow("settings.storage.clear-cutcaches", .storage, "Clear cutcaches…",
         keywords: ["cache", "remove", "disk space"])
     static let cacheLimit = SettingsRow("settings.storage.cache-limit", .storage, "Limit the shared cache folder",
-        keywords: ["cache", "cutcache", "bytes", "size"])
+        keywords: ["cache", "cutcache", "bytes", "size", "gb", "gigabytes"])
     static let draftRetention = SettingsRow("settings.storage.draft-retention", .storage, "Remove untitled drafts after",
         keywords: ["drafts", "trash", "days"])
     static let storageUsage = SettingsRow("settings.storage.usage", .storage, "Usage",
-        keywords: ["disk space", "size", "show in finder", "clear", "generated stills", "transcript recognition results",
-                   "suggested transcript cameras", "agent job receipts", "untitled drafts"])
+        keywords: ["disk space", "size", "show in finder", "clear", "cache", "generated stills", "transcript recognition results",
+                   "transcript job scratch", "suggested transcript cameras", "agent job receipts", "untitled drafts"])
 
     // Automation
     static let localMCP = SettingsRow("settings.automation.local-mcp", .automation, "Enable local MCP control",
-        keywords: ["agent", "mcp", "socket", "claude", "codex"])
+        keywords: ["agent", "mcp", "socket", "claude", "codex", "grok"])
     static let agentSettings = SettingsRow("settings.automation.agent-settings", .automation, "Let agents change settings",
         keywords: ["agent", "mcp", "permission", "preferences"])
     static let agentReplace = SettingsRow("settings.automation.agent-replace", .automation, "Let agents replace existing project files",
@@ -205,13 +206,14 @@ extension SettingsRow {
         keywords: ["agent", "mcp", "mcpServers", "claude", "codex", "json"])
 
     static let all: [SettingsRow] = [
-        multipleRecordings, historyLimit, recentItems, draftRecovery, tierWarning, rescanConfirmation, exportMessage, resetWarnings,
+        // In page order, so results list rows as the pages show them.
+        multipleRecordings, recentItems, draftRecovery, historyLimit, tierWarning, rescanConfirmation, exportMessage, resetWarnings,
         snapTarget, sourceTicks, largePreviews, cutSections, timeDisplay, panelPosition, trackLabelWidth, stillDuration, gapDuration,
         gapColor, stillTimelineWidth, stillTimelineHeight, stillTimelineFrameRate, stillTimelineCodec,
         scrubAudio, muted, volume, playbackSpeed, preroll, postroll, viewerSDR, monitorSDR, cleanFeed, monitorPlacement,
         watchMedia, sceneAutoScan, silenceAutoScan, minimumPause, maxBlip, padding, tilesLayout, tilesColumns, tilesRows, tilesDetail,
         dialogueHold, dialogueOverlap, dialogueOffscreen,
-        helperLocation, transcriberrrStatus, engine, speakers, downloads, followPlayback, readerTextSize, boundary, retainedPause, fillerTerms,
+        transcriberrrStatus, helperLocation, engine, speakers, downloads, followPlayback, readerTextSize, boundary, retainedPause, fillerTerms,
         exportFormat, captionCharacters, captionLines, captionCue, captionLabels,
         movieMode, jpegPreset, reencodeCodec, reencodeQuality, proresQuality, container, multicamAudio, resultJSON, resolveOpen,
         startFolder, finishedReveal, finishedNotify, finishedSound,
@@ -233,9 +235,10 @@ extension EnvironmentValues {
 }
 
 extension View {
-    /// Names a control after its row and lets a search result focus it.
-    func settingsRow(_ row: SettingsRow) -> some View {
-        modifier(SettingsRowModifier(row: row))
+    /// Names a control after its row and lets a search result focus it. A row whose parts carry identifiers of their
+    /// own passes `identifier: false`, so the row's identifier is not repeated on each of them.
+    func settingsRow(_ row: SettingsRow, identifier: Bool = true) -> some View {
+        modifier(SettingsRowModifier(row: row, identifier: identifier))
     }
 
     /// The brief highlight a search result puts on its control.
@@ -260,12 +263,19 @@ extension View {
 
 private struct SettingsRowModifier: ViewModifier {
     let row: SettingsRow
+    let identifier: Bool
     @Environment(\.settingsHighlight) private var highlight
     @FocusState private var focused: Bool
 
     func body(content: Content) -> some View {
-        content
-            .accessibilityIdentifier(row.id)
+        Group {
+            if identifier { content.accessibilityIdentifier(row.id) } else { content }
+        }
+            // A switch whose value changes from outside the window (Restore Defaults, an agent, another window) is set
+            // without AppKit's animation. That animation draws the switch at once, from inside SwiftUI's update, which
+            // lays the window out again while it is rendering (“NSHostingView is being laid out reentrantly”). A click is
+            // not affected: AppKit moves the switch itself before SwiftUI hears of the change.
+            .transaction { $0.disablesAnimations = true }
             .focused($focused)
             .id(row.id)
             .settingsHighlight(highlight == row.id)

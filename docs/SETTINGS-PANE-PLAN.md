@@ -7,19 +7,19 @@ Implemented. The eight-page window, the 76 keys that `preferences_read` lists an
 Where the build differs from this plan:
 
 - **Dialogue switches minimum hold** accepts 0.04–60 seconds, not 0–60.
-- **Limit the shared cache folder** is entered in gigabytes of 10⁹ bytes to three decimals (steps of 0.001 GB) and stored in bytes. It and **Remove untitled drafts after** take only their saved value, never a launch argument, because both remove files. The app also enforces the limit when it changes, waits while a window is opening or importing, and checks what open projects protect before each removal. It enforces it after the sequence or multicam editor saves a cutcache, not after core’s automatic cutcache writes during indexing. It removes the least recently modified cutcaches first.
+- **Limit the shared cache folder** is entered in gigabytes of 10⁹ bytes, to three decimals, with a stepper that steps 1 GB and a field range of 0–1,000,000 GB, and stored in bytes. It and **Remove untitled drafts after** take only their saved value, never a launch argument, because both remove files. The app also enforces the limit when it changes, waits while a window is opening or importing, and checks what open projects protect before each removal. It enforces it after the sequence or multicam editor saves a cutcache, not after core’s automatic cutcache writes during indexing. It removes the least recently modified cutcaches first.
 - **Save Export Result JSON** seeds only the sequence export sheet and the multicam save panel. The queue, JPEG, Resolve and interchange panels have no such checkbox.
 - **Helper location** looks up `MPCUT_TRANSCRIBERRR_HELPER` first, then the chosen helper, then the installed Transcriberrr app. The CLI and file jobs skip the chosen helper.
 - **Completion actions** also run for Export Current Frame and the Tiles program, and only for exports the editor starts. Exports an agent starts, replacement-audio working copies and transcript and caption files do not run them.
 - **Starting folder.** Transcript, caption and excerpt panels keep a session folder separate from the editor’s export folder. Multicam excerpts fall back to Automatic in Source folder mode. A chosen folder that is `/` or not an absolute path counts as Automatic. The multicam Resolve and interchange panels follow the setting when it is not Automatic and remember a folder chosen in them for the session.
 - **Automatic scans.** Both editors scan only the recordings just added, never one whose scan was cancelled and never one already in the project. Turning a switch off drops automatic scans that have not started. In multicam, the pause scan reads only the routed sound of the added recordings, and stopping a scan drops the recordings waiting for it.
 - **Decision 8.** An omitted codec takes the Settings codec only where the destination can hold it, and otherwise H.264 with its quality. This includes Tiles renders, Tiles queue ranges and still projects without their own format. The queue uses the Settings container only for an H.264 or HEVC re-encode of ordinary ranges, only when it is not Automatic and only when it can carry the requested audio. An omitted `audio_output` takes the Settings multicam layout, but a downmix falls back to separate tracks where it cannot be rendered.
-- **Reset All Warnings** returns the Finder action to Ask only when an alert’s “Don’t ask again” chose it. An action chosen in Settings stays.
-- **Restore Defaults** lists what will change, grouped by when each change takes effect, and what it keeps. Automation has nothing to restore, so that page has no Restore Defaults button.
+- **Reset All Warnings** returns the Finder action to Ask only when an alert’s “Don’t ask again” chose it. An action chosen in Settings stays, also after an alert chose one; choosing an action in Settings, or turning a warning switch back on, forgets the alert’s choice.
+- **Restore Defaults** lists what will change, with a paragraph for each time the changes take effect and each row title quoted, and names the rows it keeps by their titles. It says a value returns at the next launch only for a value MPCut was opened with on the command line. A value the page does not show (the remembered chosen folder outside Chosen folder mode, a Find Tiles layout a build without TileTrail shows as Even Grid) never enables the button alone. The restore runs after the dialog has closed. Automation has nothing to restore, so that page has no Restore Defaults button.
 - **Agent permissions.** `preferences_set` does not list the read-only keys, so its schema rejects them. The two stills timeline pixel keys declare `multipleOf: 2`. `file_replace_disabled` also covers the six transcript file tools that carry `in_place` inside `request`. `workspace_panel_show` uses `page` only for `show_settings`. With **Let agents change settings** off, `set_transcript_suggested_camera` stays allowed, and the snap action of `timeline_selection_set` is refused as well.
 - **Find Tiles** seeds the grid and scan detail once, when a window’s Tiles inspector is created. Selecting an unscanned recording resets only the layout.
 - **New stills timeline** frame rates 23.976, 29.97, 59.94 and 119.88 mean the exact NTSC rates (24000/1001 and so on), in Settings and in the Still Timeline Format panel.
-- **Numeric fields** commit on Return, Tab, a click elsewhere in the window, a page change and window close. Restore Defaults drops a number typed on its page and not yet committed, so the factory value wins. Each tooltip states the range, and an entry that is limited, rounded or not a number shows a notice under the field instead of an alert.
+- **Numeric fields** commit on Return, Tab, a click elsewhere in the window, a page change and window close. Esc puts the stored value back. A click on Restore Defaults… commits nothing: Restore drops a number typed on its page and not yet committed, so the factory value wins, and Cancel leaves it typed. Each tooltip states the range with grouped digits, and an entry that is limited, rounded or not a number shows a notice beside the field, or under it where there is no room, instead of an alert. Typed numbers read the same in every locale: “.” and “,” are both decimal marks, and a grouping separator counts only between groups of three digits. **Filler terms** commits the same way and keeps at most the 4,096 characters agents may store.
 - **Storage usage** shows each store’s path, marks a folder that does not exist yet, and counts everything in each folder. Clear of transcript recognition results keeps results a saved transcription job can still reuse, and keeps the whole archive while a recent job record cannot be read. Its report says when nothing was removed and counts files MPCut does not recognize, which it leaves.
 - **Defect 3** is fixed with an Automatic or English picker for the transcription language.
 - `ParticipantDialogueOptions.Overlap.visibleSpeaker` stores and reports `visible_speaker`.
@@ -28,8 +28,8 @@ Where the build differs from this plan:
 Unfinished or unverified:
 
 - Testers walked the window four times on the current system. They confirmed the pages, factory values, persistence, search (also fast typing and a value set through accessibility), the scope and wording of Restore Defaults, live updates to an open editor, resizing down to 640 × 420 of content with nothing clipped, committing a number by a click elsewhere, range notices, the Storage paths and Clear reports, and one accessibility label per numeric field.
-- Five controls (Preferred engine, the container picker, Save new cutcaches, Save and reuse analysis, Enable local MCP control) expose their title both as a description and as a title element. Whether VoiceOver speaks it twice has not been listened to.
-- Several rows put one accessibility identifier on more than one element (a path and its Copy button, a store’s size and its buttons).
+- The five controls that exposed their title both as a description and as a title element (Preferred engine, the container picker, Save new cutcaches, Save and reuse analysis, Enable local MCP control) now keep one label, checked by an in-process accessibility walk. Nobody has listened with VoiceOver.
+- Each path, size and row button has its own accessibility identifier (`.path`, `.size`, `.show`, `.clear`, `.copy`), checked by the same walk on every page.
 - Not checked on screen: macOS 14, notifications and their permission prompt, a second display, Clear on real cache entries, choosing a cache disk and the Shared cache folder row, the gap color panel, the visible effect of Force SDR, the launch recovery offer, and real exports and transcriptions with the new defaults.
 - The `mcp/` Go code and the `press_menu.swift` accessibility helper were changed without a Go toolchain or a GUI run.
 - Reopening projects at launch remains deferred. What macOS restores for these windows has not been checked.
@@ -40,7 +40,7 @@ This revision replaces the six-page plan of 23 November. It keeps that plan’s 
 
 ## What exists today
 
-The Settings scene is a two-tab `TabView` fixed at 480 × 495 points. **General** stacks Automation, Media, Timeline, History, Playback and Export defaults. **Analysis** holds cutcache storage and Silence. All 16 keys in `EditorPreferences.Key` have a control. [Current pane](../Sources/MPCutApp/EditorSettings.swift) · [Preferences](../Sources/MPCutApp/EditorPreferences.swift)
+The Settings scene is a two-tab `TabView` fixed at 480 × 495 points. **General** stacks Automation, Media, Timeline, History, Playback and Export defaults. **Analysis** holds cutcache storage and Silence. All 16 keys in `EditorPreferences.Key` have a control. The pane was `Sources/MPCutApp/EditorSettings.swift`, since removed. [Preferences](../Sources/MPCutApp/EditorPreferences.swift)
 
 Everything else an editor chooses repeatedly falls into one of four places.
 
@@ -75,11 +75,11 @@ How values are read:
 Keep the native `Settings` scene. Inside it, lay out a fixed-width sidebar list beside a scrolling grouped form in a plain horizontal stack. Do not use `NavigationSplitView`: its toolbar and collapse behavior inside a Settings scene differ between macOS 14 and later releases. Start at 760 × 560 points with a 640 × 420 minimum, and declare the resizability explicitly. Verify the layout on macOS 14 as well as the current system.
 
 - **Selection.** Reopen the last page. Store the selection through `EditorPreferences`, never through `@AppStorage`.
-- **Deep link.** One entry point opens Settings on a named page: `openSettings` plus the stored selection. Menu help, the “folder unavailable” link, the helper’s error text and the GUI tests use it. The local-control test finds “Enable local MCP control” only when Automation is showing. `mcp/integration/testdata/press_menu.swift:39`
+- **Deep link.** One entry point opens Settings on a named page: `openSettings` plus the stored selection. As built, its one caller is the MCP `show_settings` action; the helper’s error text names the page in plain text. The local-control test finds “Enable local MCP control” only when Automation is showing. `mcp/integration/testdata/press_menu.swift:39`
 - **Search.** A search field above the sidebar filters the same row definitions that label the controls. “HDR” finds both display pickers, “cache” finds Storage, “undo” finds the history limit, “export tier” finds the warning in General. A result opens its page and focuses the control.
 - **Numeric fields.** One shared component for every number: a text field with a unit, a stepper, a range, and commit on Return, on focus loss, on page change and on window close. Typing alone never commits. The history field and the three silence fields move onto it; the silence controls inside the editor keep their own component.
 - **Access.** Every page works with no project open and is reachable by keyboard and VoiceOver.
-- **Restore Defaults.** Each page ends with one. It asks first and names what will change in open projects. It writes factory values through the property setters, so every observer runs. A value supplied as a launch argument applies again at the next launch. It skips five rows whose reset reaches beyond Settings: the undo limit, the cutcache location, local MCP control and the two agent permission switches.
+- **Restore Defaults.** Each page ends with one. It asks first and names what will change in open projects. It writes factory values through the property setters, so every observer runs. A value supplied as a launch argument applies again at the next launch that passes it. It skips five rows whose reset reaches beyond Settings: the undo limit, the cutcache location, local MCP control and the two agent permission switches.
 
 Status in the tables below:
 
@@ -117,7 +117,7 @@ Status in the tables below:
 | Color gap and Space Clips duration | Default | 2 s | `StillAuthoringControls.swift:280` |
 | Gap color | Default | Black | Insert Color Gap and Space Clips each start their own color well at black. `StillAuthoringControls.swift:236`, `:256` |
 | New stills timeline: size, frame rate, codec | Default | 1920 × 1080, 30 fps, H.264 | `StillTimelineFormatPanel.swift:22`. Container stays MOV and program color stays SDR. |
-| Time display: Milliseconds / Frames | Feature | Milliseconds | Fixed `MM:SS.mmm`. `Timeline.swift:301`. Frames counts at the timeline’s cadence and falls back to milliseconds for audio-only timelines. |
+| Time display: Milliseconds / Frames | Feature | Milliseconds | Fixed `MM:SS.mmm`. `Timeline.swift:301`. Frames counts at the timeline’s cadence and falls back to milliseconds for audio-only timelines and for variable, mixed or unconfirmed frame rates. |
 
 Give the three duration paths one shared helper that rounds to a whole frame at the active cadence.
 
@@ -180,7 +180,7 @@ Seeding rules for job setup:
 | Default JPEG preset | Here | Small review images | `export_jpeg_default_preset` |
 | Re-encode video, Quality, ProRes quality | Default | H.264, Balanced, 422 | Kept per window in the sequence editor, per view in multicam. `ExportSheet.swift:60`, `MulticamExportChoices.swift:24`. Factory values come from `ExportRules.defaultCodec` and `defaultQuality`. |
 | H.264 and HEVC container: Automatic / MP4 / MOV / MKV | Default | Automatic | Automatic keeps today’s split: MP4 in the sequence editor, MOV in multicam. ProRes stays MOV. |
-| Multicam audio: Separate tracks / Mono / Stereo | Default | Separate tracks | `MulticamExportChoices.swift:26` |
+| Multicam audio: Separate tracks / Downmix to mono / Downmix to stereo | Default | Separate tracks | `MulticamExportChoices.swift:26` |
 | Save Export Result JSON | Default | Off | A new checkbox on every panel. `ExportResultFile.swift:11` |
 | Open the timeline in Resolve after sending | Default | On | `ResolveExportPanel.swift:14` |
 | Start export panels in: Automatic / Project folder / Source folder / Chosen folder | Feature | Automatic | Each entry point has its own rule, listed below. |
@@ -219,7 +219,7 @@ Export rules still decide what a timeline can use. Show the effective choice whe
 Rules for anything that removes files:
 
 - **Draft retention** moves expired drafts to the Trash. It skips drafts that are open, locked or newer than the limit, and it never touches `.transcript-jobs`.
-- **The cache limit** applies only to the managed `MPCut Cache` folder in cache-disk mode. The app enforces it at launch and after it saves a cutcache. The CLI ignores it, so the folder can exceed the limit between app runs. Eviction removes the least recently used cutcaches and never one that an open project or its history protects.
+- **The cache limit** applies only to the managed `MPCut Cache` folder in cache-disk mode. The app enforces it at launch and after it saves a cutcache. The CLI ignores it, so the folder can exceed the limit between app runs. Eviction removes the least recently modified cutcaches first and never one that an open project or its history protects.
 - **Clear** reports the bytes reclaimed and what it skipped.
 - Every routine that removes files takes its folder as a parameter, so tests run it on temporary folders. Retention and the cache limit do nothing at their factory values.
 
@@ -345,7 +345,7 @@ Names follow feature → subject → qualifier → unit. A key that only seeds n
 | `draft_retention_days` | `draftRetentionDays` | integer 0–365; 0 is never | 0 |
 | `automation_preferences_write_enabled`, `automation_file_replace_enabled` | `agentsChangeSettings`, `agentsReplaceFiles` | Boolean, read-only to agents | true |
 
-Stored through `EditorPreferences` and kept out of the MCP list: `export_start_folder_path`, `transcript_helper_path`, `playback_monitor_last_frame`, `settings_selected_page`, and the suppression state of each warning.
+Stored through `EditorPreferences` and kept out of the MCP list: `export_start_folder_path`, `transcript_helper_path`, `playback_monitor_last_frame`, `settings_selected_page`, `project_media_last_locate_folder`, `transcript_suggested_angles`, and the suppression state of each warning (`warnings_suppressed`).
 
 Read-only to agents, because setting them removes files or widens access: `draft_retention_days`, `analysis_shared_cache_max_bytes` and every `automation_*` key.
 

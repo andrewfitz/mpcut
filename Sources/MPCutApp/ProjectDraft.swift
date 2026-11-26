@@ -306,6 +306,23 @@ private final class DraftWriter: @unchecked Sendable {
 }
 
 extension ProjectSessions {
+    /// What the draft chooser lists for each draft: its first recording, or "Untitled project" without one, and when it
+    /// was last edited. Drafts that would read alike are numbered, so each stays distinguishable.
+    nonisolated static func draftLabels(_ drafts: [(project: CutProject?, edited: Date?)]) -> [String] {
+        let labels = drafts.map { draft -> String in
+            let name = draft.project?.mediaPaths.first.map { URL(fileURLWithPath: $0.1).lastPathComponent } ?? "Untitled project"
+            let edited = draft.edited.map { "last edited " + $0.formatted(date: .abbreviated, time: .standard) } ?? "edit time unknown"
+            return name + ", " + edited
+        }
+        var seen: [String: Int] = [:]
+        return labels.map { label in
+            let count = labels.filter { $0 == label }.count
+            guard count > 1 else { return label }
+            seen[label, default: 0] += 1
+            return label + " (\(seen[label]!))"
+        }
+    }
+
     @MainActor
     func recoverUntitledProject(using action: OpenWindowAction) {
         setWindowOpener(action)
@@ -334,18 +351,22 @@ extension ProjectSessions {
             let alert = NSAlert()
             alert.messageText = atLaunch ? "Recover an untitled project?" : "Recover an untitled project"
             alert.informativeText = atLaunch
-                ? "MPCut kept \(files.count == 1 ? "an untitled project" : "\(files.count) untitled projects") that \(files.count == 1 ? "was" : "were") not saved. Choose a draft by its last edit time, or recover it later with File → Recover Untitled Project…."
-                : "Choose a draft by its last edit time."
-            let choices = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 340, height: 28))
-            choices.toolTip = "Choose project draft"
-            for file in files {
-                let date = try file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
-                let label = date?.formatted(date: .abbreviated, time: .standard) ?? "Unknown edit time"
-                choices.addItem(withTitle: "\(label) (\(file.deletingLastPathComponent().lastPathComponent.prefix(8)))")
-            }
+                ? "MPCut kept \(files.count == 1 ? "an untitled project" : "\(files.count) untitled projects") that \(files.count == 1 ? "was" : "were") not saved. Choose a draft by its first recording and when it was last edited. File → Recover Untitled Project… recovers drafts later too."
+                : "Choose a draft by its first recording and when it was last edited."
+            let choices = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 360, height: 28))
+            choices.toolTip = "Choose a draft by its first recording and when it was last edited."
+            choices.setAccessibilityLabel("Draft")
+            choices.setAccessibilityIdentifier("draft-recovery.drafts")
+            let labels = Self.draftLabels(try files.map { file in
+                (project: try? CutProject.load(from: file),
+                 edited: try file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+            })
+            // Each title is unique: a pop-up button drops an item whose title is already listed.
+            for label in labels { choices.addItem(withTitle: label) }
             alert.accessoryView = choices
-            alert.addButton(withTitle: "Recover").toolTip = "Recover selected draft"
-            alert.addButton(withTitle: atLaunch ? "Not Now" : "Cancel").toolTip = "Cancel draft recovery"
+            alert.addButton(withTitle: "Recover").toolTip = "Open the chosen draft as an untitled project."
+            alert.addButton(withTitle: atLaunch ? "Not Now" : "Cancel").toolTip = atLaunch
+                ? "Keep the drafts and decide later." : "Keep the drafts and close this dialog."
             let respond: (NSApplication.ModalResponse) -> Void = { [weak self] result in
                 guard result == .alertFirstButtonReturn, files.indices.contains(choices.indexOfSelectedItem) else { return }
                 let file = files[choices.indexOfSelectedItem]

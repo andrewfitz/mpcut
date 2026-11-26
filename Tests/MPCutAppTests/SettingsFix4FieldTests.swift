@@ -10,7 +10,6 @@ import XCTest
 @MainActor
 final class SettingsFix4FieldTests: XCTestCase {
     private typealias S = SettingsFix3Support
-    private typealias A = SettingsFix4AccessibilityTests
 
     // MARK: Item 4. Columns
 
@@ -70,10 +69,11 @@ final class SettingsFix4FieldTests: XCTestCase {
 
     func testHelpNamesEachControlAsItsRowDoes() {
         var gigabytes = 0.0
-        let cache = SettingsNumericField(.cacheLimit, value: Binding(get: { gigabytes }, set: { gigabytes = $0 }),
-                                         in: 0...SettingsStoragePage.cacheLimitMaximumGigabytes, step: 1, unit: "GB", digits: 3)
-        XCTAssertEqual(cache.stepperHelp, "Raise or lower “Limit the shared cache folder” by 1 GB. Range: 0–1000000 GB.")
-        XCTAssertTrue(cache.tooltip.hasPrefix("Type a value for “Limit the shared cache folder”."), cache.tooltip)
+        // Built as the Storage page builds it.
+        let cache = SettingsStoragePage.cacheLimitField(Binding(get: { gigabytes }, set: { gigabytes = $0 }))
+        XCTAssertEqual(cache.stepperHelp, "Raise or lower “Limit the shared cache folder” by 1 GB. Range: 0–\((1_000_000).formatted()) GB.")
+        XCTAssertTrue(cache.tooltip.hasPrefix("Type the most space the shared cache folder may use"), cache.tooltip)
+        XCTAssertTrue(cache.tooltip.hasSuffix("0: no limit."), cache.tooltip)
         XCTAssertFalse(cache.stepperHelp.contains("Adjust"))
 
         // The Restore dialog names rows by their titles.
@@ -137,19 +137,20 @@ final class SettingsFix4FieldTests: XCTestCase {
         defer { window.close() }
         S.spin(0.3)
         let fields = S.editableFields(host)
-        XCTAssertEqual(fields.count, 4)
+        guard fields.count == 4 else { return XCTFail("Four fields, found \(fields.count)") }
         let before = fields.map { $0.convert($0.bounds, to: host) }
         try commit("50", into: fields[0], in: window)
         XCTAssertEqual(preferences.trackLabelWidth, 106)
         XCTAssertEqual(reveals(host).count, 1, "The notice shows")
         let after = fields.map { $0.convert($0.bounds, to: host) }
         XCTAssertEqual(after, before, "No field moves while the notice shows")
-        // The notice sits just below its field, ending where the field's row of controls ends, and is drawn by the page,
-        // so the grouped section around the last row of a section cannot clip it.
+        // The page draws the notice, so the grouped section around the last row of a section cannot clip it. With room
+        // between the title and the field it sits on the field's line, just left of the field, over nothing.
         let notice = try XCTUnwrap(notices(host).first, "The page draws the notice")
-        XCTAssertGreaterThanOrEqual(notice.minY, after[0].maxY, "\(notice) is below the field \(after[0])")
-        XCTAssertLessThan(notice.minY - after[0].maxY, 12)
-        XCTAssertGreaterThan(notice.maxX, after[0].maxX, "Its trailing edge is the stepper's, right of the number")
+        XCTAssertEqual(notice.midY, after[0].midY, accuracy: 1, "\(notice) is on the line of the field \(after[0])")
+        XCTAssertLessThanOrEqual(notice.maxX, after[0].minX - SettingsNoticePlacement.gap + 0.5, "Left of the field")
+        let title = (SettingsRow.trackLabelWidth.title as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: NSFont.systemFontSize)])
+        XCTAssertGreaterThan(notice.minX, title.width + 20, "Clear of the title “\(SettingsRow.trackLabelWidth.title)”")
 
         // Scrolling the page carries the notice with its field.
         let scroll = try XCTUnwrap(S.descendants(host).compactMap { $0 as? NSScrollView }.first { $0.documentView != nil })
@@ -160,6 +161,22 @@ final class SettingsFix4FieldTests: XCTestCase {
         let field = fields[0].convert(fields[0].bounds, to: host)
         let moved = try XCTUnwrap(notices(host).first)
         XCTAssertEqual(moved.minY - field.maxY, notice.minY - after[0].maxY, accuracy: 1, "The notice follows its field")
+    }
+
+    func testANoticeWithNoRoomBesideItsFieldSitsBelowIt() throws {
+        let preferences = EditorPreferences()
+        // Too narrow for “Limited to 106–360 pt.” between “Multicam track label width” and its field.
+        let (window, host) = S.window(Column(preferences: preferences), size: NSSize(width: 400, height: 500))
+        window.makeKeyAndOrderFront(nil)
+        defer { window.close() }
+        S.spin(0.3)
+        let field = try XCTUnwrap(S.editableFields(host).first)
+        try commit("50", into: field, in: window)
+        let frame = field.convert(field.bounds, to: host)
+        let notice = try XCTUnwrap(notices(host).first, "The page draws the notice")
+        XCTAssertGreaterThanOrEqual(notice.minY, frame.maxY, "\(notice) is below the field \(frame)")
+        XCTAssertLessThan(notice.minY - frame.maxY, 12)
+        XCTAssertGreaterThan(notice.maxX, frame.maxX, "Its trailing edge is the stepper's, right of the number")
     }
 
     func testANoticeNearTheBottomScrollsJustEnoughToShow() throws {
@@ -192,7 +209,7 @@ final class SettingsFix4FieldTests: XCTestCase {
     // MARK: Item 3. Transcriberrr
 
     func testAFinishedCheckIsKeptUntilTheHelperLocationChanges() async throws {
-        var probes = 0
+        let probes = ProbeCount()
         let data = try JSONSerialization.data(withJSONObject: ["version": "0.4.0", "engines": [
             ["name": "qwen3", "included": true, "default_model": "m", "minimum_macos": "14.0", "diarization": true]]])
         let status = TranscriberrrStatus(locate: { URL(fileURLWithPath: $0.isEmpty ? "/x/transcriberrr" : $0) },
@@ -208,15 +225,15 @@ final class SettingsFix4FieldTests: XCTestCase {
         status.follow(helperPath: "/other/transcriberrr", automatically: false)
         XCTAssertEqual(status.state, .unchecked, "A result for another helper is dropped")
 
-        let counting = TranscriberrrStatus(locate: { URL(fileURLWithPath: $0) }, probe: { _ in probes += 1; return data })
+        let counting = TranscriberrrStatus(locate: { URL(fileURLWithPath: $0) }, probe: { _ in probes.add(); return data })
         counting.follow(helperPath: "/a/transcriberrr", automatically: true)
         await counting.waitForCheck()
         counting.follow(helperPath: "/a/transcriberrr", automatically: true)
         await counting.waitForCheck()
-        XCTAssertEqual(probes, 1, "A real app checks again only when the location changes")
+        XCTAssertEqual(probes.value, 1, "A real app checks again only when the location changes")
         counting.follow(helperPath: "/b/transcriberrr", automatically: true)
         await counting.waitForCheck()
-        XCTAssertEqual(probes, 2)
+        XCTAssertEqual(probes.value, 2)
     }
 
     func testTheWindowKeepsTheLastCheckAcrossPageChanges() throws {
@@ -228,11 +245,11 @@ final class SettingsFix4FieldTests: XCTestCase {
         defer { window.close() }
         S.spin(0.4)
         func statusText() -> String {
-            let element = A.elements(host).first { $0.identifier == "settings.transcripts.transcriberrr.status" }
+            let element = S.accessibilityElements(of: host).first { $0.identifier == "settings.transcripts.transcriberrr.status" }
             return [element?.label, element?.value].compactMap { $0 }.filter { !$0.isEmpty }.first ?? ""
         }
         XCTAssertEqual(statusText(), "Not checked", "The test host never checks on its own")
-        let check = try XCTUnwrap(A.elements(host).first { $0.identifier == SettingsRow.transcriberrrStatus.id })
+        let check = try XCTUnwrap(S.accessibilityElements(of: host).first { $0.identifier == SettingsRow.transcriberrrStatus.id })
         check.press()
         S.spin(0.5)
         // The helper is missing, so Check finishes at once with that answer. Leave the page and come back: the page is
@@ -262,7 +279,7 @@ final class SettingsFix4FieldTests: XCTestCase {
         S.spin(0.3)
         XCTAssertEqual(field.stringValue, "cache")
         XCTAssertEqual(tables(), 0, "The results replace the sidebar")
-        XCTAssertNotNil(A.elements(host).first { $0.identifier == "settings.result." + SettingsRow.cacheLimit.id })
+        XCTAssertNotNil(S.accessibilityElements(of: host).first { $0.identifier == "settings.result." + SettingsRow.cacheLimit.id })
         field.setAccessibilityValue("")
         S.spin(0.3)
         XCTAssertEqual(tables(), 1, "Clearing the value brings the sidebar back")
@@ -319,7 +336,7 @@ final class SettingsFix4FieldTests: XCTestCase {
             S.spin(0.5)
             XCTAssertEqual(reports.count, settled, "pause \(pause): reports continue after typing stopped")
             XCTAssertLessThan(settled, 12, "pause \(pause): \(settled) reports for ten letters")
-            XCTAssertNotNil(A.elements(host).first { $0.identifier == "settings.result." + SettingsRow.captionCharacters.id },
+            XCTAssertNotNil(S.accessibilityElements(of: host).first { $0.identifier == "settings.result." + SettingsRow.captionCharacters.id },
                             "pause \(pause): the search ran")
         }
     }
@@ -380,11 +397,14 @@ final class SettingsFix4FieldTests: XCTestCase {
 
     // MARK: Items 8 and 10e. Storage
 
-    func testStorePathsWrapBetweenFolderNamesAndKeepEveryCharacter() {
+    /// A selected path copies exactly the path: the text shown holds no invisible break characters.
+    func testAShownPathHoldsOnlyThePathsCharacters() {
         let url = URL(fileURLWithPath: "/Volumes/Cache/Autosave Information/com.example.desktop/.transcript-jobs")
-        let wrapped = StorageUsageSection.wrappingPath(url)
-        XCTAssertEqual(wrapped.replacingOccurrences(of: "\u{200B}", with: ""), StorageUsageSection.displayPath(url))
-        XCTAssertEqual(wrapped.components(separatedBy: "/\u{200B}").count, url.pathComponents.count)
+        let shown = SettingsPath.display(url.path)
+        XCTAssertEqual(shown, url.path)
+        XCTAssertFalse(shown.unicodeScalars.contains { $0.properties.generalCategory == .format }, shown)
+        let home = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/MPCut").path
+        XCTAssertEqual(SettingsPath.display(home), "~/Library/Caches/MPCut")
     }
 
     func testAClearThatRemovedNothingSaysSoOnce() {
@@ -392,4 +412,12 @@ final class SettingsFix4FieldTests: XCTestCase {
         XCTAssertEqual(StorageUsageSection.title(empty), "Nothing removed from generated stills")
         XCTAssertEqual(StorageUsageSection.summary(empty.result, left: empty.left), "")
     }
+}
+
+/// A count the helper probe, which runs off the main actor, adds to.
+private final class ProbeCount: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    var value: Int { lock.withLock { count } }
+    func add() { lock.withLock { count += 1 } }
 }

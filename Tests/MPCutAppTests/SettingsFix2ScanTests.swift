@@ -29,9 +29,12 @@ final class SettingsFix2ScanTests: XCTestCase {
         }
     }
 
-    private func waitUntil(_ seconds: Int = 15, _ condition: () -> Bool) async throws {
+    /// Waits for `condition`, and fails the test when it is still false after `seconds`: a test must not go on to
+    /// check a state it never reached.
+    private func waitUntil(_ seconds: Int = 15, _ condition: () -> Bool, file: StaticString = #filePath, line: UInt = #line) async throws {
         let deadline = ContinuousClock.now + .seconds(seconds)
         while !condition(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertTrue(condition(), "Still waiting after \(seconds) s", file: file, line: line)
     }
 
     private func sourceID(_ model: EditorModel, _ url: URL) throws -> UUID {

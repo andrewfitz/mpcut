@@ -103,11 +103,31 @@ struct SettingsFootnote: View {
     init(_ text: String) { self.text = text }
 
     var body: some View {
-        Text(text)
+        Text(Self.attributed(text))
             .multilineTextAlignment(.leading)
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
             // Start on the rows' text, not the group's edge.
             .padding(.horizontal, 10)
+    }
+
+    /// The footnote's text: inline Markdown only, so a flag written as `--files-only` shows as code. Code never breaks
+    /// across lines: an invisible word joiner (U+2060) between its characters keeps a flag such as `--files-only` whole,
+    /// where a line would otherwise break after its hyphens.
+    static func attributed(_ text: String) -> AttributedString {
+        guard let parsed = try? AttributedString(markdown: text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)) else {
+            return AttributedString(text)
+        }
+        var result = AttributedString()
+        for run in parsed.runs {
+            let piece = AttributedString(parsed[run.range])
+            if run.inlinePresentationIntent?.contains(.code) == true {
+                let joined = String(piece.characters).map(String.init).joined(separator: "\u{2060}")
+                result += AttributedString(joined, attributes: run.attributes)
+            } else {
+                result += piece
+            }
+        }
+        return result
     }
 }

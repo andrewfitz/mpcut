@@ -395,21 +395,23 @@ final class TranscriptRecognitionClaims {
     }()
 
     static func directory() throws -> URL {
-        let root: URL
-        // Read the override on each call. A test sets it for itself and for the processes
-        // it starts, which must exchange results in the same folder.
-        if let path = getenv("MPCUT_TRANSCRIPT_CLAIMS_HOME").map({ String(cString: $0) }), path.hasPrefix("/") {
-            root = URL(fileURLWithPath: path, isDirectory: true)
-        } else if let testDirectory {
-            root = testDirectory
-        } else {
-            root = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
-                                               appropriateFor: nil, create: true)
-                .appendingPathComponent("MPCut/Transcript Claims", isDirectory: true)
-        }
+        let root = try location()
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
         return root
+    }
+
+    /// Where `directory()` is, without creating anything, for a caller that only shows or measures it.
+    static func location() throws -> URL {
+        // Read the override on each call. A test sets it for itself and for the processes
+        // it starts, which must exchange results in the same folder.
+        if let path = getenv("MPCUT_TRANSCRIPT_CLAIMS_HOME").map({ String(cString: $0) }), path.hasPrefix("/") {
+            return URL(fileURLWithPath: path, isDirectory: true)
+        }
+        if let testDirectory { return testDirectory }
+        return try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                           appropriateFor: nil, create: false)
+            .appendingPathComponent("MPCut/Transcript Claims", isDirectory: true)
     }
 
     func acquire(_ ids: Set<String>, cancelled: () -> Bool) throws {

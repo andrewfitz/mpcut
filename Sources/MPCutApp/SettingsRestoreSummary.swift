@@ -17,10 +17,10 @@ enum SettingsRestoreSummary {
 
         var lead: String {
             switch self {
-            case .now: "Changes at once, also in open projects:"
-            case .nextUse: "Used the next time it is needed, also in open projects:"
-            case .newWindows: "Used by windows opened from now on:"
-            case .nextLaunch: "Used at the next launch:"
+            case .now: "At once, in open projects too:"
+            case .nextUse: "The next time each is used, in open projects too:"
+            case .newWindows: "In windows you open from now on:"
+            case .nextLaunch: "The next time MPCut opens:"
             }
         }
     }
@@ -92,7 +92,8 @@ enum SettingsRestoreSummary {
         Key.transcriptDefaultSpeakerIdentificationEnabled.rawValue: .init(SettingsRow.speakers.title, .nextUse),
         Key.transcriptDefaultModelDownloadEnabled.rawValue: .init(SettingsRow.downloads.title, .nextUse),
         Key.transcriptFollowPlaybackDefaultEnabled.rawValue: .init(SettingsRow.followPlayback.title, .newWindows),
-        Key.transcriptReaderTextSizePoints.rawValue: .init(SettingsRow.readerTextSize.title, .newWindows),
+        // Each transcript pane reads it when it opens, so it reaches panes opened afterwards in open windows too.
+        Key.transcriptReaderTextSizePoints.rawValue: .init(SettingsRow.readerTextSize.title, .nextUse),
         Key.transcriptEditDefaultBoundaryPolicy.rawValue: .init(SettingsRow.boundary.title, .nextUse),
         Key.transcriptTightenDefaultRetainedPauseSeconds.rawValue: .init(SettingsRow.retainedPause.title, .nextUse),
         Key.transcriptDefaultFillerTerms.rawValue: .init(SettingsRow.fillerTerms.title, .nextUse),
@@ -122,13 +123,13 @@ enum SettingsRestoreSummary {
         Key.draftRetentionDays.rawValue: .init(SettingsRow.draftRetention.title, .nextLaunch)
     ]
 
-    /// What Restore Defaults leaves alone on a page, because its reset reaches beyond Settings.
+    /// What Restore Defaults leaves alone on a page, because its reset reaches beyond Settings. Automation has no
+    /// Restore Defaults button, so it needs no sentence.
     static func kept(on page: SettingsPage) -> String? {
         switch page {
-        case .general: "The undo limit keeps its value."
-        case .storage: "The cutcache location keeps its value."
-        case .automation: "Local MCP control and the agent permissions keep their values."
-        case .editing, .playback, .media, .transcripts, .export: nil
+        case .general: "“\(SettingsRow.historyLimit.title)” keeps its value."
+        case .storage: "“\(SettingsRow.cutcacheLocation.title)” keeps its value."
+        case .editing, .playback, .media, .transcripts, .export, .automation: nil
         }
     }
 
@@ -139,30 +140,40 @@ enum SettingsRestoreSummary {
 
     static func title(for page: SettingsPage) -> String { "Restore \(page.title) settings to their defaults?" }
 
-    /// Names every value on the page that differs from its factory value, grouped by when the change takes effect.
+    /// Names every value on the page that differs from its factory value, one paragraph for each time the change takes
+    /// effect, each name quoted as its row shows it. A value MPCut was opened with on the command line returns at the
+    /// next launch, so the dialog says so for each such value it would restore.
     @MainActor static func message(for page: SettingsPage, preferences: EditorPreferences) -> String {
         var names: [Reach: [String]] = [:]
+        var launchArguments: [String] = []
         for factory in EditorPreferences.factories where factory.page == page && !factory.isCurrent(preferences) {
             let entry = entries[factory.key] ?? Entry(factory.key, .now)
             if names[entry.reach]?.contains(entry.name) != true { names[entry.reach, default: []].append(entry.name) }
+            if preferences.hasLaunchArgument(factory.key), !launchArguments.contains(entry.name) { launchArguments.append(entry.name) }
         }
-        var sentences: [String] = []
+        var paragraphs: [String] = []
         if names.isEmpty {
-            sentences.append("Every value on this page already has its factory value.")
+            paragraphs.append("Every setting on this page already has its factory value.")
         }
         for reach in Reach.allCases {
             guard let list = names[reach] else { continue }
-            var sentence = reach.lead + " " + listed(list) + "."
-            if reach == .nextUse { sentence += " Sheets and panels that are already open keep their choices." }
-            sentences.append(sentence)
+            var paragraph = reach.lead + "\n" + listed(list) + "."
+            if reach == .nextUse { paragraph += "\nSheets and panels that are already open keep their choices." }
+            paragraphs.append(paragraph)
         }
-        if let kept = kept(on: page) { sentences.append(kept) }
-        sentences.append("A value supplied as a launch argument applies again at the next launch.")
-        return sentences.joined(separator: " ")
+        if let kept = kept(on: page) { paragraphs.append(kept) }
+        if !launchArguments.isEmpty {
+            let one = launchArguments.count == 1
+            paragraphs.append("MPCut was opened from the command line with " + listed(launchArguments) + " set, so "
+                              + (one ? "that setting returns" : "those settings return") + " the next time MPCut opens that way.")
+        }
+        return paragraphs.joined(separator: "\n\n")
     }
 
+    /// Names in a sentence, each quoted, so a title that itself contains “and” still reads as one name.
     static func listed(_ names: [String]) -> String {
-        guard let last = names.last else { return "" }
-        return names.count == 1 ? last : names.dropLast().joined(separator: ", ") + " and " + last
+        let quoted = names.map { "“" + $0 + "”" }
+        guard let last = quoted.last else { return "" }
+        return quoted.count == 1 ? last : quoted.dropLast().joined(separator: ", ") + " and " + last
     }
 }

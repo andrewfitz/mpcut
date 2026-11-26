@@ -27,19 +27,19 @@ final class SettingsFix3RestoreTests: XCTestCase {
         preferences.offersDraftRecovery = true
         preferences.historyLimit = 10
         let general = SettingsRestoreSummary.message(for: .general, preferences: preferences)
-        XCTAssertTrue(general.contains("Changes at once, also in open projects: Recent items."), general)
-        XCTAssertTrue(general.contains("Used at the next launch: Offer to recover untitled projects at launch."), general)
-        XCTAssertTrue(general.contains("The undo limit keeps its value."), general)
+        XCTAssertTrue(general.contains("At once, in open projects too:\n“Recent items”."), general)
+        XCTAssertTrue(general.contains("The next time MPCut opens:\n“Offer to recover untitled projects at launch”."), general)
+        XCTAssertTrue(general.hasSuffix("“Maximum undo and redo steps” keeps its value."), general)
         XCTAssertFalse(general.contains("Warn when"), "A value already at its factory value is not named")
-        XCTAssertTrue(general.hasSuffix("A value supplied as a launch argument applies again at the next launch."))
+        XCTAssertFalse(general.contains("launch argument"), "Nothing came from the command line")
 
         preferences.snapTarget = .silence
         preferences.stillDuration = 3
         preferences.showsCutSections = false
         let editing = SettingsRestoreSummary.message(for: .editing, preferences: preferences)
-        XCTAssertTrue(editing.contains("Changes at once, also in open projects: Snap to."), editing)
-        XCTAssertTrue(editing.contains("Used the next time it is needed, also in open projects: Inserted still duration."), editing)
-        XCTAssertTrue(editing.contains("Used by windows opened from now on: Show cut sections in new windows."), editing)
+        XCTAssertTrue(editing.contains("At once, in open projects too:\n“Snap to”."), editing)
+        XCTAssertTrue(editing.contains("The next time each is used, in open projects too:\n“Inserted still duration”."), editing)
+        XCTAssertTrue(editing.contains("In windows you open from now on:\n“Show cut sections in new windows”."), editing)
 
         // After restoring, the dialog's names are exactly what changed back.
         SettingsRestoreDefaults.restore(.general, preferences: preferences)
@@ -148,8 +148,8 @@ final class SettingsFix3RestoreTests: XCTestCase {
     func testStorePathsAreAbbreviatedWithATilde() {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let url = home.appendingPathComponent("Library/Caches/MPCut/GeneratedStills-v1")
-        XCTAssertEqual(StorageUsageSection.displayPath(url), "~/Library/Caches/MPCut/GeneratedStills-v1")
-        XCTAssertEqual(StorageUsageSection.displayPath(URL(fileURLWithPath: "/Volumes/Cache")), "/Volumes/Cache")
+        XCTAssertEqual(SettingsPath.display(url.path), "~/Library/Caches/MPCut/GeneratedStills-v1")
+        XCTAssertEqual(SettingsPath.display("/Volumes/Cache"), "/Volumes/Cache")
     }
 
     func testTheHelperPanelStartsSomewhereSensible() {

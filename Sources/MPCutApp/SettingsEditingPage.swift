@@ -9,25 +9,26 @@ struct SettingsEditingPage: View {
             Section {
                 SnapTargetPicker(selection: $preferences.snapTarget)
                     .settingsRow(.snapTarget)
+                    .help("Choose what edits in the timeline snap to.")
                 Toggle(SettingsRow.sourceTicks.title, isOn: $preferences.sourceTimeTicks)
                     .settingsRow(.sourceTicks)
-                    .help("Show the original recording time inside each clip")
+                    .help("Show the original recording’s time inside each clip in the timeline.")
                 Toggle(SettingsRow.largePreviews.title, isOn: $preferences.largeThumbnails)
                     .settingsRow(.largePreviews)
-                    .help("Show larger thumbnails and waveforms in the timeline")
+                    .help("Show larger thumbnails and waveforms in the timeline.")
                 Toggle(SettingsRow.cutSections.title, isOn: $preferences.showsCutSections)
                     .settingsRow(.cutSections)
-                    .help("Start new windows with cut sections showing")
+                    .help("Start new windows with the sections you cut showing in the timeline.")
                 Picker(SettingsRow.timeDisplay.title, selection: $preferences.timeDisplay) {
                     Text("Milliseconds").tag(TimelineTimeDisplay.milliseconds)
                     Text("Frames").tag(TimelineTimeDisplay.frames)
                 }
                 .settingsRow(.timeDisplay)
-                .help("Show times as milliseconds or frames")
+                .help("Show times in the timeline as milliseconds or as frames.")
             } header: {
                 Text("Timeline")
             } footer: {
-                SettingsFootnote("Frames count at the timeline’s cadence and fall back to milliseconds for audio-only timelines.")
+                SettingsFootnote("Frames count at the timeline’s frame rate. A timeline with only audio, or with a variable, mixed or unconfirmed frame rate, shows milliseconds.")
             }
             Section {
                 Picker(SettingsRow.panelPosition.title, selection: $preferences.fullHeightSidebar) {
@@ -35,7 +36,7 @@ struct SettingsEditingPage: View {
                     Text("Full height").tag(true)
                 }
                 .settingsRow(.panelPosition)
-                .help("Choose whether the transcript and Tiles panel sits above the timeline or runs the full height of the window")
+                .help("Choose whether the transcript and Tiles panel sits above the timeline or runs the full height of the window.")
                 SettingsNumericField(.trackLabelWidth, value: $preferences.trackLabelWidth,
                                      in: EditorPreferences.trackLabelWidthRange, step: 1, unit: "pt", digits: 0,
                                      help: "Type the width of the track label column in multicam timelines")
@@ -54,7 +55,7 @@ struct SettingsEditingPage: View {
                     set: { preferences.gapColor = $0.hexRGB ?? preferences.gapColor }
                 ), supportsOpacity: false)
                 .settingsRow(.gapColor)
-                .help("Choose the starting color of Insert Color Gap and Space Clips")
+                .help("Choose the color Insert Color Gap and Space Clips start with.")
             }
             Section {
                 SettingsNumericField(.stillTimelineWidth, value: $preferences.stillTimelineWidth,
@@ -70,7 +71,7 @@ struct SettingsEditingPage: View {
                     ForEach(EditorPreferences.stillTimelineCodecs, id: \.self) { Text($0.displayName).tag($0) }
                 }
                 .settingsRow(.stillTimelineCodec)
-                .help("Choose the codec of a new stills timeline")
+                .help("Choose the codec of a new stills timeline.")
             } header: {
                 Text("New stills timeline")
             } footer: {

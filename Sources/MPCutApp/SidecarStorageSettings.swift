@@ -52,23 +52,6 @@ private extension SidecarStorageMode {
 }
 
 @MainActor
-private func chooseSidecarFolder(title: String, message: String? = nil, initial: URL? = nil, allowCreation: Bool,
-                                 selected: @escaping (URL) -> Void) {
-    let panel = NSOpenPanel()
-    panel.title = title
-    if let message { panel.message = message }
-    panel.prompt = "Choose"
-    panel.canChooseFiles = false
-    panel.canChooseDirectories = true
-    panel.canCreateDirectories = allowCreation
-    panel.directoryURL = initial
-    // A standalone panel: as a sheet it is wider than the Settings window and hangs off its edge.
-    ProjectPanels.present(panel, in: nil) { accepted in
-        if accepted, let url = panel.url { selected(url) }
-    }
-}
-
-@MainActor
 struct SidecarStorageSettings: View {
     @ObservedObject var preferences: EditorPreferences
     let cacheContext: @MainActor () -> SidecarClearContext
@@ -81,41 +64,55 @@ struct SidecarStorageSettings: View {
     @State private var saving = false
     @State private var showClear = false
     @State private var error: String?
+    /// The window showing this page, so only that window becoming key reads the location again.
+    @State private var window = SettingsHostWindow()
 
     var body: some View {
         Section {
+            // Each control's own title is its one accessibility label. The switch is a plain form switch, like every
+            // other; the pop-up hides its row label from VoiceOver.
             Toggle(SettingsRow.reuseAnalysis.title, isOn: $preferences.useAnalysisSidecars)
-                .accessibilityLabel("Save and reuse analysis")
                 .settingsRow(.reuseAnalysis)
-                .help("Reuse saved media analysis")
-            Picker("Save new cutcaches", selection: Binding(get: { mode }, set: { selectMode($0) })) {
-                ForEach(SidecarStorageMode.allCases, id: \.self) { location in
-                    Text(location.settingsTitle).tag(location)
+                .help("Save the analysis of each recording in a cutcache and reuse it, so MPCut does not scan the recording again.")
+            SettingsLabeledControl(SettingsRow.cutcacheLocation.title) {
+                Picker(SettingsRow.cutcacheLocation.title, selection: Binding(get: { mode }, set: { selectMode($0) })) {
+                    ForEach(SidecarStorageMode.allCases, id: \.self) { location in
+                        Text(location.settingsTitle).tag(location)
+                    }
                 }
+                .disabled(!loaded || saving)
+                .settingsRow(.cutcacheLocation)
+                .help(!loaded ? "Reading where cutcaches are saved…" : saving ? "Saving where cutcaches are saved…"
+                      : "Choose where new cutcaches are saved: next to their media, in the project’s folder or in one shared cache folder.")
             }
-            .disabled(!loaded || saving)
-            .accessibilityLabel("Save new cutcaches")
-            .settingsRow(.cutcacheLocation)
-            .help("Choose whether new cutcaches are saved next to their media or in one shared cache folder")
             if mode == .disk {
                 LabeledContent("Shared cache folder") {
                     VStack(alignment: .trailing, spacing: 3) {
                         if let disk {
-                            Text((disk.path as NSString).abbreviatingWithTildeInPath).lineLimit(1).truncationMode(.middle)
-                                .help(disk.path).accessibilityValue(disk.path)
+                            SettingsPathText(path: disk.path)
+                                .accessibilityIdentifier("settings.storage.shared-cache-folder.path")
                             Label(available ? "Available" : "Unavailable",
                                   systemImage: available ? "checkmark.circle" : "exclamationmark.triangle")
                                 .font(.caption).foregroundStyle(.secondary)
+                                .accessibilityIdentifier("settings.storage.shared-cache-folder.status")
                         } else {
                             Text("No folder chosen").foregroundStyle(.secondary)
+                                .accessibilityIdentifier("settings.storage.shared-cache-folder.none")
                         }
-                        Button(disk == nil ? "Choose Folder…" : "Change Folder…", action: chooseDisk).disabled(saving)
+                        Button(disk == nil ? "Choose Folder…" : "Change Folder…", action: chooseDisk)
+                            .disabled(saving)
+                            .accessibilityIdentifier("settings.storage.shared-cache-folder.choose")
+                            .help(saving ? "Saving where cutcaches are saved…"
+                                  : "Choose the shared cache folder, usually on a cache disk, where every project saves new cutcaches.")
                     }
                 }
             }
-            Button(SettingsRow.clearCutcaches.title) { showClear = true }
-                .settingsRow(.clearCutcaches)
-                .help("Choose which saved analysis cutcaches to remove")
+            HStack {
+                Spacer()
+                Button(SettingsRow.clearCutcaches.title) { showClear = true }
+                    .settingsRow(.clearCutcaches)
+                    .help("Choose which cutcaches to remove. Nothing is removed until you confirm.")
+            }
         } header: {
             Text("Analysis cutcaches")
         } footer: {
@@ -128,10 +125,13 @@ struct SidecarStorageSettings: View {
         }
         .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didMountNotification)) { _ in refreshID = UUID() }
         .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didUnmountNotification)) { _ in refreshID = UUID() }
-        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in refreshID = UUID() }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { note in
+            if let shown = window.window, note.object as? NSWindow === shown { refreshID = UUID() }
+        }
+        .background(SettingsHostWindowReader(holder: window))
         .onReceive(NotificationCenter.default.publisher(for: .sidecarStorageDidChange)) { _ in refreshID = UUID() }
         .sheet(isPresented: $showClear) { SidecarClearSheet(context: cacheContext) }
-        .alert("Couldn’t Save Cutcache Location", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
+        .alert("Couldn’t save where cutcaches are saved", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
             Button("OK") { error = nil }
         } message: { Text(error ?? "") }
     }
@@ -141,7 +141,7 @@ struct SidecarStorageSettings: View {
         switch mode {
         case .media: return reads
         case .project: return "Save the project to write new analysis to its folder. " + reads
-        case .disk where !available: return "Reconnect the disk or change the shared folder to save new analysis. " + reads
+        case .disk where !available: return "Reconnect the disk or change the shared cache folder to save new analysis. " + reads
         case .disk: return "All projects save new analysis to this folder. " + reads
         }
     }
@@ -150,8 +150,10 @@ struct SidecarStorageSettings: View {
         SidecarLocations.settingsSnapshot()
     }
 
+    /// Shows the location read from disk. Editors hear about a change only after the first read: the page starts from
+    /// placeholder values, and every visit builds it anew, so the first read is no change.
     private func apply(_ state: (mode: SidecarStorageMode, disk: URL?, available: Bool)) {
-        let changed = mode != state.mode || disk != state.disk || available != state.available
+        let changed = loaded && (mode != state.mode || disk != state.disk || available != state.available)
         mode = state.mode
         disk = state.disk
         available = state.available
@@ -170,9 +172,9 @@ struct SidecarStorageSettings: View {
     }
 
     private func chooseDisk() {
-        chooseSidecarFolder(title: "Choose a cache folder for all projects",
+        SettingsPath.choose(title: "Choose the shared cache folder",
                             message: "Choose a folder, usually on a cache disk, where every project saves new cutcaches.",
-                            initial: disk, allowCreation: true) { folder in
+                            canCreateFolders: true, startingIn: disk) { folder in
             saveLocation { try SidecarLocations.chooseDisk(folder, selecting: true) }
         }
     }
@@ -295,7 +297,7 @@ private struct SidecarClearSheet: View {
             .onChange(of: scope) { _, _ in root = nil }
             Spacer()
             Button("Scan Folder…") {
-                chooseSidecarFolder(title: "Find cutcaches in a folder", allowCreation: false) { url in
+                SettingsPath.choose(title: "Find cutcaches in a folder") { url in
                     folders.removeAll { $0 == url }
                     folders.append(url)
                     loading = true
@@ -459,7 +461,31 @@ private struct SidecarClearSheet: View {
         "\(count) \(count == 1 ? "cutcache" : "cutcaches")"
     }
 
-    private func size(_ bytes: Int64) -> String {
-        bytes == 0 ? "0 bytes" : ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    private func size(_ bytes: Int64) -> String { SettingsPath.size(bytes) }
+}
+
+/// Holds the window a Settings view is shown in, without making the view update when it is set.
+@MainActor final class SettingsHostWindow {
+    weak var window: NSWindow?
+}
+
+/// Finds the window this view is shown in.
+struct SettingsHostWindowReader: NSViewRepresentable {
+    let holder: SettingsHostWindow
+
+    func makeNSView(context: Context) -> Reader { Reader(holder: holder) }
+    func updateNSView(_ view: Reader, context: Context) { holder.window = view.window }
+
+    final class Reader: NSView {
+        let holder: SettingsHostWindow
+        init(holder: SettingsHostWindow) {
+            self.holder = holder
+            super.init(frame: .zero)
+        }
+        required init?(coder: NSCoder) { nil }
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            holder.window = window
+        }
     }
 }

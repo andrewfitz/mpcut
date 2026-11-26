@@ -9,13 +9,13 @@ struct SettingsMediaPage: View {
             Section {
                 Toggle(SettingsRow.watchMedia.title, isOn: $preferences.automaticallyRefreshMedia)
                     .settingsRow(.watchMedia)
-                    .help("Refresh project media when a recording changes")
+                    .help("Watch the recordings in open projects and refresh a recording when its file changes.")
                 Toggle(SettingsRow.sceneAutoScan.title, isOn: $preferences.autoScanScenes)
                     .settingsRow(.sceneAutoScan)
-                    .help("Find scenes in each recording you add")
+                    .help("Find scenes in each recording you add to a project.")
                 Toggle(SettingsRow.silenceAutoScan.title, isOn: $preferences.autoScanSilence)
                     .settingsRow(.silenceAutoScan)
-                    .help("Find pauses in each recording you add")
+                    .help("Find pauses in each recording you add to a project.")
             } header: {
                 Text("Media")
             } footer: {
@@ -23,11 +23,12 @@ struct SettingsMediaPage: View {
             }
             Section {
                 SettingsNumericField(.minimumPause, value: $preferences.minimumPause,
-                                     in: 1.0 / Double(AudioWaveform.rate)...Double.greatestFiniteMagnitude, step: 0.1, unit: "s",
+                                     in: EditorPreferences.minimumPauseRange, step: 0.1, unit: "s",
                                      help: "Type the shortest quiet stretch that counts as a pause")
-                SettingsNumericField(.maxBlip, value: $preferences.maxBlip, in: 0...1, step: 0.02, unit: "s",
-                                     help: "Count a brief sound between quiet stretches as part of one pause. Set to 0 to keep every interruption.")
-                SettingsNumericField(.padding, value: $preferences.padding, in: 0...Double.greatestFiniteMagnitude, step: 0.05, unit: "s",
+                SettingsNumericField(.maxBlip, value: $preferences.maxBlip, in: EditorPreferences.maxBlipRange, step: 0.02, unit: "s",
+                                     help: "Type the longest sound between two quiet stretches that still counts as part of one pause",
+                                     zeroMeaning: "Every sound ends a pause")
+                SettingsNumericField(.padding, value: $preferences.padding, in: EditorPreferences.paddingRange, step: 0.05, unit: "s",
                                      help: "Type the silence to keep on each side of a cut")
             } header: {
                 Text("Silence")
@@ -36,10 +37,10 @@ struct SettingsMediaPage: View {
             }
             Section {
                 Picker(SettingsRow.tilesLayout.title, selection: Binding(
-                    get: { Self.offered(preferences.tilesScanLayout) ? preferences.tilesScanLayout : .evenGrid },
+                    get: { Self.shown(preferences.tilesScanLayout) },
                     set: { preferences.tilesScanLayout = $0 }
                 )) {
-                    ForEach(TilesScanLayout.allCases.filter(Self.offered), id: \.self) { layout in
+                    ForEach(Self.layouts, id: \.self) { layout in
                         switch layout {
                         case .videoCall: Text("Video Call").tag(layout)
                         case .cameraMultiview: Text("Camera Multiview").tag(layout)
@@ -48,7 +49,10 @@ struct SettingsMediaPage: View {
                     }
                 }
                 .settingsRow(.tilesLayout)
-                .help("Choose the Find Tiles layout for a recording with no saved layout")
+                // A pop-up with a single item seems broken, so it shows its one layout without opening.
+                .disabled(Self.layouts.count < 2)
+                .help(Self.layouts.count < 2 ? "This build offers Even Grid only: automatic meeting layout detection is unavailable."
+                                             : "Choose the layout Find Tiles starts with for a recording with no saved layout.")
                 SettingsNumericField(.tilesColumns, value: $preferences.tilesScanColumns, in: EditorPreferences.tilesGridRange, step: 1,
                                      help: "Type how many columns of tiles Find Tiles starts with for an even grid")
                 SettingsNumericField(.tilesRows, value: $preferences.tilesScanRows, in: EditorPreferences.tilesGridRange, step: 1,
@@ -59,15 +63,15 @@ struct SettingsMediaPage: View {
                     Text("Sampled").tag(ParticipantSampling.sparse)
                 }
                 .settingsRow(.tilesDetail)
-                .help("Choose how closely Find Tiles reads the recording")
+                .help("Choose how closely Find Tiles reads the recording: adaptive, every frame or sampled.")
             } header: {
                 Text("Find Tiles")
             } footer: {
                 SettingsFootnote(ParticipantAnalysis.isAvailable
                     ? "Applies to a recording with no saved layout. A scanned recording restores its own layout from the project."
-                    : "This build has no TileTrail meeting detector, so Find Tiles offers Even Grid only. A scanned recording restores its own layout from the project.")
+                    : "Automatic meeting layout detection is unavailable, so Find Tiles offers Even Grid only. A scanned recording restores its own layout from the project.")
             }
-            Section("Dialogue switches") {
+            Section {
                 SettingsNumericField(.dialogueHold, value: $preferences.dialogueMinimumHold, in: EditorPreferences.dialogueHoldRange,
                                      step: 0.25, unit: "s", help: "Type the shortest time dialogue switches hold a shot")
                 Picker(SettingsRow.dialogueOverlap.title, selection: $preferences.dialogueOverlap) {
@@ -75,20 +79,30 @@ struct SettingsMediaPage: View {
                     Text("Favor a Visible Speaker").tag(ParticipantDialogueOptions.Overlap.visibleSpeaker)
                 }
                 .settingsRow(.dialogueOverlap)
-                .help("Choose the shot while people talk over each other")
+                .help("Choose which shot dialogue switches show while people talk over each other.")
                 Picker(SettingsRow.dialogueOffscreen.title, selection: $preferences.dialogueOffscreen) {
                     Text("Hold the Shot").tag(ParticipantDialogueOptions.Offscreen.hold)
                     Text("Show Original Gallery").tag(ParticipantDialogueOptions.Offscreen.original)
                     Text("Show a Visible Reaction").tag(ParticipantDialogueOptions.Offscreen.reaction)
                 }
                 .settingsRow(.dialogueOffscreen)
-                .help("Choose the shot while the speaker has no tile")
+                .help("Choose which shot dialogue switches show while the speaker has no tile.")
+            } header: {
+                Text("Dialogue switches")
+            } footer: {
+                SettingsFootnote("Dialogue switches start from these values. You can change them for each recording when you review the switches.")
             }
         }
     }
 
-    /// A build without TileTrail has no Video Call or Camera Multiview layout. The stored value is kept for a build that has one.
-    static func offered(_ layout: TilesScanLayout) -> Bool {
+    /// The layouts this build offers.
+    nonisolated static var layouts: [TilesScanLayout] { TilesScanLayout.allCases.filter(offered) }
+
+    /// The layout the picker shows for a stored one: Even Grid for a layout this build does not offer.
+    nonisolated static func shown(_ layout: TilesScanLayout) -> TilesScanLayout { offered(layout) ? layout : .evenGrid }
+
+    /// A build without the required layout detectors has no Video Call or Camera Multiview layout. The stored value is kept for a build that has one.
+    nonisolated static func offered(_ layout: TilesScanLayout) -> Bool {
         switch layout {
         case .videoCall: ParticipantAnalysis.isAvailable
         case .cameraMultiview: ParticipantAnalysis.supportsFeedLayouts

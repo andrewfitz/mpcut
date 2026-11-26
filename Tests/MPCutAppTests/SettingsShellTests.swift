@@ -11,10 +11,10 @@ final class SettingsShellTests: XCTestCase {
     private var suiteNames: [String] = []
     private var folders: [URL] = []
 
-    override func tearDown() {
+    override func tearDown() async throws {
         for name in suiteNames { UserDefaults().removePersistentDomain(forName: name) }
         for folder in folders { try? files.removeItem(at: folder) }
-        super.tearDown()
+        try await super.tearDown()
     }
 
     private func suite() throws -> UserDefaults {

@@ -104,6 +104,8 @@ public enum GeneratedStillsStore {
 /// every generation by recognition key.
 public enum TranscriptRecognitionStore {
     public static func defaultDirectory() throws -> URL { try TranscriptRecognitionClaims.directory() }
+    /// `defaultDirectory()` without creating it, for showing and measuring the store.
+    public static func defaultLocation() throws -> URL { try TranscriptRecognitionClaims.location() }
 
     /// What the transcription jobs under some job folders can still read back from the shared store.
     struct Retained {

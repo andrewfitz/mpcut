@@ -77,7 +77,7 @@ final class SettingsFix3FieldTests: XCTestCase {
         window.makeKeyAndOrderFront(nil)
         defer { window.close() }
         let fields = S.editableFields(host)
-        XCTAssertEqual(fields.count, 2)
+        guard fields.count == 2 else { return XCTFail("Two fields, found \(fields.count)") }
         let top = EditorPreferences.historyStepRange.upperBound
 
         for (index, text) in [(0, "\(top + 4_500)"), (1, "1.234"), (0, "-5")] {
@@ -142,13 +142,12 @@ final class SettingsFix3FieldTests: XCTestCase {
         XCTAssertEqual(minimum.entry("abc").notice, "Enter a number, 0.02 s or more.")
 
         var gigabytes = 0.0
-        let cache = SettingsNumericField(.cacheLimit, value: Binding(get: { gigabytes }, set: { gigabytes = $0 }),
-                                         in: 0...SettingsStoragePage.cacheLimitMaximumGigabytes, step: 1, unit: "GB",
-                                         digits: SettingsStoragePage.cacheLimitDigits, rangeText: "0–1000000 GB, in steps of 0.001 GB")
+        // Built as the Storage page builds it.
+        let cache = SettingsStoragePage.cacheLimitField(Binding(get: { gigabytes }, set: { gigabytes = $0 }))
         XCTAssertEqual(cache.entry("2.5").value, 2.5)
         XCTAssertNil(cache.entry("2.5").notice)
         XCTAssertEqual(cache.entry("1.2345").notice, "Rounded to 1.235 GB.")
-        XCTAssertEqual(cache.entry("-1").notice, "Limited to 0–1000000 GB, in steps of 0.001 GB.")
+        XCTAssertEqual(cache.entry("-1").notice, "Limited to 0–" + (1_000_000).formatted() + " GB.")
     }
 
     func testACommittedEntryStoresWhatTheFieldThenShows() async throws {
@@ -171,6 +170,7 @@ final class SettingsFix3FieldTests: XCTestCase {
         defer { window.close() }
         let fields = S.editableFields(host)
         XCTAssertEqual(fields.map(\.stringValue), ["172", "1920", "2"])
+        guard fields.count == 3 else { return }
 
         func commit(_ text: String, into field: NSTextField) throws {
             try S.type(text, into: field, in: window)
@@ -192,21 +192,22 @@ final class SettingsFix3FieldTests: XCTestCase {
     func testEachNumericFieldStatesItsRangeAndWhatZeroMeans() {
         var recent = 10
         let items = SettingsNumericField(.recentItems, value: Binding(get: { recent }, set: { recent = $0 }),
-                                         in: EditorPreferences.recentFilesRange, step: 1, help: "Enter how many recent items File → Open Recent lists")
-        XCTAssertEqual(items.tooltip, "Enter how many recent items File → Open Recent lists. Range: 1–30.")
+                                         in: EditorPreferences.recentFilesRange, step: 1, help: "Type how many recent items File → Open Recent lists")
+        XCTAssertEqual(items.tooltip, "Type how many recent items File → Open Recent lists. Range: 1–30.")
         XCTAssertEqual(items.spokenHint, "Range: 1 to 30.")
 
         var width = 1920
         let pixels = SettingsNumericField(.stillTimelineWidth, value: Binding(get: { width }, set: { width = $0 }),
                                           in: EditorPreferences.stillTimelinePixelRange, step: 2, unit: "px")
-        XCTAssertEqual(pixels.tooltip, "Type a value for “Width”. Range: 16–8192 px.")
-        XCTAssertEqual(pixels.spokenHint, "Range: 16 to 8192 px.")
+        let top = (8192).formatted()
+        XCTAssertEqual(pixels.tooltip, "Type a value for “Width”. Range: 16–\(top) px.", "Without help of its own, the tooltip names the row")
+        XCTAssertEqual(pixels.spokenHint, "Range: 16 to \(top) px.")
 
         var days = 0
         let drafts = SettingsNumericField(.draftRetention, value: Binding(get: { days }, set: { days = $0 }),
                                           in: EditorPreferences.draftRetentionRange, step: 1, unit: "days",
                                           zeroMeaning: "Drafts are never removed")
-        XCTAssertEqual(drafts.spokenHint, "Range: 0 to 365 days. 0: Drafts are never removed.")
-        XCTAssertTrue(drafts.tooltip.hasSuffix("Range: 0–365 days. 0: Drafts are never removed."), drafts.tooltip)
+        XCTAssertEqual(drafts.spokenHint, "Range: 0 to 365 days. 0: drafts are never removed.")
+        XCTAssertTrue(drafts.tooltip.hasSuffix("Range: 0–365 days. 0: drafts are never removed."), drafts.tooltip)
     }
 }

@@ -13,7 +13,8 @@ import SwiftUI
 /// whenever something lowers it.
 ///
 /// The hooks also make a click anywhere else in the window end editing: AppKit leaves a text field editing when a click
-/// lands on blank space or on a switch, so a typed number would otherwise stay uncommitted.
+/// lands on blank space or on a switch, so a typed number would otherwise stay uncommitted. A click on Restore
+/// Defaults… is the exception: Restore drops the typed text instead.
 struct SettingsWindowHooks: NSViewRepresentable {
     static let initialSize = NSSize(width: 760, height: 560)
     static let minimumSize = NSSize(width: 640, height: 420)
@@ -102,12 +103,44 @@ struct SettingsWindowHooks: NSViewRepresentable {
         return true
     }
 
-    /// The window's mouse-down monitor. It never consumes the click: the control under it still acts.
+    /// The window's mouse-down monitor. It never consumes the click: the control under it still acts. A click on a
+    /// control that drops typed text, such as Restore Defaults…, leaves the text alone: committing it first would apply
+    /// the number the editor is about to throw away, and some numbers, such as Recent items, cannot be taken back.
     @MainActor static func handle(_ event: NSEvent, in window: NSWindow) -> NSEvent {
-        guard event.window === window, let content = window.contentView else { return event }
+        guard event.window === window, let content = window.contentView,
+              let editor = window.firstResponder as? NSTextView, editor.isFieldEditor else { return event }
+        if dropsTypedText(at: event.locationInWindow, in: window) { return event }
         let point = content.superview.map { $0.convert(event.locationInWindow, from: nil) } ?? event.locationInWindow
         if let clicked = content.hitTest(point) { finishEditing(in: window, clickedView: clicked) }
         return event
+    }
+
+    /// The window's key-down monitor. Esc in a Settings field puts the field's stored value back: the typed text is
+    /// dropped, editing ends with nothing to commit, and the field takes focus again with its value selected. Esc in
+    /// any other field, such as the search field, and Esc that cancels an input method's composition go on as usual.
+    @MainActor static func handleKey(_ event: NSEvent, in window: NSWindow) -> NSEvent? {
+        guard event.window === window, event.keyCode == 53,
+              event.modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting([.capsLock, .function]).isEmpty,
+              let editor = window.firstResponder as? NSTextView, editor.isFieldEditor, !editor.hasMarkedText(),
+              let field = editor.delegate as? NSTextField, !(field is NSSearchField) else { return event }
+        let frame = field.convert(field.bounds, to: nil)
+        guard SettingsEdits.revert(at: NSPoint(x: frame.midX, y: frame.midY), in: window) else { return event }
+        window.makeFirstResponder(nil)
+        DispatchQueue.main.async { [weak window, weak field] in
+            if let window, let field, field.window === window, window.firstResponder === window { window.makeFirstResponder(field) }
+        }
+        return nil
+    }
+
+    /// Whether `point`, in window coordinates, lies on a control marked with `SettingsDropsTypedText`.
+    @MainActor static func dropsTypedText(at point: NSPoint, in window: NSWindow) -> Bool {
+        guard let content = window.contentView else { return false }
+        func search(_ view: NSView) -> Bool {
+            if view is SettingsDropsTypedText.Marker, !view.isHiddenOrHasHiddenAncestor,
+               view.convert(view.bounds, to: nil).contains(point) { return true }
+            return view.subviews.contains(where: search)
+        }
+        return search(content)
     }
 
     final class HookView: NSView {
@@ -135,9 +168,9 @@ struct SettingsWindowHooks: NSViewRepresentable {
             ]
             NotificationCenter.default.addObserver(self, selector: #selector(windowDidBecomeKey(_:)),
                                                    name: NSWindow.didBecomeKeyNotification, object: window)
-            monitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak window] event in
+            monitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown]) { [weak window] event in
                 guard let window else { return event }
-                return SettingsWindowHooks.handle(event, in: window)
+                return event.type == .keyDown ? SettingsWindowHooks.handleKey(event, in: window) : SettingsWindowHooks.handle(event, in: window)
             }
         }
 
@@ -161,5 +194,16 @@ struct SettingsWindowHooks: NSViewRepresentable {
             styleObservation?.invalidate()
             sizeObservations.forEach { $0.invalidate() }
         }
+    }
+}
+
+/// Marks a control whose click must not commit typed text, as the background of that control. SwiftUI draws its
+/// buttons without AppKit views, so the window's mouse-down handling finds the control by this view's frame.
+struct SettingsDropsTypedText: NSViewRepresentable {
+    func makeNSView(context: Context) -> Marker { Marker() }
+    func updateNSView(_ view: Marker, context: Context) {}
+
+    final class Marker: NSView {
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
     }
 }

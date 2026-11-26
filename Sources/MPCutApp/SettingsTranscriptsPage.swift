@@ -12,6 +12,8 @@ struct SettingsTranscriptsPage: View {
     @ObservedObject var preferences: EditorPreferences
     /// Owned by the Settings window when it passes one, so a finished check outlives the page.
     @StateObject private var status: TranscriberrrStatus
+    /// The Transcriberrr app Open Transcriberrr opens, looked up when the helper or its check changes, not on every update.
+    @State private var application: URL?
 
     @MainActor init(preferences: EditorPreferences, status: TranscriberrrStatus? = nil) {
         self.preferences = preferences
@@ -23,41 +25,53 @@ struct SettingsTranscriptsPage: View {
             Section {
                 transcriberrr
                 LabeledContent(SettingsRow.helperLocation.title) {
-                    HStack {
-                        Text(preferences.transcriptHelperPath.isEmpty ? "Automatic"
-                                : (preferences.transcriptHelperPath as NSString).abbreviatingWithTildeInPath)
-                            .lineLimit(1).truncationMode(.middle)
-                            .foregroundStyle(preferences.transcriptHelperPath.isEmpty ? .secondary : .primary)
-                            .help(preferences.transcriptHelperPath.isEmpty ? "MPCut finds the helper inside Transcriberrr.app"
-                                                                          : preferences.transcriptHelperPath)
-                        if !preferences.transcriptHelperPath.isEmpty {
-                            Button("Automatic") { preferences.transcriptHelperPath = "" }
-                                .help("Find Transcriberrr automatically")
+                    VStack(alignment: .trailing, spacing: 4) {
+                        if preferences.transcriptHelperPath.isEmpty {
+                            Text("Automatic").foregroundStyle(.secondary)
+                                .help("MPCut finds the helper inside Transcriberrr.app.")
+                                .accessibilityIdentifier("settings.transcripts.helper.path")
+                        } else {
+                            SettingsPathText(path: preferences.transcriptHelperPath)
+                                .accessibilityIdentifier("settings.transcripts.helper.path")
                         }
-                        Button("Choose…", action: chooseHelper)
-                            .settingsRow(.helperLocation)
-                            .help("Choose the Transcriberrr helper")
+                        HStack {
+                            if !preferences.transcriptHelperPath.isEmpty {
+                                Button("Automatic") { preferences.transcriptHelperPath = "" }
+                                    .accessibilityIdentifier("settings.transcripts.helper.automatic")
+                                    .help("Find Transcriberrr’s helper automatically, inside Transcriberrr.app.")
+                            }
+                            Button(preferences.transcriptHelperPath.isEmpty ? "Choose Helper…" : "Change Helper…", action: chooseHelper)
+                                .settingsRow(.helperLocation)
+                                .help("Choose Transcriberrr’s helper program, the file named transcriberrr inside Transcriberrr.app.")
+                        }
                     }
                 }
-                Picker(SettingsRow.engine.title, selection: $preferences.transcriptEngine) {
-                    ForEach(Self.engineChoices(preferred: preferences.transcriptEngine, catalog: status.catalog), id: \.name) { choice in
-                        Text(choice.label).tag(choice.name).disabled(!choice.selectable)
+                let engines = Self.engineChoices(preferred: preferences.transcriptEngine, catalog: status.catalog)
+                // Each control's own title is its one accessibility label.
+                SettingsLabeledControl(SettingsRow.engine.title) {
+                    Picker(SettingsRow.engine.title, selection: $preferences.transcriptEngine) {
+                        ForEach(engines, id: \.name) { choice in
+                            Text(choice.label).tag(choice.name).disabled(!choice.selectable)
+                        }
                     }
+                    .settingsRow(.engine)
+                    // Until Transcriberrr is checked there is only Automatic, and a pop-up with one item seems broken.
+                    .disabled(engines.count < 2)
+                    .help(engines.count < 2
+                          ? "Press Check to list the engines Transcriberrr offers. Until then, new jobs use Automatic: Qwen3, then the first available engine."
+                          : "Choose the engine new transcription jobs start with. Automatic uses Qwen3, then the first available engine.")
                 }
-                .settingsRow(.engine)
-                .accessibilityLabel(SettingsRow.engine.title)
-                .help("Choose the engine new transcription jobs start with. Automatic uses Qwen3, then the first available engine.")
                 if let reason = status.catalog?.unavailableReason(forPreferred: preferences.transcriptEngine) {
                     Text(reason + " New jobs use Automatic until it is available; the preference is kept.")
-                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                         .accessibilityIdentifier("settings.transcripts.engine.issue")
                 }
                 Toggle(SettingsRow.speakers.title, isOn: $preferences.identifiesSpeakers)
                     .settingsRow(.speakers)
-                    .help("Start new jobs with speaker identification where the engine supports it")
+                    .help("Start new jobs with speaker identification where the engine supports it.")
                 Toggle(SettingsRow.downloads.title, isOn: $preferences.downloadsModels)
                     .settingsRow(.downloads)
-                    .help("Start new jobs and retries with model downloads allowed")
+                    .help("Let new jobs and retries download the models they are missing.")
             } header: {
                 Text("Transcription")
             } footer: {
@@ -66,25 +80,24 @@ struct SettingsTranscriptsPage: View {
             Section("Reader") {
                 Toggle(SettingsRow.followPlayback.title, isOn: $preferences.followsPlayback)
                     .settingsRow(.followPlayback)
-                    .help("Start new windows with the reader following playback")
+                    .help("Start new windows with the reader following playback.")
                 SettingsNumericField(.readerTextSize, value: $preferences.readerTextSize, in: EditorPreferences.readerTextSizeRange,
-                                     step: 1, unit: "pt", digits: 1, help: "Type the text size transcript readers start with in new windows")
+                                     step: 1, unit: "pt", digits: 1, help: "Type the text size transcript panes start with when they open")
             }
-            Section("Editing") {
+            // Named for transcripts, so they do not read as the Editing and Export pages.
+            Section("Transcript editing") {
                 Picker(SettingsRow.boundary.title, selection: $preferences.boundaryPolicy) {
                     Text("Nearest media frame").tag(TranscriptEditRequest.BoundaryPolicy.nearestFrame)
                     Text("Copy-safe boundary").tag(TranscriptEditRequest.BoundaryPolicy.copySafe)
                     Text("Exact requested time").tag(TranscriptEditRequest.BoundaryPolicy.exact)
                 }
                 .settingsRow(.boundary)
-                .help("Choose where transcript edits place their cuts")
+                .help("Choose where transcript edits place their cuts.")
                 SettingsNumericField(.retainedPause, value: $preferences.retainedPause, in: EditorPreferences.retainedPauseRange,
                                      step: 0.05, unit: "s", help: "Type how much of each pause Tighten keeps")
-                TextField(SettingsRow.fillerTerms.title, text: $preferences.fillerTerms, prompt: Text("um, uh, you know"))
-                    .settingsRow(.fillerTerms)
-                    .help("Type the filler terms transcript review starts with, separated by commas")
+                SettingsFillerTermsField(preferences: preferences)
             }
-            Section("Export") {
+            Section("Transcript export") {
                 Picker(SettingsRow.exportFormat.title, selection: $preferences.transcriptExportFormat) {
                     Text("Native JSON").tag(TranscriptFormat.json)
                     Text("Readable text").tag(TranscriptFormat.text)
@@ -92,7 +105,7 @@ struct SettingsTranscriptsPage: View {
                     Text("WebVTT (.vtt)").tag(TranscriptFormat.vtt)
                 }
                 .settingsRow(.exportFormat)
-                .help("Choose the first format Export Transcript offers")
+                .help("Choose the format Export Transcript offers first.")
             }
             Section {
                 SettingsNumericField(.captionCharacters, value: $preferences.captionLineCharacters,
@@ -104,7 +117,7 @@ struct SettingsTranscriptsPage: View {
                                      step: 0.5, unit: "s", help: "Type the longest time one caption stays on screen")
                 Toggle(SettingsRow.captionLabels.title, isOn: $preferences.captionSpeakerLabels)
                     .settingsRow(.captionLabels)
-                    .help("Name the speaker in each caption")
+                    .help("Name the speaker in each caption.")
             } header: {
                 Text("Captions")
             } footer: {
@@ -126,10 +139,12 @@ struct SettingsTranscriptsPage: View {
                     }
                     .disabled(status.state == .checking)
                     .settingsRow(.transcriberrrStatus)
-                    .help("Ask the Transcriberrr helper which engines it offers")
+                    .help(status.state == .checking ? "Transcriberrr is being checked."
+                                                    : "Ask Transcriberrr’s helper which engines it offers.")
                     Button("Open Transcriberrr", action: openTranscriberrr)
-                        .disabled(TranscriberrrStatus.application(helper: helper) == nil)
-                        .help("Open the Transcriberrr app")
+                        .disabled(application == nil)
+                        .accessibilityIdentifier("settings.transcripts.transcriberrr.open")
+                        .help(application == nil ? "Transcriberrr is not installed." : "Open the Transcriberrr app.")
                 }
             }
         }
@@ -137,11 +152,20 @@ struct SettingsTranscriptsPage: View {
             // The window keeps the last result: coming back to the page checks only if the helper location changed.
             status.follow(helperPath: preferences.transcriptHelperPath)
         }
+        .task(id: TranscriberrrLookup(path: preferences.transcriptHelperPath, state: status.state)) {
+            application = TranscriberrrStatus.application(helper: helper)
+        }
     }
 
     private var helper: URL? {
         if case .ready(let helper, _) = status.state { return helper }
         return try? TranscriptJobStore.helperURL(chosen: preferences.transcriptHelperPath)
+    }
+
+    /// What Open Transcriberrr's app depends on.
+    private struct TranscriberrrLookup: Equatable {
+        let path: String
+        let state: TranscriberrrStatus.State
     }
 
     static func statusText(_ state: TranscriberrrStatus.State) -> String {
@@ -163,22 +187,19 @@ struct SettingsTranscriptsPage: View {
         let selectable: Bool
     }
 
-    /// Automatic, the helper's engines, and a saved engine it does not offer, which stays selected and is kept.
+    /// Automatic, the helper's engines, and a saved engine it does not offer, which stays selected and is kept. A saved
+    /// alias of an offered engine selects that engine's own entry, which takes the alias as its tag, so the engine is
+    /// listed once and the saved name is kept.
     static func engineChoices(preferred: String, catalog: TranscriptEngineCatalog?) -> [EngineChoice] {
         var choices = [EngineChoice(name: "", label: "Automatic", selectable: true)]
         for engine in catalog?.engines ?? [] {
-            choices.append(.init(name: engine.name, label: engine.title + (engine.available ? "" : " (unavailable)"),
-                                 selectable: engine.available || engine.answers(to: preferred)))
+            let answers = !preferred.isEmpty && engine.answers(to: preferred)
+            choices.append(.init(name: answers ? preferred : engine.name, label: engine.title + (engine.available ? "" : " (unavailable)"),
+                                 selectable: engine.available || answers))
         }
         if !preferred.isEmpty, !choices.contains(where: { $0.name == preferred }) {
-            let canonical = catalog?.engine(named: preferred)
-            if canonical == nil {
-                choices.append(.init(name: preferred, label: TranscriptEngineCatalog.title(preferred)
-                                     + (catalog == nil ? "" : " (not offered)"), selectable: true))
-            } else {
-                // An alias of an offered engine keeps its own tag so the picker shows it.
-                choices.append(.init(name: preferred, label: TranscriptEngineCatalog.title(preferred), selectable: true))
-            }
+            choices.append(.init(name: preferred, label: TranscriptEngineCatalog.title(preferred)
+                                 + (catalog == nil ? "" : " (not offered)"), selectable: true))
         }
         return choices
     }
@@ -189,19 +210,12 @@ struct SettingsTranscriptsPage: View {
     }
 
     private func chooseHelper() {
-        let panel = NSOpenPanel()
-        panel.title = "Choose the Transcriberrr helper"
-        panel.message = "Choose Transcriberrr’s helper program, the file named transcriberrr inside Transcriberrr.app, in Contents/Helpers."
-        panel.prompt = "Choose"
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
         // The helper lives inside the app bundle, so bundles open like folders here.
-        panel.treatsFilePackagesAsDirectories = true
-        panel.directoryURL = Self.helperPanelFolder(chosen: preferences.transcriptHelperPath)
-        // A standalone panel: as a sheet it is wider than the Settings window and hangs off its edge.
-        ProjectPanels.present(panel, in: nil) { accepted in
-            if accepted, let url = panel.url { preferences.transcriptHelperPath = url.path }
+        SettingsPath.choose(title: "Choose Transcriberrr’s helper",
+                            message: "Choose Transcriberrr’s helper program, the file named transcriberrr inside Transcriberrr.app, in Contents/Helpers.",
+                            files: true, packagesAsFolders: true,
+                            startingIn: Self.helperPanelFolder(chosen: preferences.transcriptHelperPath)) { url in
+            preferences.transcriptHelperPath = url.path
         }
     }
 

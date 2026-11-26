@@ -40,6 +40,13 @@ final class SettingsFix4AccessibilityTests: XCTestCase {
         return [here] + children.flatMap { elements($0, depth: depth + 1) }
     }
 
+    /// Every name VoiceOver reads for an element: its label and its title element's text, whichever are set.
+    static func names(_ element: Element) -> [String] {
+        let title = ask(element.object, "accessibilityTitleUIElement") as? NSObject
+        let titleText = title.flatMap { (ask($0, "accessibilityValue") as? String) ?? (ask($0, "accessibilityLabel") as? String) }
+        return [element.label, titleText ?? ""].filter { !$0.isEmpty }
+    }
+
     /// A label made of the same words twice, such as "Width, Width".
     static func isRepeated(_ label: String) -> Bool {
         let parts = label.components(separatedBy: ", ")
@@ -64,15 +71,23 @@ final class SettingsFix4AccessibilityTests: XCTestCase {
             let (window, host) = S.window(SettingsWindow(preferences: preferences, cacheContext: { SidecarClearContext() },
                                                          storageLocations: locations), size: NSSize(width: 900, height: 2400))
             S.spin(0.4)
-            let elements = Self.elements(host)
-            XCTAssertTrue(elements.contains { $0.role == "AXTextField" || $0.role == "AXPopUpButton" || $0.role == "AXCheckBox" },
-                          "\(page.rawValue): the walk reaches the page's controls")
+            let elements = S.accessibilityElements(of: host)
             for element in elements where Self.isRepeated(element.label) {
                 XCTFail("\(page.rawValue): \(element.role) \(element.identifier) reads “\(element.label)”")
             }
-            // Controls whose second, explicit label was removed still read their row's title.
-            for row in [SettingsRow.volume, .localMCP] where row.page == page {
-                XCTAssertEqual(elements.first { $0.identifier == row.id }?.label, row.title, row.id)
+            // Controls whose second, explicit label was removed read their row's title once, as their own label, with
+            // no title element saying it again.
+            for row in [SettingsRow.volume, .cutcacheLocation, .engine, .container] where row.page == page {
+                let element = elements.first { $0.identifier == row.id }
+                XCTAssertEqual(element?.label, row.title, row.id)
+                XCTAssertEqual(element.map(Self.names), [row.title], row.id)
+            }
+            // Two switches are plain form switches again, like every other: they read their row's title once, through
+            // the row's title, and never have no name.
+            for row in [SettingsRow.localMCP, .reuseAnalysis] where row.page == page {
+                let element = elements.first { $0.identifier == row.id }
+                XCTAssertEqual(element?.role, "AXCheckBox", row.id)
+                XCTAssertEqual(element.map(Self.names), [row.title], row.id)
             }
             for row in Self.numericRows[page] ?? [] {
                 let field = elements.first { $0.identifier == row.id }
@@ -97,7 +112,7 @@ final class SettingsFix4AccessibilityTests: XCTestCase {
         let (window, host) = S.window(Doubled(), size: NSSize(width: 400, height: 200))
         defer { window.close() }
         S.spin(0.4)
-        let field = Self.elements(host).first { $0.role == "AXTextField" }
+        let field = S.accessibilityElements(of: host).first { $0.role == "AXTextField" }
         XCTAssertEqual(field?.label, "Probe title, Probe title")
         XCTAssertTrue(Self.isRepeated(field?.label ?? ""))
     }

@@ -90,10 +90,12 @@ final class StorageInventoryTests: XCTestCase {
     func testMeasurementStopsWhenCancelled() async throws {
         for index in 0..<50 { _ = try write("TranscriptJobs/\(index)/file") }
         XCTAssertThrowsError(try StorageInventory.measure(.transcriptJobs, locations: locations, defaults: nil, cancelled: { true }))
+        let locations = locations!
         let task = Task { try await StorageInventory.size(of: .transcriptJobs, locations: locations, defaults: nil) }
         task.cancel()
         do {
             _ = try await task.value
+            XCTFail("A cancelled measurement finished")
         } catch {
             XCTAssertTrue(error is CancellationError)
         }

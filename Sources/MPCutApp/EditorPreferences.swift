@@ -5,7 +5,7 @@ import MPCutCore
 /// What opening several recordings from Finder does.
 enum MultipleRecordingsAction: String, CaseIterable { case ask, join, multicam }
 enum VideoMonitorPlacement: String, CaseIterable { case otherDisplay = "other_display", lastPosition = "last_position" }
-/// The Find Tiles layout for a recording with no saved layout. A build without TileTrail offers only the even grid.
+/// The Find Tiles layout for a recording with no saved layout. A build without the required layout detectors offers only the even grid.
 enum TilesScanLayout: String, CaseIterable { case videoCall = "video_call", cameraMultiview = "camera_multiview", evenGrid = "even_grid" }
 /// Automatic keeps each editor's own container: MP4 in the sequence editor, MOV in multicam. ProRes is always MOV.
 enum ExportContainerChoice: String, CaseIterable { case automatic, mp4, mov, mkv }
@@ -168,6 +168,8 @@ final class EditorPreferences: ObservableObject {
     private var isLoaded = false
     /// Set while a property observer puts back the value an agent was refused.
     private var isRestoringRefusedWrite = false
+    /// Set while an alert's “Don’t ask again” changes the warning's value.
+    private var isSuppressing = false
     /// Set while a property observer replaces an out-of-range or invalid value. The nested observer returns at once,
     /// so the outer one stores and announces the fixed value once, against the true previous value.
     private var isNormalizing = false
@@ -192,6 +194,10 @@ final class EditorPreferences: ObservableObject {
     }
 
     static let historyStepRange = 0...CutProject.maximumHistorySteps
+    /// The shortest pause is one waveform sample; there is no practical top.
+    static let minimumPauseRange = (1.0 / Double(AudioWaveform.rate))...Double.greatestFiniteMagnitude
+    static let maxBlipRange = 0.0...1
+    static let paddingRange = 0.0...Double.greatestFiniteMagnitude
     static let recentFilesRange = 1...30
     static let trackLabelWidthRange = 106.0...360
     static let stillDurationRange = 0.04...600.0
@@ -214,6 +220,8 @@ final class EditorPreferences: ObservableObject {
     static let proresQualities = ExportRules.qualities(.prores)
     static let sharedCacheLimitRange = 0...Int.max
     static let draftRetentionRange = 0...365
+    /// The most characters of filler terms agents may store, which the Settings field keeps to as well.
+    static let fillerTermsMaximumLength = 4_096
 
     @Published private var storedHistoryLimit = 50
     var historyLimit: Int {
@@ -256,7 +264,8 @@ final class EditorPreferences: ObservableObject {
     /// Ask before an edit made by hand lowers the timeline tier. Nothing recalculates when it changes, so it is only stored.
     @Published var warnBeforeLoweringExportTier = true {
         didSet {
-            if !save(warnBeforeLoweringExportTier, replacing: oldValue, key: .exportTierDowngradeWarningEnabled, change: nil) {
+            if !save(warnBeforeLoweringExportTier, replacing: oldValue, key: .exportTierDowngradeWarningEnabled, change: nil,
+                     warning: .exportTierDowngrade) {
                 warnBeforeLoweringExportTier = oldValue
             }
         }
@@ -276,19 +285,35 @@ final class EditorPreferences: ObservableObject {
             if !save(largeThumbnails, replacing: oldValue, key: .timelineLargePreviewsEnabled, change: .largeThumbnails) { largeThumbnails = oldValue }
         }
     }
+    // The silence values and the volume keep to their ranges themselves, like every newer numeric setting, rather
+    // than relying on each writer to check.
     @Published var maxBlip = AudioWaveform.defaultMaxBlip {
-        didSet { if !save(maxBlip, replacing: oldValue, key: .silenceMaxBlipSeconds, change: .maxBlip) { maxBlip = oldValue } }
+        didSet {
+            guard !isNormalizing else { return }
+            if let fixed = Self.fixed(maxBlip, Self.maxBlipRange, oldValue) { normalize { maxBlip = fixed } }
+            if !save(maxBlip, replacing: oldValue, key: .silenceMaxBlipSeconds, change: .maxBlip) { maxBlip = oldValue }
+        }
     }
     @Published var minimumPause = 1.5 {
         didSet {
+            guard !isNormalizing else { return }
+            if let fixed = Self.fixed(minimumPause, Self.minimumPauseRange, oldValue) { normalize { minimumPause = fixed } }
             if !save(minimumPause, replacing: oldValue, key: .silenceMinPauseSeconds, change: .minimumPause) { minimumPause = oldValue }
         }
     }
     @Published var padding = 0.2 {
-        didSet { if !save(padding, replacing: oldValue, key: .silencePaddingPerSideSeconds, change: .padding) { padding = oldValue } }
+        didSet {
+            guard !isNormalizing else { return }
+            if let fixed = Self.fixed(padding, Self.paddingRange, oldValue) { normalize { padding = fixed } }
+            if !save(padding, replacing: oldValue, key: .silencePaddingPerSideSeconds, change: .padding) { padding = oldValue }
+        }
     }
     @Published var volume: Float = 1 {
-        didSet { if !save(volume, replacing: oldValue, key: .playbackPreviewVolumeFraction, change: .volume) { volume = oldValue } }
+        didSet {
+            guard !isNormalizing else { return }
+            if let fixed = Self.fixed(Double(volume), 0...1, Double(oldValue)) { normalize { volume = Float(fixed) } }
+            if !save(volume, replacing: oldValue, key: .playbackPreviewVolumeFraction, change: .volume) { volume = oldValue }
+        }
     }
     @Published var isMuted = false {
         didSet { if !save(isMuted, replacing: oldValue, key: .playbackPreviewMuted, change: .isMuted) { isMuted = oldValue } }
@@ -309,7 +334,8 @@ final class EditorPreferences: ObservableObject {
     @Published var multipleRecordingsAction = MultipleRecordingsAction.ask {
         didSet {
             if !save(multipleRecordingsAction, replacing: oldValue, key: .openMultipleRecordingsDefaultAction,
-                 stored: multipleRecordingsAction.rawValue, change: .multipleRecordingsAction) { multipleRecordingsAction = oldValue }
+                 stored: multipleRecordingsAction.rawValue, change: .multipleRecordingsAction,
+                 warning: .openMultipleRecordings) { multipleRecordingsAction = oldValue }
         }
     }
     @Published var recentFilesLimit = 10 {
@@ -331,7 +357,8 @@ final class EditorPreferences: ObservableObject {
     }
     @Published var confirmsSceneRescan = true {
         didSet {
-            if !save(confirmsSceneRescan, replacing: oldValue, key: .sceneRescanConfirmationEnabled, change: .confirmsSceneRescan) { confirmsSceneRescan = oldValue }
+            if !save(confirmsSceneRescan, replacing: oldValue, key: .sceneRescanConfirmationEnabled, change: .confirmsSceneRescan,
+                     warning: .sceneRescan) { confirmsSceneRescan = oldValue }
         }
     }
     @Published var showsProjectExportMessage = true {
@@ -890,7 +917,8 @@ final class EditorPreferences: ObservableObject {
         projectMediaLastLocateFolder = text(LocalKey.projectMediaLastLocateFolder.rawValue) ?? ""
         transcriptSuggestedAngles = defaults.object(forKey: LocalKey.transcriptSuggestedAngles.rawValue) as? Data ?? Data()
         let suppressed = (defaults.object(forKey: LocalKey.warningsSuppressed.rawValue) as? [String])?.map(SuppressibleWarning.init(rawValue:))
-        suppressedWarnings = suppressed.flatMap { $0.contains(nil) ? nil : Set($0.compactMap { $0 }) } ?? []
+        // An entry for a warning that asks again, left by a version that did not forget it, silences nothing.
+        suppressedWarnings = (suppressed.flatMap { $0.contains(nil) ? nil : Set($0.compactMap { $0 }) } ?? []).filter { !asks($0) }
         // Published properties invoke their observers during initialization. Enable persistence
         // after loading so argument and registration domains stay temporary.
         self.defaults = defaults
@@ -973,9 +1001,11 @@ final class EditorPreferences: ObservableObject {
         }
     }
 
-    /// “Don't ask again”: turns the warning's Settings value off and records that an alert did it.
+    /// “Don’t ask again”: turns the warning's Settings value off and records that an alert did it.
     /// The Finder alert remembers the choice it was answered with.
     func suppress(_ warning: SuppressibleWarning, choosing action: MultipleRecordingsAction = .ask) {
+        isSuppressing = true
+        defer { isSuppressing = false }
         switch warning {
         case .openMultipleRecordings:
             guard action != .ask else { return }
@@ -984,6 +1014,17 @@ final class EditorPreferences: ObservableObject {
         case .exportTierDowngrade: warnBeforeLoweringExportTier = false
         }
         suppressedWarnings.insert(warning)
+    }
+
+    /// A warning's value changed other than through its alert: the record that an alert silenced it no longer holds.
+    /// A Finder action chosen in Settings, or a switch turned back on, is the editor's own choice, which Reset All
+    /// Warnings keeps; a switch turned back on also leaves nothing to reset.
+    private func forgetSuppression(_ warning: SuppressibleWarning) {
+        guard isLoaded, !isSuppressing, suppressedWarnings.contains(warning) else { return }
+        switch warning {
+        case .openMultipleRecordings: suppressedWarnings.remove(warning)
+        case .sceneRescan, .exportTierDowngrade: if asks(warning) { suppressedWarnings.remove(warning) }
+        }
     }
 
     var hasSuppressedWarnings: Bool {
@@ -1006,17 +1047,26 @@ final class EditorPreferences: ObservableObject {
     struct Factory {
         let key: String
         let page: SettingsPage
+        /// Whether the value is its factory value as the page shows it.
         let isCurrent: @MainActor (EditorPreferences) -> Bool
+        /// Whether the page shows the value now. A hidden value that differs still goes back to its factory value, and
+        /// the dialog names it, but it alone never enables Restore Defaults…, which would then seem to restore nothing.
+        let isShown: @MainActor (EditorPreferences) -> Bool
         let restore: @MainActor (EditorPreferences) -> Void
 
-        init<Value: Equatable>(_ key: Key, _ page: SettingsPage, _ path: ReferenceWritableKeyPath<EditorPreferences, Value>, _ value: Value) {
-            self.init(key.rawValue, page, path, value)
+        init<Value: Equatable>(_ key: Key, _ page: SettingsPage, _ path: ReferenceWritableKeyPath<EditorPreferences, Value>, _ value: Value,
+                               shownAs show: @escaping (Value) -> Value = { $0 }) {
+            self.init(key.rawValue, page, path, value, shownAs: show)
         }
 
-        init<Value: Equatable>(_ key: String, _ page: SettingsPage, _ path: ReferenceWritableKeyPath<EditorPreferences, Value>, _ value: Value) {
+        /// `show` maps a value to the one the page shows for it, where the page cannot show every stored value.
+        init<Value: Equatable>(_ key: String, _ page: SettingsPage, _ path: ReferenceWritableKeyPath<EditorPreferences, Value>, _ value: Value,
+                               shownAs show: @escaping (Value) -> Value = { $0 },
+                               shownWhen isShown: @escaping @MainActor (EditorPreferences) -> Bool = { _ in true }) {
             self.key = key
             self.page = page
-            isCurrent = { $0[keyPath: path] == value }
+            isCurrent = { show($0[keyPath: path]) == show(value) }
+            self.isShown = isShown
             restore = { if $0[keyPath: path] != value { $0[keyPath: path] = value } }
         }
     }
@@ -1064,7 +1114,8 @@ final class EditorPreferences: ObservableObject {
         .init(.silenceMinPauseSeconds, .media, \.minimumPause, 1.5),
         .init(.silenceMaxBlipSeconds, .media, \.maxBlip, AudioWaveform.defaultMaxBlip),
         .init(.silencePaddingPerSideSeconds, .media, \.padding, 0.2),
-        .init(.tilesScanDefaultLayout, .media, \.tilesScanLayout, .videoCall),
+        // A build without the required layout detectors shows Even Grid for a layout it does not offer, the factory Video Call included.
+        .init(.tilesScanDefaultLayout, .media, \.tilesScanLayout, .videoCall, shownAs: SettingsMediaPage.shown),
         .init(.tilesScanDefaultGridColumns, .media, \.tilesScanColumns, 2),
         .init(.tilesScanDefaultGridRows, .media, \.tilesScanRows, 2),
         .init(.tilesScanDefaultDetail, .media, \.tilesScanDetail, .adaptive),
@@ -1097,7 +1148,8 @@ final class EditorPreferences: ObservableObject {
         .init(.exportResultJsonDefaultEnabled, .export, \.savesExportResult, false),
         .init(.resolveSendOpenTimelineDefaultEnabled, .export, \.opensResolveTimeline, true),
         .init(.exportStartFolderMode, .export, \.exportStartFolder, .automatic),
-        .init(LocalKey.exportStartFolderPath.rawValue, .export, \.exportStartFolderPath, ""),
+        .init(LocalKey.exportStartFolderPath.rawValue, .export, \.exportStartFolderPath, "",
+              shownWhen: { $0.exportStartFolder == .chosen }),
         .init(.exportFinishedRevealEnabled, .export, \.revealsFinishedExport, false),
         .init(.exportFinishedNotificationEnabled, .export, \.notifiesFinishedExport, false),
         .init(.exportFinishedSoundEnabled, .export, \.playsFinishedExportSound, false),
@@ -1107,18 +1159,36 @@ final class EditorPreferences: ObservableObject {
         .init(.draftRetentionDays, .storage, \.draftRetentionDays, 0)
     ]
 
-    /// Whether every restorable value on a page already has its factory value.
+    /// Whether every restorable value the page shows already has its factory value.
     func hasFactoryValues(on page: SettingsPage) -> Bool {
-        Self.factories.allSatisfy { $0.page != page || $0.isCurrent(self) }
+        Self.factories.allSatisfy { $0.page != page || !$0.isShown(self) || $0.isCurrent(self) }
     }
 
-    /// Restore Defaults for one page. A value supplied as a launch argument applies again at the next launch.
+    /// Whether MPCut was opened with `key` set on the command line, so a restored value returns at the next launch that
+    /// passes it again. Draft retention and the cache limit never take a launch argument.
+    func hasLaunchArgument(_ key: String) -> Bool {
+        guard key != Key.draftRetentionDays.rawValue, key != Key.analysisSharedCacheMaxBytes.rawValue, let defaults else { return false }
+        return defaults.volatileDomain(forName: UserDefaults.argumentDomain)[key] != nil
+    }
+
+    /// Restore Defaults for one page. A value supplied as a launch argument applies again at the next launch that passes it.
     func restoreDefaults(on page: SettingsPage) {
         for factory in Self.factories where factory.page == page { factory.restore(self) }
     }
 
     /// The one write path for a schedule key. An agent's write is refused here when Let agents change settings is off,
     /// and a read-only key is never agent-writable: nothing is stored, no change is sent and the caller restores the old value.
+    /// `save` for a warning's own value: a stored change other than the alert's, and other than putting back a
+    /// refused value, forgets that the alert silenced the warning.
+    @discardableResult
+    private func save<Value: Equatable>(_ value: Value, replacing oldValue: Value, key: Key, stored: Any? = nil,
+                                        change: Change?, warning: SuppressibleWarning) -> Bool {
+        let restoring = isRestoringRefusedWrite
+        guard save(value, replacing: oldValue, key: key, stored: stored, change: change) else { return false }
+        if value != oldValue, !restoring { forgetSuppression(warning) }
+        return true
+    }
+
     @discardableResult
     private func save<Value: Equatable>(_ value: Value, replacing oldValue: Value,
                                         key: Key, stored: Any? = nil, change: Change?) -> Bool {

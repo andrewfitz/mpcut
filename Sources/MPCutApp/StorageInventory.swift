@@ -25,7 +25,7 @@ enum StoreKind: String, CaseIterable, Sendable {
         case .transcriptRecognition: "Shared with the CLI and Transcriberrr. Clear skips results a transcription is using or a saved transcription job can still reuse."
         case .transcriptJobs: "Guarded by locks and removed after 30 days."
         case .untitledDrafts: "Use File → Recover Untitled Project… to recover or discard drafts."
-        case .suggestedCameras: "Saved for each transcript attachment."
+        case .suggestedCameras: "The camera MPCut suggests for each transcript attachment. Clear forgets the suggestions and changes no transcript."
         case .agentReceipts: "Clearing would break job recovery for a connected agent."
         }
     }
@@ -48,13 +48,13 @@ struct StorageLocations: Sendable {
     var untitledDrafts: URL
     var agentReceipts: URL
 
-    static var standard: Self {
-        Self(generatedStills: GeneratedStillsStore.defaultDirectory,
-             transcriptRecognition: try? TranscriptRecognitionStore.defaultDirectory(),
+    /// Resolved without creating any folder, so a store not created yet shows as such; once per process, because the
+    /// Settings window is rebuilt often and its usage list keeps the locations it started with.
+    static let standard = Self(generatedStills: GeneratedStillsStore.defaultDirectory,
+             transcriptRecognition: try? TranscriptRecognitionStore.defaultLocation(),
              transcriptJobs: [LiveTranscriptController.jobsDirectory, TranscriptJobStore.defaultDirectory],
              untitledDrafts: ProjectDraft.autosaveDirectory,
              agentReceipts: MCPFileReceipts.standalone.root)
-    }
 
     func urls(for kind: StoreKind) -> [URL] {
         switch kind {
