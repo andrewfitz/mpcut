@@ -256,7 +256,7 @@ def describe(schema):
     limits = []
     for key, label in [
         ("minimum", "minimum"), ("maximum", "maximum"),
-        ("exclusiveMinimum", "greater than"), ("exclusiveMaximum", "less than"),
+        ("exclusiveMinimum", "greater than"), ("exclusiveMaximum", "less than"), ("multipleOf", "multiple of"),
         ("minItems", "minimum items"), ("maxItems", "maximum items"),
         ("minLength", "minimum length"), ("maxLength", "maximum length"),
         ("default", "default"), ("format", "format"), ("pattern", "pattern"),

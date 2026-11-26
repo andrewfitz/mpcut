@@ -55,6 +55,34 @@ extension MulticamEditorModel {
         return multicamStillCadence(angle: source.id)
     }
 
+    /// The cadence the timeline read-outs count frames at: the one frame rate every picture angle shares.
+    /// Angles at different rates, or one still being indexed or of variable rate, leave the read-outs in
+    /// milliseconds. Kept until an angle's media changes, because finding it walks every frame.
+    var multicamTimelineCadence: RationalTime? {
+        guard let project else { return nil }
+        let key = project.angles.map { angle in
+            let info = media[angle.id]
+            return MulticamCadenceKey(angle: angle.id, recording: info?.url, hasVideo: info?.hasVideo,
+                                      frames: info?.frames.count ?? 0, rate: info?.videoStream?.frameRate)
+        }
+        if let memo = timelineCadenceMemo, memo.key == key { return memo.cadence }
+        var cadence: RationalTime?
+        for entry in key where entry.hasVideo != false {
+            guard let angle = multicamStillCadence(angle: entry.angle), cadence == nil || cadence == angle else {
+                cadence = nil
+                break
+            }
+            cadence = angle
+        }
+        timelineCadenceMemo = (key, cadence)
+        return cadence
+    }
+
+    /// The Time display setting for this window's timelines. Milliseconds never looks up the cadence.
+    var timelineTimeFormat: TimelineTimeFormat {
+        preferences.timeDisplay == .frames ? TimelineTimeFormat(display: .frames, cadence: multicamTimelineCadence) : .milliseconds
+    }
+
     private func multicamStillCadence(angle id: String) -> RationalTime? {
         guard let info = media[id], info.hasFullEditIndex, let rate = info.videoStream?.frameRate, rate > .zero else {
             return nil
@@ -456,4 +484,12 @@ extension MulticamEditorModel {
                          mediaURL: url, mediaStatus: mediaStatus(for: url))
         }
     }
+}
+
+struct MulticamCadenceKey: Equatable {
+    let angle: String
+    let recording: URL?
+    let hasVideo: Bool?
+    let frames: Int
+    let rate: RationalTime?
 }

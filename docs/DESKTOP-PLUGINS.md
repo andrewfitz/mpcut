@@ -1,6 +1,6 @@
 # Edit with MPCut in a desktop conversation
 
-Install a helper-enabled build of **MPCut.app** in **/Applications** on your Apple Silicon Mac. Launch it and turn on **Settings → General → Automation → Enable local MCP control**. Local control starts off in 2.0, including after an upgrade from 1.x. The desktop plugin starts the helper inside this copy of MPCut. The editor owns the timeline, media, undo history and exports.
+Install a helper-enabled build of **MPCut.app** in **/Applications** on your Apple Silicon Mac. Launch it and turn on **Settings → Automation → Enable local MCP control**. Local control starts off in 2.0, including after an upgrade from 1.x. The desktop plugin starts the helper inside this copy of MPCut. The editor owns the timeline, media, undo history and exports.
 
 ## Install in your desktop app
 

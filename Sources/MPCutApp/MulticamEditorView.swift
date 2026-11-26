@@ -677,7 +677,7 @@ struct MulticamEditorView: View {
     private func markReadout(_ name: String, _ time: RationalTime?) -> some View {
         HStack(spacing: 4) {
             Text(name).foregroundStyle(.secondary)
-            Text(time.map { timelineTime($0.seconds, milliseconds: true) } ?? "—")
+            Text(time.map { model.timelineTimeFormat.string($0.seconds) } ?? "—")
                 .font(.system(size: 12, design: .monospaced))
         }
         .font(.callout)
@@ -972,6 +972,7 @@ private struct MulticamTimelineHost: View {
                          assembly: model.assemblyPreview || inspectingAssembly
                             ? MulticamAssemblyTimeline(model: model, preview: preview, paddingSpans: model.paddingSpans(assembly: true)) : nil)
         timeline.sourceMediaStatus = { model.mediaStatus(for: model.projectMediaURL($0.file)) }
+        timeline.timeFormat = model.timelineTimeFormat
         if let revision = model.timelineOutputRevision {
             timeline.outputThumbnailRevision = revision
             timeline.outputThumbnail = { time, recording, size in

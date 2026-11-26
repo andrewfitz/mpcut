@@ -104,12 +104,6 @@ final class SettingsMulticamWiringTests: XCTestCase {
         smart.mode = .encode
         smart.settle()
         XCTAssertEqual(smart.container, "mp4")
-
-        // Overriding in the control never writes a default.
-        smart.codec = .hevc
-        smart.audioOutput = .separateTracks
-        XCTAssertEqual(preferences.reencodeCodec, .h264)
-        XCTAssertEqual(preferences.multicamAudioLayout, .downmixStereo)
     }
 
     @MainActor

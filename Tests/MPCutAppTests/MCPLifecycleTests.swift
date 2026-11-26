@@ -299,11 +299,15 @@ final class MCPLifecycleTests: XCTestCase {
                 XCTAssertFalse(failure.message.isEmpty)
             }
         }
-        // The schema has no evenness keyword, so the app refuses an odd pixel count itself.
+        // The schema says multipleOf 2, which the app's own validator does not check, so the route refuses an odd count itself.
         do {
             _ = try await preferenceCall(sessions, "preferences_set", ["key": "still_timeline_default_width_pixels", "value": 1921])
             XCTFail("An odd width was accepted")
         } catch let failure as MCPFailure { XCTAssertTrue(failure.message.contains("even"), failure.message) }
+        let valueSchemas = try preferenceValueSchemas(schemas)
+        for key in ["still_timeline_default_width_pixels", "still_timeline_default_height_pixels"] {
+            XCTAssertEqual(valueSchemas[key]?["multipleOf"] as? Int, 2, key)
+        }
         XCTAssertEqual(prefs.recentFilesLimit, 30)
         XCTAssertEqual(prefs.stillTimelineWidth, 3840)
 
@@ -322,14 +326,66 @@ final class MCPLifecycleTests: XCTestCase {
         XCTAssertEqual(prefs.sharedCacheLimitBytes, 0)
     }
 
+    /// Each settable key's value schema, from its conditional branch of `preferences_set`.
+    private func preferenceValueSchemas(_ schemas: MCPSchemas) throws -> [String: [String: Any]] {
+        let input = try XCTUnwrap(schemas.inputs["preferences_set"])
+        var result: [String: [String: Any]] = [:]
+        for branch in input["allOf"] as? [[String: Any]] ?? [] {
+            guard let key = ((branch["if"] as? [String: Any])?["properties"] as? [String: Any])
+                    .flatMap({ ($0["key"] as? [String: Any])?["const"] as? String }),
+                  let value = ((branch["then"] as? [String: Any])?["properties"] as? [String: Any])?["value"] as? [String: Any]
+            else { continue }
+            result[key] = value
+        }
+        return result
+    }
+
+    private func same(_ a: Any, _ b: Any) -> Bool { (a as? NSObject)?.isEqual(b) ?? false }
+
+    /// A valid value that differs from `current`, chosen from the key's schema.
+    private func differentValue(from current: Any, schema: [String: Any]) -> Any? {
+        if let choices = schema["enum"] as? [Any] { return choices.first { !same($0, current) } }
+        switch schema["type"] as? String {
+        case "boolean":
+            return (current as? Bool).map { !$0 }
+        case "integer":
+            let minimum = schema["minimum"] as? Int ?? 0
+            let maximum = schema["maximum"] as? Int ?? minimum + 2
+            return same(minimum, current) ? maximum : minimum
+        case "number":
+            let minimum = schema["minimum"] as? Double ?? 0
+            let maximum = schema["maximum"] as? Double ?? minimum + 1
+            return same(minimum, current) ? maximum : minimum
+        case "string":
+            if schema["pattern"] != nil { return same("#FFFFFF", current) ? "#000000" : "#FFFFFF" }
+            return same("", current) ? "um, uh" : ""
+        default:
+            return nil
+        }
+    }
+
     func testTurningOffAgentSettingsRefusesEveryWriteAndKeepsReads() async throws {
         let prefs = EditorPreferences()
         let sessions = ProjectSessions(preferences: prefs)
+        let schemas = try MCPSchemas.loaded.get()
+        let valueSchemas = try preferenceValueSchemas(schemas)
         prefs.agentsChangeSettings = false
         let before = try await preferenceCall(sessions, "preferences_read")
         XCTAssertEqual(before["automation_preferences_write_enabled"] as? Bool, false)
         for key in EditorPreferences.Key.allCases.map(\.rawValue) {
-            let value = try XCTUnwrap(before[key], key)
+            let current = try XCTUnwrap(before[key], key)
+            // A different value, so a refusal is not mistaken for a write that changed nothing.
+            let value: Any
+            if let schema = valueSchemas[key] {
+                value = try XCTUnwrap(differentValue(from: current, schema: schema), key)
+                XCTAssertNoThrow(try schemas.validate(tool: "preferences_set", arguments: [
+                    "operation_id": UUID().uuidString, "key": key, "value": value
+                ]), "\(key) = \(value) is valid")
+            } else {
+                XCTAssertTrue(EditorPreferences.Key.agentReadOnly.map(\.rawValue).contains(key), "\(key) has no value schema")
+                value = (current as? Bool).map { !$0 as Any } ?? 7
+            }
+            XCTAssertFalse(same(value, current), key)
             do {
                 _ = try await preferenceCall(sessions, "preferences_set", ["key": key, "value": value])
                 XCTFail("\(key) changed with agent settings off")
@@ -338,10 +394,10 @@ final class MCPLifecycleTests: XCTestCase {
                 XCTAssertTrue(failure.message.contains("Let agents change settings"), failure.message)
             }
         }
-        do {
-            _ = try await preferenceCall(sessions, "preferences_set", ["key": "history_max_steps", "value": 9])
-            XCTFail("History changed with agent settings off")
-        } catch let failure as MCPFailure { XCTAssertEqual(failure.code, "settings_write_disabled") }
+        let after = try await preferenceCall(sessions, "preferences_read")
+        for key in EditorPreferences.Key.allCases.map(\.rawValue) {
+            XCTAssertTrue(same(try XCTUnwrap(after[key], key), try XCTUnwrap(before[key], key)), "\(key) changed")
+        }
         XCTAssertEqual(prefs.historyLimit, 50)
         XCTAssertThrowsError(try prefs.checkAgentWrite())
         prefs.agentsChangeSettings = true

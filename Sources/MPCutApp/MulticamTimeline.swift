@@ -39,6 +39,8 @@ struct MulticamTimeline: View {
     var showsSourceRuler = false
     private var sourceRulerHeight: CGFloat { showsSourceRuler ? TimelineSourceRuler.height : 0 }
     var timeEntryRequest = 0
+    /// The playhead, duration, mark and ruler read-outs follow the Time display setting.
+    var timeFormat = TimelineTimeFormat.milliseconds
     var groupPadding: [AudioSpan] = []
     var analysis: MulticamAnalysisStore? = nil
     var snapTarget: Binding<TimelineSnapTarget> = .constant(.off)
@@ -127,7 +129,8 @@ struct MulticamTimeline: View {
             TimelineControlBar {
                 MulticamPlayheadReader(clock: clock, fallback: playhead) { head in
                     TimelineTimeControl(playhead: head.seconds, duration: project.range.to.seconds,
-                                        durationLabel: "Group duration", request: timeEntryRequest) { time in
+                                        durationLabel: "Group duration", request: timeEntryRequest,
+                                        timeFormat: timeFormat) { time in
                         let target = time == head.seconds ? head : groupTime(at: time)
                         if let target {
                             if let jump {
@@ -143,7 +146,7 @@ struct MulticamTimeline: View {
                 .layoutPriority(1)
             } options: {
                 TimelineMarkReadouts(markIn: assemblySelection?.from.seconds ?? markIn?.seconds,
-                                     markOut: assemblySelection?.to.seconds ?? markOut?.seconds)
+                                     markOut: assemblySelection?.to.seconds ?? markOut?.seconds, timeFormat: timeFormat)
                 SnapTargetMenu(selection: snapTarget)
                     .layoutPriority(1)
                 if !tileContent.feeds.isEmpty || assembly?.hasTileFeeds == true {
@@ -580,7 +583,7 @@ struct MulticamTimeline: View {
         return ZStack(alignment: .topLeading) {
             Color.clear
             visibleCanvas(visible) { context, _ in
-                let step = timelineRulerStep(scale: scale)
+                let step = timeFormat.rulerStep(scale: scale)
                 let minorStep = step / 5
                 let first = Int(ceil(max(0, seconds(at: visible.lowerBound, scale: scale)) / minorStep))
                 let last = Int(floor(min(extent, seconds(at: visible.upperBound, scale: scale)) / minorStep))
@@ -597,7 +600,7 @@ struct MulticamTimeline: View {
                     ticks.move(to: CGPoint(x: position, y: major ? 32 : 35))
                     ticks.addLine(to: CGPoint(x: position, y: 38))
                     guard major else { continue }
-                    let text = context.resolve(Text(timelineTime(time, milliseconds: step < 1))
+                    let text = context.resolve(Text(timeFormat.rulerLabel(time, step: step))
                         .font(.system(size: 10, weight: .medium).monospacedDigit()).foregroundStyle(.secondary))
                     let size = text.measure(in: CGSize(width: CGFloat.greatestFiniteMagnitude, height: 20))
                     let right = position + 4

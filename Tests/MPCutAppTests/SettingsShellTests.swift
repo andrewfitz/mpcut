@@ -542,7 +542,7 @@ final class SettingsShellTests: XCTestCase {
         let enforcer = SharedCacheLimitEnforcer(preferences: p, context: { context }, root: {
             recorded.rootReads += 1
             return root
-        }, retryDelay: .milliseconds(20)) { limit, protected, folder in
+        }, retryDelay: .milliseconds(20)) { limit, protected, folder, _ in
             recorded.append(limit, protected, folder)
             var outcome = SharedCacheLimit.Outcome()
             outcome.removedSources = [URL(fileURLWithPath: "/tmp/evicted.mov")]
@@ -614,10 +614,12 @@ final class SettingsShellTests: XCTestCase {
                 sessions.register(sessions.session(for: nil), window: window)
             }
             XCTAssertEqual(sessions.sessions.count, count)
-            // Storage reads the shared cutcache configuration and the real stores; its usage list is tested on its own.
-            for page in SettingsPage.allCases where page != .storage {
+            // Storage measures temporary stores; the test process reads a temporary cutcache configuration.
+            let (locations, _) = try temporaryLocations()
+            for page in SettingsPage.allCases {
                 p.settingsPage = page
-                let host = NSHostingView(rootView: SettingsWindow(preferences: p) { SidecarClearContext(sessions: sessions) })
+                let host = NSHostingView(rootView: SettingsWindow(preferences: p, cacheContext: { SidecarClearContext(sessions: sessions) },
+                                                                  storageLocations: locations))
                 let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 560), styleMask: [.titled, .resizable],
                                       backing: .buffered, defer: false)
                 window.isReleasedWhenClosed = false

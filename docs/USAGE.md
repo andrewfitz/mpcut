@@ -46,7 +46,7 @@ Mark a range and choose **Sequence → Replace Picture…** (⇧⌘R) to show a 
 
 Choose **Sequence → Insert Still…** (⇧⌘I) at the playhead to add a card with its own duration and silence. In multicam, position the playhead on the **Assembly** timeline to insert at a specific occurrence. To start a project with just images, insert a still or drop an image into an empty project window and set its canvas in **Still Timeline Format**.
 
-Turn on **Settings → General → Timeline → Show source time ticks inside clips** to see each recording’s original timestamps alongside the elapsed time on the main ruler. Multicam assembly ranges show their original group times.
+Turn on **Settings → Editing → Timeline → Show source time ticks inside clips** to see each recording’s original timestamps alongside the elapsed time on the main ruler. Multicam assembly ranges show their original group times.
 
 Choose **Sequence → Insert Color Gap…** to add one solid-color pause, or **Sequence → Space Clips…** to add gaps between clips or assembly items in one edit. **Fixed Duration** fits a uniform pause between items. **Source Timing** restores elapsed time between chronological, nonoverlapping ranges on the same source clock, or on the multicam group clock. To close the internal gaps, apply **Fixed Duration** with a duration of zero.
 
@@ -113,9 +113,11 @@ In multicam, drag on the **Assembly** row to target one occurrence, even when fo
 
 ## Work with several editor windows
 
-Choose **File → New Project Window** (⌘N) for an empty editor. Each window has its own timeline, playhead and edit history. **⌘O** adds recordings to the active window. **Add as Multicam…** uses an empty editor or opens a separate window if the current timeline has clips. Choose **File → Open MPCut Project…** (⇧⌘O) to open a saved project. If it is already open, MPCut brings that window forward. **File → Open Recent** lists the last ten projects and media files across windows. Choose **Clear Menu** to empty the list.
+Choose **File → New Project Window** (⌘N) for an empty editor. Each window has its own timeline, playhead and edit history. **⌘O** adds recordings to the active window. **Add as Multicam…** uses an empty editor or opens a separate window if the current timeline has clips. Choose **File → Open MPCut Project…** (⇧⌘O) to open a saved project. If it is already open, MPCut brings that window forward. **File → Open Recent** lists the last ten projects and media files across windows, or the number set in **Settings → General → Recent items**. Choose **Clear Menu** to empty the list.
 
 In Finder, select supported media and choose **Open With → MPCut**. When you open several recordings including video, choose **Join Clips** to append them to one sequence in the order Finder sends them, or **Open as Multicam** to load the videos as camera angles. The first video becomes the opening camera and you can adjust sync and audio in the multicam editor.
+
+To skip that question, choose **Join clips** or **Open as multicam** for **Opening several recordings from Finder** in **Settings → General**, or select **Don’t ask again** in the alert before choosing **Join Clips** or **Open as Multicam**.
 
 Windows opening the same recording can share one background index scan. MPCut also keeps a bounded in-memory cache of completed indexes for the current app session, including when automatic sidecars are off. It checks the file identity before reusing an index.
 
@@ -123,7 +125,11 @@ Windows opening the same recording can share one background index scan. MPCut al
 
 MPCut writes an untitled `.cut` draft when you add clips. Each window keeps its own draft in the macOS Autosave Information directory. **⌘S** writes the project and its retained history to the location you choose, then removes the draft. If the app stops unexpectedly, choose **File → Recover Untitled Project…** and select the last edit time. Saving the recovered project lets you give it a name. If macOS closes a window without completing its save prompt, you can also recover unsaved edits to a named project here. The saved original stays at its last explicit save.
 
+Turn on **Settings → General → Offer to recover untitled projects at launch** to see the recovery chooser once when MPCut opens and drafts exist. Choose **Not Now** to skip it. MPCut does not offer it when you opened files from Finder to launch the app. **Settings → Storage → Remove untitled drafts after** sets a number of days, from 1 to 365. At launch, MPCut moves older drafts to the Trash and leaves open or locked ones in place. At 0, the default, drafts stay until you save or discard them.
+
 Choose **View → Show Video Monitor** to review the active project in a video-only window. Right-click the monitor for **Clean Feed**, **Toggle Full Screen**, or display selection when more than one display is connected. Right-click either viewer to set **Force SDR Preview** for that surface. The editor viewer and monitor can use different HDR preview settings.
+
+The monitor opens on a display other than the editor’s when one is connected. To reopen it where you last placed it, set **Settings → Playback & Monitors → Open the Video Monitor on** to **Last position**. If that place is on no connected display, it opens on another display. The same page sets **Force SDR** for the editor viewer and the monitor and **Clean feed on the Video Monitor** for every window.
 
 Use **File → Import External Project…** to convert an editor project into a new `.cut` and open it. **File → Export Project** writes the current edit in the chosen format. During conversion, **File → Cancel Project Conversion** requests cancellation. MPCut waits for the active host operation to finish cleanup. Ordinary timelines use the desktop editor’s source compatibility checks when opened. [Converter requirements](../README.md#convert-projects) · [Project schema and examples](CUT-FORMAT.md)
 
@@ -141,7 +147,7 @@ Handles move one frame at a time by default. Use **Snap To** beside the zoom sli
 
 For a menu-driven trim, select a clip, position the playhead inside it, and choose **Sequence → Trim Selected Clip → Trim Start to Playhead** or **Trim End to Playhead**. The same submenu can **Restore Original Start** or **Restore Original End**. To reorder the selected clip by one position, choose **Sequence → Move Selected Clip Earlier** or **Move Selected Clip Later**.
 
-Select a clip, assembly range, or switch after the first and choose **Sequence → Preview Selected Join** to audition its incoming cut. The context menus also offer **Preview Join Before Clip** and **Preview Join at Switch**. Use **Replay** to listen again.
+Select a clip, assembly range, or switch after the first and choose **Sequence → Preview Selected Join** to audition its incoming cut. The context menus also offer **Preview Join Before Clip** and **Preview Join at Switch**. Use **Replay** to listen again. The preview plays one second on each side of the cut unless you change **Before the cut** and **After the cut** under **Play around a cut** in **Settings → Playback & Monitors**.
 
 You can watch or scrub a video while MPCut indexes it. If the file header includes a duration, the first frame fills the empty timeline. Up to ten frames from across the recording appear as they load. **Sampled audio** shows levels from short excerpts of the track you’re monitoring. As indexing finishes, MPCut fills in the detailed filmstrip and waveform and enables frame stepping, trimming, and export. To stop the import, click **Cancel** in the status bar.
 
@@ -210,7 +216,7 @@ Choose **Mix** to hear multiple microphones together. On first entry, MPCut sele
 
 Starts are inclusive and ends are exclusive. Exact switches need an outgoing frame end and an incoming frame start at the same group time. Manual sync can put two cameras on different frame grids, so visually aligned preview frames may still fail export preflight. Short recordings limit when those streams can be selected. Use the export plan to check the chosen picture and sound over each retained range. [Multicam export modes](EXPORT-MODES.md#multicam-exports)
 
-The speed menu after the forward navigation buttons sets forward preview speed from 0.125× to 8×. Space resumes at the selected speed. At 0.25×, 240 fps footage advances by 60 source frames per second. Playback presents frames according to the display refresh rate.
+The speed menu after the forward navigation buttons sets forward preview speed from 0.125× to 8×. Space resumes at the selected speed. A new window starts at **Settings → Playback & Monitors → Starting playback speed**. At 0.25×, 240 fps footage advances by 60 source frames per second. Playback presents frames according to the display refresh rate.
 
 Press **J**, **K**, and **L** to shuttle backward, pause, or shuttle forward. Repeated **J** or **L** presses increase speed to 2×, 4× and 8×. **Preview Audio** controls volume, mute and scrub sound. Click the time readout to enter a position in seconds or as a timecode. Use the timeline zoom controls or **Fit** to change the scale. Use **Use Large Thumbnails** or **Use Small Thumbnails** to change the filmstrip size. Drag the divider above the timeline to change its height, or drag the divider beside the track names to resize that column. Scroll over the track names to see more tracks. Drag the ruler or a camera or audio lane to scrub.
 
@@ -258,6 +264,8 @@ Click **Scan for Silence** below the timeline to start scanning and open the pau
 ### Queue multicam exports and replace the soundtrack
 
 Use **Sequence → Add Marked Range to Export Queue** (⇧⌘A) to queue a range as a separate file. A dragged **Assembly** selection queues picture, cards and sound in output order. A marked **Group** interval queues the switched footage once in group time. Each queued item preserves the program decisions active when you add it. Open **Export Queue** (⇧⌘E) to review or remove items and set the tracks, export mode and container for the batch. MPCut checks the ready ranges before writing the numbered files. Entries affected by a media change are marked in the queue and skipped until you replan them.
+
+The multicam save panel suggests the project’s name. After a multicam export, click **Show in Finder** in the status bar or choose **File → Show Last Export in Finder**.
 
 In Mix snapshots, the MCP `export_queue_list` result identifies queued sound by `lane_id`, `lane_label` and `lane_color_slot`. Items with `kind: "audio_gap"` mark uncovered output ranges for a lane.
 
@@ -354,7 +362,7 @@ Choose **Scan for Silence** beneath the timeline or from the **Playback** menu. 
 
 In the sequence and multicam editors, **Ignore sounds up to** sets the longest sound that can fall inside a pause. Set it to **0.30 s** to keep a mouth click of up to 300 ms inside one pause, or **0 s** to split at every sound. The default is 0.06 s (three waveform bins). Each sound needs 160 ms of uninterrupted quiet on both sides. Minimum pause applies to the joined interval. The waveform still shows the click, and a sound touching a speech onset or file edge stays outside the pause.
 
-- **Find or preview a pause.** Use **Previous** and **Next** to move the playhead. To audition a cut, choose **Preview Cut** and listen to up to a second on either side of the proposed join before applying it. **Next Cut** advances through the proposed joins in the preview window. **Keep This Pause** protects that occurrence, including overlapping detections after a sensitivity adjustment. Select a protected pause and choose **Shorten This Pause** to include it again. **Skip in playback** skips proposed removals during forward review.
+- **Find or preview a pause.** Use **Previous** and **Next** to move the playhead. To audition a cut, choose **Preview Cut** and listen to up to a second on either side of the proposed join before applying it, or the seconds set in **Settings → Playback & Monitors**. **Next Cut** advances through the proposed joins in the preview window. **Keep This Pause** protects that occurrence, including overlapping detections after a sensitivity adjustment. Select a protected pause and choose **Shorten This Pause** to include it again. **Skip in playback** skips proposed removals during forward review.
 - **Use the room itself as a reference.** Mark a short sample of room tone with **I** and **O**, then choose **Use Marked Room Tone**. MPCut adds 3 dB to the loudest marked peak in each affected recording, rounds up to a whole dBFS, and clears the calibration marks. Turn **Automatic threshold** back on to use the estimate again.
 - **Shorten the recording.** Set **Minimum pause** and **Padding per side**. The summary shows how many pauses can be shortened and how much time you will save. Two marks limit the operation to that range. Choose **Shorten Pauses**, then **⌘E** to export the joined timeline. One **⌘Z** undoes the batch.
 - **Export takes separately.** Set a longer minimum pause and choose **Queue Takes**. Open **Export Queue** to save the retained sections as separate files. In multicam, an assembly-time selection queues any cards in the selection in output order.
@@ -424,7 +432,7 @@ Press **⌘E** to choose an export mode, file format, and filename. Movies start
 | **Lossless Copy** | Copy compatible video and audio without encoding, including when changing containers. For an unsafe cut, **Review Cuts…** shows proposed boundaries and the change in total duration. **Apply to Timeline** lets you preview or undo those changes before exporting. |
 | **Re-encode** | Convert every retained video frame using the Mac’s hardware encoder. Choose H.264 or HEVC in MP4, MOV or MKV, or ProRes in MOV or MKV. |
 
-Re-encode starts with MP4, H.264, Balanced and Auto audio. H.264 and HEVC offer Smaller File, Balanced and High Quality. ProRes offers 422 LT, 422 and 422 HQ. **Auto** copies audio when the export can preserve it exactly. When conversion is necessary, it writes each track in its source's own format where the container allows: PCM, FLAC and ALAC keep their samples, and AAC, MP3 and Opus keep their rate. Where the container cannot carry that codec (MOV and FLAC or Opus, for example) or the bundled FFmpeg cannot encode it (AC-3, Vorbis, TrueHD), a lossless track becomes PCM in MOV, and in MKV for mono and stereo, and any other track becomes AAC at a matched rate or, for ProRes, PCM. MP4 cannot carry PCM here and MKV cannot describe wider PCM, so there a lossless fallback becomes AAC. You can also choose Copy Original, AAC, or PCM (MOV or MKV). To copy just the picture, clear the **Audio** checkbox. For an explicit video conversion that drops audio, the CLI accepts `--mode encode --audio remove`. Check the per-track actions, output dimensions and warnings in the sheet. For example, converting 10-bit SDR to H.264 reduces it to 8-bit.
+Re-encode starts with MP4, H.264, Balanced and Auto audio, or the codec, quality and container chosen in **Settings → Export**. A choice you change in the sheet stays for that window and does not change Settings. H.264 and HEVC offer Smaller File, Balanced and High Quality. ProRes offers 422 LT, 422 and 422 HQ. **Auto** copies audio when the export can preserve it exactly. When conversion is necessary, it writes each track in its source's own format where the container allows: PCM, FLAC and ALAC keep their samples, and AAC, MP3 and Opus keep their rate. Where the container cannot carry that codec (MOV and FLAC or Opus, for example) or the bundled FFmpeg cannot encode it (AC-3, Vorbis, TrueHD), a lossless track becomes PCM in MOV, and in MKV for mono and stereo, and any other track becomes AAC at a matched rate or, for ProRes, PCM. MP4 cannot carry PCM here and MKV cannot describe wider PCM, so there a lossless fallback becomes AAC. You can also choose Copy Original, AAC, or PCM (MOV or MKV). To copy just the picture, clear the **Audio** checkbox. For an explicit video conversion that drops audio, the CLI accepts `--mode encode --audio remove`. Check the per-track actions, output dimensions and warnings in the sheet. For example, converting 10-bit SDR to H.264 reduces it to 8-bit.
 
 If the export includes stills or color gaps, **Smart Trim** generates those frames and copies eligible camera footage. **Require Camera Video Copy** lets preflight refuse any plan that would encode retained camera frames. Check the audio actions too when an insert adds silence. [Still export](STILL-IMAGES.md#export-the-program)
 
@@ -432,7 +440,7 @@ If the export includes stills or color gaps, **Smart Trim** generates those fram
 
 The status-bar badge reports the best available quality for the complete sequence or the current multicam assembly, with its exact cuts and all tracks. A selection or another track choice can produce a different export plan.
 
-Enable **Save Export Result JSON** when exporting a project or selection to write its result and occurrence-level cut map beside the media. The report keeps individual timeline uses visible even when the render groups adjacent ranges in one segment. [Export results and cut maps](EXPORT-MODES.md)
+Enable **Save Export Result JSON** when exporting a project or selection to write its result and occurrence-level cut map beside the media. The checkbox starts on when **Save Export Result JSON** is on in **Settings → Export**. The report keeps individual timeline uses visible even when the render groups adjacent ranges in one segment. [Export results and cut maps](EXPORT-MODES.md)
 
 | Badge | What it means |
 | --- | --- |
@@ -443,7 +451,7 @@ Enable **Save Export Result JSON** when exporting a project or selection to writ
 
 Click the badge to see the recommended mode and container, factors grouped by clip or assembly range, and warnings. A factor can name the start or end of a clip, a track that limits export, or a timeline-wide format mismatch. Choose **Go to Cut** to locate an affected clip or assembly range. In a movie sequence, **Review Cuts…** appears when nearby copy-safe times are available.
 
-The **Warn when an edit lowers the export tier** setting is on by default. When MPCut offers a nearby verified boundary, review the requested and proposed times and how far the cut would move. In the sequence editor, choose **Cut at Nearest Keyframe** for video or **Cut at Nearest Exact Point** for audio, or **Cut Here** to keep the requested timing. Other changes may offer **Continue**, or **Add Anyway** when adding a clip makes the sequence mixed. **Cancel** declines the change. In multicam, the prompt can follow the edit while MPCut checks the new assembly. In that case **Cancel** undoes the changes identified in the prompt.
+The **Warn when an edit lowers the export tier** setting in **Settings → General → Warnings** is on by default. When MPCut offers a nearby verified boundary, review the requested and proposed times and how far the cut would move. In the sequence editor, choose **Cut at Nearest Keyframe** for video or **Cut at Nearest Exact Point** for audio, or **Cut Here** to keep the requested timing. Other changes may offer **Continue**, or **Add Anyway** when adding a clip makes the sequence mixed. **Cancel** declines the change. In multicam, the prompt can follow the edit while MPCut checks the new assembly. In that case **Cancel** undoes the changes identified in the prompt.
 
 The prompt includes a frame count when the index confirms both positions, and gives exact rational seconds for audio-only cuts. A trim also shows whether the proposed move keeps more material or removes it.
 
@@ -461,7 +469,7 @@ Smart Trim supports progressive 4:2:0 SDR footage with even dimensions and a ver
 
 For a saved project, use the CLI directly or start the bundled MCP helper with `--files-only`. The files-only connection works with the editor closed. If you lose a reply, reconnect and look up the original operation UUID with `file_job_status_read`. If the receipt says `outcome_unknown`, inspect the saved file and output before submitting another operation. [Command-line guide](CLI.md) · [File jobs and recovery](HEADLESS.md)
 
-For agent control of open and unsaved GUI projects, enable **Settings → General → Automation → Enable local MCP control** and connect the bundled stdio helper. [MCP setup, editing recipes and recovery](MCP-AGENT-GUIDE.md)
+For agent control of open and unsaved GUI projects, enable **Settings → Automation → Enable local MCP control** and connect the bundled stdio helper. [MCP setup, editing recipes and recovery](MCP-AGENT-GUIDE.md)
 
 Start with the installed executable. In a shell, set `mpcut=/Applications/MPCut.app/Contents/Helpers/mpcut`, use the path copied from **About MPCut**, or use `dist/MPCut.app/Contents/Helpers/mpcut` in a source checkout. The examples below using the bare command `mpcut` assume that executable is on your PATH. Python and other subprocess clients can pass its absolute path directly.
 
@@ -637,26 +645,150 @@ jq '{file, mode, tracks, audio_stream: .audio_stream_index, ranges: .clips, outp
 
 ## Set editing and export defaults
 
-Open **MPCut → Settings…** (⌘,).
+Open **MPCut → Settings…** (⌘,) and choose a page in the sidebar. Settings reopens on the last page you used, and every page works with no project open. Type in the search field above the sidebar to find a setting by name or keyword, such as “HDR”, “cache” or “undo”. Choose a result to open its page, scroll to the control and highlight it. Press Esc or click the clear button to empty the search. You can resize the window.
 
-| Where | What you can set |
+| Page | What you can set |
 | --- | --- |
-| **General → Automation** | Enable local MCP control and check its status. [MPCut Agent Guide](MCP-AGENT-GUIDE.md) |
-| **General → Media** | Turn on **Watch recordings for changes while editing** to refresh changed recordings automatically. |
-| **General → Timeline** | Choose the snap target, **Show source time ticks inside clips**, and enlarge thumbnails and waveforms. |
-| **General → History** | Set **Maximum undo and redo steps** per project. |
-| **General → Playback** | Adjust **Preview volume**, **Mute preview audio**, or **Play audio while scrubbing**. |
-| **General → Export defaults** | Choose the **Default movie export mode** and **Default JPEG preset**. Use **Warn when an edit lowers the export tier** to control the prompt for manual edits. |
-| **Analysis → Analysis cutcaches** | Choose whether to save and reuse analysis, where to store new cutcaches, and which caches to clear. |
-| **Analysis → Silence** | Set **Minimum pause**, **Ignore sounds up to**, and **Padding per side** for new scans. |
+| **General** | What opening several recordings from Finder does, the number of **Recent items**, the launch recovery offer, **Maximum undo and redo steps**, and the **Warnings**. |
+| **Editing** | Snapping, source time ticks, enlarged previews, cut sections in new windows and **Time display**. The panel position and multicam track label width. The starting duration of inserted stills, color gaps and Space Clips, the gap color, and the size, frame rate and codec of a new stills timeline. |
+| **Playback & Monitors** | Scrub audio, mute and preview volume. The speed new windows start at and how long Preview Join and pause previews play around a cut. Force SDR for the editor viewer and the Video Monitor, clean feed, and where the Video Monitor opens. |
+| **Media & Analysis** | Watching recordings for changes, automatic scene and pause scans, the **Silence** values, the Find Tiles layout, grid and scan detail for a recording with no saved layout, and the starting dialogue switch options. |
+| **Transcripts** | Transcriberrr’s status and engines with **Open Transcriberrr**, the helper location, the preferred engine and job options, the reader, transcript edit defaults, the Export Transcript format and caption limits. |
+| **Export** | The default movie export mode and JPEG preset. The starting re-encode codec, quality, ProRes quality, H.264 and HEVC container and multicam audio layout. **Save Export Result JSON**, opening the timeline in Resolve after sending, where export panels start, and what happens when an export finishes. |
+| **Storage** | Reusing analysis, where new cutcaches are saved, **Clear cutcaches…**, a limit for the shared cache folder, how long untitled drafts are kept, and the space each of MPCut’s stores uses. |
+| **Automation** | Local MCP control and its status, the paths of the command-line tool and the MCP helper with **Copy**, **Open Agent Guide**, **Copy Agent Configuration**, and the two agent permissions. [MPCut Agent Guide](MCP-AGENT-GUIDE.md) |
+
+Snapping, enlarged previews, the panel position, the track label width, Force SDR, clean feed and the preview audio settings apply at once in every open window. Settings that give a starting value apply to the next window, sheet or job. An open sheet keeps its values, and a choice you change in a sheet applies to that window or job without changing Settings. The CLI and file jobs never read these settings, so scripts get the same result on every Mac. The cutcache location is the exception: the app and the CLI share it.
+
+Each page ends with **Restore Defaults…**, which asks first. It lists what will change, grouped by when each change takes effect, and what it keeps. It leaves the undo limit, the cutcache location, local MCP control and the two agent permissions as they are, so the **Automation** page has no **Restore Defaults…** button. A value supplied as a launch argument applies again at the next launch.
+
+A number you type is saved when you press Return or Tab, click elsewhere in the window, change page or close Settings. Typing alone saves nothing, and **Restore Defaults…** replaces a number you typed but have not saved. Each number field’s tooltip states its range. If an entry is outside the range, finer than the field takes, or not a number, a short notice under the field says what was stored.
+
+| Setting | Page | Default | Key |
+| --- | --- | --- | --- |
+| Opening several recordings from Finder | General | Ask | `open_multiple_recordings_default_action` |
+| Recent items | General | 10 (1–30) | `recent_files_max_count` |
+| Offer to recover untitled projects at launch | General | Off | `draft_recovery_prompt_enabled` |
+| Maximum undo and redo steps | General | 50 (0–500) | `history_max_steps` |
+| Warn when an edit lowers the export tier | General | On | `export_tier_downgrade_warning_enabled` |
+| Confirm before scanning scenes again | General | On | `scene_rescan_confirmation_enabled` |
+| Show “Exported …” after a project export with no warnings | General | On | `project_export_completion_message_enabled` |
+| Snap to | Editing | Off | `timeline_snap_target` |
+| Show source time ticks inside clips | Editing | Off | `timeline_source_time_ticks_enabled` |
+| Enlarge thumbnails and waveforms | Editing | Off | `timeline_large_previews_enabled` |
+| Show cut sections in new windows | Editing | On | `timeline_cut_sections_default_enabled` |
+| Time display | Editing | Milliseconds | `timeline_time_display` |
+| Panel position | Editing | Above timeline | `workspace_full_height_sidebar_enabled` |
+| Multicam track label width | Editing | 172 pt (106–360) | `multicam_track_label_width_points` |
+| Inserted still duration | Editing | 2 s (0.04–600) | `still_placement_default_duration_seconds` |
+| Color gap and Space Clips duration | Editing | 2 s (0.04–600) | `gap_default_duration_seconds` |
+| Gap color | Editing | Black, `#000000` | `gap_default_color` |
+| New stills timeline width and height | Editing | 1920 × 1080 px (even, 16–8192) | `still_timeline_default_width_pixels`, `still_timeline_default_height_pixels` |
+| New stills timeline frame rate | Editing | 30 fps (1–240) | `still_timeline_default_frame_rate` |
+| New stills timeline codec | Editing | H.264 | `still_timeline_default_codec` |
+| Play audio while scrubbing | Playback & Monitors | On | `playback_scrub_audio_enabled` |
+| Mute preview audio | Playback & Monitors | Off | `playback_preview_muted` |
+| Preview volume | Playback & Monitors | 100% | `playback_preview_volume_fraction` |
+| Starting playback speed | Playback & Monitors | 1× | `playback_default_speed` |
+| Play around a cut: Before the cut, After the cut | Playback & Monitors | 1 s each (0.25–10) | `playback_cut_preview_preroll_seconds`, `playback_cut_preview_postroll_seconds` |
+| Editor viewer | Playback & Monitors | Automatic | `playback_viewer_force_sdr_enabled` |
+| Video Monitor | Playback & Monitors | Automatic | `playback_monitor_force_sdr_enabled` |
+| Clean feed on the Video Monitor | Playback & Monitors | Off | `playback_monitor_clean_feed_enabled` |
+| Open the Video Monitor on | Playback & Monitors | Other display | `playback_monitor_placement` |
+| Watch recordings for changes while editing | Media & Analysis | Off | `media_auto_refresh_enabled` |
+| Scan for scenes when a recording is added | Media & Analysis | Off | `analysis_scene_auto_scan_enabled` |
+| Scan for pauses when a recording is added | Media & Analysis | Off | `analysis_silence_auto_scan_enabled` |
+| Minimum pause | Media & Analysis | 1.5 s | `silence_min_pause_seconds` |
+| Ignore sounds up to | Media & Analysis | 0.06 s (0–1) | `silence_max_blip_seconds` |
+| Padding per side | Media & Analysis | 0.2 s | `silence_padding_per_side_seconds` |
+| Find Tiles layout | Media & Analysis | Video Call | `tiles_scan_default_layout` |
+| Find Tiles grid columns and rows | Media & Analysis | 2 × 2 (1–12) | `tiles_scan_default_grid_columns`, `tiles_scan_default_grid_rows` |
+| Find Tiles scan detail | Media & Analysis | Adaptive | `tiles_scan_default_detail` |
+| Dialogue switches minimum hold | Media & Analysis | 1 s (0.04–60) | `tiles_dialogue_default_min_hold_seconds` |
+| Overlapping speech | Media & Analysis | Hold the Shot | `tiles_dialogue_default_overlap_policy` |
+| Offscreen speaker | Media & Analysis | Hold the Shot | `tiles_dialogue_default_offscreen_policy` |
+| Preferred engine | Transcripts | Automatic | `transcript_default_engine` |
+| Identify speakers in mixed audio | Transcripts | Off | `transcript_default_speaker_identification_enabled` |
+| Download missing models | Transcripts | Off | `transcript_default_model_download_enabled` |
+| Follow playback in new windows | Transcripts | On | `transcript_follow_playback_default_enabled` |
+| Reader text size | Transcripts | 14 pt (11–24) | `transcript_reader_text_size_points` |
+| Boundary | Transcripts | Nearest media frame | `transcript_edit_default_boundary_policy` |
+| Pause to keep when tightening | Transcripts | 0.2 s (0–10) | `transcript_tighten_default_retained_pause_seconds` |
+| Filler terms | Transcripts | Empty | `transcript_default_filler_terms` |
+| Export Transcript format | Transcripts | Native JSON | `transcript_export_default_format` |
+| Caption characters per line | Transcripts | 42 (20–80) | `transcript_caption_max_line_characters` |
+| Caption lines | Transcripts | 2 (1–3) | `transcript_caption_max_lines` |
+| Longest caption cue | Transcripts | 6 s (1–20) | `transcript_caption_max_cue_seconds` |
+| Caption speaker labels | Transcripts | On | `transcript_caption_speaker_labels_enabled` |
+| Default movie export mode | Export | Smart Trim | `export_movie_default_mode` |
+| Default JPEG preset | Export | Small review images | `export_jpeg_default_preset` |
+| Re-encode video | Export | H.264 | `export_reencode_default_codec` |
+| Quality | Export | Balanced | `export_reencode_default_quality` |
+| ProRes quality | Export | 422 | `export_prores_default_quality` |
+| H.264 and HEVC container | Export | Automatic | `export_reencode_default_container` |
+| Multicam audio | Export | Separate tracks | `export_multicam_default_audio_layout` |
+| Save Export Result JSON | Export | Off | `export_result_json_default_enabled` |
+| Open the timeline in Resolve after sending | Export | On | `resolve_send_open_timeline_default_enabled` |
+| Start export panels in | Export | Automatic | `export_start_folder_mode` |
+| When an export finishes: Show in Finder, Notify, Play a sound | Export | Off | `export_finished_reveal_enabled`, `export_finished_notification_enabled`, `export_finished_sound_enabled` |
+| Save and reuse analysis | Storage | On | `analysis_sidecar_reuse_enabled` |
+| Limit the shared cache folder | Storage | 0 GB, no limit (to 0.001 GB) | `analysis_shared_cache_max_bytes` |
+| Remove untitled drafts after | Storage | 0 days, never (0–365) | `draft_retention_days` |
+| Enable local MCP control | Automation | Off | `automation_local_mcp_enabled` |
+| Let agents change settings | Automation | On | `automation_preferences_write_enabled` |
+| Let agents replace existing project files | Automation | On | `automation_file_replace_enabled` |
+
+Agents read these keys with `preferences_read` and change them with `preferences_set`. They cannot set the three `automation_` keys, `draft_retention_days` or `analysis_shared_cache_max_bytes`. Settings shows the cache limit in gigabytes of 10⁹ bytes, to three decimals; the key stores bytes. `draft_retention_days` and `analysis_shared_cache_max_bytes` take only their saved value, never one supplied as a launch argument.
+
+### Warnings
+
+Three alerts offer **Don’t ask again**: opening several recordings from Finder, scanning a recording’s scenes again, and an edit that lowers the export tier. Selecting it turns off the matching switch under **Settings → General → Warnings**. For the Finder alert, the button you choose becomes the default action. **Reset All Warnings** turns every warning switch on again, including one you turned off in Settings. It also returns the Finder action to **Ask** when an alert chose it; an action chosen in Settings stays. **Restart scene analysis?**, which discards a paused scan’s progress, always asks, as do save, discard and quit confirmations. With **Show “Exported …” after a project export with no warnings** off, a project interchange export that has warnings still shows them.
+
+### Starting values for new work
+
+A new window starts with the **Starting playback speed**, **Show cut sections in new windows** and **Follow playback in new windows** values. Open windows keep their own. Inserted stills, color gaps and Space Clips start at the Editing durations and gap color, and the **Still Timeline Format** panel for a new stills timeline starts from the size, frame rate and codec there. The container stays MOV and program color stays SDR.
+
+Each time an export sheet opens, its re-encode codec, quality, ProRes quality and container start from **Settings → Export**, except for any field you already changed in that window. The multicam Export inspector and queue start from the same values. **Automatic** container is MP4 in the sequence editor and MOV in multicam, and ProRes always uses MOV. Export rules still decide what a timeline can use, and the panel shows the effective choice. **Save Export Result JSON** sets the starting state of that checkbox in the export sheet and the multicam save panel.
+
+Find Tiles takes its grid and scan detail from Media & Analysis when a window’s Tiles inspector opens, and its layout each time you select a recording with no saved layout. Selecting another recording keeps the grid and scan detail you set. A scanned recording restores its own layout from the project. A build without the TileTrail meeting detector offers **Even Grid** only. The dialogue switch review starts from the minimum hold, overlapping speech and offscreen speaker choices, and the tile switch lane uses the same minimum hold.
+
+### Time display
+
+**Time display** in **Settings → Editing** chooses how the timeline reads out times: **Milliseconds** (`MM:SS.mmm`) or **Frames**, non-drop `MM:SS:FF`, or `H:MM:SS:FF` from an hour. With **Frames**, the playhead and duration, the In, Out and Duration read-outs in both editors, the In and Out read-outs in the multicam inspector, and ruler labels closer together than one second count frames. Ruler labels a second or more apart stay `MM:SS`. Open windows change at once. The sequence editor counts at the stills timeline format or at the first video’s constant frame rate. Multicam counts frames only when every picture angle has the same constant rate. An audio-only timeline, variable or mixed frame rates, or a rate MPCut cannot confirm keep milliseconds. At 29.97 and 23.976 fps the non-drop count runs about 3.6 seconds an hour behind the clock.
+
+With **Frames**, typing in the playhead field reads three or four colon-separated whole numbers as `[H:]MM:SS:FF`, so `1:02:03` means 1 minute, 2 seconds and frame 3. For hours, type `1:02:03.0`, plain seconds or `1:02:03:00`. Other entries read as they do with milliseconds. Source times, transcripts, the export queue, Project History, scan progress, media reports, VoiceOver values, and everything written to files or returned to agents stay in milliseconds.
+
+### Automatic scans
+
+With **Scan for scenes when a recording is added** or **Scan for pauses when a recording is added** on, MPCut scans each recording you add to a project, and only those recordings. Opening a project does not start a scan, and turning a switch on does not scan recordings already in the project. A scan you cancel stays cancelled, and turning a switch off drops automatic scans that have not started. In multicam, the pause scan runs only for a recording that feeds the program soundtrack. These scans take time and cutcache space for every recording added.
+
+### Export panels and finished exports
+
+**Start export panels in** sets the first folder of each window’s session for movie, queue, JPEG and frame exports, multicam exports, transcript and caption exports, excerpts, ISO deliveries, Resolve sends and project interchange. Choose **Project folder**, **Source folder** or **Chosen folder**. A folder you pick in a panel is used for the rest of that session. If the chosen folder is offline, panels open at their usual folder and Settings marks it unavailable. A chosen folder that is the disk root or not an absolute path is treated as **Automatic**. **Automatic** keeps each panel’s own rule. For example, sequence export panels reopen the window’s last export folder.
+
+Under **When an export finishes**, MPCut can show the result in Finder, post a notification or play a sound. These apply to movie, multicam, queue, JPEG frame, current frame, ISO, Resolve and project interchange exports you start in the app. Exports an agent starts, replacement-audio working files, and transcript and caption files don’t use them. MPCut asks for notification permission only when you turn on **Notify**. If notifications for MPCut are off in System Settings, the row offers **Open System Settings…**. A notification appears only while MPCut is in the background, and a muted launch plays no sound. MPCut keeps the Mac awake during exports and desktop transcription jobs.
+
+### Transcripts settings
+
+**Helper location** is **Automatic** unless you choose a Transcriberrr helper with **Choose…**. MPCut uses the `MPCUT_TRANSCRIBERRR_HELPER` environment variable when it is set, then the chosen helper, then the installed Transcriberrr app. The CLI and file jobs skip the chosen helper. **Preferred engine** lists **Automatic** and the helper’s engines. Automatic uses Qwen3, then the first available engine. If a saved engine is unavailable, Settings shows why and keeps the preference, and new jobs use Automatic. Job setup starts from **Identify speakers in mixed audio** and **Download missing models**, and the retry form starts from **Download missing models**. Reader text size applies to transcript panes opened afterwards. The caption limits and speaker labels apply to **Export Captions** in the app. The CLI and MCP keep 42 characters per line, 2 lines, 6-second cues and speaker labels. Export Captions always writes SubRip.
+
+### Storage settings
+
+The **Usage** list shows the size of generated stills, transcript recognition results, transcript job scratch, untitled drafts, suggested transcript cameras and agent job receipts, with each store’s location and **Show in Finder**. A folder MPCut has not created yet is marked **(not created yet)**, and its **Show in Finder** is unavailable. Sizes count everything in each folder. **Clear…** is available for generated stills, transcript recognition results and suggested transcript cameras. It asks first and skips anything in use. For transcript recognition results it also keeps results that a saved transcription job can still reuse. The report gives the space reclaimed, or says nothing was removed, lists what it left in use and why, and counts any files in the folder that MPCut does not recognize as its own, which it leaves for you to remove in Finder.
+
+**Limit the shared cache folder** applies only to the managed `MPCut Cache` folder when **Save new cutcaches** is **On cache disk**. MPCut checks it at launch, when the limit changes, and after the sequence or multicam editor saves analysis, and waits while a window is opening or importing. It removes the least recently written cutcaches first and never one that an open project or its retained history uses. The CLI ignores the limit, so the folder can grow past it between app runs.
+
+### Updates
+
+Choose **Help → Check for Updates…** to open the MPCut releases page in your browser. MPCut itself makes no network request to check for updates.
 
 ## Save and reuse analysis
 
 MPCut saves completed indexes, scene scans, thumbnails, waveforms and silence measurements in SQLite cutcaches. By default, the cache for `Interview.mov` is `Interview.mov.cutcache` beside the media. **File → Save Analysis Sidecars** writes the full edit index and available measurements. MPCut rebuilds missing sections from the recording on demand. Save the project to keep scene names, manual thresholds, pending reviews and transcripts.
 
-Automatic sidecars are on by default. When you open a recording, MPCut loads the saved editing index if it is complete and matches the file. It builds an index when the saved one is missing, out of date, or unreadable. In **MPCut → Settings… → Analysis**, turn off **Save and reuse analysis** to bypass automatic sidecars, including during export checks. An explicit **Save Analysis Sidecars** can still save the current analysis.
+Automatic sidecars are on by default. When you open a recording, MPCut loads the saved editing index if it is complete and matches the file. It builds an index when the saved one is missing, out of date, or unreadable. In **MPCut → Settings… → Storage**, turn off **Save and reuse analysis** to bypass automatic sidecars, including during export checks. An explicit **Save Analysis Sidecars** can still save the current analysis.
 
-In **Settings → Analysis → Save new cutcaches**, choose **Next to media**, **In project folder**, or **On cache disk**. Project-folder storage uses an `MPCut Cache` directory beside the saved project. Cache-disk storage uses the folder you choose for all projects. Two recordings named `Interview.mov` have separate entries. Changing this setting directs future saves. When loading a recording, MPCut checks available locations for the freshest compatible analysis. An unsaved project can hold its analysis in memory until you save the project.
+In **Settings → Storage → Save new cutcaches**, choose **Next to media**, **In project folder**, or **On cache disk**. Project-folder storage uses an `MPCut Cache` directory beside the saved project. Cache-disk storage uses the folder you choose for all projects. Two recordings named `Interview.mov` have separate entries. Changing this setting directs future saves. When loading a recording, MPCut checks available locations for the freshest compatible analysis. An unsaved project can hold its analysis in memory until you save the project.
 
 Choose **Clear cutcaches…** to preview recordings and reclaimable space. Inspect the section sizes, SQLite overhead and duplicate copies for each recording. The project size is reported separately. Filter by location or folder, or use **Scan Folder…** to discover additional caches.
 
@@ -690,7 +822,7 @@ Choose **File → Refresh Project Media** after replacing a recording or changin
 
 Choose **File → Deep Verify Project Media** if a replacement might have the same size and modification time. This checks source contents.
 
-To watch the recordings while you edit, enable **Watch recordings for changes while editing** in **Settings → General → Media**. Watching is off by default.
+To watch the recordings while you edit, enable **Watch recordings for changes while editing** in **Settings → Media & Analysis**. Watching is off by default.
 
 To check a saved project from the terminal, run `mpcut project media refresh --project edit.cut --json`. Add `--deep` to verify stream contents when a replacement might have the same size and modification time. The command leaves the saved edit intact.
 

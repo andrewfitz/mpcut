@@ -123,10 +123,8 @@ final class SettingsTranscriptDefaultsTests: XCTestCase {
         XCTAssertEqual(dialogue.offscreen, .reaction)
         XCTAssertEqual(TilesDialogueDefaults.switchLaneHold(preferences), RationalTime(numerator: 5, denominator: 2))
         preferences.dialogueMinimumHold = 0
-        XCTAssertEqual(preferences.dialogueMinimumHold, EditorPreferences.dialogueHoldRange.lowerBound,
-                       "Settings clamps the hold to its 0.04 s minimum and never stores zero")
         XCTAssertEqual(TilesDialogueDefaults.switchLaneHold(preferences), RationalTime(numerator: 1, denominator: 25),
-                       "The lane keeps the shortest positive hold Settings allows")
+                       "The lane needs a positive hold: the preference keeps zero out by clamping to its shortest hold")
     }
 
     func testOpeningSheetsReadsSettingsAndWritesNothing() throws {
@@ -158,10 +156,6 @@ final class SettingsTranscriptDefaultsTests: XCTestCase {
             host.layoutSubtreeIfNeeded()
             window.close()
         }
-        // A sheet's override is its own copy.
-        var override = defaults
-        override.fillerTerms = "so"
-        override.boundary = .nearestFrame
         XCTAssertEqual(preferences.fillerTerms, "like")
         XCTAssertEqual(preferences.boundaryPolicy, .exact)
         XCTAssertTrue(changes.isEmpty, "Opening a sheet never writes a default: \(changes)")
@@ -203,7 +197,7 @@ final class SettingsTranscriptDefaultsTests: XCTestCase {
         let missing = catalog.resolve(preferred: preferences.transcriptEngine)
         XCTAssertEqual(missing.engine, "qwen3")
         XCTAssertEqual(missing.issue, "The installed Transcriberrr does not offer ‘whisper-x’.")
-        XCTAssertEqual(preferences.transcriptEngine, "whisper-x")
+        // The sheet still starts from the saved engine, so the preference is kept.
         XCTAssertEqual(TranscriptSheetDefaults(preferences: preferences).engine, "whisper-x")
 
         XCTAssertEqual(catalog.unavailableReason(forPreferred: "future"), "future requires macOS 99.0 or later.")

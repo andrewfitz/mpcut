@@ -10,6 +10,12 @@ struct BulkQueueView: View {
 
     init(editor: EditorModel) {
         self.editor = editor
+        _options = State(initialValue: Self.startingOptions(editor: editor))
+    }
+
+    /// The options a fresh queue sheet opens with, for the editor's ready queued ranges.
+    @MainActor
+    static func startingOptions(editor: EditorModel) -> ExportSheetOptions {
         var value = ExportSheetOptions()
         // A fresh queue sheet starts from Settings → Export. A project's own still format and the export rules come first.
         value.seedEncoding(from: editor.preferences)
@@ -37,7 +43,7 @@ struct BulkQueueView: View {
             value.mode = .encode
             value.encodeContainer = "mov"
         }
-        _options = State(initialValue: value)
+        return value
     }
 
     private var media: [MediaInfo] { editor.readyQueuedRanges.flatMap { $0.media.values } }

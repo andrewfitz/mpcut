@@ -164,6 +164,9 @@ struct MCPSchemas {
                   number <= (schema["maximum"] as? Int ?? Int.max) else {
                 throw reject("Expected an integer in the supported range.")
             }
+            if let step = schema["multipleOf"] as? Int, step > 0, !number.isMultiple(of: step) {
+                throw reject("Expected a multiple of \(step).")
+            }
             return number
         case "number":
             guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),

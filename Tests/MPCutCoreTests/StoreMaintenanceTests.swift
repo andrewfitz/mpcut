@@ -137,7 +137,7 @@ final class StoreMaintenanceTests: XCTestCase {
         let expected = allocated(root.appendingPathComponent(free + ".mpx")) + allocated(root.appendingPathComponent(free + ".json"))
             + allocated(root.appendingPathComponent(orphan + ".mpx")) + allocated(archived)
 
-        let result = TranscriptRecognitionStore.clear(in: root)
+        let result = TranscriptRecognitionStore.clear(in: root, jobs: [])
         XCTAssertEqual(result.reclaimedBytes, expected)
         XCTAssertTrue(result.skipped.isEmpty)
         for gone in [free, free + ".mpx", free + ".json", orphan, orphan + ".mpx", "Results/\(claim("key"))"] {
@@ -161,7 +161,7 @@ final class StoreMaintenanceTests: XCTestCase {
         let claims = TranscriptRecognitionClaims()
         try claims.acquire([busy], in: root, cancelled: { false })
 
-        let result = TranscriptRecognitionStore.clear(in: root)
+        let result = TranscriptRecognitionStore.clear(in: root, jobs: [])
         withExtendedLifetime(claims) {}
         XCTAssertTrue(files.fileExists(atPath: root.appendingPathComponent(busy).path))
         XCTAssertTrue(files.fileExists(atPath: root.appendingPathComponent(busy + ".mpx").path))
@@ -171,6 +171,100 @@ final class StoreMaintenanceTests: XCTestCase {
         XCTAssertEqual(result.reclaimedBytes, freeBytes)
     }
 
+    /// A silent 16 kHz mono recording, enough for a job record's track.
+    private func silentWave(_ url: URL) throws {
+        var data = Data("RIFF".utf8)
+        func append<T: FixedWidthInteger>(_ value: T) { withUnsafeBytes(of: value.littleEndian) { data.append(contentsOf: $0) } }
+        let samples: UInt32 = 16_000
+        append(samples * 2 + 36)
+        data.append(Data("WAVEfmt ".utf8))
+        append(UInt32(16)); append(UInt16(1)); append(UInt16(1)); append(UInt32(16_000)); append(UInt32(32_000))
+        append(UInt16(2)); append(UInt16(16))
+        data.append(Data("data".utf8))
+        append(samples * 2)
+        data.append(Data(repeating: 0, count: Int(samples * 2)))
+        try data.write(to: url)
+    }
+
+    /// Writes a job record whose one track was recognized under `key`, as a paused or failed job leaves it.
+    private func writeJob(in directory: URL, key: String, state: TranscriptJobState) throws -> TranscriptJobTrack {
+        try files.createDirectory(at: directory, withIntermediateDirectories: true)
+        let media = root.appendingPathComponent("media-\(UUID().uuidString).wav")
+        try silentWave(media)
+        var sessions = try TranscriptJobPlan.inventory(media: media)
+        var track = try XCTUnwrap(sessions.first?.tracks.first)
+        track.recognitionKey = key
+        track.hasReusableEvidence = true
+        track.state = .recognized
+        sessions[0].tracks[0] = track
+        let id = UUID()
+        let record = TranscriptJobRecord(id: id, documentID: media.path, options: .init(), policy: .reuse, state: state,
+                                         sessions: sessions,
+                                         workingDirectory: directory.appendingPathComponent(id.uuidString, isDirectory: true))
+        try JSONEncoder().encode(record).write(to: TranscriptJobStore(directory: directory).recordURL(id))
+        return track
+    }
+
+    func testRecognitionClearKeepsWhatAJobRecordCanStillReuse() throws {
+        // Desktop and CLI job folders, as the Storage page passes them.
+        let desktopJobs = root.appendingPathComponent("Drafts/.transcript-jobs", isDirectory: true)
+        let cliJobs = root.appendingPathComponent("TranscriptJobs", isDirectory: true)
+        let claims = root.appendingPathComponent("Claims", isDirectory: true)
+        let pausedKey = claim("paused-key"), finishedKey = claim("finished-key"), freeKey = claim("free-key")
+        let paused = try writeJob(in: desktopJobs, key: pausedKey, state: .cancelled)
+        let finished = try writeJob(in: cliJobs, key: finishedKey, state: .completed)
+        let pausedClaim = TranscriptExternalCacheDescriptor.claimID(scope: paused.evidence, key: pausedKey)
+        let finishedClaim = TranscriptExternalCacheDescriptor.claimID(scope: finished.evidence, key: finishedKey)
+        let freeClaim = claim("free-claim")
+        for id in [pausedClaim, finishedClaim, freeClaim] {
+            try write(claims.appendingPathComponent(id + ".mpx"))
+        }
+        for key in [pausedKey, finishedKey, freeKey] {
+            try write(claims.appendingPathComponent("Results/\(key)/\(claim(key + "-generation"))"))
+        }
+
+        let result = TranscriptRecognitionStore.clear(in: claims, jobs: [desktopJobs, cliJobs])
+        // A retry or reconcile of either job reads its finished track back from the exchange or the archive.
+        for kept in [pausedClaim + ".mpx", finishedClaim + ".mpx", "Results/\(pausedKey)", "Results/\(finishedKey)"] {
+            XCTAssertTrue(files.fileExists(atPath: claims.appendingPathComponent(kept).path), kept)
+        }
+        for gone in [freeClaim + ".mpx", "Results/\(freeKey)"] {
+            XCTAssertFalse(files.fileExists(atPath: claims.appendingPathComponent(gone).path), gone)
+        }
+        let reasons = Dictionary(result.skipped.map { ($0.url.lastPathComponent, $0.reason) }, uniquingKeysWith: { a, _ in a })
+        XCTAssertEqual(Set(reasons.keys), [pausedClaim, finishedClaim, pausedKey, finishedKey])
+        XCTAssertTrue(reasons.values.allSatisfy { $0.contains("can still reuse") }, "\(reasons)")
+        XCTAssertGreaterThan(result.reclaimedBytes, 0)
+
+        // Without the job folders, Clear removes everything, as before.
+        let unguarded = TranscriptRecognitionStore.clear(in: claims, jobs: [])
+        XCTAssertTrue(unguarded.skipped.isEmpty)
+        XCTAssertFalse(files.fileExists(atPath: claims.appendingPathComponent("Results/\(pausedKey)").path))
+    }
+
+    func testRecognitionClearKeepsTheArchiveWhenAJobRecordCannotBeRead() throws {
+        let jobs = root.appendingPathComponent("TranscriptJobs", isDirectory: true)
+        try write(jobs.appendingPathComponent(UUID().uuidString + ".json"), bytes: 16)
+        let claims = root.appendingPathComponent("Claims", isDirectory: true)
+        let free = claim("free")
+        try write(claims.appendingPathComponent(free + ".mpx"))
+        let archived = claims.appendingPathComponent("Results/\(claim("key"))/\(claim("generation"))")
+        try write(archived)
+
+        let result = TranscriptRecognitionStore.clear(in: claims, jobs: [jobs])
+        XCTAssertTrue(files.fileExists(atPath: archived.path))
+        XCTAssertFalse(files.fileExists(atPath: claims.appendingPathComponent(free + ".mpx").path))
+        XCTAssertEqual(result.skipped.map(\.url.lastPathComponent), ["Results"])
+        XCTAssertTrue(result.skipped[0].reason.contains("could not be read"))
+
+        // Pruning never removes an unreadable record, so one older than the prune age no longer keeps the archive.
+        let record = try XCTUnwrap(files.contentsOfDirectory(at: jobs, includingPropertiesForKeys: nil).first)
+        try files.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -31 * 86_400)], ofItemAtPath: record.path)
+        let later = TranscriptRecognitionStore.clear(in: claims, jobs: [jobs])
+        XCTAssertTrue(later.skipped.isEmpty)
+        XCTAssertFalse(files.fileExists(atPath: archived.path))
+    }
+
     func testRecognitionClearLeavesSymlinkedExchangeTargets() throws {
         let id = claim("linked")
         let outside = files.temporaryDirectory.appendingPathComponent("mpcut-outside-\(UUID().uuidString)")
@@ -178,7 +272,7 @@ final class StoreMaintenanceTests: XCTestCase {
         defer { try? files.removeItem(at: outside) }
         try files.createSymbolicLink(at: root.appendingPathComponent(id + ".mpx"), withDestinationURL: outside)
 
-        let result = TranscriptRecognitionStore.clear(in: root)
+        let result = TranscriptRecognitionStore.clear(in: root, jobs: [])
         XCTAssertTrue(files.fileExists(atPath: outside.path))
         XCTAssertEqual(result.reclaimedBytes, 0)
         XCTAssertEqual(result.skipped.count, 1)

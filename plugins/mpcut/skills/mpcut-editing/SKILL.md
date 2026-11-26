@@ -5,7 +5,7 @@ description: Use MPCut on the user's Mac for live timeline editing and review, m
 
 # Edit in MPCut
 
-Use the connected MPCut MCP tools. The installed helper advertises the schemas for this build. When the host exposes resources, consult `mpcut://docs/agent-guide` for workflows and `mpcut://docs/tool-reference` for arguments and result semantics. If tools are missing, identify the missing desktop connection. For live tools, open MPCut and check **Settings → General → Automation → Enable local MCP control**. A `--files-only` connection works with the app closed. Call `cli_version_read` and collect its result to check the bundled CLI build, supported schema and detector capabilities.
+Use the connected MPCut MCP tools. The installed helper advertises the schemas for this build. When the host exposes resources, consult `mpcut://docs/agent-guide` for workflows and `mpcut://docs/tool-reference` for arguments and result semantics. If tools are missing, identify the missing desktop connection. For live tools, open MPCut and check **Settings → Automation → Enable local MCP control**. A `--files-only` connection works with the app closed. Call `cli_version_read` and collect its result to check the bundled CLI build, supported schema and detector capabilities.
 
 For project recovery, history, transport, synchronization, audio, analysis, queues or interchange, see [live editor workflows](references/live-editor.md). For saved media, CLI-backed file jobs, batch processing and options specific to the bundled CLI, see [file workflows](references/files.md). Use the installed tool schema to check each requested option.
 

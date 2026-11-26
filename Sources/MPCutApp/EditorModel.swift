@@ -469,6 +469,14 @@ final class EditorModel: ObservableObject {
     let projectMediaSummaryPaths = ProjectMediaSummaryPaths()
     let preferences: EditorPreferences
     let preview: SequencePreview
+    fileprivate struct TimelineCadenceKey: Equatable {
+        let format: RationalTime?
+        let recording: URL?
+        let frames: Int
+        let rate: RationalTime?
+    }
+    /// The timeline cadence and the format and recording it was found for. See `timelineCadence`.
+    fileprivate var timelineCadenceMemo: (key: TimelineCadenceKey, cadence: RationalTime?)?
 
     @Published private var edit = EditSnapshot() {
         didSet {
@@ -1316,7 +1324,12 @@ final class EditorModel: ObservableObject {
     private var checkedSilenceSidecars = Set<UUID>()
     private var silenceIssues: [UUID: String] = [:]
     private var pendingSilenceRescans = Set<UUID>()
-    @Published private(set) var silenceScanRequested = false
+    @Published private(set) var silenceScanRequested = false {
+        didSet { if !silenceScanRequested { automaticSilenceScope = nil } }
+    }
+    /// The recordings an automatic pause scan detects, while one runs. Nil while no scan runs and for a scan the editor
+    /// or an agent started, which detects every recording without results.
+    private var automaticSilenceScope: Set<UUID>?
     private var automaticThresholds: [UUID: Double] = [:]
     private var thresholdOverrides: [AudioTrackKey: Double] = [:]
     var minimumPause: Double {
@@ -1410,9 +1423,14 @@ final class EditorModel: ObservableObject {
         }
         return nil
     }
+    /// The recordings the running pause scan detects: every pending one, or only those an automatic scan was started for.
+    private var scannedSilenceSources: Set<UUID> {
+        automaticSilenceScope.map { pendingSilenceSources.intersection($0) } ?? pendingSilenceSources
+    }
     var silenceProgress: Double? {
-        let pending = pendingSilenceSources
-        guard silenceScanRequested, !pending.isEmpty, silenceIssue == nil else { return nil }
+        let pending = scannedSilenceSources
+        guard silenceScanRequested, !pending.isEmpty,
+              !pending.contains(where: { silenceIssues[$0] ?? audioStore.issues[$0] != nil }) else { return nil }
         var total = 0.0, done = 0.0
         for (id, media) in silenceMedia {
             let seconds = media.duration.seconds
@@ -1527,12 +1545,19 @@ final class EditorModel: ObservableObject {
                 updateStatus()
                 saveUntitledDraft()
             }
-        case .largeThumbnails, .sourceTimeTicks:
+        case .largeThumbnails, .sourceTimeTicks, .timeDisplay:
             break
         case .minimumPause, .maxBlip:
             refreshDetectedPauses(invalidating: activeAudioSources)
         case .padding:
             rebuildPausePlan()
+        case .autoScanScenes:
+            // Turning the switch off stops automatic scans that have not started. A running scan finishes.
+            if !preferences.autoScanScenes { automaticSceneScanSources.removeAll() }
+            return
+        case .autoScanSilence:
+            if !preferences.autoScanSilence { automaticSilenceScanSources.removeAll() }
+            return
         default:
             // New work reads its starting values when it is created.
             return
@@ -2376,6 +2401,7 @@ final class EditorModel: ObservableObject {
     /// Scans the scenes of recordings added with Settings' automatic scene scan on, through the menu command's path.
     private func startAutomaticSceneScan() {
         guard !automaticSceneScanSources.isEmpty else { return }
+        guard preferences.autoScanScenes else { automaticSceneScanSources.removeAll(); return }
         // A recording with saved scenes or without picture needs no scan.
         automaticSceneScanSources = automaticSceneScanSources.filter {
             sceneReports[$0] == nil && edit.preparation.sourceMedia[$0]?.hasVideo != false
@@ -2390,19 +2416,30 @@ final class EditorModel: ObservableObject {
         runSceneRequests(requests, clip: nil, policy: .reuse)
     }
 
-    /// Scans the pauses of recordings added with Settings' automatic pause scan on. It shares the snap scan's
-    /// bookkeeping, so a cancelled scan is not started again by a later edit.
+    /// Scans the pauses of recordings added with Settings' automatic pause scan on: only those recordings, never one
+    /// already in the project, so a scan the editor cancelled stays cancelled. A recording leaves the waiting set when
+    /// its scan starts. The menu command and Snap to Silence still scan every recording without results.
     private func startAutomaticSilenceScan() {
         guard !automaticSilenceScanSources.isEmpty else { return }
+        guard preferences.autoScanSilence else { automaticSilenceScanSources.removeAll(); return }
         automaticSilenceScanSources.subtract(sourcePauses.keys)
-        guard refreshStaleSilence.isEmpty, canScanSilence, !hasSilenceResults else { return }
-        let missing = activeAudioSources.subtracting(sourcePauses.keys)
-        let added = automaticSilenceScanSources.intersection(missing)
+        guard refreshStaleSilence.isEmpty, canEdit else { return }
+        let added = automaticSilenceScanSources.intersection(activeAudioSources.subtracting(sourcePauses.keys))
         guard !added.isEmpty else { return }
+        if silenceScanRequested {
+            // A scan is running. One the editor started reads every pending recording, these included; an automatic
+            // one takes these on as well.
+            automaticSilenceScanSources.subtract(added)
+            guard automaticSilenceScope != nil else { return }
+            automaticSilenceScope?.formUnion(added)
+            audioStore.allowOverviews(added)
+            syncWaveforms()
+            return
+        }
+        guard canScanSilence else { return }
         automaticSilenceScanSources.subtract(added)
-        guard !missing.isSubset(of: snapScanRequests) else { return }
-        snapScanRequests.formUnion(missing)
-        scanForSilence()
+        automaticSilenceScope = added
+        beginSilenceScan()
     }
 
     func cancelSceneAnalysisFromEditor() {
@@ -4602,33 +4639,7 @@ final class EditorModel: ObservableObject {
                     cancelTrim()
                     preview.pause()
                     let source = currentSoundtrackMedia ?? candidate.first?.source.media ?? segments.lazy.compactMap({ $0.source.media }).first
-                    var options = sheetExportOptions
-                    options.placements = scope
-                    options.tracks = .all
-                    options.mode = mode ?? ExportRules.defaultStillMode(tracks: options.tracks, placements: scope, otherwise: defaultExportMode)
-                    if stillProject.stillSoundtrack != nil || project.stillInserts.contains(where: \.usesExactDuration) {
-                        options.pictureTiming = options.pictureTiming ?? .held
-                    }
-                    if project.stillSoundtrack != nil || project.stillAudioReference?.audioTrack != nil {
-                        options.audio = .auto
-                    } else if !ExportRules.stillMovieAudioActions.contains(options.audio) {
-                        options.audio = .copyOriginal
-                    }
-                    options.audioMode = .copy
-                    if project.stillSoundtrack != nil || project.stillAudioReference?.audioTrack != nil {
-                        options.convertAudio(to: .alac, preferred: "m4a")
-                    }
-                    options.audioTrackOrdinal = nil
-                    let preferred = project.stillFormat?.container ?? preferredCopyContainer
-                    options.codec = project.stillFormat?.codec ?? options.codec
-                    options.copyContainer = preferred.flatMap { ExportRules.stillMovieContainers.contains($0) ? $0 : nil } ?? "mov"
-                    let encode = ExportRules.stillContainers(mode: .encode, tracks: .all, codec: options.codec, audio: options.audio)
-                    if let format = project.stillFormat {
-                        options.encodeContainer = format.container
-                        options.proResContainer = format.container
-                    }
-                    if !encode.contains(options.encodeContainer) { options.encodeContainer = encode.first ?? "mov" }
-                    if !encode.contains(options.proResContainer) { options.proResContainer = encode.first ?? "mov" }
+                    let options = stillSheetOptions(project, scope: scope, mode: mode)
                     let containers = ExportContainerChoices(stillSource: source, cancelled: { false })
                     presentExport(options: options, copyContainers: containers, candidate: candidate,
                                   useSidecar: useAnalysisSidecars, selectionOnly: selectionOnly, stillProject: project)
@@ -5435,6 +5446,39 @@ final class EditorModel: ObservableObject {
     var sheetExportOptions: ExportSheetOptions {
         var options = exportOptions
         options.seedEncoding(from: preferences, keeping: exportEncodingKept)
+        return options
+    }
+
+    /// The options the export sheet opens with for `project`, a stills timeline or selection whose still placements
+    /// export with `scope`. A project's own format comes first, and a container the placements cannot use is replaced.
+    func stillSheetOptions(_ project: CutProject, scope: ExportPlacementScope, mode: ExportMode?) -> ExportSheetOptions {
+        var options = sheetExportOptions
+        options.placements = scope
+        options.tracks = .all
+        options.mode = mode ?? ExportRules.defaultStillMode(tracks: options.tracks, placements: scope, otherwise: defaultExportMode)
+        if stillProject.stillSoundtrack != nil || project.stillInserts.contains(where: \.usesExactDuration) {
+            options.pictureTiming = options.pictureTiming ?? .held
+        }
+        if project.stillSoundtrack != nil || project.stillAudioReference?.audioTrack != nil {
+            options.audio = .auto
+        } else if !ExportRules.stillMovieAudioActions.contains(options.audio) {
+            options.audio = .copyOriginal
+        }
+        options.audioMode = .copy
+        if project.stillSoundtrack != nil || project.stillAudioReference?.audioTrack != nil {
+            options.convertAudio(to: .alac, preferred: "m4a")
+        }
+        options.audioTrackOrdinal = nil
+        let preferred = project.stillFormat?.container ?? preferredCopyContainer
+        options.codec = project.stillFormat?.codec ?? options.codec
+        options.copyContainer = preferred.flatMap { ExportRules.stillMovieContainers.contains($0) ? $0 : nil } ?? "mov"
+        let encode = ExportRules.stillContainers(mode: .encode, tracks: .all, codec: options.codec, audio: options.audio)
+        if let format = project.stillFormat {
+            options.encodeContainer = format.container
+            options.proResContainer = format.container
+        }
+        if !encode.contains(options.encodeContainer) { options.encodeContainer = encode.first ?? "mov" }
+        if !encode.contains(options.proResContainer) { options.proResContainer = encode.first ?? "mov" }
         return options
     }
 
@@ -6345,6 +6389,14 @@ extension EditorModel {
 
     func scanForSilence() {
         guard canScanSilence else { return }
+        // The menu command, Snap to Silence and agents scan every recording without results.
+        automaticSilenceScope = nil
+        beginSilenceScan()
+    }
+
+    /// Starts pause detection for every recording without results, or for an automatic scan only the recordings in
+    /// `automaticSilenceScope`.
+    private func beginSilenceScan() {
         let stale = refreshStaleSilence.intersection(activeAudioSources)
         audioStore.allowOverviews(activeAudioSources)
         if !stale.isEmpty {
@@ -6366,6 +6418,8 @@ extension EditorModel {
     func cancelSilenceScan() {
         invalidateMCPSilenceReceipt()
         if snapTarget == .silence { snapScanRequests.formUnion(activeAudioSources) }
+        // Recordings still waiting for an automatic scan stay unscanned, as in multicam.
+        automaticSilenceScanSources.removeAll()
         silenceScanRequested = false
         pendingSilenceRescans.removeAll()
         for task in pauseDetections.values { task.cancel() }
@@ -6415,7 +6469,8 @@ extension EditorModel {
             let readSaved = !rescan && persist && checkedSilenceSidecars.insert(id).inserted
             let wave = audioStore.finished.contains(id) ? audioStore.waves[id] : nil
             let calibrated = automaticThresholds[id]
-            let requested = silenceScanRequested
+            // An automatic scan detects only its own recordings; the rest restore saved results and calibrate as before.
+            let requested = silenceScanRequested && automaticSilenceScope?.contains(id) != false
             guard readSaved || (wave != nil && (requested || calibrated == nil)) else { continue }
             // This job restores saved results even before the waveform has arrived.
             // Fresh detection shares the waveform decoder and runs only on request.
@@ -6482,7 +6537,7 @@ extension EditorModel {
             for task in pauseDetections.values { task.cancel() }
             pauseDetections.removeAll()
             mcpSilenceWorkers.removeAll()
-        } else if silenceScanRequested && pendingSilenceSources.isEmpty {
+        } else if silenceScanRequested && scannedSilenceSources.isEmpty {
             silenceScanRequested = false
             mcpSilenceReceipt?.finish("succeeded", detail: ["sources": activeAudioSources.map(\.uuidString).sorted()])
             mcpSilenceReceipt = nil
@@ -7188,6 +7243,23 @@ extension EditorModel {
             }
         }
         return false
+    }
+
+    /// The cadence the timeline read-outs count frames at: `stillCadence`, kept until the timeline's
+    /// format or its first picture recording changes, because finding it walks every frame.
+    var timelineCadence: RationalTime? {
+        let reference = segments.lazy.compactMap({ $0.source.media }).first(where: \.hasVideo)
+        let key = TimelineCadenceKey(format: edit.stillSequence?.stillFormat?.cadence, recording: reference?.url,
+                                     frames: reference?.frames.count ?? 0, rate: reference?.videoStream?.frameRate)
+        if let memo = timelineCadenceMemo, memo.key == key { return memo.cadence }
+        let cadence = stillCadence
+        timelineCadenceMemo = (key, cadence)
+        return cadence
+    }
+
+    /// The Time display setting for this timeline. Milliseconds never looks up the cadence.
+    var timelineTimeFormat: TimelineTimeFormat {
+        preferences.timeDisplay == .frames ? TimelineTimeFormat(display: .frames, cadence: timelineCadence) : .milliseconds
     }
 
     var stillCadence: RationalTime? {

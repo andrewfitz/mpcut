@@ -4,7 +4,7 @@ A person reading one setting should know what it controls. A person choosing an 
 
 ## Rules
 
-- **Values:** feature → subject → qualifier → unit. Examples are `multicam_track_label_width_points`, `playback_preview_volume_fraction` and `history_max_steps`. Use ordinary language in the UI: **Multicam → Track label width**, **Playback → Preview volume**, **History → Maximum undo and redo steps**.
+- **Values:** feature → subject → qualifier → unit. Examples are `multicam_track_label_width_points`, `playback_preview_volume_fraction` and `history_max_steps`. Use ordinary language in the UI: **Multicam track label width**, **Preview volume**, **Maximum undo and redo steps**.
 - **Actions:** feature → target when needed → object → verb. Examples are `multicam_camera_take`, `transcript_editor_excerpt_queue` and `export_queue_render`. Buttons use the same nouns in natural order: **Move switch**, **Queue excerpt**, **Render queued exports**.
 - **Scope:** distinguish app preferences, window layout, project state, source tracks, timeline occurrences and job options. Specify whether a tool reads the open editor revision or a saved file. Identify the owner of a job when reporting or cancelling it.
 - **Coordinates:** include the clock when source, sequence, group or assembly time could apply. Include the occurrence when footage repeats. Preserve exact rational times. Distinguish an absolute stream index from a displayed track number and specify the index base.
@@ -12,26 +12,30 @@ A person reading one setting should know what it controls. A person choosing an 
 
 ## Settings and interface vocabulary
 
-| Swift preference | Standalone name | Settings tab, section and control |
+| Swift preference | Standalone name | Settings page, section and control |
 |---|---|---|
-| localMCPEnabled | automation_local_mcp_enabled | General → Automation → Enable local MCP control |
-| automaticallyRefreshMedia | media_auto_refresh_enabled | General → Media → Watch recordings for changes while editing |
-| useAnalysisSidecars | analysis_sidecar_reuse_enabled | Analysis → Analysis sidecars → Save and reuse analysis |
+| localMCPEnabled | automation_local_mcp_enabled | Automation → Local control → Enable local MCP control |
+| automaticallyRefreshMedia | media_auto_refresh_enabled | Media & Analysis → Media → Watch recordings for changes while editing |
+| useAnalysisSidecars | analysis_sidecar_reuse_enabled | Storage → Analysis cutcaches → Save and reuse analysis |
 | historyLimit | history_max_steps | General → History → Maximum undo and redo steps |
-| snapTarget | timeline_snap_target | General → Timeline → Snap to |
-| sourceTimeTicks | timeline_source_time_ticks_enabled | General → Timeline → Show source time ticks inside clips |
-| largeThumbnails | timeline_large_previews_enabled | General → Timeline → Enlarge thumbnails and waveforms |
-| volume | playback_preview_volume_fraction | General → Playback → Preview volume |
-| isMuted | playback_preview_muted | General → Playback → Mute preview audio |
-| scrubSoundEnabled | playback_scrub_audio_enabled | General → Playback → Play audio while scrubbing |
-| defaultExportMode | export_movie_default_mode | General → Export defaults → Default movie export mode |
-| jpegPreset | export_jpeg_default_preset | General → Export defaults → Default JPEG preset |
-| warnBeforeLoweringExportTier | export_tier_downgrade_warning_enabled | General → Export defaults → Warn when an edit lowers the export tier |
-| minimumPause | silence_min_pause_seconds | Analysis → Silence → Minimum pause (s) |
-| maxBlip | silence_max_blip_seconds | Analysis → Silence → Ignore sounds up to (s) |
-| padding | silence_padding_per_side_seconds | Analysis → Silence → Padding per side (s) |
+| snapTarget | timeline_snap_target | Editing → Timeline → Snap to |
+| sourceTimeTicks | timeline_source_time_ticks_enabled | Editing → Timeline → Show source time ticks inside clips |
+| largeThumbnails | timeline_large_previews_enabled | Editing → Timeline → Enlarge thumbnails and waveforms |
+| volume | playback_preview_volume_fraction | Playback & Monitors → Audio → Preview volume |
+| isMuted | playback_preview_muted | Playback & Monitors → Audio → Mute preview audio |
+| scrubSoundEnabled | playback_scrub_audio_enabled | Playback & Monitors → Audio → Play audio while scrubbing |
+| defaultExportMode | export_movie_default_mode | Export → Defaults → Default movie export mode |
+| jpegPreset | export_jpeg_default_preset | Export → Defaults → Default JPEG preset |
+| warnBeforeLoweringExportTier | export_tier_downgrade_warning_enabled | General → Warnings → Warn when an edit lowers the export tier |
+| minimumPause | silence_min_pause_seconds | Media & Analysis → Silence → Minimum pause (s) |
+| maxBlip | silence_max_blip_seconds | Media & Analysis → Silence → Ignore sounds up to (s) |
+| padding | silence_padding_per_side_seconds | Media & Analysis → Silence → Padding per side (s) |
+| agentsChangeSettings | automation_preferences_write_enabled | Automation → Agent permissions → Let agents change settings |
+| agentsReplaceFiles | automation_file_replace_enabled | Automation → Agent permissions → Let agents replace existing project files |
 
 Window layout and multicam settings follow the same rule, including `workspace_full_height_sidebar_enabled` and `multicam_track_label_width_points`. Each schema records type, unit, scope, default, accepted range and special values. A changed preview volume affects monitoring; replacing the soundtrack changes media. In a transcript, padding extends a word selection. In silence editing, padding keeps quiet audio on each side of a cut.
+
+Most keys that give a sheet, window or job its starting value include `default`, as in `export_reencode_default_codec`. The user guide lists every key with its page and factory value. [Settings defaults](USAGE.md#set-editing-and-export-defaults)
 
 ## Choosing a command or tool
 

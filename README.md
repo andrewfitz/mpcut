@@ -31,13 +31,13 @@ This source build opens and saves schema 9 projects. To reopen an earlier `.cut`
 
 MPCut requires **macOS 14 or later on Apple Silicon**. Download the arm64 ZIP, expand it, and move **MPCut.app** into Applications. To verify the download, put `SHA256SUMS.txt` next to the ZIP and run `shasum -a 256 -c SHA256SUMS.txt`. The published app is ad-hoc signed, so macOS may ask for approval on the first launch. [Release and downloads](https://github.com/andrewfitz/mpcut/releases/latest) · [Apple’s guide to opening downloaded apps](https://support.apple.com/en-us/102445)
 
-The **Help** menu opens the bundled **MPCut User Guide** (⌘?) and **Release Notes** offline. **MPCut → About MPCut** also shows the installed version, documentation, credits, and a **Copy CLI Path** button.
+The **Help** menu opens the bundled **MPCut User Guide** (⌘?) and **Release Notes** offline, and **Help → Check for Updates…** opens the releases page in your browser. **MPCut → About MPCut** also shows the installed version, documentation, credits, and a **Copy CLI Path** button.
 
 ## Control open projects from an agent
 
 Edit from Claude Desktop, ChatGPT Desktop (Work and Codex), Grok or Grok Bot using the MPCut connector for your host. [Desktop setup and example editing requests](docs/DESKTOP-PLUGINS.md)
 
-Open **Settings → General → Automation** and enable local MCP control. Configure your agent’s stdio server to launch `/Applications/MPCut.app/Contents/Helpers/mpcut-mcp` or the helper from the app bundle you have open. Ask the agent to list open projects, inspect the timeline and split a specific clip. Edits use the GUI’s native history, including its retention limit. Turn off the setting to end access. **Help → MPCut Agent Guide** opens the instructions offline. [Setup and use cases](docs/MCP-AGENT-GUIDE.md) · [Tool reference](docs/MCP-REFERENCE.md)
+Open **Settings → Automation** and enable local MCP control. Configure your agent’s stdio server to launch `/Applications/MPCut.app/Contents/Helpers/mpcut-mcp` or the helper from the app bundle you have open. Ask the agent to list open projects, inspect the timeline and split a specific clip. Edits use the GUI’s native history, including its retention limit. Turn off the setting to end access. The same page can stop agents from changing settings or replacing existing project files, and **Copy Agent Configuration** copies the helper setup for your host. **Help → MPCut Agent Guide** opens the instructions offline. [Setup and use cases](docs/MCP-AGENT-GUIDE.md) · [Tool reference](docs/MCP-REFERENCE.md)
 
 For a saved project, start the same helper with `--files-only`. You can review a frame, compare mask or tile changes against saved history, or preflight a movie and pass the returned approval token to the render. Keep the operation UUID so you can recover a file job after reconnecting. [Headless workflows](docs/HEADLESS.md)
 

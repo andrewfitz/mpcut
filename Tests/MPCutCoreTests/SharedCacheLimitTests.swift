@@ -16,8 +16,8 @@ final class SharedCacheLimitTests: XCTestCase {
         var folder: URL { disk.appendingPathComponent("MPCut Cache", isDirectory: true) }
     }
 
-    /// Three disk-mode cutcaches in an isolated sidecar home.
-    private func fixture(_ body: (Fixture) throws -> Void) throws {
+    /// Three disk-mode cutcaches in an isolated sidecar home. `diskName` names the shared folder the user chose.
+    private func fixture(diskName: String = "shared", _ body: (Fixture) throws -> Void) throws {
         let root = files.temporaryDirectory.appendingPathComponent("mpcut-limit-\(UUID().uuidString)", isDirectory: true)
         try files.createDirectory(at: root, withIntermediateDirectories: false)
         defer { try? files.removeItem(at: root) }
@@ -27,7 +27,7 @@ final class SharedCacheLimitTests: XCTestCase {
             let adjacent = try AnalysisSidecar(source: media)
             try adjacent.save(["waveform_peaks.v1.0": Data(repeating: 4, count: 8_192)])
             try files.setAttributes([.modificationDate: Date.distantPast], ofItemAtPath: adjacent.url.path)
-            let disk = root.appendingPathComponent("shared", isDirectory: true)
+            let disk = root.appendingPathComponent(diskName, isDirectory: true)
             try files.createDirectory(at: disk, withIntermediateDirectories: false)
             try SidecarLocations.chooseDisk(disk)
             try SidecarLocations.setMode(.disk)
@@ -101,11 +101,56 @@ final class SharedCacheLimitTests: XCTestCase {
         }
     }
 
-    func testAcceptsTheCacheFolderItselfAsRoot() throws {
+    func testAChosenFolderNamedMPCutCacheIsEnforced() throws {
+        // The managed folder is then `<chosen>/MPCut Cache`; the chosen folder's name is not stripped.
+        try fixture(diskName: "MPCut Cache") { fixture in
+            XCTAssertEqual(fixture.folder.deletingLastPathComponent().lastPathComponent, "MPCut Cache")
+            let total = bytes(fixture.folder)
+            XCTAssertGreaterThan(total, 0)
+            let outcome = SharedCacheLimit.enforce(limit: total - 1, protected: [], root: fixture.disk)
+            XCTAssertEqual(outcome.bytesBefore, total)
+            XCTAssertEqual(outcome.removed.map(\.lastPathComponent), [fixture.stores[0].url.lastPathComponent])
+            XCTAssertFalse(exists(fixture.stores[0]))
+        }
+    }
+
+    func testARecordingProtectedDuringTheRunKeepsItsCacheAndTheNextOldestGoes() throws {
         try fixture { fixture in
             let total = bytes(fixture.folder)
-            let outcome = SharedCacheLimit.enforce(limit: total - 1, protected: [], root: fixture.folder)
-            XCTAssertEqual(outcome.removed.map(\.lastPathComponent), [fixture.stores[0].url.lastPathComponent])
+            let second = bytes(fixture.stores[1].url)
+            let asked = Counter()
+            // A project that lists B, the oldest, opens after the run started with nothing protected.
+            let outcome = SharedCacheLimit.enforce(limit: total - second, protected: [], root: fixture.disk, recheck: {
+                asked.increment()
+                return [fixture.stores[0].source]
+            })
+            XCTAssertGreaterThanOrEqual(asked.value, 2, "Asked before each removal")
+            XCTAssertTrue(exists(fixture.stores[0]))
+            XCTAssertFalse(exists(fixture.stores[1]))
+            XCTAssertTrue(exists(fixture.stores[2]))
+            XCTAssertEqual(outcome.skipped.first { $0.key.lastPathComponent == fixture.stores[0].url.lastPathComponent }?.value,
+                           "An open project uses this cache.")
+            XCTAssertFalse(outcome.aborted)
+            XCTAssertEqual(outcome.removedSources.map(\.lastPathComponent), ["A.mov"])
+        }
+    }
+
+    func testARecheckThatAnswersNilStopsBeforeAnyRemoval() throws {
+        try fixture { fixture in
+            let outcome = SharedCacheLimit.enforce(limit: 1, protected: [], root: fixture.disk, recheck: { nil })
+            XCTAssertTrue(outcome.aborted)
+            XCTAssertTrue(outcome.removed.isEmpty)
+            XCTAssertTrue(fixture.stores.allSatisfy(exists))
+            XCTAssertEqual(outcome.bytesAfter, outcome.bytesBefore)
+        }
+    }
+
+    func testTheFolderItselfIsNotARoot() throws {
+        // `root` is always the chosen folder. Passing its managed child reads `<child>/MPCut Cache`, which is empty.
+        try fixture { fixture in
+            let outcome = SharedCacheLimit.enforce(limit: 1, protected: [], root: fixture.folder)
+            XCTAssertTrue(outcome.removed.isEmpty)
+            XCTAssertTrue(fixture.stores.allSatisfy(exists))
         }
     }
 
@@ -162,4 +207,11 @@ final class SharedCacheLimitTests: XCTestCase {
             XCTAssertTrue(outcome.removed.allSatisfy { $0.path.hasPrefix(AnalysisSidecar.canonicalSource(fixture.folder).path) })
         }
     }
+}
+
+private final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    var value: Int { lock.withLock { count } }
+    func increment() { lock.withLock { count += 1 } }
 }

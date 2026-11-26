@@ -1402,14 +1402,8 @@ extension TranscriptPane {
     }
 
     private var transcriptSourceRecording: URL? {
-        if isMulticam, let project = multicam.project {
-            let groupTime = multicam.groupTime(at: multicam.preview.currentTime())
-            let source = project.selection(at: groupTime).flatMap { project.pictureSource(for: $0.angle, at: groupTime) }
-                ?? project.sources.first
-            return source.map { URL(fileURLWithPath: $0.file) }
-        }
-        if let sourceID = editor.analysisPlayheadSourceID, let media = editor.analysisSourceMedia[sourceID] { return media.url }
-        return editor.sequenceClips.first.map { URL(fileURLWithPath: $0.file) }
+        if isMulticam, multicam.project != nil { return multicam.transcriptSourceRecording }
+        return editor.transcriptSourceRecording
     }
 
     private var transcriptPanelDirectory: URL? {
@@ -2465,5 +2459,32 @@ extension TranscriptPane {
                 try await review(request, name: name ?? "")
             }
         }
+    }
+}
+
+extension MulticamEditorModel {
+    /// The recording Settings' Source folder starts transcript and caption panels from: the picture on screen at the
+    /// playhead, or the first source. A source's file can be relative to the project, so it resolves against the
+    /// project, never the working folder.
+    var transcriptSourceRecording: URL? {
+        guard let project else { return nil }
+        let groupTime = groupTime(at: preview.currentTime())
+        let source = project.selection(at: groupTime).flatMap { project.pictureSource(for: $0.angle, at: groupTime) }
+            ?? project.sources.first
+        return source.map { projectMediaURL($0.file) }
+    }
+}
+
+extension EditorModel {
+    /// A project media path as a file URL: a relative path resolves against the saved project, or the untitled draft.
+    func projectMediaURL(_ path: String) -> URL {
+        ProjectMediaVolume.watchURL(path, relativeTo: projectURL ?? draft.url ?? LiveProjectMediaArchive.untitledURL)
+    }
+
+    /// The recording Settings' Source folder starts transcript and caption panels from: the one at the playhead, or the
+    /// first clip's, resolved against the project.
+    var transcriptSourceRecording: URL? {
+        if let sourceID = analysisPlayheadSourceID, let media = analysisSourceMedia[sourceID] { return media.url }
+        return sequenceClips.first.map { projectMediaURL($0.file) }
     }
 }

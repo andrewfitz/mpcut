@@ -6,6 +6,9 @@ struct SettingsExportPage: View {
     @ObservedObject var preferences: EditorPreferences
     /// Nil until checked. A process without an app bundle, such as the test host, always reads unavailable.
     @State private var notificationAuthorization: ExportNotificationAuthorization?
+    /// Whether the chosen start folder is reachable, checked off the main actor: an offline volume can take a long time
+    /// to answer. Nil until checked, which shows no warning.
+    @State private var chosenFolderAvailable: Bool?
 
     var body: some View {
         SettingsForm(page: .export, preferences: preferences) {
@@ -14,13 +17,13 @@ struct SettingsExportPage: View {
                     ForEach(ExportMode.allCases, id: \.self) { Text($0.displayName).tag($0) }
                 }
                 .settingsRow(.movieMode)
-                .help("Set default movie mode")
+                .help("Choose the default movie export mode")
                 Picker(SettingsRow.jpegPreset.title, selection: $preferences.jpegPreset) {
                     Text("Small review images").tag(JPEGPreset.review)
                     Text("Full resolution, high quality").tag(JPEGPreset.full)
                 }
                 .settingsRow(.jpegPreset)
-                .help("Set default JPEG quality")
+                .help("Choose the default JPEG preset")
             } header: {
                 Text("Defaults")
             } footer: {
@@ -49,6 +52,7 @@ struct SettingsExportPage: View {
                     Text("MKV").tag(ExportContainerChoice.mkv)
                 }
                 .settingsRow(.container)
+                .accessibilityLabel(SettingsRow.container.title)
                 .help("Automatic uses MP4 in the sequence editor and MOV in multicam. ProRes stays MOV.")
                 Picker(SettingsRow.multicamAudio.title, selection: $preferences.multicamAudioLayout) {
                     ForEach(MulticamAudioOutput.allCases, id: \.self) { Text($0.title).tag($0) }
@@ -73,23 +77,45 @@ struct SettingsExportPage: View {
                 .help("Choose the first folder export panels open in")
                 if preferences.exportStartFolder == .chosen {
                     LabeledContent("Chosen folder") {
-                        HStack {
-                            Text(preferences.exportStartFolderPath.isEmpty ? "No folder selected" : preferences.exportStartFolderPath)
-                                .lineLimit(1).truncationMode(.middle)
-                                .foregroundStyle(preferences.exportStartFolderPath.isEmpty ? .secondary : .primary)
-                                .help(preferences.exportStartFolderPath)
+                        VStack(alignment: .trailing, spacing: 4) {
+                            if preferences.exportStartFolderPath.isEmpty {
+                                Text("None").foregroundStyle(.secondary)
+                            } else {
+                                Text((preferences.exportStartFolderPath as NSString).abbreviatingWithTildeInPath)
+                                    .lineLimit(1).truncationMode(.middle)
+                                    .help(preferences.exportStartFolderPath)
+                                    .accessibilityValue(preferences.exportStartFolderPath)
+                            }
                             Button(preferences.exportStartFolderPath.isEmpty ? "Choose Folder…" : "Change Folder…", action: chooseFolder)
                                 .accessibilityIdentifier("settings.export.start-folder.choose")
+                                .help("Choose the folder export panels start in")
                         }
                     }
-                    if let folder = preferences.chosenExportFolder, !ExportStartFolder.isAvailable(folder) {
-                        Label("This folder is unavailable. Export panels open at their usual folder until it is back.",
+                    if preferences.exportStartFolderPath.isEmpty {
+                        // An explanation reads from the left, like the page's other notes.
+                        Text("No folder chosen. Export panels open at their automatic location until you choose one.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .accessibilityIdentifier("settings.export.start-folder.none")
+                    }
+                    if preferences.chosenExportFolder != nil, chosenFolderAvailable == false {
+                        Label("This folder is unavailable. Export panels open at their automatic location until it is back.",
                               systemImage: "exclamationmark.triangle")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                             .accessibilityIdentifier("settings.export.start-folder.unavailable")
                     }
                 }
+            }
+            .task(id: preferences.exportStartFolder == .chosen ? preferences.exportStartFolderPath : "") {
+                chosenFolderAvailable = nil
+                guard preferences.exportStartFolder == .chosen, let folder = preferences.chosenExportFolder else { return }
+                let available = await Task.detached(priority: .utility) { ExportStartFolder.isAvailable(folder) }.value
+                guard !Task.isCancelled else { return }
+                chosenFolderAvailable = available
             }
             Section {
                 Toggle(SettingsRow.finishedReveal.title, isOn: $preferences.revealsFinishedExport)
@@ -132,6 +158,7 @@ struct SettingsExportPage: View {
     private func chooseFolder() {
         let panel = NSOpenPanel()
         panel.title = "Choose where export panels start"
+        panel.message = "Export panels open in this folder at the start of each window's session."
         panel.prompt = "Choose"
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
@@ -139,7 +166,8 @@ struct SettingsExportPage: View {
         if !preferences.exportStartFolderPath.isEmpty {
             panel.directoryURL = URL(fileURLWithPath: preferences.exportStartFolderPath, isDirectory: true)
         }
-        ProjectPanels.present(panel, in: NSApp.keyWindow, fromSheet: true) { accepted in
+        // A standalone panel: as a sheet it is wider than the Settings window and hangs off its edge.
+        ProjectPanels.present(panel, in: nil) { accepted in
             if accepted, let url = panel.url { preferences.exportStartFolderPath = url.path }
         }
     }

@@ -14,7 +14,7 @@ struct SettingsGeneralPage: View {
                 .settingsRow(.multipleRecordings)
                 .help("Choose what opening several recordings from Finder does")
                 SettingsNumericField(.recentItems, value: $preferences.recentFilesLimit, in: EditorPreferences.recentFilesRange,
-                                     step: 1, help: "Enter how many recent items File → Open Recent lists")
+                                     step: 1, help: "Type how many recent items File → Open Recent lists")
                 Toggle(SettingsRow.draftRecovery.title, isOn: $preferences.offersDraftRecovery)
                     .settingsRow(.draftRecovery)
                     .help("Ask about unsaved untitled projects when MPCut opens")
@@ -35,7 +35,7 @@ struct SettingsGeneralPage: View {
                     .help("Ask before scanning a recording's scenes again")
                 Toggle(SettingsRow.exportMessage.title, isOn: $preferences.showsProjectExportMessage)
                     .settingsRow(.exportMessage)
-                    .help("Confirm that a project interchange export finished")
+                    .help("Show a message when a project export finishes with no warnings")
                 HStack {
                     Spacer()
                     Button(SettingsRow.resetWarnings.title, action: preferences.resetAllWarnings)

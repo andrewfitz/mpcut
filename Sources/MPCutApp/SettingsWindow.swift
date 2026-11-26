@@ -32,37 +32,33 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .automation: "terminal"
         }
     }
-
-    /// What Restore Defaults changes beyond Settings, named before it asks.
-    var restoreMessage: String {
-        switch self {
-        case .general: "The undo limit keeps its value. Warnings that were turned off ask again."
-        case .editing: "Snapping, source time ticks, enlarged previews, the panel position and the track label width change in every open window."
-        case .playback: "Scrub audio, mute, volume and the Force SDR and clean feed choices change in every open window."
-        case .media: "Watching recordings changes in open projects, and new silence values recalculate pauses in open projects."
-        case .transcripts: "Open sheets keep their values. New transcription jobs and reviews start from the factory values."
-        case .export: "The movie export mode changes in every open sequence editor. Open export panels keep their choices."
-        case .storage: "Reusing analysis turns on again for open projects. The cutcache location keeps its value."
-        case .automation: "Local MCP control and the agent permissions keep their values."
-        }
-    }
 }
 
 struct SettingsWindow: View {
     static let sidebarWidth: CGFloat = 210
     @ObservedObject var preferences: EditorPreferences
     let cacheContext: @MainActor () -> SidecarClearContext
+    /// The stores the Storage page measures and clears. Tests pass temporary folders.
+    var storageLocations: StorageLocations = .standard
     @State private var query = ""
+    /// The page the sidebar shows as selected. The stored page follows it on the next turn of the run loop, so the
+    /// sidebar's table never sees a model change from inside its own selection callback.
+    @State private var sidebarSelection: SettingsPage?
+    /// The search result chosen last, shown highlighted in the results.
+    @State private var chosen: String?
     @State private var highlight: String?
     @State private var highlightReset: Task<Void, Never>?
+    /// Transcriberrr's last check, kept for the life of the window: the Transcripts page is rebuilt on every visit.
+    @StateObject private var transcriberrr = TranscriberrrStatus()
 
     private var results: [SettingsRow] { SettingsRow.search(query) }
+    private var searching: Bool { !query.trimmingCharacters(in: .whitespaces).isEmpty }
 
     var body: some View {
         // A plain stack, not NavigationSplitView: its toolbar and collapse behavior in a Settings scene vary by release.
         HStack(spacing: 0) {
             VStack(spacing: 8) {
-                SettingsSearchField(query: $query) { if let first = results.first { reveal(first) } }
+                SettingsSearchField(query: $query) { if let first = results.first { choose(first) } }
                     .padding([.horizontal, .top], 10)
                 sidebar
             }
@@ -80,14 +76,30 @@ struct SettingsWindow: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(minWidth: 640, idealWidth: 760, maxWidth: .infinity, minHeight: 420, idealHeight: 560, maxHeight: .infinity)
+        .frame(minWidth: SettingsWindowHooks.minimumSize.width, idealWidth: SettingsWindowHooks.initialSize.width, maxWidth: .infinity,
+               minHeight: SettingsWindowHooks.minimumSize.height, idealHeight: SettingsWindowHooks.initialSize.height,
+               maxHeight: .infinity)
+        .background(SettingsWindowHooks())
+        .onChange(of: query) { _, _ in chosen = nil }
+        .onChange(of: preferences.settingsPage) { _, page in
+            // A deep link, a search result or Restore Defaults moved the page: the sidebar follows.
+            if sidebarSelection != nil, sidebarSelection != page { sidebarSelection = page }
+        }
     }
 
     @ViewBuilder private var sidebar: some View {
-        if query.trimmingCharacters(in: .whitespaces).isEmpty {
-            List(selection: Binding(get: { preferences.settingsPage }, set: { if let page = $0 { preferences.settingsPage = page } })) {
+        if !searching {
+            List(selection: Binding(
+                get: { sidebarSelection ?? preferences.settingsPage },
+                set: { page in
+                    // Clicking empty space deselects; the page stays.
+                    guard let page, page != (sidebarSelection ?? preferences.settingsPage) else { return }
+                    sidebarSelection = page
+                    DispatchQueue.main.async { if preferences.settingsPage != page { preferences.settingsPage = page } }
+                }
+            )) {
                 ForEach(SettingsPage.allCases) { page in
-                    Label(page.title, systemImage: page.symbol)
+                    SettingsSidebarLabel(page: page)
                         .tag(page)
                         .accessibilityIdentifier("settings.page." + page.rawValue)
                 }
@@ -97,20 +109,19 @@ struct SettingsWindow: View {
             .accessibilityIdentifier("settings.pages")
         } else if results.isEmpty {
             Text("No Results").foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
+                .accessibilityIdentifier("settings.results.none")
         } else {
-            List(selection: Binding(get: { nil as SettingsRow? }, set: { if let row = $0 { reveal(row) } })) {
-                ForEach(results) { row in
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(row.title).lineLimit(2)
-                        Text(row.page.title).font(.caption).foregroundStyle(.secondary)
+            // Buttons in a scroll view, not a second List: nothing here is a table whose selection a choice could write.
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 2) {
+                    ForEach(results) { row in
+                        SettingsResultButton(row: row, isChosen: chosen == row.id) { choose(row) }
                     }
-                    .tag(row)
-                    .accessibilityElement(children: .combine)
-                    .accessibilityHint("Opens \(row.page.title) settings")
-                    .accessibilityIdentifier("settings.result." + row.id)
                 }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
             }
-            .listStyle(.sidebar)
+            .accessibilityElement(children: .contain)
             .accessibilityLabel("Search results")
             .accessibilityIdentifier("settings.results")
         }
@@ -122,26 +133,77 @@ struct SettingsWindow: View {
         case .editing: SettingsEditingPage(preferences: preferences)
         case .playback: SettingsPlaybackPage(preferences: preferences)
         case .media: SettingsMediaPage(preferences: preferences)
-        case .transcripts: SettingsTranscriptsPage(preferences: preferences)
+        case .transcripts: SettingsTranscriptsPage(preferences: preferences, status: transcriberrr)
         case .export: SettingsExportPage(preferences: preferences)
-        case .storage: SettingsStoragePage(preferences: preferences, cacheContext: cacheContext)
+        case .storage: SettingsStoragePage(preferences: preferences, cacheContext: cacheContext, locations: storageLocations)
         case .automation: SettingsAutomationPage(preferences: preferences)
         }
     }
 
-    /// Opens a search result's page and focuses its control.
+    /// Marks a search result chosen and opens it on the next turn of the run loop, outside any view update.
+    private func choose(_ row: SettingsRow) {
+        chosen = row.id
+        DispatchQueue.main.async { reveal(row) }
+    }
+
+    /// Opens a search result's page, scrolls to its control, highlights it briefly and focuses it where it can take focus.
     private func reveal(_ row: SettingsRow) {
-        preferences.settingsPage = row.page
+        if preferences.settingsPage != row.page { preferences.settingsPage = row.page }
+        if sidebarSelection != nil { sidebarSelection = row.page }
         highlight = nil
         highlightReset?.cancel()
         highlightReset = Task { @MainActor in
-            // The page's controls need one pass to exist before they can take focus.
+            // The page's controls need one pass to exist before they can scroll into view and take focus.
             await Task.yield()
             highlight = row.id
-            try? await Task.sleep(for: .seconds(2))
+            try? await Task.sleep(for: .seconds(3))
             guard !Task.isCancelled else { return }
             highlight = nil
         }
+    }
+}
+
+/// A sidebar row: a fixed-width icon column, so every label starts at the same place, and the same height for every row.
+/// Its look comes from the List's selection alone.
+private struct SettingsSidebarLabel: View {
+    let page: SettingsPage
+
+    var body: some View {
+        Label {
+            Text(page.title)
+        } icon: {
+            Image(systemName: page.symbol)
+                .symbolRenderingMode(.monochrome)
+                .frame(width: 20, height: 16)
+        }
+        .frame(height: 22)
+    }
+}
+
+/// One search result. The chosen one stays highlighted.
+private struct SettingsResultButton: View {
+    let row: SettingsRow
+    let isChosen: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(row.title).lineLimit(2)
+                Text(row.page.title).font(.caption).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 4)
+            .padding(.horizontal, 6)
+            .background(isChosen ? Color.accentColor.opacity(0.22) : Color.clear, in: RoundedRectangle(cornerRadius: 6))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(isChosen ? [.isButton, .isSelected] : .isButton)
+        .accessibilityHint("Opens \(row.page.title) settings")
+        .accessibilityIdentifier("settings.result." + row.id)
+        .help("Open \(row.title) in \(row.page.title)")
     }
 }
 
@@ -165,7 +227,8 @@ extension SettingsWindow {
     }
 }
 
-/// Every page ends with this. It asks first, names what changes in open projects and writes factory values through the setters.
+/// Every page with something to restore ends with this. It asks first, names what changes, also in open projects, from
+/// the factory table that performs the restore, and writes factory values through the setters.
 struct SettingsRestoreDefaults: View {
     let page: SettingsPage
     @ObservedObject var preferences: EditorPreferences
@@ -181,12 +244,19 @@ struct SettingsRestoreDefaults: View {
                     .help("Restore this page's factory values")
             }
         }
-        .confirmationDialog("Restore \(page.title) settings to their defaults?", isPresented: $confirming) {
-            Button("Restore Defaults", role: .destructive) { preferences.restoreDefaults(on: page) }
+        .confirmationDialog(SettingsRestoreSummary.title(for: page), isPresented: $confirming) {
+            Button("Restore Defaults", role: .destructive) { Self.restore(page, preferences: preferences) }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text(page.restoreMessage + " A value supplied as a launch argument applies again at the next launch.")
+            Text(SettingsRestoreSummary.message(for: page, preferences: preferences))
         }
+    }
+
+    /// Restoring wins over a number typed on the page and not yet committed: that text is dropped first, so
+    /// closing the window afterwards cannot write it back.
+    static func restore(_ page: SettingsPage, preferences: EditorPreferences) {
+        SettingsEdits.discardPending(on: page)
+        preferences.restoreDefaults(on: page)
     }
 }
 
@@ -199,9 +269,14 @@ struct SettingsForm<Content: View>: View {
     var body: some View {
         Form {
             content
-            SettingsRestoreDefaults(page: page, preferences: preferences)
+            if SettingsRestoreSummary.isRestorable(page) {
+                SettingsRestoreDefaults(page: page, preferences: preferences)
+            }
         }
         .formStyle(.grouped)
         .accessibilityIdentifier("settings.form." + page.rawValue)
+        // Range notices float above the sections, which clip what a row draws outside them. The layer comes after the
+        // form's identifier, so a notice keeps its own.
+        .overlayPreferenceValue(SettingsNoticeKey.self) { SettingsNoticeLayer(notices: $0) }
     }
 }

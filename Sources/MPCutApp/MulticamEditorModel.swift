@@ -248,6 +248,8 @@ final class MulticamEditorModel: ObservableObject {
     weak var window: NSWindow?
     private var storageObservers: Set<AnyCancellable> = []
     private var preferenceObservation: AnyCancellable?
+    /// The timeline cadence and the picture media it was found for. See `multicamTimelineCadence`.
+    var timelineCadenceMemo: (key: [MulticamCadenceKey], cadence: RationalTime?)?
     var useAnalysisSidecars: Bool {
         get { preferences.useAnalysisSidecars }
         set { preferences.useAnalysisSidecars = newValue }
@@ -386,7 +388,12 @@ final class MulticamEditorModel: ObservableObject {
                 if let self {
                     self.analysis.configureSilence(minimum: self.preferences.minimumPause, threshold: self.analysis.pauseThreshold)
                 }
-            case .largeThumbnails, .sourceTimeTicks, .defaultExportMode, .jpegPreset, .padding, .trackLabelWidth:
+            case .autoScanScenes:
+                // Turning the switch off stops automatic scans that have not started. A running scan finishes.
+                if let self, !self.preferences.autoScanScenes { self.analysis.dropAutomaticScans(.scenes) }
+            case .autoScanSilence:
+                if let self, !self.preferences.autoScanSilence { self.analysis.dropAutomaticScans(.silence) }
+            case .largeThumbnails, .sourceTimeTicks, .defaultExportMode, .jpegPreset, .padding, .trackLabelWidth, .timeDisplay:
                 self?.objectWillChange.send()
             default:
                 break

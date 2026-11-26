@@ -175,6 +175,7 @@ struct MulticamAssemblyTimeline: View {
             if model.assemblySelection != nil { result.onClearTileLayouts = model.clearMarkedTileLayout }
         }
         result.timelinePadding = paddingSpans
+        result.timeFormat = model.timelineTimeFormat
         result.assemblyAssets = current.assetSpans.map { span in
             var span = span
             if let url = span.mediaURL { span.mediaStatus = model.mediaStatus(for: url) }

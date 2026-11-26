@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 import MPCutCore
 import XCTest
 @testable import MPCutApp
@@ -188,33 +189,79 @@ final class SettingsSequenceWiringTests: XCTestCase {
         XCTAssertEqual(model.sheetExportOptions.encodeContainer, "mp4", "Automatic is the sequence editor's MP4.")
     }
 
-    func testAudioOnlyAndStillPlacementsStillGetEligibleChoices() throws {
+    /// The sheets' own opening paths, not a copy of their fallbacks: what each produces is checked against the rules.
+    func testAudioOnlyAndStillPlacementsStillGetEligibleChoices() async throws {
         let preferences = preferences()
         preferences.reencodeCodec = .prores
         preferences.reencodeContainer = .mkv
-        var seeded = ExportSheetOptions()
-        seeded.seedEncoding(from: preferences)
-        // Audio-only output ignores the picture codec and keeps a container its sound can use.
-        let audio = try CutEngine(useSidecar: false).inspect(fixture("Pause-Quiet"), keyframes: true)
+        let model = EditorModel(preferences: preferences)
+        defer { model.endSession() }
+
+        // Audio-only output: the sheet opens on sound-only tracks and a container its sound can use.
+        let audio = try CutEngine(useSidecar: false).inspect(fixture("Covered-Audio", "mp3"), keyframes: true)
+        XCTAssertFalse(audio.hasVideo)
         let choices = ExportContainerChoices(source: audio, clips: [], preferred: nil, cancelled: { false })
-        var options = EditorModel.openingExportOptions(seeded, mode: .copy, convertingByName: false, source: audio,
-                                                       choices: choices, preferred: nil, verified: nil)
-        options.tracks = .audio
-        options.copyContainer = choices.choices(for: options).first ?? options.copyContainer
-        XCTAssertTrue(choices.choices(for: options).contains(options.container))
-        // A ProRes default writes MOV for ordinary encode, which is eligible.
-        seeded.mode = .encode
-        XCTAssertEqual(seeded.container, "mov")
-        XCTAssertTrue(ExportRules.reencodeContainers(seeded.codec).contains(seeded.container))
-        // Still placements: the MKV H.264 default is replaced by a container still export can write.
+        let opened = EditorModel.openingExportOptions(model.sheetExportOptions, mode: .copy, convertingByName: false, source: audio,
+                                                      choices: choices, preferred: nil, verified: nil)
+        XCTAssertEqual(opened.tracks, .audio)
+        XCTAssertTrue(choices.choices(for: opened).contains(opened.container), opened.container)
+
+        // A ProRes default writes MOV for ordinary encode, never the H.264 and HEVC container.
+        var encode = model.sheetExportOptions
+        encode.mode = .encode
+        XCTAssertEqual(encode.container, "mov")
+        XCTAssertTrue(ExportRules.reencodeContainers(encode.codec).contains(encode.container))
+
+        // Still placements: the sheet and the queue open on a container still export can write with their codec.
         preferences.reencodeCodec = .h264
-        var still = ExportSheetOptions()
-        still.seedEncoding(from: preferences)
-        still.placements = .insertion
-        still.mode = .encode
-        let eligible = ExportRules.stillContainers(mode: .encode, tracks: .all, codec: still.codec, audio: still.audio)
-        if !eligible.contains(still.encodeContainer) { still.encodeContainer = eligible.first ?? "mov" }
-        XCTAssertTrue(eligible.contains(still.container))
+        model.importFiles([try fixture("ProRes-2997")])
+        try await waitForEdit(model)
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let image = folder.appendingPathComponent("card.png")
+        let context = try XCTUnwrap(CGContext(data: nil, width: 16, height: 16, bitsPerComponent: 8, bytesPerRow: 0,
+                                              space: CGColorSpaceCreateDeviceRGB(),
+                                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        context.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
+        context.fill(.init(x: 0, y: 0, width: 16, height: 16))
+        let png = try XCTUnwrap(CGImageDestinationCreateWithURL(image as CFURL, "public.png" as CFString, 1, nil))
+        CGImageDestinationAddImage(png, try XCTUnwrap(context.makeImage()), nil)
+        XCTAssertTrue(CGImageDestinationFinalize(png))
+        let asset = StillAsset(id: "card", file: image.path, displayName: "Card", fingerprint: try StillImage.fingerprint(image))
+        let cadence = RationalTime(numerator: 1001, denominator: 30_000)
+        let card = StillInsert(id: "card", assetID: asset.id, duration: try cadence.multiplied(by: .init(numerator: 15)), cadence: cadence)
+        try model.applyStillProject(try model.stillProject.addingStillAsset(asset).insertingStill(card, at: .zero), action: "Insert Still")
+        let project = model.stillProject
+        let scope = try project.exportPlacementScope()
+        XCTAssertNotEqual(scope, .none)
+        for mode in [ExportMode.encode, .smart] {
+            let still = model.stillSheetOptions(project, scope: scope, mode: mode)
+            XCTAssertEqual(still.codec, .h264)
+            XCTAssertEqual(still.placements, scope)
+            let eligible = ExportRules.stillContainers(mode: .encode, tracks: .all, codec: still.codec, audio: still.audio)
+            XCTAssertTrue(eligible.contains(still.encodeContainer), "\(mode): \(still.encodeContainer) not in \(eligible)")
+            XCTAssertEqual(still.encodeContainer, "mkv", "The Settings container stays where still export can write it.")
+        }
+        // Settings MP4 with the session's PCM sound: still export cannot write PCM in MP4, so the sheet opens elsewhere.
+        preferences.reencodeContainer = .mp4
+        var pcm = model.sheetExportOptions
+        XCTAssertEqual(pcm.encodeContainer, "mp4")
+        pcm.audio = .pcm
+        model.exportSheetChanged(pcm, from: model.sheetExportOptions)
+        let corrected = model.stillSheetOptions(project, scope: scope, mode: .encode)
+        XCTAssertEqual(corrected.audio, .pcm)
+        let pcmEligible = ExportRules.stillContainers(mode: .encode, tracks: .all, codec: corrected.codec, audio: .pcm)
+        XCTAssertFalse(pcmEligible.contains("mp4"))
+        XCTAssertTrue(pcmEligible.contains(corrected.encodeContainer), "\(corrected.encodeContainer) not in \(pcmEligible)")
+        model.selectRange(0, model.duration)
+        model.addMarkedRange()
+        XCTAssertTrue(model.readyQueuedRanges.contains { $0.placements != .none })
+        let queued = BulkQueueView.startingOptions(editor: model)
+        XCTAssertEqual(queued.codec, .h264)
+        XCTAssertEqual(queued.mode, .smart)
+        let eligible = ExportRules.stillContainers(mode: .encode, tracks: .all, codec: queued.codec, audio: queued.audio)
+        XCTAssertTrue(eligible.contains(queued.encodeContainer), "\(queued.encodeContainer) not in \(eligible)")
     }
 
     func testResultJSONAndResolveCheckboxesStartFromSettings() {

@@ -1,3 +1,4 @@
+import AppKit
 import MPCutCore
 import SwiftUI
 
@@ -80,10 +81,10 @@ extension SettingsRow {
     static let volume = SettingsRow("settings.playback.volume", .playback, "Preview volume", keywords: ["sound", "loudness"])
     static let playbackSpeed = SettingsRow("settings.playback.speed", .playback, "Starting playback speed",
         keywords: ["rate", "fast", "slow"])
-    static let preroll = SettingsRow("settings.playback.preroll", .playback, "Seconds before a cut",
-        keywords: ["play around a cut", "pre-roll", "audition", "join"])
-    static let postroll = SettingsRow("settings.playback.postroll", .playback, "Seconds after a cut",
-        keywords: ["play around a cut", "post-roll", "audition", "join"])
+    static let preroll = SettingsRow("settings.playback.preroll", .playback, "Before the cut",
+        keywords: ["play around a cut", "seconds", "pre-roll", "audition", "join"])
+    static let postroll = SettingsRow("settings.playback.postroll", .playback, "After the cut",
+        keywords: ["play around a cut", "seconds", "post-roll", "audition", "join"])
     static let viewerSDR = SettingsRow("settings.playback.viewer-sdr", .playback, "Editor viewer",
         keywords: ["hdr", "force sdr", "tone map", "display", "preview"])
     static let monitorSDR = SettingsRow("settings.playback.monitor-sdr", .playback, "Video Monitor",
@@ -236,6 +237,25 @@ extension View {
     func settingsRow(_ row: SettingsRow) -> some View {
         modifier(SettingsRowModifier(row: row))
     }
+
+    /// The brief highlight a search result puts on its control.
+    func settingsHighlight(_ isOn: Bool) -> some View {
+        background {
+            if isOn {
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color.accentColor.opacity(0.18))
+                    .padding(-4)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
+        }
+    }
+}
+
+/// Moves focus on the next turn of the run loop, never from inside a view update. A switch or picker takes keyboard focus
+/// only while keyboard navigation is on in System Settings; it is scrolled into view and highlighted either way.
+@MainActor func settingsFocusSoon(_ focus: @escaping @MainActor () -> Void) {
+    DispatchQueue.main.async { focus() }
 }
 
 private struct SettingsRowModifier: ViewModifier {
@@ -248,24 +268,138 @@ private struct SettingsRowModifier: ViewModifier {
             .accessibilityIdentifier(row.id)
             .focused($focused)
             .id(row.id)
-            .listRowBackground(highlight == row.id ? Color.accentColor.opacity(0.15) : nil)
+            .settingsHighlight(highlight == row.id)
             .onChange(of: highlight, initial: true) { _, target in
-                if target == row.id { focused = true }
+                if target == row.id { settingsFocusSoon { focused = true } }
             }
     }
 }
 
-/// The search field above the sidebar.
-struct SettingsSearchField: View {
+/// The search field above the sidebar: a standard search field with its clear button. Esc clears the search and Return
+/// opens the first result. Only the field's own callbacks write the query: typing, the clear button, and a value set any
+/// other way, such as through accessibility, which sends no action of its own.
+struct SettingsSearchField: NSViewRepresentable {
     @Binding var query: String
     let submit: () -> Void
 
-    var body: some View {
-        TextField("Search", text: $query, prompt: Text("Search"))
-            .textFieldStyle(.roundedBorder)
-            .onSubmit(submit)
-            .accessibilityLabel("Search settings")
-            .accessibilityIdentifier("settings.search")
-            .help("Find a setting by name or keyword")
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> ValueReportingSearchField {
+        let field = ValueReportingSearchField()
+        field.valueChanged = { [weak coordinator = context.coordinator] text in coordinator?.valueChanged(text) }
+        field.placeholderString = "Search"
+        field.sendsSearchStringImmediately = true
+        field.sendsWholeSearchString = false
+        field.target = context.coordinator
+        field.action = #selector(Coordinator.searchChanged(_:))
+        field.delegate = context.coordinator
+        field.toolTip = "Find a setting by name or keyword. Esc clears the search."
+        field.setAccessibilityLabel("Search settings")
+        field.setAccessibilityIdentifier("settings.search")
+        field.setContentHuggingPriority(.defaultHigh, for: .vertical)
+        field.query = query
+        field.stringValue = query
+        return field
+    }
+
+    func updateNSView(_ field: ValueReportingSearchField, context: Context) {
+        context.coordinator.parent = self
+        field.query = query
+        if field.currentText != query { field.stringValue = query }
+    }
+
+    @MainActor final class Coordinator: NSObject, NSSearchFieldDelegate {
+        var parent: SettingsSearchField
+
+        init(_ parent: SettingsSearchField) { self.parent = parent }
+
+        /// Typing and the clear button both send this.
+        @objc func searchChanged(_ sender: NSSearchField) { update(sender.stringValue) }
+
+        /// The field's value changed without typing, as when an accessibility client sets it. Setting the value to the
+        /// query from `updateNSView` matches the query and writes nothing.
+        func valueChanged(_ text: String) { update(text) }
+
+        func controlTextDidChange(_ note: Notification) {
+            if let field = note.object as? NSSearchField { update(field.stringValue) }
+        }
+
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+            switch selector {
+            case #selector(NSResponder.cancelOperation(_:)):
+                guard !control.stringValue.isEmpty else { return false }
+                control.stringValue = ""
+                update("")
+                return true
+            case #selector(NSResponder.insertNewline(_:)):
+                update(control.stringValue)
+                parent.submit()
+                return true
+            default:
+                return false
+            }
+        }
+
+        private func update(_ text: String) {
+            if parent.query != text { parent.query = text }
+        }
+    }
+}
+
+/// A search field that reports every change of its value, however it is made. Typing reports through the field editor;
+/// a value set on the field or its cell directly, as an accessibility client does, sends no action, so the cell reports it.
+///
+/// A report always gives the text the field shows when the report is delivered, never the value that caused it: keys can
+/// arrive between the two, and an earlier value written to the query would be set on the field again, replacing what was
+/// typed since and starting the field and the query replacing each other without end.
+final class ValueReportingSearchField: NSSearchField {
+    var valueChanged: ((String) -> Void)?
+    /// The query the view last gave the field. A value equal to it is not reported, so the field writing back the text
+    /// being typed, or `updateNSView` setting the query, reports nothing.
+    var query = ""
+    private var reportPending = false
+
+    /// The text the field shows. Read from the field editor while the field edits: reading `stringValue` then writes
+    /// the edited text back into the cell, which is itself a change of value.
+    var currentText: String { currentEditor()?.string ?? stringValue }
+
+    /// An accessibility client can set the value on the field as well as on its cell: both change the text.
+    override func setAccessibilityValue(_ value: Any?) {
+        if let text = value as? String, text != currentText { stringValue = text } else { super.setAccessibilityValue(value) }
+    }
+
+    /// Reports the text the field shows on the next turn of the run loop, once however many values were set before
+    /// then: the value can change inside a view update or a layout pass.
+    fileprivate func reportSoon() {
+        guard !reportPending else { return }
+        reportPending = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.reportPending = false
+            let text = self.currentText
+            if text != self.query { self.valueChanged?(text) }
+        }
+    }
+
+    override class var cellClass: AnyClass? {
+        get { Cell.self }
+        set {}
+    }
+
+    final class Cell: NSSearchFieldCell {
+        /// The text a cell value holds. Taken from the value being set: reading the cell's `stringValue` while its field
+        /// edits writes the edited text back, which would set the value again from inside this setter.
+        static func text(_ value: Any?) -> String {
+            (value as? String) ?? (value as? NSAttributedString)?.string ?? ""
+        }
+
+        override var objectValue: Any? {
+            get { super.objectValue }
+            set {
+                super.objectValue = newValue
+                guard let field = controlView as? ValueReportingSearchField, Self.text(newValue) != field.query else { return }
+                field.reportSoon()
+            }
+        }
     }
 }

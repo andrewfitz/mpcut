@@ -11,10 +11,10 @@ struct SettingsEditingPage: View {
                     .settingsRow(.snapTarget)
                 Toggle(SettingsRow.sourceTicks.title, isOn: $preferences.sourceTimeTicks)
                     .settingsRow(.sourceTicks)
-                    .help("Show the original recording time inside each clip.")
+                    .help("Show the original recording time inside each clip")
                 Toggle(SettingsRow.largePreviews.title, isOn: $preferences.largeThumbnails)
                     .settingsRow(.largePreviews)
-                    .help("Enlarge timeline previews")
+                    .help("Show larger thumbnails and waveforms in the timeline")
                 Toggle(SettingsRow.cutSections.title, isOn: $preferences.showsCutSections)
                     .settingsRow(.cutSections)
                     .help("Start new windows with cut sections showing")
@@ -35,9 +35,10 @@ struct SettingsEditingPage: View {
                     Text("Full height").tag(true)
                 }
                 .settingsRow(.panelPosition)
-                .help("Place the transcript and Tiles panel above the timeline or beside it")
+                .help("Choose whether the transcript and Tiles panel sits above the timeline or runs the full height of the window")
                 SettingsNumericField(.trackLabelWidth, value: $preferences.trackLabelWidth,
-                                     in: EditorPreferences.trackLabelWidthRange, step: 1, unit: "pt", digits: 0)
+                                     in: EditorPreferences.trackLabelWidthRange, step: 1, unit: "pt", digits: 0,
+                                     help: "Type the width of the track label column in multicam timelines")
             } header: {
                 Text("Layout")
             } footer: {
@@ -45,9 +46,9 @@ struct SettingsEditingPage: View {
             }
             Section("Stills and gaps") {
                 SettingsNumericField(.stillDuration, value: $preferences.stillDuration, in: EditorPreferences.stillDurationRange,
-                                     step: 0.5, unit: "s")
+                                     step: 0.5, unit: "s", help: "Type how long a still placed in the timeline lasts")
                 SettingsNumericField(.gapDuration, value: $preferences.gapDuration, in: EditorPreferences.stillDurationRange,
-                                     step: 0.5, unit: "s")
+                                     step: 0.5, unit: "s", help: "Type how long Insert Color Gap and Space Clips make a gap")
                 ColorPicker(SettingsRow.gapColor.title, selection: Binding(
                     get: { Color(hex: preferences.gapColor) },
                     set: { preferences.gapColor = $0.hexRGB ?? preferences.gapColor }
@@ -57,11 +58,14 @@ struct SettingsEditingPage: View {
             }
             Section {
                 SettingsNumericField(.stillTimelineWidth, value: $preferences.stillTimelineWidth,
-                                     in: EditorPreferences.stillTimelinePixelRange, step: 2, unit: "px")
+                                     in: EditorPreferences.stillTimelinePixelRange, step: 2, unit: "px",
+                                     help: "Type the picture width of a new stills timeline, an even number of pixels")
                 SettingsNumericField(.stillTimelineHeight, value: $preferences.stillTimelineHeight,
-                                     in: EditorPreferences.stillTimelinePixelRange, step: 2, unit: "px")
+                                     in: EditorPreferences.stillTimelinePixelRange, step: 2, unit: "px",
+                                     help: "Type the picture height of a new stills timeline, an even number of pixels")
                 SettingsNumericField(.stillTimelineFrameRate, value: $preferences.stillTimelineFrameRate,
-                                     in: EditorPreferences.stillTimelineFrameRateRange, step: 1, unit: "fps", digits: 3)
+                                     in: EditorPreferences.stillTimelineFrameRateRange, step: 1, unit: "fps", digits: 3,
+                                     help: "Type the frame rate of a new stills timeline")
                 Picker(SettingsRow.stillTimelineCodec.title, selection: $preferences.stillTimelineCodec) {
                     ForEach(EditorPreferences.stillTimelineCodecs, id: \.self) { Text($0.displayName).tag($0) }
                 }

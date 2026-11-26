@@ -8,11 +8,18 @@ final class StorageUsageModel: ObservableObject {
     struct Report: Equatable {
         let kind: StoreKind
         let result: StoreClearResult
+        /// What Clear left in the store's folders that it neither removed nor skipped: files MPCut does not recognize as
+        /// its own, which the size still counts.
+        var left = StoreLeftovers()
     }
 
     let locations: StorageLocations
     let preferences: EditorPreferences
     @Published private(set) var sizes: [StoreKind: Int64] = [:]
+    /// Each store's first folder on disk, found off the main actor. A folder on a slow or offline volume never stalls a view.
+    @Published private(set) var folders: [StoreKind: URL] = [:]
+    /// Every store folder that existed at the last refresh.
+    @Published private(set) var existing: Set<URL> = []
     @Published private(set) var clearing: StoreKind?
     @Published var report: Report?
 
@@ -23,6 +30,15 @@ final class StorageUsageModel: ObservableObject {
 
     /// Measures every store. Suggested cameras are measured from the value in memory, which is what Clear removes.
     func refresh() async {
+        let locations = self.locations
+        let existing = await Task.detached(priority: .utility) {
+            Set(StoreKind.allCases.flatMap { locations.urls(for: $0) }.filter { FileManager.default.fileExists(atPath: $0.path) })
+        }.value
+        if Task.isCancelled { return }
+        self.existing = existing
+        folders = StoreKind.allCases.reduce(into: [StoreKind: URL]()) { found, kind in
+            found[kind] = locations.urls(for: kind).first { existing.contains($0) }
+        }
         for kind in StoreKind.allCases {
             if Task.isCancelled { return }
             if kind == .suggestedCameras {
@@ -33,10 +49,8 @@ final class StorageUsageModel: ObservableObject {
         }
     }
 
-    /// The folder Show in Finder reveals: the store's first folder on disk.
-    func folder(for kind: StoreKind) -> URL? {
-        locations.urls(for: kind).first { FileManager.default.fileExists(atPath: $0.path) }
-    }
+    /// The folder Show in Finder reveals: the store's first folder on disk, as of the last refresh.
+    func folder(for kind: StoreKind) -> URL? { folders[kind] }
 
     /// Clears a store the table allows and reports what was reclaimed and skipped. Others do nothing.
     @discardableResult
@@ -45,6 +59,7 @@ final class StorageUsageModel: ObservableObject {
         clearing = kind
         defer { clearing = nil }
         var result: StoreClearResult
+        var left = StoreLeftovers()
         if kind == .suggestedCameras {
             // Through the shared preferences, so open windows forget the suggestions too.
             result = StoreClearResult()
@@ -52,8 +67,11 @@ final class StorageUsageModel: ObservableObject {
             preferences.transcriptSuggestedAngles = Data()
         } else {
             result = await StorageInventory.clear(kind, locations: locations, defaults: nil)
+            let folders = locations.urls(for: kind)
+            let cleared = result
+            left = await Task.detached(priority: .utility) { StoreLeftovers.find(in: folders, after: cleared) }.value
         }
-        report = Report(kind: kind, result: result)
+        report = Report(kind: kind, result: result, left: left)
         await refresh()
         return result
     }
@@ -75,7 +93,7 @@ struct StorageUsageSection: View {
         } header: {
             Text(SettingsRow.storageUsage.title).settingsRow(.storageUsage)
         } footer: {
-            SettingsFootnote("Sizes are the space each store uses now. Clear asks first and skips anything in use.")
+            SettingsFootnote("Each size counts everything in the store’s folder, including files MPCut did not write. Clear asks first, removes only MPCut’s own entries and skips anything in use, and says what it left.")
         }
         .task { await model.refresh() }
         .confirmationDialog(confirming.map { "Clear \($0.title.lowercased())?" } ?? "",
@@ -86,54 +104,137 @@ struct StorageUsageSection: View {
         } message: { kind in
             Text(kind.note)
         }
-        .alert(model.report.map { "Cleared \($0.kind.title.lowercased())" } ?? "",
+        .alert(model.report.map(Self.title) ?? "",
                isPresented: Binding(get: { model.report != nil }, set: { if !$0 { model.report = nil } }),
                presenting: model.report) { _ in
             Button("OK") { model.report = nil }
         } message: { report in
-            Text(Self.summary(report.result))
+            Text(Self.summary(report.result, left: report.left))
         }
     }
 
     private func row(_ kind: StoreKind) -> some View {
-        LabeledContent {
-            HStack(spacing: 8) {
+        let folder = model.folder(for: kind)
+        let paths = model.locations.urls(for: kind)
+        return LabeledContent {
+            VStack(alignment: .trailing, spacing: 4) {
                 Text(model.sizes[kind].map(Self.size) ?? "Measuring…")
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
-                if let folder = model.folder(for: kind) {
-                    Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([folder]) }
-                        .help("Show \(kind.title.lowercased()) in Finder")
-                        .accessibilityLabel("Show \(kind.title) in Finder")
-                }
-                if kind.clearable {
-                    Button("Clear…") { confirming = kind }
-                        .disabled(model.clearing != nil || model.sizes[kind] == 0)
-                        .help("Clear \(kind.title.lowercased())")
-                        .accessibilityLabel("Clear \(kind.title)")
+                HStack(spacing: 6) {
+                    if !paths.isEmpty {
+                        Button("Show in Finder") { if let folder { NSWorkspace.shared.activateFileViewerSelecting([folder]) } }
+                            .disabled(folder == nil)
+                            .help(folder == nil ? "The folder does not exist yet. MPCut creates it when it first saves \(kind.title.lowercased())."
+                                                : "Show \(kind.title.lowercased()) in Finder")
+                            .accessibilityLabel("Show \(kind.title) in Finder")
+                            .accessibilityHint(folder == nil ? "The folder does not exist yet." : "")
+                    }
+                    if kind.clearable {
+                        Button("Clear…") { confirming = kind }
+                            .disabled(model.clearing != nil || model.sizes[kind] == 0)
+                            .help("Clear \(kind.title.lowercased())")
+                            .accessibilityLabel("Clear \(kind.title)")
+                    }
                 }
             }
         } label: {
             VStack(alignment: .leading, spacing: 2) {
                 Text(kind.title)
                 Text(kind.note).font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if paths.isEmpty {
+                    Text(kind.storageDescription).font(.caption).foregroundStyle(.secondary)
+                } else {
+                    ForEach(paths, id: \.self) { url in
+                        // The whole path, wrapping onto more lines under the store's name rather than losing its middle.
+                        Text(Self.wrappingPath(url) + (model.sizes.isEmpty || model.existing.contains(url) ? "" : " (not created yet)"))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .help(url.path)
+                            .accessibilityLabel("Location")
+                            .accessibilityValue(url.path)
+                    }
+                }
             }
         }
         .accessibilityIdentifier("settings.storage.usage." + kind.rawValue)
     }
 
-    static func size(_ bytes: Int64) -> String {
-        bytes == 0 ? "Zero KB" : ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    /// A store's folder with the home folder written as `~`.
+    static func displayPath(_ url: URL) -> String {
+        (url.path as NSString).abbreviatingWithTildeInPath
     }
 
-    /// The bytes reclaimed and every item Clear skipped, with its reason.
-    static func summary(_ result: StoreClearResult) -> String {
-        var text = "Reclaimed \(size(result.reclaimedBytes))."
+    /// `displayPath` with a break allowed after each slash, so a long path wraps between folder names. The break
+    /// opportunities are zero-width spaces: nothing extra shows.
+    static func wrappingPath(_ url: URL) -> String {
+        displayPath(url).replacingOccurrences(of: "/", with: "/\u{200B}")
+    }
+
+    /// A byte count for the page and its messages, written "0 KB" rather than "Zero KB".
+    static func size(_ bytes: Int64) -> String {
+        bytes == 0 ? "0 KB" : ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+
+    /// The alert's title says whether anything was removed; its message gives only the details, so neither repeats the other.
+    static func title(_ report: StorageUsageModel.Report) -> String {
+        removedAnything(report.result) ? "Cleared \(report.kind.title.lowercased())"
+                                       : "Nothing removed from \(report.kind.title.lowercased())"
+    }
+
+    private static func removedAnything(_ result: StoreClearResult) -> Bool {
+        result.reclaimedBytes > 0 || !result.removed.isEmpty
+    }
+
+    private static func items(_ count: Int) -> String { count == 1 ? "1 item" : "\(count) items" }
+
+    /// The bytes reclaimed; every item Clear skipped, with its reason; and what it left because MPCut does not recognize it
+    /// as its own. That nothing was removed is the title's to say, so it is not said again here.
+    static func summary(_ result: StoreClearResult, left: StoreLeftovers = StoreLeftovers()) -> String {
+        var text = removedAnything(result) ? "Reclaimed \(size(result.reclaimedBytes))." : ""
         if !result.skipped.isEmpty {
-            text += " Skipped \(result.skipped.count) in use:"
+            if !text.isEmpty { text += " " }
+            text += "Left \(items(result.skipped.count)) in use or still needed:"
             for skip in result.skipped.prefix(10) { text += "\n\(skip.url.lastPathComponent): \(skip.reason)" }
             if result.skipped.count > 10 { text += "\n…and \(result.skipped.count - 10) more." }
         }
+        if left.count > 0 {
+            if !result.skipped.isEmpty { text += "\n" } else if !text.isEmpty { text += " " }
+            text += "Left \(items(left.count)) (\(size(left.bytes))) that MPCut does not recognize as its own. "
+                + "Remove \(left.count == 1 ? "it" : "them") in Finder if you no longer need \(left.count == 1 ? "it" : "them")."
+        }
         return text
+    }
+}
+
+/// Files Clear neither removed nor skipped, found by walking a store's folders afterwards. Folders themselves, such as
+/// the stills cache's shard folders, are MPCut's and do not count.
+struct StoreLeftovers: Equatable, Sendable {
+    var count = 0
+    var bytes: Int64 = 0
+
+    static func find(in folders: [URL], after result: StoreClearResult) -> StoreLeftovers {
+        let skipped = result.skipped.map { $0.url.standardizedFileURL.path }
+        func coveredBySkip(_ path: String) -> Bool {
+            let stem = (path as NSString).deletingPathExtension
+            return skipped.contains { path == $0 || path.hasPrefix($0 + "/") || stem == $0 }
+        }
+        var left = StoreLeftovers()
+        for folder in folders {
+            guard let walk = FileManager.default.enumerator(at: folder, includingPropertiesForKeys: [.isDirectoryKey]) else { continue }
+            for case let url as URL in walk {
+                let path = url.standardizedFileURL.path
+                if coveredBySkip(path) {
+                    walk.skipDescendants()
+                    continue
+                }
+                if (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true { continue }
+                left.count += 1
+                left.bytes += (try? StoreMeasurement.allocatedBytes(at: url)) ?? 0
+            }
+        }
+        return left
     }
 }

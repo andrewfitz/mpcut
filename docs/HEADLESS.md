@@ -8,6 +8,8 @@ codex mcp add mpcut-files -- "/Applications/MPCut.app/Contents/Helpers/mpcut-mcp
 
 The worker starts with the MCP connection, exposes saved-file tools in discovery, and uses the bundled CLI. It requires neither an editor window nor the desktop local-control setting. The ordinary helper invocation still connects to the running editor and uses its local-control setting. Configure the file worker only in clients you trust to read and write local files under your account.
 
+The local-control switch and the agent permissions in **Settings → Automation** do not gate the file worker, because there is no app to ask. The CLI does not read desktop settings, so file jobs use the factory value of every omitted option. A transcription job that names no engine uses Qwen3, and the worker finds Transcriberrr through the `MPCUT_TRANSCRIBERRR_HELPER` environment variable or the installed app. The cutcache location is shared with the app, and `analysis_file_cache_settings_set` can change it from this worker. To edit open or unsaved projects in the running app, connect the ordinary helper instead. [Live editing from an agent](MCP-AGENT-GUIDE.md)
+
 Use the helper from the bundle whose CLI you checked. In a source checkout, run `dist/MPCut.app/Contents/Helpers/mpcut --version --json` and configure the absolute path to its sibling `mpcut-mcp`. The completed `cli_version_read` job reports the same build ID, supported project schemas and detector capabilities.
 
 MCP edits record **Agent** in project history. Shell edits default to **User**. Set `MPCUT_HISTORY_ORIGIN=agent` when invoking the CLI directly from an agent.

@@ -168,6 +168,9 @@ final class EditorPreferences: ObservableObject {
     private var isLoaded = false
     /// Set while a property observer puts back the value an agent was refused.
     private var isRestoringRefusedWrite = false
+    /// Set while a property observer replaces an out-of-range or invalid value. The nested observer returns at once,
+    /// so the outer one stores and announces the fixed value once, against the true previous value.
+    private var isNormalizing = false
     // Subscribers that recalculate project state need to read the new value after it is stored.
     private let changes = PassthroughSubject<Change, Never>()
 
@@ -178,6 +181,14 @@ final class EditorPreferences: ObservableObject {
         // A separate home does not isolate cfprefsd for the same bundle ID.
         guard !MCPSocket.directory.isEmpty else { return nil }
         return UserDefaults(suiteName: "com.mpcut.test-preferences." + name)
+    }
+
+    /// The persistent domain `applicationDefaults` writes, so the keys that remove files can be read from it alone.
+    static var applicationDefaultsDomain: String? {
+        guard let name = ProcessInfo.processInfo.environment["MPCUT_TEST_SOCKET_DIRECTORY"], !name.isEmpty else {
+            return Bundle.main.bundleIdentifier
+        }
+        return MCPSocket.directory.isEmpty ? nil : "com.mpcut.test-preferences." + name
     }
 
     static let historyStepRange = 0...CutProject.maximumHistorySteps
@@ -303,7 +314,8 @@ final class EditorPreferences: ObservableObject {
     }
     @Published var recentFilesLimit = 10 {
         didSet {
-            if let fixed = Self.fixed(recentFilesLimit, Self.recentFilesRange) { recentFilesLimit = fixed }
+            guard !isNormalizing else { return }
+            if let fixed = Self.fixed(recentFilesLimit, Self.recentFilesRange) { normalize { recentFilesLimit = fixed } }
             if !save(recentFilesLimit, replacing: oldValue, key: .recentFilesMaxCount, change: .recentFilesLimit) {
                 recentFilesLimit = oldValue
             } else if recentFilesLimit != oldValue {
@@ -344,53 +356,61 @@ final class EditorPreferences: ObservableObject {
     /// Live. Each window clamps it to its own space with `MulticamTimeline.trackWidth`.
     @Published var trackLabelWidth = 172.0 {
         didSet {
-            if let fixed = Self.fixed(trackLabelWidth, Self.trackLabelWidthRange, oldValue) { trackLabelWidth = fixed }
+            guard !isNormalizing else { return }
+            if let fixed = Self.fixed(trackLabelWidth, Self.trackLabelWidthRange, oldValue) { normalize { trackLabelWidth = fixed } }
             if !save(trackLabelWidth, replacing: oldValue, key: .multicamTrackLabelWidthPoints, change: .trackLabelWidth) { trackLabelWidth = oldValue }
         }
     }
     @Published var stillDuration = 2.0 {
         didSet {
-            if let fixed = Self.fixed(stillDuration, Self.stillDurationRange, oldValue) { stillDuration = fixed }
+            guard !isNormalizing else { return }
+            if let fixed = Self.fixed(stillDuration, Self.stillDurationRange, oldValue) { normalize { stillDuration = fixed } }
             if !save(stillDuration, replacing: oldValue, key: .stillPlacementDefaultDurationSeconds, change: .stillDuration) { stillDuration = oldValue }
         }
     }
     @Published var gapDuration = 2.0 {
         didSet {
-            if let fixed = Self.fixed(gapDuration, Self.stillDurationRange, oldValue) { gapDuration = fixed }
+            guard !isNormalizing else { return }
+            if let fixed = Self.fixed(gapDuration, Self.stillDurationRange, oldValue) { normalize { gapDuration = fixed } }
             if !save(gapDuration, replacing: oldValue, key: .gapDefaultDurationSeconds, change: .gapDuration) { gapDuration = oldValue }
         }
     }
     /// `#RRGGBB`, upper case. Anything else keeps the previous color.
     @Published var gapColor = "#000000" {
         didSet {
+            guard !isNormalizing else { return }
             let normalized = Self.hexColor(gapColor) ?? oldValue
-            if normalized != gapColor { gapColor = normalized }
+            if normalized != gapColor { normalize { gapColor = normalized } }
             if !save(gapColor, replacing: oldValue, key: .gapDefaultColor, change: .gapColor) { gapColor = oldValue }
         }
     }
     /// Even pixel counts, rounded down.
     @Published var stillTimelineWidth = 1920 {
         didSet {
-            if let fixed = Self.fixedPixels(stillTimelineWidth) { stillTimelineWidth = fixed }
+            guard !isNormalizing else { return }
+            if let fixed = Self.fixedPixels(stillTimelineWidth) { normalize { stillTimelineWidth = fixed } }
             if !save(stillTimelineWidth, replacing: oldValue, key: .stillTimelineDefaultWidthPixels, change: .stillTimelineWidth) { stillTimelineWidth = oldValue }
         }
     }
     @Published var stillTimelineHeight = 1080 {
         didSet {
-            if let fixed = Self.fixedPixels(stillTimelineHeight) { stillTimelineHeight = fixed }
+            guard !isNormalizing else { return }
+            if let fixed = Self.fixedPixels(stillTimelineHeight) { normalize { stillTimelineHeight = fixed } }
             if !save(stillTimelineHeight, replacing: oldValue, key: .stillTimelineDefaultHeightPixels, change: .stillTimelineHeight) { stillTimelineHeight = oldValue }
         }
     }
     @Published var stillTimelineFrameRate = 30.0 {
         didSet {
-            if let fixed = Self.fixed(stillTimelineFrameRate, Self.stillTimelineFrameRateRange, oldValue) { stillTimelineFrameRate = fixed }
+            guard !isNormalizing else { return }
+            if let fixed = Self.fixed(stillTimelineFrameRate, Self.stillTimelineFrameRateRange, oldValue) { normalize { stillTimelineFrameRate = fixed } }
             if !save(stillTimelineFrameRate, replacing: oldValue, key: .stillTimelineDefaultFrameRate, change: .stillTimelineFrameRate) { stillTimelineFrameRate = oldValue }
         }
     }
     /// H.264, HEVC or ProRes. JPEG keeps the previous codec.
     @Published var stillTimelineCodec = ReencodeCodec.h264 {
         didSet {
-            if !Self.stillTimelineCodecs.contains(stillTimelineCodec) { stillTimelineCodec = oldValue }
+            guard !isNormalizing else { return }
+            if !Self.stillTimelineCodecs.contains(stillTimelineCodec) { normalize { stillTimelineCodec = oldValue } }
             if !save(stillTimelineCodec, replacing: oldValue, key: .stillTimelineDefaultCodec, stored: stillTimelineCodec.rawValue,
                  change: .stillTimelineCodec) { stillTimelineCodec = oldValue }
         }
@@ -410,13 +430,15 @@ final class EditorPreferences: ObservableObject {
     }
     @Published var cutPreviewPreroll = 1.0 {
         didSet {
-            if let fixed = Self.fixed(cutPreviewPreroll, Self.cutPreviewRange, oldValue) { cutPreviewPreroll = fixed }
+            guard !isNormalizing else { return }
+            if let fixed = Self.fixed(cutPreviewPreroll, Self.cutPreviewRange, oldValue) { normalize { cutPreviewPreroll = fixed } }
             if !save(cutPreviewPreroll, replacing: oldValue, key: .playbackCutPreviewPrerollSeconds, change: .cutPreviewPreroll) { cutPreviewPreroll = oldValue }
         }
     }
     @Published var cutPreviewPostroll = 1.0 {
         didSet {
-            if let fixed = Self.fixed(cutPreviewPostroll, Self.cutPreviewRange, oldValue) { cutPreviewPostroll = fixed }
+            guard !isNormalizing else { return }
+            if let fixed = Self.fixed(cutPreviewPostroll, Self.cutPreviewRange, oldValue) { normalize { cutPreviewPostroll = fixed } }
             if !save(cutPreviewPostroll, replacing: oldValue, key: .playbackCutPreviewPostrollSeconds, change: .cutPreviewPostroll) { cutPreviewPostroll = oldValue }
         }
     }
@@ -444,7 +466,8 @@ final class EditorPreferences: ObservableObject {
     /// The Video Monitor's last window frame in screen coordinates, for the Last position placement.
     @Published var monitorLastFrame: CGRect? {
         didSet {
-            if let frame = monitorLastFrame, !Self.usableFrame(frame) { monitorLastFrame = oldValue }
+            guard !isNormalizing else { return }
+            if let frame = monitorLastFrame, !Self.usableFrame(frame) { normalize { monitorLastFrame = oldValue } }
             guard monitorLastFrame != oldValue else { return }
             if let frame = monitorLastFrame {
                 defaults?.set(NSStringFromRect(frame), forKey: LocalKey.playbackMonitorLastFrame.rawValue)
@@ -474,13 +497,15 @@ final class EditorPreferences: ObservableObject {
     }
     @Published var tilesScanColumns = 2 {
         didSet {
-            if let fixed = Self.fixed(tilesScanColumns, Self.tilesGridRange) { tilesScanColumns = fixed }
+            guard !isNormalizing else { return }
+            if let fixed = Self.fixed(tilesScanColumns, Self.tilesGridRange) { normalize { tilesScanColumns = fixed } }
             if !save(tilesScanColumns, replacing: oldValue, key: .tilesScanDefaultGridColumns, change: .tilesScanColumns) { tilesScanColumns = oldValue }
         }
     }
     @Published var tilesScanRows = 2 {
         didSet {
-            if let fixed = Self.fixed(tilesScanRows, Self.tilesGridRange) { tilesScanRows = fixed }
+            guard !isNormalizing else { return }
+            if let fixed = Self.fixed(tilesScanRows, Self.tilesGridRange) { normalize { tilesScanRows = fixed } }
             if !save(tilesScanRows, replacing: oldValue, key: .tilesScanDefaultGridRows, change: .tilesScanRows) { tilesScanRows = oldValue }
         }
     }
@@ -491,7 +516,8 @@ final class EditorPreferences: ObservableObject {
     }
     @Published var dialogueMinimumHold = 1.0 {
         didSet {
-            if let fixed = Self.fixed(dialogueMinimumHold, Self.dialogueHoldRange, oldValue) { dialogueMinimumHold = fixed }
+            guard !isNormalizing else { return }
+            if let fixed = Self.fixed(dialogueMinimumHold, Self.dialogueHoldRange, oldValue) { normalize { dialogueMinimumHold = fixed } }
             if !save(dialogueMinimumHold, replacing: oldValue, key: .tilesDialogueDefaultMinHoldSeconds, change: .dialogueMinimumHold) { dialogueMinimumHold = oldValue }
         }
     }
@@ -532,7 +558,8 @@ final class EditorPreferences: ObservableObject {
     }
     @Published var readerTextSize = 14.0 {
         didSet {
-            if let fixed = Self.fixed(readerTextSize, Self.readerTextSizeRange, oldValue) { readerTextSize = fixed }
+            guard !isNormalizing else { return }
+            if let fixed = Self.fixed(readerTextSize, Self.readerTextSizeRange, oldValue) { normalize { readerTextSize = fixed } }
             if !save(readerTextSize, replacing: oldValue, key: .transcriptReaderTextSizePoints, change: .readerTextSize) { readerTextSize = oldValue }
         }
     }
@@ -543,7 +570,8 @@ final class EditorPreferences: ObservableObject {
     }
     @Published var retainedPause = 0.2 {
         didSet {
-            if let fixed = Self.fixed(retainedPause, Self.retainedPauseRange, oldValue) { retainedPause = fixed }
+            guard !isNormalizing else { return }
+            if let fixed = Self.fixed(retainedPause, Self.retainedPauseRange, oldValue) { normalize { retainedPause = fixed } }
             if !save(retainedPause, replacing: oldValue, key: .transcriptTightenDefaultRetainedPauseSeconds, change: .retainedPause) { retainedPause = oldValue }
         }
     }
@@ -561,19 +589,22 @@ final class EditorPreferences: ObservableObject {
     }
     @Published var captionLineCharacters = 42 {
         didSet {
-            if let fixed = Self.fixed(captionLineCharacters, Self.captionLineCharacterRange) { captionLineCharacters = fixed }
+            guard !isNormalizing else { return }
+            if let fixed = Self.fixed(captionLineCharacters, Self.captionLineCharacterRange) { normalize { captionLineCharacters = fixed } }
             if !save(captionLineCharacters, replacing: oldValue, key: .transcriptCaptionMaxLineCharacters, change: .captionLineCharacters) { captionLineCharacters = oldValue }
         }
     }
     @Published var captionLines = 2 {
         didSet {
-            if let fixed = Self.fixed(captionLines, Self.captionLineRange) { captionLines = fixed }
+            guard !isNormalizing else { return }
+            if let fixed = Self.fixed(captionLines, Self.captionLineRange) { normalize { captionLines = fixed } }
             if !save(captionLines, replacing: oldValue, key: .transcriptCaptionMaxLines, change: .captionLines) { captionLines = oldValue }
         }
     }
     @Published var captionCueSeconds = 6.0 {
         didSet {
-            if let fixed = Self.fixed(captionCueSeconds, Self.captionCueRange, oldValue) { captionCueSeconds = fixed }
+            guard !isNormalizing else { return }
+            if let fixed = Self.fixed(captionCueSeconds, Self.captionCueRange, oldValue) { normalize { captionCueSeconds = fixed } }
             if !save(captionCueSeconds, replacing: oldValue, key: .transcriptCaptionMaxCueSeconds, change: .captionCueSeconds) { captionCueSeconds = oldValue }
         }
     }
@@ -591,20 +622,23 @@ final class EditorPreferences: ObservableObject {
 
     @Published var reencodeCodec = ExportRules.defaultCodec {
         didSet {
-            if !Self.reencodeCodecs.contains(reencodeCodec) { reencodeCodec = oldValue }
+            guard !isNormalizing else { return }
+            if !Self.reencodeCodecs.contains(reencodeCodec) { normalize { reencodeCodec = oldValue } }
             if !save(reencodeCodec, replacing: oldValue, key: .exportReencodeDefaultCodec, stored: reencodeCodec.rawValue, change: .reencodeCodec) { reencodeCodec = oldValue }
         }
     }
     /// The H.264 and HEVC quality. A ProRes quality keeps the previous value.
     @Published var reencodeQuality = ExportRules.defaultQuality(.h264) {
         didSet {
-            if !Self.reencodeQualities.contains(reencodeQuality) { reencodeQuality = oldValue }
+            guard !isNormalizing else { return }
+            if !Self.reencodeQualities.contains(reencodeQuality) { normalize { reencodeQuality = oldValue } }
             if !save(reencodeQuality, replacing: oldValue, key: .exportReencodeDefaultQuality, stored: reencodeQuality.rawValue, change: .reencodeQuality) { reencodeQuality = oldValue }
         }
     }
     @Published var proresQuality = ExportRules.defaultQuality(.prores) {
         didSet {
-            if !Self.proresQualities.contains(proresQuality) { proresQuality = oldValue }
+            guard !isNormalizing else { return }
+            if !Self.proresQualities.contains(proresQuality) { normalize { proresQuality = oldValue } }
             if !save(proresQuality, replacing: oldValue, key: .exportProresDefaultQuality, stored: proresQuality.rawValue, change: .proresQuality) { proresQuality = oldValue }
         }
     }
@@ -661,14 +695,16 @@ final class EditorPreferences: ObservableObject {
     /// The managed shared cache folder's limit in bytes. 0 is no limit.
     @Published var sharedCacheLimitBytes = 0 {
         didSet {
-            if let fixed = Self.fixed(sharedCacheLimitBytes, Self.sharedCacheLimitRange) { sharedCacheLimitBytes = fixed }
+            guard !isNormalizing else { return }
+            if let fixed = Self.fixed(sharedCacheLimitBytes, Self.sharedCacheLimitRange) { normalize { sharedCacheLimitBytes = fixed } }
             if !save(sharedCacheLimitBytes, replacing: oldValue, key: .analysisSharedCacheMaxBytes, change: .sharedCacheLimitBytes) { sharedCacheLimitBytes = oldValue }
         }
     }
     /// Days before an untitled draft moves to the Trash. 0 is never.
     @Published var draftRetentionDays = 0 {
         didSet {
-            if let fixed = Self.fixed(draftRetentionDays, Self.draftRetentionRange) { draftRetentionDays = fixed }
+            guard !isNormalizing else { return }
+            if let fixed = Self.fixed(draftRetentionDays, Self.draftRetentionRange) { normalize { draftRetentionDays = fixed } }
             if !save(draftRetentionDays, replacing: oldValue, key: .draftRetentionDays, change: .draftRetentionDays) { draftRetentionDays = oldValue }
         }
     }
@@ -715,7 +751,10 @@ final class EditorPreferences: ObservableObject {
         }
     }
 
-    init(defaults: UserDefaults? = nil) {
+    /// `persistentDomain` names the domain `defaults` saves to. Draft retention and the cache limit remove files, so they
+    /// are read from that domain alone, never from a launch argument. Without a name, `.standard` uses the bundle
+    /// identifier; for any other store, either key that a launch argument supplies keeps its factory value.
+    init(defaults: UserDefaults? = nil, persistentDomain: String? = nil) {
         let storedRecentLimit = defaults.flatMap { Self.integer($0.object(forKey: Key.recentFilesMaxCount.rawValue)) }
             .flatMap { Self.recentFilesRange.contains($0) ? $0 : nil }
         recentFiles = RecentFiles(defaults: defaults, limit: storedRecentLimit ?? 10)
@@ -773,6 +812,15 @@ final class EditorPreferences: ObservableObject {
             choice(key.rawValue, Array(Value.allCases))
         }
         func text(_ key: String) -> String? { defaults.object(forKey: key) as? String }
+        // A launch argument such as `-draft_retention_days 1` would trash drafts or evict cutcaches at launch.
+        // These keys come from the saved store only; registered defaults never name them.
+        let arguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+        let domain = persistentDomain ?? (defaults === UserDefaults.standard ? Bundle.main.bundleIdentifier : nil)
+        let persisted = domain.flatMap { defaults.persistentDomain(forName: $0) }
+        func saved(_ key: Key, _ range: ClosedRange<Int>) -> Int? {
+            let stored = arguments[key.rawValue] == nil ? defaults.object(forKey: key.rawValue) : persisted?[key.rawValue]
+            return Self.integer(stored).flatMap { range.contains($0) ? $0 : nil }
+        }
 
         multipleRecordingsAction = option(.openMultipleRecordingsDefaultAction, MultipleRecordingsAction.self) ?? .ask
         recentFilesLimit = integer(.recentFilesMaxCount, Self.recentFilesRange) ?? 10
@@ -834,8 +882,8 @@ final class EditorPreferences: ObservableObject {
         revealsFinishedExport = flag(.exportFinishedRevealEnabled) ?? false
         notifiesFinishedExport = flag(.exportFinishedNotificationEnabled) ?? false
         playsFinishedExportSound = flag(.exportFinishedSoundEnabled) ?? false
-        sharedCacheLimitBytes = integer(.analysisSharedCacheMaxBytes, Self.sharedCacheLimitRange) ?? 0
-        draftRetentionDays = integer(.draftRetentionDays, Self.draftRetentionRange) ?? 0
+        sharedCacheLimitBytes = saved(.analysisSharedCacheMaxBytes, Self.sharedCacheLimitRange) ?? 0
+        draftRetentionDays = saved(.draftRetentionDays, Self.draftRetentionRange) ?? 0
         agentsChangeSettings = flag(.automationPreferencesWriteEnabled) ?? true
         agentsReplaceFiles = flag(.automationFileReplaceEnabled) ?? true
         settingsPage = choice(LocalKey.settingsSelectedPage.rawValue, SettingsPage.allCases) ?? .general
@@ -893,6 +941,13 @@ final class EditorPreferences: ObservableObject {
         let bounded = min(stillTimelinePixelRange.upperBound, max(stillTimelinePixelRange.lowerBound, value))
         let even = bounded - bounded % 2
         return even == value ? nil : even
+    }
+
+    /// Assigns a normalized value from inside a property observer without running that observer again.
+    private func normalize(_ assign: () -> Void) {
+        isNormalizing = true
+        defer { isNormalizing = false }
+        assign()
     }
 
     func observeChanges(_ receiveValue: @escaping (Change) -> Void) -> AnyCancellable {

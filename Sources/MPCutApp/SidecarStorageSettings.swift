@@ -52,16 +52,18 @@ private extension SidecarStorageMode {
 }
 
 @MainActor
-private func chooseSidecarFolder(title: String, initial: URL? = nil, allowCreation: Bool,
+private func chooseSidecarFolder(title: String, message: String? = nil, initial: URL? = nil, allowCreation: Bool,
                                  selected: @escaping (URL) -> Void) {
     let panel = NSOpenPanel()
     panel.title = title
+    if let message { panel.message = message }
     panel.prompt = "Choose"
     panel.canChooseFiles = false
     panel.canChooseDirectories = true
     panel.canCreateDirectories = allowCreation
     panel.directoryURL = initial
-    ProjectPanels.present(panel, in: NSApp.keyWindow, fromSheet: true) { accepted in
+    // A standalone panel: as a sheet it is wider than the Settings window and hangs off its edge.
+    ProjectPanels.present(panel, in: nil) { accepted in
         if accepted, let url = panel.url { selected(url) }
     }
 }
@@ -94,16 +96,18 @@ struct SidecarStorageSettings: View {
             .disabled(!loaded || saving)
             .accessibilityLabel("Save new cutcaches")
             .settingsRow(.cutcacheLocation)
+            .help("Choose whether new cutcaches are saved next to their media or in one shared cache folder")
             if mode == .disk {
                 LabeledContent("Shared cache folder") {
                     VStack(alignment: .trailing, spacing: 3) {
                         if let disk {
-                            Text(disk.path).lineLimit(1).truncationMode(.middle).help(disk.path)
+                            Text((disk.path as NSString).abbreviatingWithTildeInPath).lineLimit(1).truncationMode(.middle)
+                                .help(disk.path).accessibilityValue(disk.path)
                             Label(available ? "Available" : "Unavailable",
                                   systemImage: available ? "checkmark.circle" : "exclamationmark.triangle")
                                 .font(.caption).foregroundStyle(.secondary)
                         } else {
-                            Text("No folder selected").foregroundStyle(.secondary)
+                            Text("No folder chosen").foregroundStyle(.secondary)
                         }
                         Button(disk == nil ? "Choose Folder…" : "Change Folder…", action: chooseDisk).disabled(saving)
                     }
@@ -111,6 +115,7 @@ struct SidecarStorageSettings: View {
             }
             Button(SettingsRow.clearCutcaches.title) { showClear = true }
                 .settingsRow(.clearCutcaches)
+                .help("Choose which saved analysis cutcaches to remove")
         } header: {
             Text("Analysis cutcaches")
         } footer: {
@@ -165,7 +170,9 @@ struct SidecarStorageSettings: View {
     }
 
     private func chooseDisk() {
-        chooseSidecarFolder(title: "Choose a cache folder for all projects", initial: disk, allowCreation: true) { folder in
+        chooseSidecarFolder(title: "Choose a cache folder for all projects",
+                            message: "Choose a folder, usually on a cache disk, where every project saves new cutcaches.",
+                            initial: disk, allowCreation: true) { folder in
             saveLocation { try SidecarLocations.chooseDisk(folder, selecting: true) }
         }
     }

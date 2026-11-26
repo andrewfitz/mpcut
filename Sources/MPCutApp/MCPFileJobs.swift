@@ -9,8 +9,8 @@ extension ProjectSessions {
         // The cutcache location is not an EditorPreferences value, so it asks the switch itself. The files-only
         // worker runs these through the CLI without the app and is not gated.
         if tool == "analysis_file_cache_settings_set" { try preferences.checkAgentWrite() }
-        // `in_place` rewrites the saved project the request names.
-        if (arguments["in_place"] as? NSNumber)?.boolValue == true, !preferences.agentsReplaceFiles {
+        // `in_place`, at any level of the request, rewrites the saved project the request names.
+        if !preferences.agentsReplaceFiles, MCPFileRequest.replacesProject(tool: tool, arguments: arguments) {
             throw MCPFailure("file_replace_disabled", Self.fileReplaceDisabledMessage)
         }
         try checkAccess()

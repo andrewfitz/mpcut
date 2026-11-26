@@ -607,7 +607,8 @@
                 "type": "integer",
                 "minimum": 16,
                 "maximum": 8192,
-                "description": "New stills timeline width in pixels, an even number from 16 to 8192. Factory 1920."
+                "multipleOf": 2,
+                "description": "New stills timeline width in pixels, an even number from 16 to 8192. An odd number is refused. Factory 1920."
               }
             }
           }
@@ -626,7 +627,8 @@
                 "type": "integer",
                 "minimum": 16,
                 "maximum": 8192,
-                "description": "New stills timeline height in pixels, an even number from 16 to 8192. Factory 1080."
+                "multipleOf": 2,
+                "description": "New stills timeline height in pixels, an even number from 16 to 8192. An odd number is refused. Factory 1080."
               }
             }
           }

@@ -12,9 +12,14 @@ package enum SharedCacheLimit {
         /// Recordings whose cutcache was removed, for `sidecarCachesDidClear`.
         package var removedSources: Set<URL> = []
         package var skipped: [URL: String] = [:]
+        /// The run stopped before a removal because `recheck` answered nil, for example while a project opens.
+        package var aborted = false
 
         package init() {}
     }
+
+    /// Asked before each removal. Returns the protected set as it is now, or nil to stop the run.
+    package typealias Recheck = @Sendable () -> Set<URL>?
 
     /// The selected shared cache folder while disk mode is on and the folder is reachable.
     package static var configuredRoot: URL? {
@@ -23,16 +28,17 @@ package enum SharedCacheLimit {
         return settings.disk
     }
 
-    /// `root` is the shared cache folder or its `MPCut Cache` child. A limit of zero or less does
-    /// nothing. `protected` holds media, project and cutcache URLs; a cutcache whose own path or
-    /// recording is protected is never removed. Last use is the cutcache's modification date,
-    /// which every analysis save updates; opening a cache for reading does not.
+    /// `root` is the shared cache folder the user chose; its managed `MPCut Cache` child is the only folder read.
+    /// The chosen folder may itself be named `MPCut Cache`. A limit of zero or less does nothing. `protected`
+    /// holds media, project and cutcache URLs; a cutcache whose own path or recording is protected is never
+    /// removed. `recheck` runs before each removal and replaces `protected` with its answer, so a project
+    /// opened during the run keeps its cutcaches; nil stops the run. Last use is the cutcache's modification
+    /// date, which every analysis save updates; opening a cache for reading does not.
     package static func enforce(limit: Int64, protected: Set<URL>, root: URL? = configuredRoot,
-                                cancelled: () -> Bool = { false }) -> Outcome {
+                                recheck: Recheck? = nil, cancelled: () -> Bool = { false }) -> Outcome {
         var outcome = Outcome()
         guard limit > 0, let root else { return outcome }
-        let base = root.lastPathComponent == "MPCut Cache" ? root.deletingLastPathComponent() : root
-        let folder = AnalysisSidecar.canonicalSource(base.appendingPathComponent("MPCut Cache", isDirectory: true))
+        let folder = AnalysisSidecar.canonicalSource(root.appendingPathComponent("MPCut Cache", isDirectory: true))
         var info = stat()
         guard lstat(folder.path, &info) == 0, info.st_mode & S_IFMT == S_IFDIR,
               let total = try? StoreMeasurement.allocatedBytes(at: folder, cancelled: cancelled) else { return outcome }
@@ -42,8 +48,10 @@ package enum SharedCacheLimit {
 
         let candidates = layoutCaches(in: folder)
         guard !candidates.isEmpty, !cancelled() else { return outcome }
-        let forbidden = Set(protected.map { AnalysisSidecar.canonicalSource($0).path })
-        let entries = SidecarCacheCleaner.preview(scanning: [base], protected: protected, scannedOnly: true)
+        var current = protected
+        var forbidden = Set(protected.map { AnalysisSidecar.canonicalSource($0).path })
+        // Scan only the managed folder. The chosen folder can be a whole disk.
+        let entries = SidecarCacheCleaner.preview(scanning: [folder], protected: protected, scannedOnly: true)
         var verified: [String: SidecarCacheEntry] = [:]
         for entry in entries where entry.location == .disk {
             let path = AnalysisSidecar.canonicalSource(entry.url).path
@@ -57,7 +65,10 @@ package enum SharedCacheLimit {
                 outcome.skipped[candidate.url] = "MPCut could not confirm this cache belongs to the shared folder."
                 continue
             }
-            if forbidden.contains(candidate.url.path) || forbidden.contains(AnalysisSidecar.canonicalSource(entry.source).path) {
+            func isProtected() -> Bool {
+                forbidden.contains(candidate.url.path) || forbidden.contains(AnalysisSidecar.canonicalSource(entry.source).path)
+            }
+            if isProtected() {
                 outcome.skipped[candidate.url] = "An open project uses this cache."
                 continue
             }
@@ -65,7 +76,22 @@ package enum SharedCacheLimit {
                 outcome.skipped[candidate.url] = issue
                 continue
             }
-            let cleared = SidecarCacheCleaner.clear([entry], protected: protected)
+            // A project can open while the folder is being measured. Ask again just before removing anything.
+            if let recheck {
+                guard let fresh = recheck() else {
+                    outcome.aborted = true
+                    break
+                }
+                if fresh != current {
+                    current = fresh
+                    forbidden = Set(fresh.map { AnalysisSidecar.canonicalSource($0).path })
+                }
+                if isProtected() {
+                    outcome.skipped[candidate.url] = "An open project uses this cache."
+                    continue
+                }
+            }
+            let cleared = SidecarCacheCleaner.clear([entry], protected: current)
             if let reason = cleared.skippedEntries.first?.reason {
                 outcome.skipped[candidate.url] = reason
                 continue

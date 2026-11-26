@@ -41,6 +41,23 @@ struct StillTimelineFormatDefaults: Equatable {
         while text.hasSuffix("0") { text.removeLast() }
         return text
     }
+
+    /// The decimal NTSC rates the field shows, and the exact rates they stand for.
+    private static let ntscRates: [(shown: String, exact: String)] = [
+        ("23.976", "24000/1001"), ("29.97", "30000/1001"), ("59.94", "60000/1001"), ("119.88", "120000/1001")
+    ]
+
+    /// The timeline cadence for the panel's frame rate field, or nil when it is not a positive rate. The field shows
+    /// NTSC rates as 23.976, 29.97, 59.94 and 119.88, which are the 1001-denominator rates of NTSC footage; any other
+    /// entry, such as "30" or "30000/1001", is read as written.
+    static func cadence(frameRate text: String) throws -> RationalTime? {
+        var fps = try RationalTime(parsing: text.trimmingCharacters(in: .whitespaces))
+        if let ntsc = try ntscRates.first(where: { try RationalTime(parsing: $0.shown) == fps }) {
+            fps = try RationalTime(parsing: ntsc.exact)
+        }
+        guard fps > .zero else { return nil }
+        return RationalTime(numerator: fps.denominator, denominator: fps.numerator)
+    }
 }
 
 @MainActor
@@ -71,18 +88,16 @@ extension StillPanels {
             ("Video codec", codec), ("Container", container), ("Program color", color)
         ], in: window) {
             do {
-                let fps = try RationalTime(parsing: rate.stringValue.trimmingCharacters(in: .whitespaces))
+                let cadence = try StillTimelineFormatDefaults.cadence(frameRate: rate.stringValue)
                 guard let width = Int(width.stringValue.trimmingCharacters(in: .whitespaces)),
                       let height = Int(height.stringValue.trimmingCharacters(in: .whitespaces)),
                       let codec = codec.titleOfSelectedItem.flatMap(ReencodeCodec.init(rawValue:)),
                       let container = container.titleOfSelectedItem,
                       let color = color.titleOfSelectedItem.flatMap({ StillTimelineFormat.Color(rawValue: $0.lowercased()) }),
-                      fps > .zero else {
+                      let cadence else {
                     throw CutError(code: "invalid_still_format", message: "Enter a canvas size and a positive frame rate.")
                 }
-                let format = StillTimelineFormat(width: width, height: height,
-                                                 cadence: .init(numerator: fps.denominator, denominator: fps.numerator),
-                                                 codec: codec, container: container)
+                let format = StillTimelineFormat(width: width, height: height, cadence: cadence, codec: codec, container: container)
                 try format.validate(color: color.policy)
                 completion(format, color.policy)
             } catch {

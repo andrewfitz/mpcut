@@ -126,6 +126,19 @@ struct MCPFileRequest {
         supports(tool) || [MCPFileReview.resultTool, "file_job_status_read", "file_job_result_read", "file_job_cancel", "file_job_release"].contains(tool)
     }
 
+    /// Whether the call rewrites the saved project it names. `in_place` is the only way a file tool replaces an
+    /// existing project: every other project destination must be new. Most tools take it at the top level; the
+    /// transcript tools take it inside their JSON `request`, which can itself carry a `request`. Every level counts.
+    /// Runs before validation, so it never throws.
+    static func replacesProject(tool: String, arguments: [String: Any]) -> Bool {
+        func inPlace(_ fields: [String: Any], depth: Int) -> Bool {
+            if (fields["in_place"] as? NSNumber)?.boolValue == true { return true }
+            guard depth < 8, let request = fields["request"] as? [String: Any] else { return false }
+            return inPlace(request, depth: depth + 1)
+        }
+        return supports(tool) && inPlace(arguments, depth: 0)
+    }
+
     init(tool: String, fields: [String: Any]) throws {
         let validated = try MCPSchemas.loaded.get().validate(tool: tool, arguments: fields)
         try self.init(tool: tool, validatedFields: validated)

@@ -69,7 +69,9 @@ struct SettingsAutomationPage: View {
                 HStack {
                     Text(url.path)
                         .font(.system(.caption, design: .monospaced))
-                        .lineLimit(1).truncationMode(.middle)
+                        .lineLimit(3).truncationMode(.middle)
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
                         .help(url.path)
                     Button(copied == row ? "Copied" : "Copy") { copy(url.path, row: row) }

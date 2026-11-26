@@ -172,6 +172,10 @@ final class MulticamAnalysisStore: ObservableObject {
     /// its media arrives. Cancelling a scan drops the ones still waiting, so a later update never starts them.
     private var automaticSceneScans = Set<String>()
     private var automaticPauseScans = Set<String>()
+    /// The routes an automatic pause scan reads, while one runs: the routed sound of recordings just added. Nil while no
+    /// scan runs and for a scan the editor, an agent or Snap to Silence started, which reads every routed track. When
+    /// these routes finish the request ends, so a later routing change scans nothing on its own.
+    private var automaticPauseRoutes: Set<MulticamAudioSelection>?
     var changed: (() -> Void)?
     private(set) var snapTarget: TimelineSnapTarget = .off
     var maxBlip = AudioWaveform.defaultMaxBlip {
@@ -242,8 +246,13 @@ final class MulticamAnalysisStore: ObservableObject {
         return track
     }
 
+    /// The routes the pause scan reads: every routed track, or only those of a running automatic scan.
+    private var scannedSilenceTracks: Set<MulticamAudioSelection> {
+        automaticPauseRoutes.map { activeSilenceTracks.intersection($0) } ?? activeSilenceTracks
+    }
+
     var silenceProgress: Double? {
-        let routes = activeSilenceTracks
+        let routes = scannedSilenceTracks
         let pending = routes.contains { route in
             jobs[.silence(route)] != nil ||
                 (requested.contains(.silence) && !complete(.silence(route)) && jobs[.waveform(route)] != nil)
@@ -336,6 +345,7 @@ final class MulticamAnalysisStore: ObservableObject {
         requested = snapTarget == .silence ? [snapTarget] : []
         automaticSceneScans = []
         automaticPauseScans = []
+        automaticPauseRoutes = nil
         waves = [:]
         finishedWaves = []
         silences = [:]
@@ -496,7 +506,7 @@ final class MulticamAnalysisStore: ObservableObject {
                 }
             }
             if thresholds != roomThresholds || pauseThreshold != annotations.multicamThresholdDB {
-                if !silences.isEmpty { requested.insert(.silence) }
+                if !silences.isEmpty { requestSilenceAgain() }
                 invalidateSilenceResults()
                 roomThresholds = thresholds
                 pauseThreshold = annotations.multicamThresholdDB
@@ -537,7 +547,7 @@ final class MulticamAnalysisStore: ObservableObject {
             pendingSilenceRescans.formIntersection(activeSilenceTracks)
             selectedSilenceTracks = audioRouting.selections
             if refreshes.isEmpty, oldMinimum != inputPauseMinimum {
-                if !silences.isEmpty { requested.insert(.silence) }
+                if !silences.isEmpty { requestSilenceAgain() }
                 invalidateSilenceResults()
             }
             angleOffsets = nextAngles
@@ -601,8 +611,10 @@ final class MulticamAnalysisStore: ObservableObject {
         let pauses = automaticPauseScans.filter { sources[$0] != nil }
         if !pauses.isEmpty {
             automaticPauseScans.subtract(pauses)
-            // The pause scan reads the program's routed microphones, through the same bookkeeping as Snap to Silence.
-            if activeSilenceTracks.contains(where: { pauses.contains($0.source) }) { scan(.silence) }
+            // The pause scan reads the program's routed microphones of these recordings only, never a recording already
+            // in the project, so a scan the editor cancelled stays cancelled.
+            let routes = activeSilenceTracks.filter { pauses.contains($0.source) }
+            if !routes.isEmpty { scanAutomatically(routes) }
         }
         guard !isScanning(.scenes) else { return }
         let scenes = automaticSceneScans.filter { sources[$0] != nil }
@@ -736,9 +748,53 @@ final class MulticamAnalysisStore: ObservableObject {
             return issue.key.target != target
         }
         visibleOnlyWaveforms.subtract(activeSilenceTracks)
+        // The menu command, an agent and room tone read every routed track.
+        automaticPauseRoutes = nil
         requested.insert(target)
         schedule()
         publish()
+    }
+
+    /// Asks for the pause scan again after a change invalidated its results. A running automatic scan keeps to its own
+    /// routes and the routes that had results; otherwise every routed track is read, as before.
+    private func requestSilenceAgain() {
+        if automaticPauseRoutes != nil { automaticPauseRoutes?.formUnion(silences.keys) }
+        requested.insert(.silence)
+    }
+
+    /// The automatic pause scan of recordings just added: only their routed tracks.
+    private func scanAutomatically(_ routes: Set<MulticamAudioSelection>) {
+        if requested.contains(.silence) {
+            // A scan the editor started, or Snap to Silence, already reads every routed track.
+            guard automaticPauseRoutes != nil else { return }
+            automaticPauseRoutes?.formUnion(routes)
+        } else {
+            automaticPauseRoutes = routes
+        }
+        issues = issues.filter { issue in
+            switch issue.key {
+            case .waveform(let route), .silence(let route): return !routes.contains(route)
+            default: return true
+            }
+        }
+        visibleOnlyWaveforms.subtract(routes)
+        requested.insert(.silence)
+        schedule()
+        publish()
+    }
+
+    /// Ends an automatic pause scan once each of its routes has results or an issue. The request goes with it, so a
+    /// later routing change starts nothing.
+    private func finishAutomaticPauseScan() {
+        guard let scope = automaticPauseRoutes else { return }
+        let routes = activeSilenceTracks.intersection(scope)
+        let done = routes.allSatisfy { route in
+            jobs[.silence(route)] == nil && jobs[.waveform(route)] == nil
+                && (complete(.silence(route)) || issues[.silence(route)] != nil || issues[.waveform(route)] != nil)
+        }
+        guard done else { return }
+        automaticPauseRoutes = nil
+        if snapTarget != .silence { requested.remove(.silence) }
     }
 
     func canScanScenes(camera: String?) -> Bool {
@@ -876,7 +932,10 @@ final class MulticamAnalysisStore: ObservableObject {
         }
         mcpReceipts.removeValue(forKey: target)?.finish("cancelled")
         requested.remove(target)
-        if target == .silence { pendingSilenceRescans.removeAll() }
+        if target == .silence {
+            pendingSilenceRescans.removeAll()
+            automaticPauseRoutes = nil
+        }
         for job in Array(jobs.keys) where job.target == target { cancelJob(job) }
         publish()
     }
@@ -884,6 +943,8 @@ final class MulticamAnalysisStore: ObservableObject {
     func setSnap(_ target: TimelineSnapTarget) {
         snapTarget = target
         if target == .silence {
+            // Snap to Silence reads every routed track.
+            automaticPauseRoutes = nil
             requested.insert(target)
             schedule()
         }
@@ -897,7 +958,7 @@ final class MulticamAnalysisStore: ObservableObject {
         pauseMinimum = minimum
         if oldMinimum != inputPauseMinimum || pauseThreshold != threshold {
             if mcpReceipts[.silence] != nil { cancel(.silence) }
-            if activeSilenceTracks.contains(where: { silences[$0] != nil }) { requested.insert(.silence) }
+            if activeSilenceTracks.contains(where: { silences[$0] != nil }) { requestSilenceAgain() }
             invalidateSilenceResults()
         }
         pauseThreshold = threshold
@@ -960,7 +1021,7 @@ final class MulticamAnalysisStore: ObservableObject {
     private func candidates(for target: TimelineSnapTarget) -> [Job] {
         switch target {
         case .off: return activeSilenceTracks.subtracting(visibleOnlyWaveforms).map(Job.waveform)
-        case .silence: return activeSilenceTracks.map(Job.silence)
+        case .silence: return scannedSilenceTracks.map(Job.silence)
         case .scenes, .keyframes: return []
         }
     }
@@ -982,6 +1043,7 @@ final class MulticamAnalysisStore: ObservableObject {
                 start(job, media: media)
             }
         }
+        finishAutomaticPauseScan()
         if useSidecars {
             for (id, media) in sources where pictureSourceIDs.contains(id) && media.hasVideo && sidecarPreference.permits(media.url)
                 && !refreshStaleScenes.contains(id) && !isScanning(.scenes) {

@@ -6,7 +6,7 @@ An agent connected to MPCut can edit any open timeline, including an unsaved seq
 
 ## Connect an editing agent
 
-1. Open a build of MPCut that includes `Contents/Helpers/mpcut-mcp`. In **Settings → General → Automation**, turn on **Enable local MCP control**. Local MCP control starts off in 2.0, including after upgrading from 1.x. Turning it on lets local applications running under your macOS account inspect and edit open projects.
+1. Open a build of MPCut that includes `Contents/Helpers/mpcut-mcp`. In **Settings → Automation**, turn on **Enable local MCP control**. Local MCP control starts off in 2.0, including after upgrading from 1.x. Turning it on lets local applications running under your macOS account inspect and edit open projects.
 2. Configure the host to launch the bundled helper as a **stdio** server named `mpcut`. Supply the executable’s absolute path as one command value, including any spaces, and leave the arguments empty. Match the helper to the running app bundle. If you move or replace the app, update the host’s path and restart its connection.
 3. Open a project and ask, “List my open MPCut projects and tell me which one is an unsaved sequence.” An empty `projects` array means the app responded and has no project windows.
 
@@ -18,7 +18,7 @@ For Codex CLI, register the installed app with this command, then start a new se
 codex mcp add mpcut -- "/Applications/MPCut.app/Contents/Helpers/mpcut-mcp"
 ```
 
-For hosts that accept an `mcpServers` JSON configuration, use the same path as a single string.
+For hosts that accept an `mcpServers` JSON configuration, use the same path as a single string. **Settings → Automation** shows the helper’s path with **Copy**, and **Copy Agent Configuration** copies this block with the path of the running app’s helper.
 
 ```json
 {
@@ -33,11 +33,24 @@ For hosts that accept an `mcpServers` JSON configuration, use the same path as a
 
 The helper uses the official Go SDK and supports the `2026-07-28` protocol. Tool discovery and documentation work while the app is closed. Both live and file tool calls require the running app and its local-control setting. Turn off local control in Settings to revoke existing access. An already committed edit remains in the project and follows the configured history limit.
 
+The local-control setting does not gate a helper started with `--files-only`. That worker runs the saved-file tools through the bundled CLI, works while the app is closed and never reads desktop Settings, so only configure it in clients you trust with your files. Under `--files-only`, `analysis_file_cache_settings_set` can still change the cutcache location that the app and the CLI share. [Headless setup](HEADLESS.md)
+
 Codex CLI 0.171.0 negotiated `2025-06-18` with a signed MPCut 1.2.0 development bundle in a November 2026 host test. It discovered the tools and read both resources. The Python walkthrough and the official Go SDK integration exercise `2026-07-28`. The version used in a session depends on the host. [Verified workflows](MCP-COVERAGE.md)
 
 Helper tests also exercise `2025-11-25`, `2025-06-18`, `2025-03-26` and `2024-11-05` over stdio with the Go SDK.
 
 Open **Help → MPCut Agent Guide** to read these instructions offline. Hosts with MCP resource support can read `mpcut://docs/agent-guide` and `mpcut://docs/tool-reference` through `resources/read`. The installed helper advertises argument schemas through `tools/list`.
+
+### Settings and agent permissions
+
+`preferences_read` returns every shared setting. `preferences_set` changes one, except `automation_local_mcp_enabled`, `automation_preferences_write_enabled`, `automation_file_replace_enabled`, `draft_retention_days` and `analysis_shared_cache_max_bytes`, which agents can read but not set. To show the editor a setting, call `workspace_panel_show` with `action: "show_settings"` and an optional `page`: `general`, `editing`, `playback`, `media`, `transcripts`, `export`, `storage` or `automation`. Without a page, Settings reopens on the last page shown. Other actions ignore `page`. The two stills timeline pixel keys take even numbers only.
+
+**Settings → Automation** has two agent permissions. Both start on, and only the editor can change them.
+
+- **Let agents change settings.** With it off, every agent write of a setting fails with `settings_write_disabled`. This covers `preferences_set`, the `workspace_layout_set` actions `set_large_thumbnails`, `set_full_height_panel` and `set_track_label_width`, the `snap` action of `timeline_selection_set` and `multicam_preview_control`, and `analysis_file_cache_settings_set` sent through the app. Reads still work, and `set_transcript_suggested_camera` stays allowed.
+- **Let agents replace existing project files.** With it off, `project_save`, or `project_close` with `changes: "save"`, fails with `file_replace_disabled` when `replace_existing` would write over another existing file. Every file tool sent through the app with `in_place: true` fails with the same code, including the transcript file tools that carry `in_place` inside `request`: `transcript_file_attachment_import`, `transcript_file_attachment_bind`, `transcript_file_attachment_detach`, `transcript_file_words_correct`, `transcript_file_edit_apply` and `transcript_file_excerpt_queue`. Saving to the project’s own path still works.
+
+When a live editor call omits an option, some tools take the editor’s Settings value. `export_editor_project_plan` and `export_editor_project_render` use the default movie export mode, the re-encode codec and quality, and in multicam the multicam audio layout. The Settings codec applies to an ordinary or multicam Re-encode, a Tiles render and a still project without its own format, but only where the destination extension can hold it; otherwise the export uses H.264 with its quality. `export_queue_plan` and `export_queue_render` use the same codec and quality for ordinary ranges and Tiles ranges, and the H.264 and HEVC container unless it is Automatic or cannot carry the requested audio. A Settings downmix applies only when the output keeps sound, `audio` is omitted, `auto`, `pcm` or `aac`, and the destination renders that sound; otherwise the output has separate tracks. `transcript_editor_job_start` without an engine uses the preferred engine, resolved as job setup resolves Automatic. Every other omitted argument keeps its documented fallback. File jobs and the CLI never read desktop Settings and use factory values. Each schema says which applies. [Settings defaults](USAGE.md#set-editing-and-export-defaults)
 
 ### Try a read-only walkthrough
 
@@ -246,6 +259,7 @@ Use absolute paths for file operations. Read each tool’s schema for its sideca
 | Observation | Next action |
 | --- | --- |
 | Tools appear, but the app is unavailable | Check the app instance and its local-control setting. If the user disabled control, return control to them. |
+| MPCut reports `settings_write_disabled` or `file_replace_disabled` | The user turned off an agent permission in **Settings → Automation**. Report what was refused; nothing changed. Save to a new path, or pass `out_project` instead of `in_place`, only if the user asks for that. |
 | Project disappeared or a handle expired | List projects again. Re-establish the intended document before applying any edit. |
 | A transcript edit plan is stale | Refresh the timeline and transcript revisions, resolve the intended occurrences and review a new plan with `transcript_editor_edit_plan` before applying it. |
 | A person edited while the agent was planning | Read the new revision and locate the original occurrence and interval. Proceed if the requested edit is still unambiguous. |

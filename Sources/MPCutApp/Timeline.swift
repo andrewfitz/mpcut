@@ -197,6 +197,8 @@ struct SequenceTimeline: View {
     var largeThumbnails: Binding<Bool> = .constant(false)
     var zoom: Binding<Double> = .constant(0)
     var timeEntryRequest = 0
+    /// The playhead, duration, mark and ruler read-outs follow the Time display setting.
+    var timeFormat = TimelineTimeFormat.milliseconds
     var allowsClipEdits = true
     var allowsStillTrims = false
     var allowsStillEndResize = false
@@ -266,14 +268,14 @@ struct SequenceTimeline: View {
     private var controls: some View {
         TimelineControlBar {
             TimelineTimeControl(playhead: playhead, duration: duration, durationLabel: "Sequence duration",
-                                request: timeEntryRequest) { target in
+                                request: timeEntryRequest, timeFormat: timeFormat) { target in
                 onSeek(target)
                 revealTime = target
                 revealRequest += 1
             }
             .layoutPriority(1)
         } options: {
-            TimelineMarkReadouts(markIn: markIn, markOut: markOut)
+            TimelineMarkReadouts(markIn: markIn, markOut: markOut, timeFormat: timeFormat)
             SnapTargetMenu(selection: snapTarget, audioOnly: audioOnly)
                 .disabled(!allowsClipEdits)
                 .layoutPriority(1)
@@ -705,7 +707,7 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
             if !sharedClips || oldValue?.sceneRevision != timeline?.sceneRevision ||
                 oldValue?.showsWaveform != timeline?.showsWaveform || oldValue?.selection != timeline?.selection ||
                 laneHeightChanged || tileLanesChanged || paddingChanged || oldValue?.assemblyAssets != timeline?.assemblyAssets
-                || oldValue?.soundtrack != timeline?.soundtrack
+                || oldValue?.soundtrack != timeline?.soundtrack || oldValue?.timeFormat != timeline?.timeFormat
                 || (oldValue?.thumbnail == nil) != (timeline?.thumbnail == nil) {
                 needsDisplay = true
             } else if oldValue?.waveformRevision != timeline?.waveformRevision {
@@ -1478,7 +1480,8 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
     }
 
     private func drawRuler(_ visible: NSRect, position: PositionedClip, lastLabelEnd: inout CGFloat) {
-        let step = timelineRulerStep(scale: scale)
+        let format = timeline?.timeFormat ?? .milliseconds
+        let step = format.rulerStep(scale: scale)
         let minorStep = step / 5
         let offset = position.keptStart - position.sequenceStart
         let first = ceil(max(position.sequenceStart, stripTime(at: visible.minX) - offset) / minorStep)
@@ -1491,7 +1494,7 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
             let major = index.isMultiple(of: 5)
             fill(NSRect(x: tickX, y: major ? 20 : 24, width: 1, height: major ? 8 : 4), .separatorColor)
             guard major else { continue }
-            let text = timelineTime(time, milliseconds: step < 1)
+            let text = format.rulerLabel(time, step: step)
             let font = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .medium)
             let width = ceil((text as NSString).size(withAttributes: [.font: font]).width)
             let right = tickX + 4

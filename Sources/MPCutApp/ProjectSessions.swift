@@ -1360,7 +1360,9 @@ private final class ProjectWindowDelegate: NSObject, NSWindowDelegate {
 
 @MainActor
 final class EditorApplication: NSObject, NSApplicationDelegate {
-    let sessions = ProjectSessions(preferences: EditorPreferences(defaults: EditorPreferences.applicationDefaults), launching: true)
+    let sessions = ProjectSessions(preferences: EditorPreferences(defaults: EditorPreferences.applicationDefaults,
+                                                                  persistentDomain: EditorPreferences.applicationDefaultsDomain),
+                                   launching: true)
     private var isQuitting = false
 
     func applicationWillFinishLaunching(_ notification: Notification) {

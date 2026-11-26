@@ -1,6 +1,6 @@
 # Connect MPCut to Grok or Grok Bot
 
-On the Mac with the footage, open MPCut and enable **Settings → General → Automation → Enable local MCP control**. Local control starts off again after upgrading from 1.x to 2.0. The default app location is `/Applications/MPCut.app`. For another location, edit the absolute path in the accompanying `helper-path.txt`.
+On the Mac with the footage, open MPCut and enable **Settings → Automation → Enable local MCP control**. Local control starts off again after upgrading from 1.x to 2.0. The default app location is `/Applications/MPCut.app`. For another location, edit the absolute path in the accompanying `helper-path.txt`.
 
 1. Expand the ZIP on the editing Mac. Double-click **Start MPCut Connector.command** in Finder. The launcher starts the included Apple Silicon connector and prints the location of the connector key file. The key stays on this Mac until you enter it in your connector's credential settings.
 2. Route a reachable HTTPS endpoint to **http://127.0.0.1:8472** on that Mac, preserving the **/mpcut/mcp** path and the Authorization header. Set the upstream Host header to `127.0.0.1:8472`. For example, with ngrok installed and configured, `ngrok http 8472 --host-header=rewrite` gives you a forwarding URL. Append `/mpcut/mcp` to that URL. Keep the bridge and HTTPS route running while you edit. [Grok's tunnel setup](https://docs.x.ai/grok/connectors/custom-mcp-tunneling)

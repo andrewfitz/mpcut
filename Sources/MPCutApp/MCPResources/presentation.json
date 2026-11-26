@@ -405,7 +405,7 @@
             "storage",
             "automation"
           ],
-          "description": "For show_settings, the Settings page to open. Omit it to reopen the last page."
+          "description": "Used only by show_settings: the Settings page to open. Omit it to reopen the last page. Other actions ignore it."
         }
       },
       "required": [

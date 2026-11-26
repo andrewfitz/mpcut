@@ -28,10 +28,16 @@ struct ExportStartFolder: Equatable, Sendable {
         case .source: sourceRecording?.deletingLastPathComponent()
         case .chosen: chosenFolder
         }
-        guard let preferred, isAvailable(preferred, fileManager: fileManager) else {
+        guard let preferred, isStartingFolder(preferred), isAvailable(preferred, fileManager: fileManager) else {
             return .init(directory: automatic, chosenFolderUnavailable: unavailable)
         }
         return .init(directory: preferred, chosenFolderUnavailable: false)
+    }
+
+    /// A folder Settings can start a panel in: written as an absolute path, and not the disk root. A folder made from a
+    /// project-relative file name resolves against the process's working folder, often "/", so it is refused.
+    static func isStartingFolder(_ folder: URL) -> Bool {
+        folder.isFileURL && folder.relativePath.hasPrefix("/") && folder.standardizedFileURL.path != "/"
     }
 
     /// For the Settings row: whether a saved folder can open now.

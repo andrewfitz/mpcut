@@ -35,6 +35,8 @@ struct TimelineTimeControl: View {
     let duration: Double
     let durationLabel: String
     let request: Int
+    /// The visible read-outs follow the Time display setting. The accessibility values stay in milliseconds.
+    var timeFormat = TimelineTimeFormat.milliseconds
     let seek: (Double) -> Void
 
     @State private var editing = false
@@ -48,7 +50,7 @@ struct TimelineTimeControl: View {
     var body: some View {
         HStack(spacing: 0) {
             // The readout and its field share one footprint, so entering a time moves nothing.
-            Text(timelineTime(max(playhead, duration), milliseconds: true))
+            Text(timeFormat.string(max(playhead, duration)))
                 .font(Self.font.weight(.medium))
                 .hidden()
                 .accessibilityHidden(true)
@@ -60,7 +62,7 @@ struct TimelineTimeControl: View {
                             .textFieldStyle(.plain)
                             .focused($focused)
                             .onSubmit {
-                                guard let time = Self.parseTime(input, initialTime: initialTime) else {
+                                guard let time = Self.parseTime(input, initialTime: initialTime, format: timeFormat) else {
                                     MutedLaunch.beep()
                                     return
                                 }
@@ -79,7 +81,7 @@ struct TimelineTimeControl: View {
                             .help("Enter playhead time")
                     } else {
                         Button(action: beginEditing) {
-                            Text(timelineTime(playhead, milliseconds: true))
+                            Text(timeFormat.string(playhead))
                                 .font(Self.font.weight(.medium))
                         }
                         .buttonStyle(.plain)
@@ -105,11 +107,13 @@ struct TimelineTimeControl: View {
                 .foregroundStyle(.tertiary)
                 .padding(.trailing, 6)
                 .accessibilityHidden(true)
-            Text(timelineTime(duration, milliseconds: true))
+            Text(timeFormat.string(duration))
                 .font(Self.font)
                 .foregroundStyle(.secondary)
                 .accessibilityLabel(durationLabel)
+                // The value stays in milliseconds in Frames mode too, so tests and agents can read it; the hint says so.
                 .accessibilityValue(timelineTime(duration, milliseconds: true))
+                .accessibilityHint("Given to the millisecond, whatever the time display shows")
         }
         .onChange(of: request) { _, _ in beginEditing() }
     }
@@ -117,13 +121,20 @@ struct TimelineTimeControl: View {
     private func beginEditing() {
         guard !editing else { return }
         initialTime = playhead
-        input = timelineTime(playhead, milliseconds: true)
+        input = timeFormat.string(playhead)
         editing = true
     }
 
-    static func parseTime(_ text: String, initialTime: Double) -> Double? {
+    /// Untouched text returns `initialTime` exactly. Showing frames, three or four whole-number fields are
+    /// `[H:]MM:SS:FF` and nothing else, so an invalid frame is refused. Every other entry reads as it does in
+    /// milliseconds: seconds, `MM:SS.mmm` or `H:MM:SS.mmm`.
+    static func parseTime(_ text: String, initialTime: Double, format: TimelineTimeFormat = .milliseconds) -> Double? {
         let input = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if input == timelineTime(initialTime, milliseconds: true) { return initialTime }
+        if input == format.string(initialTime) { return initialTime }
+        if let cadence = format.frameCadence, (3...4).contains(input.split(separator: ":", omittingEmptySubsequences: false).count),
+           input.utf8.allSatisfy({ $0 == UInt8(ascii: ":") || (48...57).contains($0) }) {
+            return TimelineTimeDisplay.parseFrames(input, cadence: cadence)
+        }
         if let seconds = Double(input), seconds.isFinite, seconds >= 0 { return seconds }
 
         let parts = input.split(separator: ":", omittingEmptySubsequences: false)
@@ -286,6 +297,7 @@ func timelineZoomAnchor(playheadX: CGFloat, visible: Range<CGFloat>) -> CGFloat 
 struct TimelineMarkReadouts: View {
     let markIn: Double?
     let markOut: Double?
+    var timeFormat = TimelineTimeFormat.milliseconds
 
     var body: some View {
         if markIn != nil || markOut != nil {
@@ -316,7 +328,7 @@ struct TimelineMarkReadouts: View {
         let timestamp = timelineTime(time, milliseconds: true)
         return HStack(spacing: 4) {
             Text(name).foregroundStyle(.secondary)
-            Text(timestamp).font(.system(size: 12, design: .monospaced))
+            Text(timeFormat.string(time)).font(.system(size: 12, design: .monospaced))
         }
             .font(.callout)
             .fixedSize()

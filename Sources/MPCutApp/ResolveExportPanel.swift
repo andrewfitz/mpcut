@@ -35,14 +35,11 @@ extension MulticamEditorModel {
         guard let project, !isBusy else { return }
         let location = projectURL ?? URL(fileURLWithPath: "/Untitled.cut")
         let imported = media
-        // Multicam keeps its session's export folder in its own model, so only Settings' starting folder applies here.
-        let start = preferences.exportStartFolder == .automatic ? nil
-            : ExportStartFolder.resolve(preferences, projectFile: projectURL, sourceRecording: nil,
-                                        sessionFolder: nil, automatic: nil).directory
-        ResolveExportPanel.choose(name: projectName ?? "Untitled Multicam", directory: start,
+        ResolveExportPanel.choose(name: projectName ?? "Untitled Multicam", directory: interchangeStartFolder,
                                   opensTimeline: preferences.opensResolveTimeline, in: window) { output, open in
             do { try self.validateHistoryDestination(output) }
             catch { self.fail(error.localizedDescription); return }
+            self.noteExportFolder(output.deletingLastPathComponent())
             let checkingVolumes = self.interchangeCheckingVolumes
             self.run("Exporting Resolve timeline…", exporting: true) { token, useSidecar in
                 let awake = SleepPrevention(reason: "Exporting from MPCut")

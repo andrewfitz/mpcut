@@ -10,6 +10,7 @@ extension SettingsRow {
 
 struct SettingsTranscriptsPage: View {
     @ObservedObject var preferences: EditorPreferences
+    /// Owned by the Settings window when it passes one, so a finished check outlives the page.
     @StateObject private var status: TranscriberrrStatus
 
     @MainActor init(preferences: EditorPreferences, status: TranscriberrrStatus? = nil) {
@@ -23,10 +24,12 @@ struct SettingsTranscriptsPage: View {
                 transcriberrr
                 LabeledContent(SettingsRow.helperLocation.title) {
                     HStack {
-                        Text(preferences.transcriptHelperPath.isEmpty ? "Automatic" : preferences.transcriptHelperPath)
+                        Text(preferences.transcriptHelperPath.isEmpty ? "Automatic"
+                                : (preferences.transcriptHelperPath as NSString).abbreviatingWithTildeInPath)
                             .lineLimit(1).truncationMode(.middle)
                             .foregroundStyle(preferences.transcriptHelperPath.isEmpty ? .secondary : .primary)
-                            .help(preferences.transcriptHelperPath)
+                            .help(preferences.transcriptHelperPath.isEmpty ? "MPCut finds the helper inside Transcriberrr.app"
+                                                                          : preferences.transcriptHelperPath)
                         if !preferences.transcriptHelperPath.isEmpty {
                             Button("Automatic") { preferences.transcriptHelperPath = "" }
                                 .help("Find Transcriberrr automatically")
@@ -42,7 +45,8 @@ struct SettingsTranscriptsPage: View {
                     }
                 }
                 .settingsRow(.engine)
-                .help("Automatic uses Qwen3, then the first available engine.")
+                .accessibilityLabel(SettingsRow.engine.title)
+                .help("Choose the engine new transcription jobs start with. Automatic uses Qwen3, then the first available engine.")
                 if let reason = status.catalog?.unavailableReason(forPreferred: preferences.transcriptEngine) {
                     Text(reason + " New jobs use Automatic until it is available; the preference is kept.")
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -64,7 +68,7 @@ struct SettingsTranscriptsPage: View {
                     .settingsRow(.followPlayback)
                     .help("Start new windows with the reader following playback")
                 SettingsNumericField(.readerTextSize, value: $preferences.readerTextSize, in: EditorPreferences.readerTextSizeRange,
-                                     step: 1, unit: "pt", digits: 1)
+                                     step: 1, unit: "pt", digits: 1, help: "Type the text size transcript readers start with in new windows")
             }
             Section("Editing") {
                 Picker(SettingsRow.boundary.title, selection: $preferences.boundaryPolicy) {
@@ -75,12 +79,12 @@ struct SettingsTranscriptsPage: View {
                 .settingsRow(.boundary)
                 .help("Choose where transcript edits place their cuts")
                 SettingsNumericField(.retainedPause, value: $preferences.retainedPause, in: EditorPreferences.retainedPauseRange,
-                                     step: 0.05, unit: "s")
+                                     step: 0.05, unit: "s", help: "Type how much of each pause Tighten keeps")
                 TextField(SettingsRow.fillerTerms.title, text: $preferences.fillerTerms, prompt: Text("um, uh, you know"))
                     .settingsRow(.fillerTerms)
-                    .help("Separate terms with commas")
+                    .help("Type the filler terms transcript review starts with, separated by commas")
             }
-            Section {
+            Section("Export") {
                 Picker(SettingsRow.exportFormat.title, selection: $preferences.transcriptExportFormat) {
                     Text("Native JSON").tag(TranscriptFormat.json)
                     Text("Readable text").tag(TranscriptFormat.text)
@@ -89,18 +93,22 @@ struct SettingsTranscriptsPage: View {
                 }
                 .settingsRow(.exportFormat)
                 .help("Choose the first format Export Transcript offers")
+            }
+            Section {
                 SettingsNumericField(.captionCharacters, value: $preferences.captionLineCharacters,
-                                     in: EditorPreferences.captionLineCharacterRange, step: 1)
-                SettingsNumericField(.captionLines, value: $preferences.captionLines, in: EditorPreferences.captionLineRange, step: 1)
+                                     in: EditorPreferences.captionLineCharacterRange, step: 1,
+                                     help: "Type the most characters a caption line holds")
+                SettingsNumericField(.captionLines, value: $preferences.captionLines, in: EditorPreferences.captionLineRange, step: 1,
+                                     help: "Type the most lines a caption shows at once")
                 SettingsNumericField(.captionCue, value: $preferences.captionCueSeconds, in: EditorPreferences.captionCueRange,
-                                     step: 0.5, unit: "s")
+                                     step: 0.5, unit: "s", help: "Type the longest time one caption stays on screen")
                 Toggle(SettingsRow.captionLabels.title, isOn: $preferences.captionSpeakerLabels)
                     .settingsRow(.captionLabels)
                     .help("Name the speaker in each caption")
             } header: {
-                Text("Export")
+                Text("Captions")
             } footer: {
-                SettingsFootnote("Export Captions stays SubRip. Caption limits apply to desktop exports; the CLI and MCP keep 42 characters, 2 lines, 6 seconds and speaker labels.")
+                SettingsFootnote("Export Captions writes SubRip. These limits apply to desktop exports; the CLI and MCP keep 42 characters, 2 lines, 6 seconds and speaker labels.")
             }
         }
     }
@@ -126,7 +134,8 @@ struct SettingsTranscriptsPage: View {
             }
         }
         .task(id: preferences.transcriptHelperPath) {
-            if TranscriberrrStatus.checksAutomatically { status.check(helperPath: preferences.transcriptHelperPath) }
+            // The window keeps the last result: coming back to the page checks only if the helper location changed.
+            status.follow(helperPath: preferences.transcriptHelperPath)
         }
     }
 
@@ -182,15 +191,25 @@ struct SettingsTranscriptsPage: View {
     private func chooseHelper() {
         let panel = NSOpenPanel()
         panel.title = "Choose the Transcriberrr helper"
+        panel.message = "Choose Transcriberrr’s helper program, the file named transcriberrr inside Transcriberrr.app, in Contents/Helpers."
         panel.prompt = "Choose"
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
-        if !preferences.transcriptHelperPath.isEmpty {
-            panel.directoryURL = URL(fileURLWithPath: preferences.transcriptHelperPath).deletingLastPathComponent()
-        }
-        ProjectPanels.present(panel, in: NSApp.keyWindow, fromSheet: true) { accepted in
+        // The helper lives inside the app bundle, so bundles open like folders here.
+        panel.treatsFilePackagesAsDirectories = true
+        panel.directoryURL = Self.helperPanelFolder(chosen: preferences.transcriptHelperPath)
+        // A standalone panel: as a sheet it is wider than the Settings window and hangs off its edge.
+        ProjectPanels.present(panel, in: nil) { accepted in
             if accepted, let url = panel.url { preferences.transcriptHelperPath = url.path }
         }
+    }
+
+    /// Where the helper panel opens: the chosen helper's folder, else the installed app's helper folder, else Applications.
+    static func helperPanelFolder(chosen: String, installedApp: URL? = NSWorkspace.shared.urlForApplication(
+        withBundleIdentifier: "com.transcriberrr.app")) -> URL {
+        if !chosen.isEmpty { return URL(fileURLWithPath: chosen).deletingLastPathComponent() }
+        if let installedApp { return installedApp.appendingPathComponent("Contents/Helpers", isDirectory: true) }
+        return URL(fileURLWithPath: "/Applications", isDirectory: true)
     }
 }

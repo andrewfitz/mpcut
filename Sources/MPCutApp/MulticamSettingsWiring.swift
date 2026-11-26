@@ -51,6 +51,11 @@ extension MulticamEditorModel {
                                          automatic: automatic, fileManager: fileManager).directory
     }
 
+    /// Where the Resolve and project interchange panels open. They have no folder rule of their own, so Automatic leaves
+    /// the folder to AppKit as before; any other Settings choice starts the session, and a folder chosen in a later panel
+    /// of the session wins.
+    var interchangeStartFolder: URL? { exportStartFolder(automatic: nil) }
+
     /// Records the folder an export panel chose, for the rest of this window's session.
     func noteExportFolder(_ folder: URL) {
         exportSessionFolder = folder.standardizedFileURL

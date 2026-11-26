@@ -91,7 +91,8 @@ struct TranscriptEngineCatalog: Decodable, Equatable {
 }
 
 /// Transcriberrr's state for the Settings page, which works with no project open. It asks the
-/// helper only when told to, so opening Settings in a test host starts nothing.
+/// helper only when told to, so opening Settings in a test host starts nothing. The Settings window owns one for its
+/// lifetime, so a finished check survives leaving the page and coming back.
 @MainActor
 final class TranscriberrrStatus: ObservableObject {
     enum State: Equatable {
@@ -102,6 +103,8 @@ final class TranscriberrrStatus: ObservableObject {
     }
 
     @Published private(set) var state = State.unchecked
+    /// The helper location the current state describes, or nil before any check.
+    private(set) var checkedHelperPath: String?
     private let locate: (String) throws -> URL
     private let probe: @Sendable (URL) throws -> Data
     private var task: Task<Void, Never>?
@@ -122,8 +125,24 @@ final class TranscriberrrStatus: ObservableObject {
         return nil
     }
 
+    /// Brings the state up to date with the helper location, when the page appears or the location changes. A result
+    /// for this location is kept. For another location a real app checks again; a process that never checks on its own
+    /// forgets the old result, which describes another helper, and waits for Check.
+    func follow(helperPath: String, automatically: Bool? = nil) {
+        guard checkedHelperPath != helperPath else { return }
+        let automatically = automatically ?? Self.checksAutomatically
+        if automatically {
+            check(helperPath: helperPath)
+        } else if checkedHelperPath != nil {
+            task?.cancel()
+            checkedHelperPath = nil
+            state = .unchecked
+        }
+    }
+
     func check(helperPath: String) {
         task?.cancel()
+        checkedHelperPath = helperPath
         let helper: URL
         do {
             helper = try locate(helperPath)

@@ -3164,7 +3164,7 @@ Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pe
 
 ### `preferences_read`
 
-Read shared MPCut settings and inspect the local-control toggle.
+Read every shared MPCut setting in the key schedule, including the read-only local-control, agent permission, draft retention and cache limit values.
 
 Returns current preference values. Changes apply app-wide. Lowering the history limit can trim retained steps immediately.
 
@@ -3172,21 +3172,55 @@ Pass an empty arguments object.
 
 ### `preferences_set`
 
-Change a native preference. Lowering history_max_steps immediately trims retained history in open projects. Local MCP access is controlled in Settings.
+Change a native preference. Lowering history_max_steps immediately trims retained history in open projects. Refused while Settings → Automation → Let agents change settings is off. Local MCP control, the agent permissions, draft_retention_days and analysis_shared_cache_max_bytes are read-only to agents.
 
 Returns current preference values. Changes apply app-wide. Lowering the history limit can trim retained steps immediately.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `operation_id` | required | string, minimum length `1`, maximum length `128` | Unique operation ID for identical retries. |
-| `key` | required | `history_max_steps` / `analysis_sidecar_reuse_enabled` / `media_auto_refresh_enabled` / `export_tier_downgrade_warning_enabled` / `export_movie_default_mode` / `timeline_snap_target` / `timeline_large_previews_enabled` / `timeline_source_time_ticks_enabled` / `silence_min_pause_seconds` / `silence_max_blip_seconds` / `silence_padding_per_side_seconds` / `playback_preview_volume_fraction` / `playback_preview_muted` / `playback_scrub_audio_enabled` / `export_jpeg_default_preset` |  |
-| `value` | required | boolean or string or number | history_max_steps 0–500, playback_preview_volume_fraction 0–1, silence_max_blip_seconds 0–1 second, pause durations in seconds. Enum values match preferences_read. |
+| `key` | required | `media_auto_refresh_enabled` / `analysis_sidecar_reuse_enabled` / `history_max_steps` / `timeline_source_time_ticks_enabled` / `timeline_snap_target` / `timeline_large_previews_enabled` / `playback_preview_volume_fraction` / `playback_preview_muted` / `playback_scrub_audio_enabled` / `export_movie_default_mode` / `export_jpeg_default_preset` / `export_tier_downgrade_warning_enabled` / `silence_min_pause_seconds` / `silence_max_blip_seconds` / `silence_padding_per_side_seconds` / `open_multiple_recordings_default_action` / `recent_files_max_count` / `draft_recovery_prompt_enabled` / `scene_rescan_confirmation_enabled` / `project_export_completion_message_enabled` / `timeline_cut_sections_default_enabled` / `workspace_full_height_sidebar_enabled` / `multicam_track_label_width_points` / `still_placement_default_duration_seconds` / `gap_default_duration_seconds` / `gap_default_color` / `still_timeline_default_width_pixels` / `still_timeline_default_height_pixels` / `still_timeline_default_frame_rate` / `still_timeline_default_codec` / `timeline_time_display` / `playback_default_speed` / `playback_cut_preview_preroll_seconds` / `playback_cut_preview_postroll_seconds` / `playback_viewer_force_sdr_enabled` / `playback_monitor_force_sdr_enabled` / `playback_monitor_clean_feed_enabled` / `playback_monitor_placement` / `analysis_scene_auto_scan_enabled` / `analysis_silence_auto_scan_enabled` / `tiles_scan_default_layout` / `tiles_scan_default_grid_columns` / `tiles_scan_default_grid_rows` / `tiles_scan_default_detail` / `tiles_dialogue_default_min_hold_seconds` / `tiles_dialogue_default_overlap_policy` / `tiles_dialogue_default_offscreen_policy` / `transcript_default_engine` / `transcript_default_speaker_identification_enabled` / `transcript_default_model_download_enabled` / `transcript_follow_playback_default_enabled` / `transcript_reader_text_size_points` / `transcript_edit_default_boundary_policy` / `transcript_tighten_default_retained_pause_seconds` / `transcript_default_filler_terms` / `transcript_export_default_format` / `transcript_caption_max_line_characters` / `transcript_caption_max_lines` / `transcript_caption_max_cue_seconds` / `transcript_caption_speaker_labels_enabled` / `export_reencode_default_codec` / `export_reencode_default_quality` / `export_prores_default_quality` / `export_reencode_default_container` / `export_multicam_default_audio_layout` / `export_result_json_default_enabled` / `resolve_send_open_timeline_default_enabled` / `export_start_folder_mode` / `export_finished_reveal_enabled` / `export_finished_notification_enabled` / `export_finished_sound_enabled` |  |
+| `value` | required | boolean or string or number | The type, unit, range and special values of each key are in its conditional schema. Enum values match preferences_read. |
 
 Additional schema rules
 
 ```json
 {
   "allOf": [
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "media_auto_refresh_enabled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "boolean",
+            "description": "Watch recordings for changes while editing. Factory false."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "analysis_sidecar_reuse_enabled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "boolean",
+            "description": "Save and reuse analysis in cutcaches. Factory true."
+          }
+        }
+      }
+    },
     {
       "if": {
         "properties": {
@@ -3200,7 +3234,8 @@ Additional schema rules
           "value": {
             "type": "integer",
             "minimum": 0,
-            "maximum": 500
+            "maximum": 500,
+            "description": "Undo and redo steps, 0\u2013500; 0 turns history off. Lowering it trims open projects. Factory 50."
           }
         }
       }
@@ -3209,97 +3244,15 @@ Additional schema rules
       "if": {
         "properties": {
           "key": {
-            "enum": [
-              "playback_preview_volume_fraction",
-              "silence_max_blip_seconds"
-            ]
+            "const": "timeline_source_time_ticks_enabled"
           }
         }
       },
       "then": {
         "properties": {
           "value": {
-            "type": "number",
-            "minimum": 0,
-            "maximum": 1
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "key": {
-            "const": "silence_min_pause_seconds"
-          }
-        }
-      },
-      "then": {
-        "properties": {
-          "value": {
-            "type": "number",
-            "minimum": 0.02
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "key": {
-            "const": "silence_padding_per_side_seconds"
-          }
-        }
-      },
-      "then": {
-        "properties": {
-          "value": {
-            "type": "number",
-            "minimum": 0
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "key": {
-            "enum": [
-              "media_auto_refresh_enabled",
-              "export_tier_downgrade_warning_enabled",
-              "analysis_sidecar_reuse_enabled",
-              "timeline_large_previews_enabled",
-              "timeline_source_time_ticks_enabled",
-              "playback_preview_muted",
-              "playback_scrub_audio_enabled"
-            ]
-          }
-        }
-      },
-      "then": {
-        "properties": {
-          "value": {
-            "type": "boolean"
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "key": {
-            "const": "export_movie_default_mode"
-          }
-        }
-      },
-      "then": {
-        "properties": {
-          "value": {
-            "enum": [
-              "copy",
-              "smart",
-              "encode"
-            ]
+            "type": "boolean",
+            "description": "Show source time ticks inside clips. Factory false."
           }
         }
       }
@@ -3320,7 +3273,99 @@ Additional schema rules
               "keyframes",
               "scenes",
               "silence"
-            ]
+            ],
+            "description": "Snap target. Factory off."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "timeline_large_previews_enabled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "boolean",
+            "description": "Enlarge thumbnails and waveforms. Factory false."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "playback_preview_volume_fraction"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Preview volume as a fraction, 0\u20131. Factory 1."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "playback_preview_muted"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "boolean",
+            "description": "Mute preview audio. Factory false."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "playback_scrub_audio_enabled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "boolean",
+            "description": "Play audio while scrubbing. Factory true."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "export_movie_default_mode"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "enum": [
+              "copy",
+              "smart",
+              "encode"
+            ],
+            "description": "Default movie export mode. Factory smart."
           }
         }
       }
@@ -3339,7 +3384,1147 @@ Additional schema rules
             "enum": [
               "review",
               "full"
-            ]
+            ],
+            "description": "Default JPEG preset. Factory review."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "export_tier_downgrade_warning_enabled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "boolean",
+            "description": "Warn when an edit lowers the export tier. Factory true."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "silence_min_pause_seconds"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "number",
+            "minimum": 0.02,
+            "description": "Minimum pause in seconds, at least 0.02. Factory 1.5."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "silence_max_blip_seconds"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Ignore sounds up to this many seconds, 0\u20131; 0 keeps every interruption. Factory 0.06."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "silence_padding_per_side_seconds"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Silence kept on each side of a cut in seconds, at least 0. Factory 0.2."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "open_multiple_recordings_default_action"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "enum": [
+              "ask",
+              "join",
+              "multicam"
+            ],
+            "description": "Opening several recordings from Finder: ask, join clips or open as multicam. Factory ask."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "recent_files_max_count"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 30,
+            "description": "Recent items, 1\u201330. Factory 10."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "draft_recovery_prompt_enabled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "boolean",
+            "description": "Offer to recover untitled projects at launch. Factory false."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "scene_rescan_confirmation_enabled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "boolean",
+            "description": "Confirm before scanning scenes again. Factory true."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "project_export_completion_message_enabled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "boolean",
+            "description": "Show the exported message after a project export with no warnings. Factory true."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "timeline_cut_sections_default_enabled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "boolean",
+            "description": "Show cut sections in new windows. Starting value. Factory true."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "workspace_full_height_sidebar_enabled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "boolean",
+            "description": "Full-height panel beside the timeline in every window. Factory false."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "multicam_track_label_width_points"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "number",
+            "minimum": 106,
+            "maximum": 360,
+            "description": "Multicam track label width in points, 106\u2013360. Each window clamps it to its own space. Factory 172."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "still_placement_default_duration_seconds"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "number",
+            "minimum": 0.04,
+            "maximum": 600,
+            "description": "Inserted still duration in seconds, 0.04\u2013600. Starting value. Factory 2."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "gap_default_duration_seconds"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "number",
+            "minimum": 0.04,
+            "maximum": 600,
+            "description": "Color gap and Space Clips duration in seconds, 0.04\u2013600. Starting value. Factory 2."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "gap_default_color"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "string",
+            "pattern": "^#[0-9A-Fa-f]{6}$",
+            "description": "Gap color as #RRGGBB. Starting value. Factory #000000."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "still_timeline_default_width_pixels"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "integer",
+            "minimum": 16,
+            "maximum": 8192,
+            "multipleOf": 2,
+            "description": "New stills timeline width in pixels, an even number from 16 to 8192. An odd number is refused. Factory 1920."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "still_timeline_default_height_pixels"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "integer",
+            "minimum": 16,
+            "maximum": 8192,
+            "multipleOf": 2,
+            "description": "New stills timeline height in pixels, an even number from 16 to 8192. An odd number is refused. Factory 1080."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "still_timeline_default_frame_rate"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 240,
+            "description": "New stills timeline frame rate in frames per second, 1\u2013240. Factory 30."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "still_timeline_default_codec"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "enum": [
+              "h264",
+              "hevc",
+              "prores"
+            ],
+            "description": "New stills timeline codec. Factory h264."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "timeline_time_display"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "enum": [
+              "milliseconds",
+              "frames"
+            ],
+            "description": "Time display. Factory milliseconds."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "playback_default_speed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "number",
+            "enum": [
+              0.125,
+              0.25,
+              0.5,
+              0.75,
+              1,
+              1.25,
+              1.5,
+              2,
+              4,
+              8
+            ],
+            "description": "Starting playback speed as a rate. Factory 1."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "playback_cut_preview_preroll_seconds"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "number",
+            "minimum": 0.25,
+            "maximum": 10,
+            "description": "Seconds played before a cut, 0.25\u201310. Factory 1."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "playback_cut_preview_postroll_seconds"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "number",
+            "minimum": 0.25,
+            "maximum": 10,
+            "description": "Seconds played after a cut, 0.25\u201310. Factory 1."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "playback_viewer_force_sdr_enabled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "boolean",
+            "description": "Force SDR on every picture surface except the Video Monitor. Factory false."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "playback_monitor_force_sdr_enabled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "boolean",
+            "description": "Force SDR on the Video Monitor. Factory false."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "playback_monitor_clean_feed_enabled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "boolean",
+            "description": "Clean feed on the Video Monitor. Factory false."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "playback_monitor_placement"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "enum": [
+              "other_display",
+              "last_position"
+            ],
+            "description": "Where the Video Monitor opens. Factory other_display."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "analysis_scene_auto_scan_enabled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "boolean",
+            "description": "Scan for scenes when a recording is added. Factory false."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "analysis_silence_auto_scan_enabled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "boolean",
+            "description": "Scan for pauses when a recording is added. Factory false."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "tiles_scan_default_layout"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "enum": [
+              "video_call",
+              "camera_multiview",
+              "even_grid"
+            ],
+            "description": "Find Tiles layout for a recording with no saved layout. A build without TileTrail uses even_grid. Factory video_call."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "tiles_scan_default_grid_columns"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 12,
+            "description": "Find Tiles grid columns, 1\u201312. Factory 2."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "tiles_scan_default_grid_rows"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 12,
+            "description": "Find Tiles grid rows, 1\u201312. Factory 2."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "tiles_scan_default_detail"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "enum": [
+              "adaptive",
+              "every_frame",
+              "sparse"
+            ],
+            "description": "Find Tiles scan detail. Factory adaptive."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "tiles_dialogue_default_min_hold_seconds"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "number",
+            "minimum": 0.04,
+            "maximum": 60,
+            "description": "Dialogue switches minimum hold in seconds, 0.04\u201360. Factory 1."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "tiles_dialogue_default_overlap_policy"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "enum": [
+              "hold",
+              "visible_speaker"
+            ],
+            "description": "Dialogue switches during overlapping speech. Factory hold."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "tiles_dialogue_default_offscreen_policy"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "enum": [
+              "hold",
+              "original",
+              "reaction"
+            ],
+            "description": "Dialogue switches for an offscreen speaker. Factory hold."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "transcript_default_engine"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Preferred transcription engine name; empty is Automatic (Qwen3, then the first available). Factory empty."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "transcript_default_speaker_identification_enabled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "boolean",
+            "description": "Identify speakers in mixed audio. Factory false."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "transcript_default_model_download_enabled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "boolean",
+            "description": "Download missing models. Factory false."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "transcript_follow_playback_default_enabled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "boolean",
+            "description": "Follow playback in new windows. Starting value. Factory true."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "transcript_reader_text_size_points"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "number",
+            "minimum": 11,
+            "maximum": 24,
+            "description": "Transcript reader text size in points, 11\u201324. Factory 14."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "transcript_edit_default_boundary_policy"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "enum": [
+              "nearest_frame",
+              "copy_safe",
+              "exact"
+            ],
+            "description": "Transcript edit boundary. Factory nearest_frame."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "transcript_tighten_default_retained_pause_seconds"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 10,
+            "description": "Pause to keep when tightening, in seconds, 0\u201310. Factory 0.2."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "transcript_default_filler_terms"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "string",
+            "maxLength": 4096,
+            "description": "Filler terms as one string, terms separated by commas. Factory empty."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "transcript_export_default_format"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "enum": [
+              "json",
+              "text",
+              "srt",
+              "vtt"
+            ],
+            "description": "Export Transcript format. Factory json."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "transcript_caption_max_line_characters"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "integer",
+            "minimum": 20,
+            "maximum": 80,
+            "description": "Caption characters per line, 20\u201380. Factory 42."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "transcript_caption_max_lines"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3,
+            "description": "Caption lines per cue, 1\u20133. Factory 2."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "transcript_caption_max_cue_seconds"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 20,
+            "description": "Longest caption cue in seconds, 1\u201320. Factory 6."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "transcript_caption_speaker_labels_enabled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "boolean",
+            "description": "Speaker labels in captions. Factory true."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "export_reencode_default_codec"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "enum": [
+              "h264",
+              "hevc",
+              "prores"
+            ],
+            "description": "Default re-encode video codec. Factory h264."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "export_reencode_default_quality"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "enum": [
+              "smaller",
+              "balanced",
+              "high"
+            ],
+            "description": "Default H.264 and HEVC quality. Factory balanced."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "export_prores_default_quality"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "enum": [
+              "422-lt",
+              "422",
+              "422-hq"
+            ],
+            "description": "Default ProRes quality. Factory 422."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "export_reencode_default_container"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "enum": [
+              "automatic",
+              "mp4",
+              "mov",
+              "mkv"
+            ],
+            "description": "H.264 and HEVC container; automatic is MP4 in the sequence editor and MOV in multicam. ProRes stays MOV. Factory automatic."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "export_multicam_default_audio_layout"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "enum": [
+              "separate_tracks",
+              "downmix_mono",
+              "downmix_stereo"
+            ],
+            "description": "Default multicam audio layout. Factory separate_tracks."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "export_result_json_default_enabled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "boolean",
+            "description": "Save Export Result JSON. Factory false."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "resolve_send_open_timeline_default_enabled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "boolean",
+            "description": "Open the timeline in Resolve after sending. Factory true."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "export_start_folder_mode"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "enum": [
+              "automatic",
+              "project",
+              "source",
+              "chosen"
+            ],
+            "description": "Where export panels start. Factory automatic."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "export_finished_reveal_enabled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "boolean",
+            "description": "Show in Finder when an export finishes. Factory false."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "export_finished_notification_enabled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "boolean",
+            "description": "Notify when an export finishes. Setting it never asks for notification permission. Factory false."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "export_finished_sound_enabled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "boolean",
+            "description": "Play a sound when an export finishes. Factory false."
           }
         }
       }
@@ -4615,13 +5800,13 @@ Starts a live job. Poll `export_editor_job_status_read` for its result. A succes
 | `scope` | optional | `timeline` / `selection` / `group` |  |
 | `tracks` | optional | `all` / `video` / `audio` |  |
 | `require_camera_copy` | optional | boolean | Require zero encoded camera duration when generating stills. |
-| `mode` | optional | `smart` / `copy` / `encode` | Defaults to Smart Trim for visible still picture. Other outputs use the native defaults. |
-| `codec` | optional | `h264` / `hevc` / `prores` / `jpeg` |  |
-| `quality` | optional | `smaller` / `balanced` / `high` / `422-lt` / `422` / `422-hq` | Use smaller, balanced or high for H.264 and HEVC. Use 422-lt, 422 or 422-hq for ProRes. For ordinary movie export, requires Re-encode. Still picture also supports these settings in Smart Trim. |
+| `mode` | optional | `smart` / `copy` / `encode` | Defaults to Smart Trim for visible still picture. Other outputs use Settings → Export → Default movie export mode, or their native defaults. |
+| `codec` | optional | `h264` / `hevc` / `prores` / `jpeg` | Video codec for Re-encode. When omitted in a live editor, the export uses Settings → Export → Re-encode video where the destination extension can hold it, and H.264 where it cannot. This applies to an ordinary or multicam Re-encode, a Tiles render and a still project without its own format; a still project with a format keeps its format's codec. File jobs and the CLI use the factory value, H.264. |
+| `quality` | optional | `smaller` / `balanced` / `high` / `422-lt` / `422` / `422-hq` | Use smaller, balanced or high for H.264 and HEVC. Use 422-lt, 422 or 422-hq for ProRes. For ordinary movie export, requires Re-encode. Still picture also supports these settings in Smart Trim. When omitted in a live editor, the export uses Settings → Export → Quality or ProRes quality for the chosen codec. File jobs and the CLI use balanced or 422. |
 | `audio` | optional | `auto` / `copy` / `aac` / `pcm` / `remove` / `mp3` / `flac` / `opus` / `alac` |  |
 | `audio_track_ordinal` | optional | integer, minimum `0` | Zero-based track within the ordinary source audio tracks. |
 | `use_reviewed_cuts` | optional | boolean | Use the native verified copy-boundary proposal for this ordinary export only. The timeline and its history stay intact. |
-| `audio_output` | optional | `separate_tracks` / `downmix_mono` / `downmix_stereo` | Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track. |
+| `audio_output` | optional | `separate_tracks` / `downmix_mono` / `downmix_stereo` | Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track. When omitted in a live multicam editor, the export uses Settings → Export → Multicam audio. A downmix from Settings applies only when the output keeps sound, audio is omitted, auto, pcm or aac, and the destination extension renders that sound; otherwise separate tracks. File jobs and the CLI use separate tracks. |
 | `still_timing` | optional | `cadence` / `held` | Still picture timing. Held writes one independently decodable sample per visible hold. Cadence uses the authored frame schedule. |
 | `container` | optional | `mov` / `mp4` / `m4v` / `mkv` / `m4a` / `mka` / `wav` / `wave` / `caf` / `flac` | Explicit container for a still project export. Match the destination filename extension and selected tracks. |
 
@@ -4640,13 +5825,13 @@ Starts a live job. Poll `export_editor_job_status_read` for its result. A succes
 | `scope` | optional | `timeline` / `selection` / `group` |  |
 | `tracks` | optional | `all` / `video` / `audio` |  |
 | `require_camera_copy` | optional | boolean | Require zero encoded camera duration when generating stills. |
-| `mode` | optional | `smart` / `copy` / `encode` | Defaults to Smart Trim for visible still picture. Other outputs use the native defaults. |
-| `codec` | optional | `h264` / `hevc` / `prores` / `jpeg` |  |
-| `quality` | optional | `smaller` / `balanced` / `high` / `422-lt` / `422` / `422-hq` | Use smaller, balanced or high for H.264 and HEVC. Use 422-lt, 422 or 422-hq for ProRes. For ordinary movie export, requires Re-encode. Still picture also supports these settings in Smart Trim. |
+| `mode` | optional | `smart` / `copy` / `encode` | Defaults to Smart Trim for visible still picture. Other outputs use Settings → Export → Default movie export mode, or their native defaults. |
+| `codec` | optional | `h264` / `hevc` / `prores` / `jpeg` | Video codec for Re-encode. When omitted in a live editor, the export uses Settings → Export → Re-encode video where the destination extension can hold it, and H.264 where it cannot. This applies to an ordinary or multicam Re-encode, a Tiles render and a still project without its own format; a still project with a format keeps its format's codec. File jobs and the CLI use the factory value, H.264. |
+| `quality` | optional | `smaller` / `balanced` / `high` / `422-lt` / `422` / `422-hq` | Use smaller, balanced or high for H.264 and HEVC. Use 422-lt, 422 or 422-hq for ProRes. For ordinary movie export, requires Re-encode. Still picture also supports these settings in Smart Trim. When omitted in a live editor, the export uses Settings → Export → Quality or ProRes quality for the chosen codec. File jobs and the CLI use balanced or 422. |
 | `audio` | optional | `auto` / `copy` / `aac` / `pcm` / `remove` / `mp3` / `flac` / `opus` / `alac` |  |
 | `audio_track_ordinal` | optional | integer, minimum `0` | Zero-based track within the ordinary source audio tracks. |
 | `use_reviewed_cuts` | optional | boolean | Use the native verified copy-boundary proposal for this ordinary export only. The timeline and its history stay intact. |
-| `audio_output` | optional | `separate_tracks` / `downmix_mono` / `downmix_stereo` | Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track. |
+| `audio_output` | optional | `separate_tracks` / `downmix_mono` / `downmix_stereo` | Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track. When omitted in a live multicam editor, the export uses Settings → Export → Multicam audio. A downmix from Settings applies only when the output keeps sound, audio is omitted, auto, pcm or aac, and the destination extension renders that sound; otherwise separate tracks. File jobs and the CLI use separate tracks. |
 | `still_timing` | optional | `cadence` / `held` | Still picture timing. Held writes one independently decodable sample per visible hold. Cadence uses the authored frame schedule. |
 | `container` | optional | `mov` / `mp4` / `m4v` / `mkv` / `m4a` / `mka` / `wav` / `wave` / `caf` / `flac` | Explicit container for a still project export. Match the destination filename extension and selected tracks. |
 
@@ -4713,17 +5898,17 @@ Returns a live job receipt with `job_id`, `input_revision`, `state`, `progress` 
 | `expected_revision` | required | integer, minimum `0` |  |
 | `operation_id` | required | string, minimum length `1` | Unique operation identifier; repeat the exact request after a lost reply. |
 | `output` | required | string, minimum length `1` | Absolute local output path. Existing media destinations are protected. |
-| `container` | optional | string, minimum length `1` |  |
+| `container` | optional | string, minimum length `1` | Container for every queued file. When omitted in a live editor, an H.264 or HEVC Re-encode of ordinary ranges uses Settings → Export → H.264 and HEVC container unless it is Automatic or cannot carry the requested audio; otherwise MOV, or each still project's own format. ProRes stays MOV. |
 | `tracks` | optional | `all` / `video` / `audio` |  |
 | `require_camera_copy` | optional | boolean | Require zero encoded camera duration when generating stills. |
 | `mode` | optional | `smart` / `copy` / `encode` |  |
-| `codec` | optional | `h264` / `hevc` / `prores` / `jpeg` |  |
-| `quality` | optional | `smaller` / `balanced` / `high` / `422-lt` / `422` / `422-hq` |  |
+| `codec` | optional | `h264` / `hevc` / `prores` / `jpeg` | Video codec for Re-encode. When omitted in a live editor, Re-encode with picture of ordinary queued ranges, and a queue with Tiles ranges, use Settings → Export → Re-encode video where the container can hold it, and H.264 where it cannot. Ranges with still picture keep their own format or H.264. |
+| `quality` | optional | `smaller` / `balanced` / `high` / `422-lt` / `422` / `422-hq` | When omitted in a live editor, Re-encode with picture of ordinary queued ranges, and a queue with Tiles ranges, use Settings → Export → Quality or ProRes quality for the chosen codec; other outputs use balanced or 422. |
 | `audio` | optional | `auto` / `copy` / `aac` / `pcm` / `remove` / `mp3` / `flac` / `opus` / `alac` |  |
 | `audio_track_ordinal` | optional | integer, minimum `0` | Zero-based track within the ordinary source audio tracks. |
 | `subfolder` | optional | string, minimum length `1` | Optional output subfolder. |
 | `base_name` | optional | string, minimum length `1` | Optional filename prefix. |
-| `audio_output` | optional | `separate_tracks` / `downmix_mono` / `downmix_stereo` | Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track. |
+| `audio_output` | optional | `separate_tracks` / `downmix_mono` / `downmix_stereo` | Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track. When omitted in a live multicam editor, the queue uses Settings → Export → Multicam audio. A downmix from Settings applies only when the output keeps sound, audio is omitted, auto, pcm or aac, and the container renders that sound; otherwise separate tracks. Other callers use separate tracks. |
 | `still_timing` | optional | `cadence` / `held` | Still picture timing. Held writes one independently decodable sample per visible hold. Cadence uses the authored frame schedule. |
 
 ### `export_queue_range_add`
@@ -4750,17 +5935,17 @@ Returns a live job receipt with `job_id`, `input_revision`, `state`, `progress` 
 | `expected_revision` | required | integer, minimum `0` |  |
 | `operation_id` | required | string, minimum length `1` | Unique operation identifier; repeat the exact request after a lost reply. |
 | `output` | required | string, minimum length `1` | Absolute local output path. Existing media destinations are protected. |
-| `container` | optional | string, minimum length `1` |  |
+| `container` | optional | string, minimum length `1` | Container for every queued file. When omitted in a live editor, an H.264 or HEVC Re-encode of ordinary ranges uses Settings → Export → H.264 and HEVC container unless it is Automatic or cannot carry the requested audio; otherwise MOV, or each still project's own format. ProRes stays MOV. |
 | `tracks` | optional | `all` / `video` / `audio` |  |
 | `require_camera_copy` | optional | boolean | Require zero encoded camera duration when generating stills. |
 | `mode` | optional | `smart` / `copy` / `encode` |  |
-| `codec` | optional | `h264` / `hevc` / `prores` / `jpeg` |  |
-| `quality` | optional | `smaller` / `balanced` / `high` / `422-lt` / `422` / `422-hq` |  |
+| `codec` | optional | `h264` / `hevc` / `prores` / `jpeg` | Video codec for Re-encode. When omitted in a live editor, Re-encode with picture of ordinary queued ranges, and a queue with Tiles ranges, use Settings → Export → Re-encode video where the container can hold it, and H.264 where it cannot. Ranges with still picture keep their own format or H.264. |
+| `quality` | optional | `smaller` / `balanced` / `high` / `422-lt` / `422` / `422-hq` | When omitted in a live editor, Re-encode with picture of ordinary queued ranges, and a queue with Tiles ranges, use Settings → Export → Quality or ProRes quality for the chosen codec; other outputs use balanced or 422. |
 | `audio` | optional | `auto` / `copy` / `aac` / `pcm` / `remove` / `mp3` / `flac` / `opus` / `alac` |  |
 | `audio_track_ordinal` | optional | integer, minimum `0` | Zero-based track within the ordinary source audio tracks. |
 | `subfolder` | optional | string, minimum length `1` | Optional output subfolder. |
 | `base_name` | optional | string, minimum length `1` | Optional filename prefix. |
-| `audio_output` | optional | `separate_tracks` / `downmix_mono` / `downmix_stereo` | Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track. |
+| `audio_output` | optional | `separate_tracks` / `downmix_mono` / `downmix_stereo` | Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track. When omitted in a live multicam editor, the queue uses Settings → Export → Multicam audio. A downmix from Settings applies only when the output keeps sound, audio is omitted, auto, pcm or aac, and the container renders that sound; otherwise separate tracks. Other callers use separate tracks. |
 | `still_timing` | optional | `cadence` / `held` | Still picture timing. Held writes one independently decodable sample per visible hold. Cadence uses the authored frame schedule. |
 
 ### `project_editor_convert`
@@ -5365,6 +6550,7 @@ Returns the window’s actual presentation state, including zoom, available scro
 | `project_handle` | required | string, minimum length `1` |  |
 | `action` | required | `show_about` / `show_settings` / `show_help` / `show_last_export` / `show_tiles` |  |
 | `topic` | optional | `guide` / `agent_guide` / `release_notes` |  |
+| `page` | optional | `general` / `editing` / `playback` / `media` / `transcripts` / `export` / `storage` / `automation` | Used only by show_settings: the Settings page to open. Omit it to reopen the last page. Other actions ignore it. |
 
 ## Project discovery
 
@@ -5563,7 +6749,7 @@ Returns resulting editor state with `revision`, or a command-specific result suc
 | `action` | required | `copy_container` / `move` / `trim` / `restore_edge` / `delete_clip` / `apply_csv` / `preview_trim` / `cancel_trim` |  |
 | `occurrence` | optional | string | Clip occurrence UUID from project_editor_state_read. |
 | `time` | optional | string | Exact media time as rational seconds, e.g. 1001/30000. |
-| `value` | optional | string | Snap target off, keyframes, scenes, or silence, or a copy container extension supported by this sequence. |
+| `value` | optional | string | Snap target off, keyframes, scenes, or silence, or a copy container extension supported by this sequence. Snap to is a shared setting: with Settings → Automation → Let agents change settings off, snap is refused with settings_write_disabled. |
 | `slot` | optional | integer, minimum `0` | Insertion slot before moving, 0 through clip count. |
 | `edge` | optional | `start` / `end` |  |
 | `path` | optional | string | Absolute input CSV path. |
@@ -5647,7 +6833,7 @@ Returns resulting editor state with `revision`, or a command-specific result suc
 | `space` | optional | `sequence` / `source` / `group` / `assembly` |  |
 | `time` | optional | string | Exact media time as rational seconds, e.g. 1001/30000. |
 | `enabled` | optional | boolean | Requested setting. |
-| `value` | optional | string | Snap target off, keyframes, scenes, or silence, or a copy container extension supported by this sequence. |
+| `value` | optional | string | Snap target off, keyframes, scenes, or silence, or a copy container extension supported by this sequence. Snap to is a shared setting: with Settings → Automation → Let agents change settings off, snap is refused with settings_write_disabled. |
 
 | Action | Additional required arguments |
 | --- | --- |
@@ -8833,7 +10019,7 @@ Returns the durable job ID and current state.
 | `policy` | optional | `reuse` / `resume` / `restart`, default `reuse` |  |
 | `download` | optional | boolean | Explicitly permit the helper to download a missing model. |
 | `options` | optional | object |  |
-| `options.engine` | optional | string, minimum length `1`, maximum length `512` |  |
+| `options.engine` | optional | string, minimum length `1`, maximum length `512` | Transcriberrr engine name. When omitted, the app uses Settings → Transcripts → Preferred engine; Automatic, or a preferred engine that cannot run on this Mac, resolves to qwen3, then the first available engine. File jobs and the CLI use qwen3 and never read desktop Settings. |
 | `options.model` | optional | string, minimum length `1`, maximum length `512` |  |
 | `options.language` | optional | string, minimum length `1`, maximum length `512` |  |
 | `options.expected_speakers` | optional | integer, minimum `1` |  |
@@ -9672,7 +10858,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | --- | --- | --- | --- |
 | `request` | required | object | JSON request for this CLI action. See mpcut help transcript --json. |
 | `request.diarization` | optional | boolean |  |
-| `request.engine` | optional | string |  |
+| `request.engine` | optional | string | Transcriberrr engine name. Defaults to qwen3. File jobs do not read desktop Settings. |
 | `request.expected_speakers` | optional | integer, minimum `0` |  |
 | `request.file` | optional | string, pattern `^/` | Absolute local path. |
 | `request.job_directory` | optional | string, pattern `^/` | Absolute local path. |

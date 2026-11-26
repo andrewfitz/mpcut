@@ -105,14 +105,65 @@ public enum GeneratedStillsStore {
 public enum TranscriptRecognitionStore {
     public static func defaultDirectory() throws -> URL { try TranscriptRecognitionClaims.directory() }
 
+    /// What the transcription jobs under some job folders can still read back from the shared store.
+    struct Retained {
+        /// `Results/<key>` folders.
+        var keys = Set<String>()
+        /// Claim IDs, naming the lock file and exchange files.
+        var claims = Set<String>()
+        /// Recent job records that could not be read, perhaps written by a newer MPCut. Their tracks are unknown,
+        /// so the whole archive stays.
+        var unreadable: [URL] = []
+    }
+
+    /// Job pruning never removes a record it cannot read, so an unreadable record keeps the archive only while it is
+    /// younger than the age after which the app prunes idle jobs. A program that can read it would have pruned it by then.
+    static let unreadableRecordAge: TimeInterval = 30 * 86_400
+
+    /// Every job record a retry or reconcile can still prepare again names its tracks' recognition keys. A retry
+    /// that changes the project or its tracks reads finished tracks back from the shared exchange and archive only,
+    /// so those stay. Records are read without recovering owners or rewriting them.
+    static func retained(byJobsIn jobDirectories: [URL], now: Date = Date()) -> Retained {
+        var retained = Retained()
+        let cutoff = now.addingTimeInterval(-unreadableRecordAge)
+        for directory in jobDirectories {
+            guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { continue }
+            let store = TranscriptJobStore(directory: directory)
+            for name in names where (name as NSString).pathExtension == "json" {
+                guard let id = UUID(uuidString: (name as NSString).deletingPathExtension) else { continue }
+                guard let record = try? store.read(id) else {
+                    let file = directory.appendingPathComponent(name)
+                    let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+                    if modified.map({ $0 >= cutoff }) ?? true { retained.unreadable.append(file) }
+                    continue
+                }
+                for track in record.sessions.flatMap(\.tracks) where track.hasReusableEvidence {
+                    // A preserved result is archived under the key it was recognized with.
+                    let stored = track.result.flatMap { TranscriptRecognitionCache.Artifacts(job: $0, activity: nil)?.recognitionKey }
+                    for key in Set([track.recognitionKey, stored].compactMap { $0 }) where TranscriptStore.validDigest(key) {
+                        retained.keys.insert(key)
+                        retained.claims.insert(TranscriptExternalCacheDescriptor.claimID(scope: track.evidence, key: key))
+                    }
+                }
+            }
+        }
+        return retained
+    }
+
     /// Removes every claim whose lock is free, with its exchange files, taking each lock as a
     /// running job does. A claim held by a job is skipped. The archive goes only when no claim was
     /// held, since an archive folder cannot be traced to the claims that write it. A job that
     /// starts after the claims were read can still find its archive folder gone; it then keeps
     /// its result in the job folder.
-    public static func clear(in directory: URL) -> StoreClearResult {
+    ///
+    /// `jobs` are the transcription job folders (the desktop's and the CLI's). A claim or archive key that a job
+    /// record there names is kept, since retrying or reconciling that job reads it back; when a record younger than
+    /// `unreadableRecordAge` cannot be read, the whole archive is kept. Each is reported as skipped with its reason.
+    public static func clear(in directory: URL, jobs: [URL]) -> StoreClearResult {
         var result = StoreClearResult()
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { return result }
+        let retained = retained(byJobsIn: jobs)
+        let reuse = "A transcription job can still reuse this result."
         let versions = [TranscriptRecognitionExchange.fileExtension, TranscriptRecognitionExchange.legacyExtension]
         var claims = Set<String>()
         for name in names {
@@ -125,6 +176,10 @@ public enum TranscriptRecognitionStore {
         var busy = false
         for claim in claims.sorted() {
             let lock = directory.appendingPathComponent(claim)
+            if retained.claims.contains(claim) {
+                result.skipped.append(.init(url: lock, reason: reuse))
+                continue
+            }
             // An exchange without a lock file is claimed the way a job claims it.
             let descriptor = open(lock.path, O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_RDWR, 0o600)
             guard descriptor >= 0 else {
@@ -166,10 +221,18 @@ public enum TranscriptRecognitionStore {
             result.skipped.append(.init(url: archive, reason: "Kept while a transcription holds a shared result."))
             return result
         }
+        guard retained.unreadable.isEmpty else {
+            result.skipped.append(.init(url: archive, reason: "Kept because a transcription job record could not be read."))
+            return result
+        }
         for key in ((try? FileManager.default.contentsOfDirectory(atPath: archive.path)) ?? []).sorted()
             where TranscriptStore.validDigest(key) {
             let folder = archive.appendingPathComponent(key, isDirectory: true)
             guard lstat(folder.path, &info) == 0, info.st_mode & S_IFMT == S_IFDIR else { continue }
+            if retained.keys.contains(key) {
+                result.skipped.append(.init(url: folder, reason: reuse))
+                continue
+            }
             let bytes = (try? StoreMeasurement.allocatedBytes(at: folder)) ?? 0
             do {
                 try FileManager.default.removeItem(at: folder)

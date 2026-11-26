@@ -67,12 +67,9 @@ extension ProjectSessions {
         let name = session.isMulticam ? session.multicam.projectName : session.editor.projectURL?.deletingPathExtension().lastPathComponent
         panel.nameFieldStringValue = (name ?? "Untitled") + "." + format.rawValue
         panel.allowedContentTypes = [format.contentType]
-        // Project interchange has no folder rule of its own, so only Settings' starting folder applies.
+        // Project interchange has no folder rule of its own, so only Settings' starting folder and the session's folder apply.
         if session.isMulticam {
-            if preferences.exportStartFolder != .automatic {
-                panel.directoryURL = ExportStartFolder.resolve(preferences, projectFile: session.multicam.projectURL, sourceRecording: nil,
-                                                               sessionFolder: nil, automatic: nil).directory
-            }
+            if let start = session.multicam.interchangeStartFolder { panel.directoryURL = start }
         } else if let start = session.editor.exportPanelDirectory(source: session.editor.firstSourceURL, hasAutomaticRule: false) {
             panel.directoryURL = start
         }
@@ -111,7 +108,11 @@ extension ProjectSessions {
             }
             let exclusions = session.isMulticam ? session.multicam.sidecarExclusions : session.editor.sidecarExclusions
             let checkingVolumes = session.isMulticam ? session.multicam.interchangeCheckingVolumes : session.editor.interchangeCheckingVolumes
-            if !session.isMulticam { session.editor.noteExportFolder(output.deletingLastPathComponent(), hasAutomaticRule: false) }
+            if session.isMulticam {
+                session.multicam.noteExportFolder(output.deletingLastPathComponent())
+            } else {
+                session.editor.noteExportFolder(output.deletingLastPathComponent(), hasAutomaticRule: false)
+            }
             let allowLoss = loss.state == .on
             let flattenMulticam = allowLoss && flatten?.state == .on
             // Unsaved desktop projects already retain absolute paths for all working media.

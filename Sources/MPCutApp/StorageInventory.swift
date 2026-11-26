@@ -22,11 +22,19 @@ enum StoreKind: String, CaseIterable, Sendable {
     var note: String {
         switch self {
         case .generatedStills: "Clear skips stills in use."
-        case .transcriptRecognition: "Shared with the CLI and Transcriberrr. Clear skips results a transcription is using."
+        case .transcriptRecognition: "Shared with the CLI and Transcriberrr. Clear skips results a transcription is using or a saved transcription job can still reuse."
         case .transcriptJobs: "Guarded by locks and removed after 30 days."
-        case .untitledDrafts: "Recover or discard drafts with File → Recover Untitled Project…."
+        case .untitledDrafts: "Use File → Recover Untitled Project… to recover or discard drafts."
         case .suggestedCameras: "Saved for each transcript attachment."
         case .agentReceipts: "Clearing would break job recovery for a connected agent."
+        }
+    }
+
+    /// Where a store with no folder of its own keeps its data.
+    var storageDescription: String {
+        switch self {
+        case .suggestedCameras: "Stored in MPCut’s preferences."
+        default: ""
         }
     }
 }
@@ -102,7 +110,9 @@ enum StorageInventory {
         case .generatedStills:
             return locations.generatedStills.map(GeneratedStillsStore.clear(in:)) ?? StoreClearResult()
         case .transcriptRecognition:
-            return locations.transcriptRecognition.map(TranscriptRecognitionStore.clear(in:)) ?? StoreClearResult()
+            // Results a transcription job can still read back on a retry stay.
+            return locations.transcriptRecognition.map { TranscriptRecognitionStore.clear(in: $0, jobs: locations.transcriptJobs) }
+                ?? StoreClearResult()
         case .suggestedCameras:
             return clearSuggestedCameras(defaults: defaults)
         case .transcriptJobs, .untitledDrafts, .agentReceipts:

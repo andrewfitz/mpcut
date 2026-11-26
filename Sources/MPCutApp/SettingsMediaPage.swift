@@ -23,11 +23,12 @@ struct SettingsMediaPage: View {
             }
             Section {
                 SettingsNumericField(.minimumPause, value: $preferences.minimumPause,
-                                     in: 1.0 / Double(AudioWaveform.rate)...Double.greatestFiniteMagnitude, step: 0.1, unit: "s")
+                                     in: 1.0 / Double(AudioWaveform.rate)...Double.greatestFiniteMagnitude, step: 0.1, unit: "s",
+                                     help: "Type the shortest quiet stretch that counts as a pause")
                 SettingsNumericField(.maxBlip, value: $preferences.maxBlip, in: 0...1, step: 0.02, unit: "s",
                                      help: "Count a brief sound between quiet stretches as part of one pause. Set to 0 to keep every interruption.")
                 SettingsNumericField(.padding, value: $preferences.padding, in: 0...Double.greatestFiniteMagnitude, step: 0.05, unit: "s",
-                                     help: "Silence to keep on each side of a cut.")
+                                     help: "Type the silence to keep on each side of a cut")
             } header: {
                 Text("Silence")
             } footer: {
@@ -48,8 +49,10 @@ struct SettingsMediaPage: View {
                 }
                 .settingsRow(.tilesLayout)
                 .help("Choose the Find Tiles layout for a recording with no saved layout")
-                SettingsNumericField(.tilesColumns, value: $preferences.tilesScanColumns, in: EditorPreferences.tilesGridRange, step: 1)
-                SettingsNumericField(.tilesRows, value: $preferences.tilesScanRows, in: EditorPreferences.tilesGridRange, step: 1)
+                SettingsNumericField(.tilesColumns, value: $preferences.tilesScanColumns, in: EditorPreferences.tilesGridRange, step: 1,
+                                     help: "Type how many columns of tiles Find Tiles starts with for an even grid")
+                SettingsNumericField(.tilesRows, value: $preferences.tilesScanRows, in: EditorPreferences.tilesGridRange, step: 1,
+                                     help: "Type how many rows of tiles Find Tiles starts with for an even grid")
                 Picker(SettingsRow.tilesDetail.title, selection: $preferences.tilesScanDetail) {
                     Text("Adaptive").tag(ParticipantSampling.adaptive)
                     Text("Every Frame").tag(ParticipantSampling.everyFrame)
@@ -66,7 +69,7 @@ struct SettingsMediaPage: View {
             }
             Section("Dialogue switches") {
                 SettingsNumericField(.dialogueHold, value: $preferences.dialogueMinimumHold, in: EditorPreferences.dialogueHoldRange,
-                                     step: 0.25, unit: "s")
+                                     step: 0.25, unit: "s", help: "Type the shortest time dialogue switches hold a shot")
                 Picker(SettingsRow.dialogueOverlap.title, selection: $preferences.dialogueOverlap) {
                     Text("Hold the Shot").tag(ParticipantDialogueOptions.Overlap.hold)
                     Text("Favor a Visible Speaker").tag(ParticipantDialogueOptions.Overlap.visibleSpeaker)

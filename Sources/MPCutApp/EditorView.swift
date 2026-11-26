@@ -249,6 +249,7 @@ struct EditorView: View {
             }
         }
         timeline.cutSectionsHidden = $presentation.cutSectionsHidden
+        timeline.timeFormat = editor.timelineTimeFormat
         timeline.tileContent = editor.tileTimeline
         timeline.showTileFeeds = $showTileFeeds
         if editor.canEdit {

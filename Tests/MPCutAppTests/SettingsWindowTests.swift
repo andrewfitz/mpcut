@@ -1,4 +1,5 @@
 import AppKit
+import MPCutCore
 import SwiftUI
 import XCTest
 @testable import MPCutApp
@@ -101,22 +102,52 @@ final class SettingsWindowTests: XCTestCase {
     func testEveryPageOpensWithNoProjectAndNamesItsControls() throws {
         _ = NSApplication.shared
         let preferences = EditorPreferences()
-        // Storage reads the shared cutcache configuration, which tests must not touch.
-        for page in SettingsPage.allCases where page != .storage {
+        // Storage measures temporary stores here, and the cutcache configuration it reads is a temporary one.
+        let files = FileManager.default
+        let root = files.temporaryDirectory.appendingPathComponent("mpcut-window-\(UUID().uuidString)", isDirectory: true)
+        defer { try? files.removeItem(at: root) }
+        let locations = StorageLocations(generatedStills: root.appendingPathComponent("Stills"),
+                                         transcriptRecognition: root.appendingPathComponent("Claims"),
+                                         transcriptJobs: [root.appendingPathComponent("Drafts/.transcript-jobs")],
+                                         untitledDrafts: root.appendingPathComponent("Drafts"),
+                                         agentReceipts: root.appendingPathComponent("Receipts"))
+        let home = root.appendingPathComponent("Sidecars", isDirectory: true)
+        let disk = root.appendingPathComponent("Shared", isDirectory: true)
+        try files.createDirectory(at: disk, withIntermediateDirectories: true)
+        try SidecarLocations.$storageDirectory.withValue(home) {
+            try SidecarLocations.chooseDisk(disk, selecting: true)
+            XCTAssertTrue(SidecarLocations.home.path.hasPrefix(root.path))
+        }
+        // The page reads the location again from a task, which uses the test process's own temporary home.
+        XCTAssertTrue(SidecarLocations.home.path.hasPrefix(files.temporaryDirectory.path), SidecarLocations.home.path)
+
+        preferences.sharedCacheLimitBytes = 2_500_000_000
+        preferences.draftRetentionDays = 7
+        for page in SettingsPage.allCases {
             preferences.settingsPage = page
-            let host = NSHostingView(rootView: SettingsWindow(preferences: preferences) { SidecarClearContext() })
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 560), styleMask: [.titled, .resizable],
                                   backing: .buffered, defer: false)
             window.isReleasedWhenClosed = false
+            let host = NSHostingView(rootView: SettingsWindow(preferences: preferences, cacheContext: { SidecarClearContext() },
+                                                              storageLocations: locations))
             window.contentView = host
-            host.layoutSubtreeIfNeeded()
+            window.orderBack(nil)
+            SidecarLocations.$storageDirectory.withValue(home) { host.layoutSubtreeIfNeeded() }
             XCTAssertGreaterThanOrEqual(host.fittingSize.width, 640, page.rawValue)
             let rows = SettingsRow.all.filter { $0.page == page }
             XCTAssertFalse(rows.isEmpty, page.rawValue)
+            if page == .storage {
+                // Its two limits render from the preferences. The usage list's rows are SwiftUI text, which this host
+                // cannot read; StorageUsageModel's measurement of injected stores is tested in SettingsShellTests.
+                let fields = descendants(host).compactMap { $0 as? NSTextField }.filter(\.isEditable).map(\.stringValue)
+                XCTAssertTrue(fields.contains("2.5") && fields.contains("7"), fields.description)
+            }
             window.close()
         }
         XCTAssertEqual(preferences.settingsPage, .automation)
     }
+
+    private func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
 
     func testRestoreDefaultsIsAvailableOnlyWhenThePageDiffers() {
         let preferences = EditorPreferences()
@@ -128,6 +159,9 @@ final class SettingsWindowTests: XCTestCase {
         XCTAssertEqual(preferences.reencodeCodec, .h264)
         preferences.localMCPEnabled = true
         XCTAssertTrue(preferences.hasFactoryValues(on: .automation), "Automation has nothing Restore Defaults changes")
-        XCTAssertFalse(SettingsPage.automation.restoreMessage.isEmpty)
+        XCTAssertFalse(SettingsRestoreSummary.isRestorable(.automation), "So Automation shows no Restore Defaults button")
+        for page in SettingsPage.allCases where page != .automation {
+            XCTAssertTrue(SettingsRestoreSummary.isRestorable(page), page.rawValue)
+        }
     }
 }

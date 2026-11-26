@@ -122,6 +122,23 @@ struct ParticipantInspector: View {
     init(session: ProjectSession) {
         self.session = session
         _presentation = ObservedObject(wrappedValue: session.presentation)
+        // Settings → Media & Analysis → Find Tiles seeds the grid and scan detail once, when the inspector's state is made.
+        // Choosing another recording later keeps what the editor set, as before.
+        let defaults = TilesScanDefaults(preferences: session.editor.preferences)
+        _scanColumns = State(initialValue: String(defaults.columns))
+        _scanRows = State(initialValue: String(defaults.rows))
+        _scanDetail = State(initialValue: defaults.detail)
+        // The layout starts on one the picker offers: a build without TileTrail has only the even grid.
+        _scanLayout = State(initialValue: Self.startingScanLayout(defaults.layout))
+    }
+
+    /// The picker's choice for a starting layout, as `restoreScanLayout` chooses it for a recording's saved layout.
+    private static func startingScanLayout(_ layout: ParticipantFeedLayout) -> ScanLayout {
+        switch layout {
+        case .meeting, .gallery: ParticipantAnalysis.isAvailable ? .meeting : .fixed
+        case .automatic: ParticipantAnalysis.supportsFeedLayouts ? .automatic : ParticipantAnalysis.isAvailable ? .meeting : .fixed
+        case .fixed: .fixed
+        }
     }
 
     private var project: ParticipantProject { session.participantProject }
@@ -254,16 +271,9 @@ struct ParticipantInspector: View {
             if let selection, inspectorSource != selection {
                 inspectorSource = selection
                 showFind = false
-                if let saved = source?.feedLayout {
-                    restoreScanLayout(saved)
-                } else {
-                    // No saved layout: start from Settings → Media & Analysis → Find Tiles.
-                    let defaults = TilesScanDefaults(preferences: session.editor.preferences)
-                    scanColumns = String(defaults.columns)
-                    scanRows = String(defaults.rows)
-                    scanDetail = defaults.detail
-                    restoreScanLayout(defaults.layout)
-                }
+                // No saved layout: the layout starts from Settings → Media & Analysis → Find Tiles. Only the layout is
+                // reset, as before; an even grid layout carries the Settings grid.
+                restoreScanLayout(source?.feedLayout ?? TilesScanDefaults(preferences: session.editor.preferences).layout)
             }
             updateScanPreview()
         }
