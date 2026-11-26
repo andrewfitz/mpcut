@@ -57,6 +57,78 @@ final class MCPTranscriptContractTests: XCTestCase {
                                    attachment: attachment, spaces: [.source])
     }
 
+    func testCompactRowsKeepWhatReadingAndSelectingNeed() throws {
+        let index = MCPTranscriptProjectIndexCache().index(for: [try transcriptIndex("word", count: 120)], space: .source)
+        func json(_ value: some Encodable) throws -> [String: Any] {
+            try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(value)) as? [String: Any])
+        }
+        func size(_ value: Any) throws -> Int { try JSONSerialization.data(withJSONObject: value).count }
+        let page = try json(index.read(limit: 100))
+        let full = try XCTUnwrap(page["items"] as? [[String: Any]])
+        let compact = try XCTUnwrap((TranscriptMCPCompact.compact(page) as? [String: Any])?["items"] as? [[String: Any]])
+        XCTAssertEqual(compact.count, 100)
+        XCTAssertEqual(Set(compact[3].keys), ["id", "word_id", "text", "from", "to", "attachment_id"])
+        XCTAssertEqual(compact[3]["id"] as? String, full[3]["id"] as? String)
+        XCTAssertEqual(compact[3]["word_id"] as? String, "word-3")
+        XCTAssertEqual(compact[3]["from"] as? String, "3/4")
+        XCTAssertEqual(compact[3]["to"] as? String, "1")
+        // An unbound test word is the smallest full record. Bound, routed words run to about 2 KB each.
+        XCTAssertLessThan(try size(compact) * 3, try size(full))
+
+        // Lines join an unbroken run and keep the four identifiers a selection takes.
+        let lines = TranscriptMCPCompact.lines(full)
+        XCTAssertEqual(lines.count, 2)
+        XCTAssertEqual(lines[0]["words"] as? Int, 80)
+        XCTAssertEqual(lines[1]["words"] as? Int, 20)
+        XCTAssertEqual(lines[0]["from"] as? String, "0")
+        XCTAssertEqual(lines[1]["to"] as? String, "25")
+        XCTAssertEqual(lines[1]["first_word_id"] as? String, "word-80")
+        XCTAssertEqual(lines[1]["last_word_id"] as? String, "word-99")
+        XCTAssertEqual(lines[1]["first_occurrence_id"] as? String, full[80]["id"] as? String)
+        XCTAssertEqual(lines[1]["last_occurrence_id"] as? String, full[99]["id"] as? String)
+        XCTAssertEqual((lines[1]["text"] as? String)?.split(separator: " ").count, 20)
+        XCTAssertEqual(lines[0]["attachment_id"] as? String, "word")
+        XCTAssertLessThan(try size(lines) * 30, try size(full))
+        // A page reports its one transcript once, and a line never joins two transcripts.
+        var hoisted: [String: Any] = ["items": compact]
+        TranscriptMCPCompact.hoist(&hoisted)
+        XCTAssertEqual((hoisted["shared"] as? [String: String])?["attachment_id"], "word")
+        XCTAssertEqual(Set(try XCTUnwrap((hoisted["items"] as? [[String: Any]])?[3]).keys), ["id", "word_id", "text", "from", "to"])
+        var other = Array(full.prefix(3))
+        other[2]["attachment_id"] = "second"
+        XCTAssertEqual(TranscriptMCPCompact.lines(other).map { $0["words"] as? Int }, [2, 1])
+        var broken = Array(full.prefix(3))
+        broken[2]["speaker_id"] = "guest"
+        XCTAssertEqual(TranscriptMCPCompact.lines(broken).map { $0["words"] as? Int }, [2, 1])
+
+        // A phrase match is one row with its context as text.
+        let search = try json(index.search("word word", limit: 1))
+        let match = try XCTUnwrap(((TranscriptMCPCompact.compact(search) as? [String: Any])?["items"] as? [[String: Any]])?.first)
+        XCTAssertEqual(match["text"] as? String, "word word")
+        XCTAssertEqual(match["words"] as? Int, 2)
+        XCTAssertEqual(match["first_word_id"] as? String, "word-0")
+        XCTAssertEqual(match["last_word_id"] as? String, "word-1")
+        XCTAssertNil(match["before"])
+        XCTAssertTrue(match["after"] is String)
+
+        // A recording that every row repeats is reported once.
+        var rows: [String: Any] = ["items": [["text": "a", "file": "/m.mov"], ["text": "b", "file": "/m.mov"]]]
+        TranscriptMCPCompact.hoist(&rows)
+        XCTAssertEqual(rows["shared"] as? [String: String], ["file": "/m.mov"])
+        XCTAssertEqual((rows["items"] as? [[String: String]])?.map(\.keys.count), [1, 1])
+        var mixed: [String: Any] = ["items": [["text": "a", "file": "/m.mov"], ["text": "b", "file": "/n.mov"]]]
+        TranscriptMCPCompact.hoist(&mixed)
+        XCTAssertNil(mixed["shared"])
+
+        let schemas = try MCPSchemas.loaded.get()
+        XCTAssertNoThrow(try schemas.validate(tool: "transcript_editor_words_read",
+                                              arguments: ["project_handle": "test", "lines": true, "limit": 500]))
+        XCTAssertNoThrow(try schemas.validate(tool: "transcript_editor_words_search",
+                                              arguments: ["project_handle": "test", "query": "hello", "verbose": true]))
+        XCTAssertThrowsError(try schemas.validate(tool: "transcript_editor_words_search",
+                                                   arguments: ["project_handle": "test", "query": "hello", "lines": true]))
+    }
+
     func testSearchAcceptsPagedScopedReadsAndRejectsNavigation() throws {
         let schemas = try MCPSchemas.loaded.get()
         let resultID = String(repeating: "a", count: 64)

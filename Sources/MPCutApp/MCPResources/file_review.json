@@ -6,7 +6,7 @@
     "inputSchema": {
       "type": "object",
       "properties": {
-        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."},
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained."},
         "project_path": {"type": "string", "description": "Absolute path to the saved .cut project."},
         "space": {"type": "string", "enum": ["source", "sequence", "group", "assembly"]},
         "from": {"type": "string", "description": "Inclusive rational time in the selected clock."},
@@ -25,7 +25,7 @@
     "inputSchema": {
       "type": "object",
       "properties": {
-        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."},
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained."},
         "before_project_path": {"type": "string", "description": "Absolute path to the earlier saved .cut."},
         "project_path": {"type": "string", "description": "Absolute path to the later saved .cut."},
         "history_index": {"type": "integer", "minimum": 0, "description": "Zero-based index from oldest retained state through newest. The number of undo steps is the current cursor."}
@@ -72,7 +72,7 @@
     "inputSchema": {
       "type": "object",
       "properties": {
-        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."},
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained."},
         "project_path": {"type": "string", "description": "Absolute path to the saved multicam .cut."},
         "source_id": {"type": "string", "minLength": 1, "description": "Analyze one recording other than the reference. Defaults to all other recordings."},
         "reference_source_id": {"type": "string", "minLength": 1, "description": "Choose a recording on the reference camera for group sync, or any camera recording for replacement sync."},
@@ -100,7 +100,7 @@
     "inputSchema": {
       "type": "object",
       "properties": {
-        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes."},
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained."},
         "project_path": {"type": "string", "description": "Absolute path to the saved multicam .cut."},
         "angle_id": {"type": "string", "minLength": 1, "description": "Camera angle ID for the proposed switch."},
         "group_time": {"type": "string", "description": "Exact proposed group time in rational seconds."}

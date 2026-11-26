@@ -19,7 +19,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
+          "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained.",
           "format": "uuid"
         },
         "working_directory": {
@@ -77,7 +77,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
+          "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained.",
           "format": "uuid"
         },
         "working_directory": {
@@ -134,7 +134,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
+          "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained.",
           "format": "uuid"
         }
       },
@@ -187,7 +187,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
+          "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained.",
           "format": "uuid"
         }
       },
@@ -269,7 +269,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
+          "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained.",
           "format": "uuid"
         },
         "working_directory": {
@@ -331,7 +331,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
+          "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained.",
           "format": "uuid"
         },
         "working_directory": {
@@ -381,7 +381,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
+          "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained.",
           "format": "uuid"
         },
         "working_directory": {
@@ -431,7 +431,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
+          "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained.",
           "format": "uuid"
         },
         "working_directory": {
@@ -489,7 +489,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
+          "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained.",
           "format": "uuid"
         },
         "working_directory": {
@@ -613,7 +613,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
+          "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained.",
           "format": "uuid"
         },
         "working_directory": {
@@ -709,7 +709,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
+          "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained.",
           "format": "uuid"
         },
         "working_directory": {
@@ -815,7 +815,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
+          "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained.",
           "format": "uuid"
         },
         "working_directory": {
@@ -873,7 +873,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
+          "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained.",
           "format": "uuid"
         },
         "working_directory": {
@@ -976,7 +976,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
+          "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained.",
           "format": "uuid"
         },
         "working_directory": {
@@ -1080,7 +1080,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
+          "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained.",
           "format": "uuid"
         },
         "working_directory": {
@@ -1186,7 +1186,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
+          "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained.",
           "format": "uuid"
         },
         "working_directory": {
@@ -1294,7 +1294,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
+          "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained.",
           "format": "uuid"
         },
         "working_directory": {
@@ -1400,7 +1400,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
+          "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained.",
           "format": "uuid"
         },
         "working_directory": {
@@ -1550,7 +1550,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
+          "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained.",
           "format": "uuid"
         },
         "working_directory": {
@@ -1683,7 +1683,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
+          "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained.",
           "format": "uuid"
         },
         "working_directory": {
@@ -1791,7 +1791,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
+          "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained.",
           "format": "uuid"
         },
         "working_directory": {
@@ -1996,7 +1996,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
+          "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained.",
           "format": "uuid"
         },
         "working_directory": {
@@ -2204,7 +2204,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
+          "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained.",
           "format": "uuid"
         },
         "working_directory": {
@@ -2412,7 +2412,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
+          "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained.",
           "format": "uuid"
         },
         "working_directory": {
@@ -2511,7 +2511,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 36,
-          "description": "A fresh UUID for each distinct job. Identical retries return the existing receipt while retained. Standalone files-only receipts survive reconnects for seven days after completion or recorded interruption. Desktop receipts are session-local for up to ten minutes.",
+          "description": "A fresh UUID for each distinct job. An identical retry returns the existing receipt while it is retained.",
           "format": "uuid"
         },
         "working_directory": {
@@ -2595,7 +2595,7 @@
   },
   {
     "name": "transcript_editor_words_read",
-    "description": "Page words in the selected transcript clock and scope.",
+    "description": "Page words in the selected transcript clock and scope. Rows are compact: id, word_id, text, from, to, speaker, and the recording when it differs between rows; a recording shared by the whole page is under shared. Set lines to read dialogue as one row per utterance, the cheapest way to read a transcript. Set verbose for full word records.",
     "annotations": {
       "readOnlyHint": true,
       "openWorldHint": false
@@ -2623,8 +2623,8 @@
         "limit": {
           "type": "integer",
           "minimum": 1,
-          "maximum": 200,
-          "description": "Maximum entries for this page. The server can return a shorter page."
+          "maximum": 500,
+          "description": "Maximum words for this page. Defaults to 50. The server can return a shorter page."
         },
         "space": {
           "type": "string",
@@ -2701,6 +2701,14 @@
         },
         "include_inferred": {
           "type": "boolean"
+        },
+        "verbose": {
+          "type": "boolean",
+          "description": "Return full word records with binding, lane, routing and evidence fields, about 2 KB per word. Omit for compact rows."
+        },
+        "lines": {
+          "type": "boolean",
+          "description": "Group this page's words into dialogue lines: text, from, to, speaker, a word count, and the first and last word and occurrence IDs a selection takes. Offset, limit and next_offset still count words. Not with verbose."
         }
       },
       "required": [
@@ -2711,7 +2719,7 @@
   },
   {
     "name": "transcript_editor_words_search",
-    "description": "Find a phrase and return its matching word occurrences.",
+    "description": "Find a phrase. Each match is one compact row: the matched text, from, to, speaker, the first and last word and occurrence IDs a selection takes, and the surrounding words as before and after text. Set verbose for full word records.",
     "annotations": {
       "readOnlyHint": true,
       "openWorldHint": false
@@ -2818,6 +2826,10 @@
         },
         "include_inferred": {
           "type": "boolean"
+        },
+        "verbose": {
+          "type": "boolean",
+          "description": "Return full word records with binding, lane, routing and evidence fields, about 2 KB per word. Omit for compact rows."
         }
       },
       "required": [
@@ -2829,7 +2841,7 @@
   },
   {
     "name": "transcript_editor_occurrences_locate",
-    "description": "Locate occurrences by word ID or read one exact occurrence.",
+    "description": "Locate occurrences by word ID or read one exact occurrence. Rows are compact unless verbose is set.",
     "annotations": {
       "readOnlyHint": true,
       "openWorldHint": false
@@ -2940,6 +2952,10 @@
         },
         "include_inferred": {
           "type": "boolean"
+        },
+        "verbose": {
+          "type": "boolean",
+          "description": "Return full word records with binding, lane, routing and evidence fields, about 2 KB per word. Omit for compact rows."
         }
       },
       "required": [
@@ -3352,7 +3368,7 @@
   },
   {
     "name": "transcript_editor_occurrence_seek",
-    "description": "Move the playhead to an exact word occurrence in the pinned revision.",
+    "description": "Move the playhead to an exact word occurrence in the pinned revision. The occurrence is compact unless verbose is set.",
     "annotations": {
       "readOnlyHint": false,
       "openWorldHint": false
@@ -3452,6 +3468,10 @@
         },
         "include_inferred": {
           "type": "boolean"
+        },
+        "verbose": {
+          "type": "boolean",
+          "description": "Return full word records with binding, lane, routing and evidence fields, about 2 KB per word. Omit for compact rows."
         }
       },
       "required": [
@@ -3466,7 +3486,7 @@
   },
   {
     "name": "transcript_editor_takes_compare",
-    "description": "Compare takes matching a phrase and include adjacent words.",
+    "description": "Compare takes matching a phrase. Each take is one compact row with adjacent words as before and after text. Set verbose for full word records.",
     "annotations": {
       "readOnlyHint": true,
       "openWorldHint": false
@@ -3579,6 +3599,10 @@
         },
         "include_inferred": {
           "type": "boolean"
+        },
+        "verbose": {
+          "type": "boolean",
+          "description": "Return full word records with binding, lane, routing and evidence fields, about 2 KB per word. Omit for compact rows."
         }
       },
       "required": [
@@ -3590,7 +3614,7 @@
   },
   {
     "name": "transcript_editor_edits_suggest",
-    "description": "Find proposed transcript edits using the selected filler terms.",
+    "description": "Find proposed transcript edits using the selected filler terms. Takes are compact rows unless verbose is set.",
     "annotations": {
       "readOnlyHint": true,
       "openWorldHint": false
@@ -3701,6 +3725,10 @@
         },
         "include_inferred": {
           "type": "boolean"
+        },
+        "verbose": {
+          "type": "boolean",
+          "description": "Return full word records with binding, lane, routing and evidence fields, about 2 KB per word. Omit for compact rows."
         }
       },
       "required": [
@@ -4033,7 +4061,7 @@
   },
   {
     "name": "transcript_editor_script_candidates_list",
-    "description": "Page candidate matches for a script beat.",
+    "description": "Page candidate matches for a script beat. Takes are compact rows unless verbose is set.",
     "annotations": {
       "readOnlyHint": true,
       "openWorldHint": false
@@ -4151,6 +4179,10 @@
         },
         "include_inferred": {
           "type": "boolean"
+        },
+        "verbose": {
+          "type": "boolean",
+          "description": "Return full word records with binding, lane, routing and evidence fields, about 2 KB per word. Omit for compact rows."
         }
       },
       "required": [

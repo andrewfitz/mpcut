@@ -1,7 +1,7 @@
 [
   {
     "name": "review_editor_frame_read",
-    "description": "Return one JPEG from the current in-memory program at the playhead or at an exact sequence, group or assembly time. Output applies tile layouts and feed treatments. Choose Source to inspect an untreated recording. An explicit angle_id also selects Source when view is omitted. The longest image edge is at most 640 pixels.",
+    "description": "Return JPEGs inline from the open project: the playhead, one time, or up to 12 times in one call. Sequence, group and assembly times read the current edit; Output applies tile layouts and feed treatments and Source shows the untreated recording. The source clock reads any time in one recording by source_id or file, including material the edit no longer uses, for example what plays just before a cut. Start with the default 640-pixel picture, which is enough to identify a shot. When the result reports native_width and native_height, the picture was reduced: if you cannot make out what you need, such as on-screen text, ask again with a larger max_edge, or with region to see part of the frame at its own pixels. A region shows more detail than a larger whole frame, at a fraction of the cost.",
     "annotations": {
       "readOnlyHint": true,
       "openWorldHint": false
@@ -19,15 +19,36 @@
         },
         "time": {
           "type": "string",
-          "description": "Rational seconds such as 1001/30000. Supply space with time."
+          "description": "One frame time: seconds, a clock time such as 19:01.5, or exact rational seconds such as 1001/30000. Supply space with time."
+        },
+        "times": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 12,
+          "items": {
+            "type": "string"
+          },
+          "description": "Several frame times in the same formats, all on the clock in space. The result holds frames, in request order, and one image per frame. Together the images can total 2 MiB."
         },
         "space": {
           "type": "string",
           "enum": [
             "sequence",
             "group",
-            "assembly"
-          ]
+            "assembly",
+            "source"
+          ],
+          "description": "Clock of the supplied times. Source is the recording's own clock and needs source_id or file."
+        },
+        "source_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "With space source: a source_id from project_editor_state_read clips, a transcript word, or a multicam source."
+        },
+        "file": {
+          "type": "string",
+          "minLength": 1,
+          "description": "With space source: absolute path of a recording the project uses or keeps in its undo history."
         },
         "view": {
           "type": "string",
@@ -41,6 +62,49 @@
           "type": "string",
           "minLength": 1,
           "description": "A multicam camera ID for Source review. Omit to use the camera selected at that time."
+        },
+        "max_edge": {
+          "type": "integer",
+          "minimum": 160,
+          "maximum": 1920,
+          "description": "Longest image edge in pixels. Defaults to 640. Raise it for more detail in the whole frame; lower it for a cheap contact sheet of many times."
+        },
+        "region": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "x",
+            "y",
+            "width",
+            "height"
+          ],
+          "description": "Return only this part of the picture, keeping its own pixels up to max_edge. Use it to read small detail in 4K or larger footage. Fractions of the picture from its top left: x 0.5, y 0, width 0.5, height 0.5 is the top right quarter.",
+          "properties": {
+            "x": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "Left edge."
+            },
+            "y": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "Top edge."
+            },
+            "width": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "At least 0.01."
+            },
+            "height": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "At least 0.01."
+            }
+          }
         }
       },
       "required": [
@@ -78,12 +142,71 @@
         {
           "if": {
             "required": [
-              "space"
+              "times"
             ]
           },
           "then": {
             "required": [
+              "space"
+            ]
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "space"
+            ],
+            "not": {
+              "required": [
+                "times"
+              ]
+            }
+          },
+          "then": {
+            "required": [
               "time"
+            ]
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "time",
+              "times"
+            ]
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "source_id"
+            ]
+          },
+          "then": {
+            "properties": {
+              "space": {
+                "const": "source"
+              }
+            },
+            "required": [
+              "space"
+            ]
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "file"
+            ]
+          },
+          "then": {
+            "properties": {
+              "space": {
+                "const": "source"
+              }
+            },
+            "required": [
+              "space"
             ]
           }
         }

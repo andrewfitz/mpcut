@@ -3584,6 +3584,20 @@ final class EditorModel: ObservableObject {
         }
         guard canEdit, let index = segments.firstIndex(where: { $0.id == id }) else { return }
         var proposed = segments
+        // Cut-section context belongs to the recording, rather than to the
+        // occurrence that happened to expose it. When an occurrence is
+        // removed, carry that context onto an adjacent occurrence of the same
+        // recording so the surrounding source remains discoverable and the
+        // faded area does not disappear as a side effect of selection.
+        let removed = proposed[index]
+        let context = removed.displayRange ?? AudioSpan(from: removed.start, to: removed.end)
+        let neighboringIndices = [index - 1, index + 1].filter { proposed.indices.contains($0) }
+        for neighboringIndex in neighboringIndices where proposed[neighboringIndex].source.id == removed.source.id {
+            let neighbor = proposed[neighboringIndex]
+            let existing = neighbor.displayRange ?? AudioSpan(from: neighbor.start, to: neighbor.end)
+            proposed[neighboringIndex].displayRange = AudioSpan(from: min(existing.from, context.from),
+                                                                 to: max(existing.to, context.to))
+        }
         proposed.remove(at: index)
         validate(proposed, selecting: proposed.indices.contains(index) ? proposed[index].id : proposed.last?.id,
                  at: edit.offsets[index].seconds, action: "Delete Clip")
@@ -7186,6 +7200,32 @@ extension EditorModel {
         }
         if let issue = mediaReviewIssue(clip) { throw MCPCommandError("source_needs_review", issue) }
         guard let media = clip.source.media else { throw MCPCommandError("source_needs_review", "Recording is offline.") }
+        return (clip.source.id, media)
+    }
+
+    /// A recording addressed on its own clock, so a review can show material the edit no longer uses.
+    /// The current clips are searched first, then the clips of retained undo and redo states.
+    func mcpReviewSource(id: String?, file: String?) throws -> (UUID, MediaInfo) {
+        let wanted = id.flatMap(UUID.init(uuidString:))
+        guard id == nil || wanted != nil else {
+            throw MCPCommandError("invalid_target", "Supply a source_id from project_editor_state_read.")
+        }
+        let path = file.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
+        func matches(_ source: EditorSource) -> Bool {
+            (wanted == nil || source.id == wanted)
+                && (path == nil || source.url.standardizedFileURL.path == path
+                    || source.originalURL.standardizedFileURL.path == path)
+        }
+        let retained = (undoStack + redoStack).lazy.flatMap { state -> [EditorSegment] in
+            if case .live(let snapshot) = state.contents { return snapshot.segments }
+            return []
+        }
+        guard let clip = segments.first(where: { matches($0.source) }) ?? retained.first(where: { matches($0.source) }) else {
+            throw MCPCommandError("invalid_target", "No recording in this project or its retained history matches. Read source_id or file from project_editor_state_read.")
+        }
+        if let issue = mediaReviewIssue(clip) { throw MCPCommandError("source_needs_review", issue) }
+        guard let media = clip.source.media else { throw MCPCommandError("source_needs_review", "Recording is offline.") }
+        guard media.hasVideo else { throw MCPCommandError("no_frame", "This recording has no picture.") }
         return (clip.source.id, media)
     }
 }

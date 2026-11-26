@@ -177,10 +177,10 @@ def export_quote(client, args, tools):
                          space="current_cut", offset=(args.match or 1) - 1, limit=1)
     if not search["items"] or (search["total"] > 1 and args.match is None):
         raise ValueError(f"Found {search['total']} occurrences. Choose one with --match NUMBER.")
-    words = search["items"][0]["words"]
-    first, last = words[0], words[-1]
-    selection = {"space": "current_cut", "first_word_id": first["word_id"], "last_word_id": last["word_id"],
-                 "first_occurrence_id": first["id"], "last_occurrence_id": last["id"]}
+    # A compact match row carries the four identifiers a selection takes.
+    match = search["items"][0]
+    selection = {"space": "current_cut", **{key: match[key] for key in (
+        "first_word_id", "last_word_id", "first_occurrence_id", "last_occurrence_id")}}
     reviewed = client.call("transcript_editor_edit_plan", **target, **revisions,
                            operation_id=str(uuid.uuid4()), edit={"action": "queue", "selections": [selection],
                                                                 "name": "Transcript quote"})

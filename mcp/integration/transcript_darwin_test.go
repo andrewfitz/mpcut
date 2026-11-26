@@ -59,7 +59,7 @@ func checkTranscriptMCP(t *testing.T, call func(string, object, string) object, 
 	}
 	searchArgs := object{"project_handle": project, "query": "THE SAME QUOTE",
 		"space": "current_cut", "limit": 1, "expected_revision": imported["revision"],
-		"expected_transcript_revision": imported["transcript_revision"], "result_id": imported["result_id"]}
+		"expected_transcript_revision": imported["transcript_revision"], "result_id": imported["result_id"], "verbose": true}
 	search := call("transcript_editor_words_search", searchArgs, "")
 	if search["total"] != float64(8) || search["next_offset"] != float64(1) {
 		t.Fatalf("unexpected first search page: %v", search)
@@ -361,7 +361,7 @@ func checkTranscriptProjectMCP(t *testing.T, call func(string, object, string) o
 		}, "")
 		ids = append(ids, result["attachment_id"])
 	}
-	first := read("transcript_editor_words_read", object{"space": "current_cut", "limit": 1}, "")
+	first := read("transcript_editor_words_read", object{"space": "current_cut", "limit": 1, "verbose": true}, "")
 	if first["total"] != float64(6) || first["next_offset"] != float64(1) || first["result_id"] != nil {
 		t.Fatalf("project-wide page should report both attachments: %v", first)
 	}
@@ -369,7 +369,7 @@ func checkTranscriptProjectMCP(t *testing.T, call func(string, object, string) o
 		t.Helper()
 		return page["items"].([]any)[0].(object)
 	}
-	second := read("transcript_editor_words_read", object{"space": "current_cut", "limit": 1, "offset": 3,
+	second := read("transcript_editor_words_read", object{"space": "current_cut", "limit": 1, "offset": 3, "verbose": true,
 		"expected_revision": first["revision"], "expected_transcript_revision": first["transcript_revision"],
 		"expected_attachment_results": first["attachment_results"]}, "")
 	z, a := obtain(first), obtain(second)
@@ -386,7 +386,7 @@ func checkTranscriptProjectMCP(t *testing.T, call func(string, object, string) o
 	if got := read("transcript_editor_occurrences_locate", object{"word_id": z["word_id"]}, ""); got["total"] != float64(2) {
 		t.Fatalf("project-wide locate lost one scoped word: %v", got)
 	}
-	if got := read("transcript_editor_occurrences_locate", object{"occurrence_id": a["id"]}, ""); got["total"] != float64(1) || obtain(got)["attachment_id"] != ids[0] {
+	if got := read("transcript_editor_occurrences_locate", object{"occurrence_id": a["id"], "verbose": true}, ""); got["total"] != float64(1) || obtain(got)["attachment_id"] != ids[0] {
 		t.Fatalf("project-wide occurrence ID resolved incorrectly: %v", got)
 	}
 	if got := read("transcript_editor_takes_compare", object{"query": "same phrase"}, ""); got["total"] != float64(2) {
@@ -470,7 +470,7 @@ func checkTranscriptProjectMCP(t *testing.T, call func(string, object, string) o
 		if result["state"] != "succeeded" {
 			return false
 		}
-		live := obtain(read("transcript_editor_words_read", object{"space": "current_cut", "offset": 3, "limit": 1}, ""))
+		live := obtain(read("transcript_editor_words_read", object{"space": "current_cut", "offset": 3, "limit": 1, "verbose": true}, ""))
 		saved := obtain(result["result"].(object))
 		for _, key := range []string{"attachment_id", "word_id", "clip_id", "range", "track_id"} {
 			if !reflect.DeepEqual(live[key], saved[key]) {

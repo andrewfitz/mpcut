@@ -41,6 +41,41 @@ Helper tests also exercise `2025-11-25`, `2025-06-18`, `2025-03-26` and `2024-11
 
 Open **Help → MPCut Agent Guide** to read these instructions offline. Hosts with MCP resource support can read `mpcut://docs/agent-guide` and `mpcut://docs/tool-reference` through `resources/read`. The installed helper advertises argument schemas through `tools/list`.
 
+### Advertise fewer tools
+
+The catalog has 325 tools and about 480 KB of schema. A host that loads tools on demand pays for the ones it uses. A host that puts every schema in the model’s context pays for all of them on each request, which is over 100,000 tokens. For such a host, pass helper arguments to advertise part of the catalog:
+
+- `--live-only` leaves out the saved-file tools, about 45% of the catalog. Use it when the agent only edits open projects.
+- `--toolsets GROUP,GROUP` advertises the named groups. Project discovery is always included with live tools, and the `file_job_*` receipts with file tools. An unknown name stops the helper with the list of valid ones.
+- Both combine with each other, and `--toolsets` combines with `--files-only`.
+
+| Group | Covers | Live | File |
+| --- | --- | ---: | ---: |
+| `projects`, `lifecycle` | Windows, open, save, close, drafts, preferences | 30 KB | |
+| `sequence`, `source_ranges`, `timeline_review` | Sequence edits, history, selects, range mapping | 19 KB | |
+| `review`, `file_frame`, `file_review` | Inline frames; saved-file frames and frame export | 3 KB | 8 KB |
+| `transcript` | Reading, searching, editing and recognition | 84 KB | 37 KB |
+| `multicam`, `sync` | Cameras, switches, assembly, sync | 20 KB | |
+| `outputs`, `output_settings` | Exports, the queue and their job status | 30 KB | 2 KB |
+| `analysis`, `cache` | Scenes, silence, waveforms, sidecars | 14 KB | 3 KB |
+| `stills`, `media`, `file_media` | Still placements; project media and relinking | 21 KB | 10 KB |
+| `presentation` | Window layout and monitors | 5 KB | |
+| `tiles`, `participants` | Tiles, feeds and ISO delivery | 47 KB | 68 KB |
+| `file` | Saved-file editing, inspection and jobs | | 79 KB |
+
+For transcript-led editing of an open sequence, `--live-only --toolsets lifecycle,sequence,timeline_review,review,transcript,outputs` advertises about 160 KB. A group’s job tools travel with it: live exports and transcript exports are polled with `export_editor_job_status_read` in `outputs`, and scans with `analysis_job_status_read` in `analysis`.
+
+```json
+{
+  "mcpServers": {
+    "mpcut": {
+      "command": "/Applications/MPCut.app/Contents/Helpers/mpcut-mcp",
+      "args": ["--live-only", "--toolsets", "lifecycle,sequence,timeline_review,review,transcript,outputs"]
+    }
+  }
+}
+```
+
 ### Settings and agent permissions
 
 `preferences_read` returns every shared setting. `preferences_set` changes one, except `automation_local_mcp_enabled`, `automation_preferences_write_enabled`, `automation_file_replace_enabled`, `draft_retention_days` and `analysis_shared_cache_max_bytes`, which agents can read but not set. To show the editor a setting, call `workspace_panel_show` with `action: "show_settings"` and an optional `page`: `general`, `editing`, `playback`, `media`, `transcripts`, `export`, `storage` or `automation`. Without a page, Settings reopens on the last page shown. Other actions ignore `page`. The two stills timeline pixel keys take even numbers only.
@@ -99,9 +134,13 @@ After an unsafe multicam cut, inspect `multicam_state_read` with `section: "sugg
 ## Find dialogue and review an edit
 
 1. Use `project_windows_list`, then `transcript_editor_attachments_list`. Keep the project handle, timeline `revision`, `transcript_revision`, and the chosen attachment’s `id` and `result_id`.
-2. Search with `transcript_editor_words_search`, a `query`, and `space: "current_cut"`. Read `source` for deleted takes and `group` for synchronized multicam dialogue. Follow `next_offset` in the same revision until the page omits it. When the line appears more than once, supply the intended `first_occurrence_id` and `last_occurrence_id` in the selection.
+2. Search with `transcript_editor_words_search`, a `query`, and `space: "current_cut"`. Read `source` for deleted takes and `group` for synchronized multicam dialogue. Follow `next_offset` in the same revision until the page omits it. Each match is one compact row with the matched text, its `from` and `to`, the surrounding words, and the `first_word_id`, `first_occurrence_id`, `last_word_id` and `last_occurrence_id` to copy into a selection. When the line appears more than once, choose the row you mean.
 3. Call `transcript_editor_edit_plan` with an `edit` containing the action, selections, and boundary policy. Check the requested and resolved boundaries, copy-safe alternatives, affected occurrences, duration, and any tier assessment.
 4. Use `transcript_editor_edit_apply`, the reviewed `plan_id`, and a new operation ID. Pass the same expected timeline and transcript revisions and result identity. If the tool returns `stale_transcript_plan`, refresh and review again. A committed edit appears in native history.
+
+To read dialogue, call `transcript_editor_words_read` with `lines: true` and a `limit` up to 500 words. Each row is one utterance: its text, speaker, `from`, `to` and the four selection identifiers. It costs a small fraction of a word-by-word page. Without `lines`, a row is one compact word. Transcript reads return full word records, with bindings, lanes, routing and evidence, only when you pass `verbose: true`. A full record is about 2 KB per word, so ask for it when you need those fields.
+
+To see what was on screen at a line, pass the row’s time to `review_editor_frame_read` on the same clock. A source-clock row gives a `file` or `source_id`, under `shared` when the whole page has one recording. Send it with `space: "source"` to read material the edit has removed.
 
 For a named excerpt, plan with `edit.action: "queue"`, then use `transcript_editor_excerpt_queue`, the plan ID, and a name. Read its ID and name with `export_queue_list`. Use `transcript_editor_excerpt_save` to write the captured queue entry as an editable `.cut`. For a transcript file, use `transcript_editor_attachment_export`, an absolute path, and a format. Poll both outputs with `export_editor_job_status_read`.
 
@@ -163,7 +202,7 @@ Read `project_editor_state_read` and page `still_editor_placements_list` at that
 - Call `still_editor_picture_replace` with an absolute image `path`, and `from` and `to` in sequence or multicam group time. A replacement keeps the underlying sound. Group replacements appear in each assembly occurrence of the covered group interval.
 - For a title or other insert, call `still_editor_placement_insert` with the image path, `at` and `duration` in sequence or assembly time. The duration shifts later picture and sound. Supply an exact `cadence` frame interval when the current timeline has no verified fixed cadence.
 - Use `still_editor_placement_update` to adjust framing, change an insert's duration or position, or edit replacement coverage. Refer to fragments by the current index under their placement. `still_editor_asset_relink` follows a moved image across all uses and retained history. `still_editor_placement_remove` reveals the camera under a replacement or removes an insert and closes its gap.
-- Call `review_editor_frame_read` at a program time to see Output. Supply `view: "source"` to inspect untreated pixels, with an explicit `angle_id` for another multicam camera. For JPEG files use `review_editor_frames_export` with a program `space` and `selection: "times"` or sample the active playhead.
+- Call `review_editor_frame_read` at a program time to see Output. Supply `view: "source"` to inspect untreated pixels, with an explicit `angle_id` for another multicam camera. Pass `times` with up to 12 times to review a cut point or sample a stretch in one call. Each image follows a `frame N` label. With `space: "source"` and a `source_id` or `file`, times are on the recording’s own clock, so you can look at material before a trim or inside a deleted range, which has no sequence time. Images are 640 pixels on the long edge, whatever the footage, which is enough to identify a shot. When a result carries `native_width` and `native_height`, the picture was reduced. If you cannot make out what you need, ask again: set `max_edge` up to 1920 for more detail in the whole frame, or pass `region` with `x`, `y`, `width` and `height` as fractions from the top left to get that part of the frame at its own pixels. A region is the way to read small text in 4K or 8K footage, because a model reduces a very large image before looking at it. Lower `max_edge` to 160 for a cheap contact sheet. For a full-size file on disk, use `review_editor_frames_export` with `preset: "full"`. For JPEG files use `review_editor_frames_export` with a program `space` and `selection: "times"` or sample the active playhead.
 - Preflight with `export_editor_project_plan`. An omitted mode chooses Smart Trim for visible still picture. Set `require_camera_copy: true` when the export must preserve all retained camera packets. Read the exact camera copy, camera encode and generated still durations, plus the per-track sound actions. To accept a verified whole-timeline boundary change, pass its `still_adjustment` to `export_editor_boundary_apply` with the same render settings.
 
 To pair an image with a recording, call `still_editor_soundtrack_attach` with the audio path and optional `fit_soundtrack: true`, `still_editor_soundtrack_fit` to fit the single image later, or `still_editor_soundtrack_detach` to remove it. Saved projects use the `still_file_soundtrack_*` tools. Export tools accept `still_timing: "held"` to store one sample per visible hold and `container` to override the saved default. [Still images](STILL-IMAGES.md)

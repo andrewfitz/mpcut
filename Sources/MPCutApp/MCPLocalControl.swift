@@ -358,13 +358,16 @@ final class MCPLocalControl {
             let start = min(total, offset)
             return start..<(start + min(limit, total - start))
         }
-        var available: [String] = [], unavailable: [String: String] = [:]
+        // Only blocked tools are reported, each with its reason. A list of the ready ones named a
+        // fraction of the catalog, and a client read a tool's absence from it as unavailable.
+        var unavailable: [String: String] = [:]
         let modal = session.window?.attachedSheet != nil
         func capability(_ tool: String, _ enabled: Bool, _ reason: String, allowsSheet: Bool = false) {
             let blockedBySheet = modal && !allowsSheet
-            if enabled && !blockedBySheet { available.append(tool) }
-            else { unavailable[tool] = blockedBySheet ? "The project window has an open sheet." : reason }
+            if !enabled || blockedBySheet { unavailable[tool] = blockedBySheet ? "The project window has an open sheet." : reason }
         }
+        let refreshing = (session.isMulticam ? session.multicam.mediaRefreshProgress : session.editor.mediaRefreshProgress) != nil
+        capability("review_editor_frame_read", !refreshing, "Wait for the project media refresh to finish.", allowsSheet: true)
         if session.isMulticam {
             let model = session.multicam, items = model.assemblyItems, ends = model.assemblyRangeEnds
             guard ends.count == items.count else { throw MCPFailure("invalid_result", "The assembly timeline is inconsistent.") }
@@ -450,7 +453,11 @@ final class MCPLocalControl {
             capability("timeline_playhead_seek", canNavigate, "A navigable preview is required.")
             capability("playback_transport_pause", canNavigate, "Playback is unavailable.")
             capability("playback_transport_play", canNavigate && (!model.preview.hasBlockingIssue || model.preview.isPlaying), "Playback is unavailable.")
-            capability("timeline_item_split", canEdit, "A loaded, idle timeline is required.")
+            for tool in ["timeline_item_split", "sequence_range_edit"] {
+                capability(tool, canEdit, "A loaded, idle timeline is required.")
+            }
+            // A clip edit can continue the trim that blocks the others.
+            capability("sequence_clip_edit", model.canEdit, "A loaded, idle timeline is required.")
             capability("history_undo", model.canUndo && !model.mcpHasActiveTrim, "No available undo step.")
             capability("history_redo", (model.canRedo || session.canRedoFeedAngleConversion) && !model.mcpHasActiveTrim, "No available redo step.")
             capability("timeline_editor_join_preview", canEdit && total > 1 && model.cutPreview == nil,
@@ -499,7 +506,6 @@ final class MCPLocalControl {
             result["stills"] = stills
             result["program_color_policy"] = stills["program_color_policy"]
         }
-        result["available_operations"] = available
         result["unavailable_operations"] = unavailable
         return result
     }

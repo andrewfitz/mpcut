@@ -60,3 +60,53 @@ func TestReviewFrameValidatesImageAndMetadata(t *testing.T) {
 		t.Fatal("accepted JPEG with missing scan data")
 	}
 }
+
+func TestReviewFrameBatchLabelsEachImage(t *testing.T) {
+	encode := func(width int) []byte {
+		t.Helper()
+		var encoded bytes.Buffer
+		if err := jpeg.Encode(&encoded, image.NewGray(image.Rect(0, 0, width, 4)), nil); err != nil {
+			t.Fatal(err)
+		}
+		return encoded.Bytes()
+	}
+	// The second picture is wider than the default review edge, as a request with max_edge allows.
+	first, second := encode(8), encode(1280)
+	raw, err := json.Marshal(map[string]any{"view": "source", "frames": []map[string]any{
+		{"jpeg": first, "width": 8, "height": 4, "space": "source", "time": "0"},
+		{"jpeg": second, "width": 1280, "height": 4, "space": "source", "time": "1141"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := reviewFrameResult(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"frames":[{"height":4,"space":"source","time":"0","width":8},{"height":4,"space":"source","time":"1141","width":1280}],"view":"source"}`
+	if got := string(result.StructuredContent.(json.RawMessage)); got != want {
+		t.Fatalf("unexpected batch metadata: %s", got)
+	}
+	if len(result.Content) != 5 {
+		t.Fatalf("expected metadata and a label and an image per frame, got %d blocks", len(result.Content))
+	}
+	for i, picture := range [][]byte{first, second} {
+		label, isText := result.Content[1+2*i].(*mcp.TextContent)
+		block, isImage := result.Content[2+2*i].(*mcp.ImageContent)
+		if !isText || !isImage || !bytes.Equal(block.Data, picture) {
+			t.Fatalf("frame %d is not a label followed by its image", i+1)
+		}
+		if want := []string{"frame 1: source 0", "frame 2: source 1141"}[i]; label.Text != want {
+			t.Fatalf("label %q, want %q", label.Text, want)
+		}
+	}
+	for _, invalid := range []string{`{"frames":[]}`, `{"frames":[{"jpeg":"broken","width":8,"height":4}]}`} {
+		if _, err := reviewFrameResult(json.RawMessage(invalid)); err == nil {
+			t.Errorf("accepted an invalid batch: %s", invalid)
+		}
+	}
+	oversized, _ := json.Marshal(map[string]any{"jpeg": encode(2000), "width": 2000, "height": 4})
+	if _, err := reviewFrameResult(oversized); err == nil {
+		t.Fatal("accepted a picture wider than the largest review edge")
+	}
+}

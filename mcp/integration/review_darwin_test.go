@@ -55,3 +55,34 @@ func checkReviewFrame(t *testing.T, reply *mcp.CallToolResult, want object) {
 		t.Fatalf("expected one inline JPEG, received %d", images)
 	}
 }
+
+// A request for several times returns its metadata under frames, then a label and an image per frame.
+func checkReviewBatch(t *testing.T, reply *mcp.CallToolResult, space string, times []string) {
+	t.Helper()
+	if reply.IsError {
+		t.Fatalf("review frames: %v", reply.StructuredContent)
+	}
+	metadata, _ := reply.StructuredContent.(map[string]any)
+	frames, _ := metadata["frames"].([]any)
+	if len(frames) != len(times) || len(reply.Content) != 1+2*len(times) {
+		t.Fatalf("expected %d frames and their images, got %v with %d content blocks", len(times), metadata, len(reply.Content))
+	}
+	for i, time := range times {
+		frame := frames[i].(map[string]any)
+		label, isText := reply.Content[1+2*i].(*mcp.TextContent)
+		picture, isImage := reply.Content[2+2*i].(*mcp.ImageContent)
+		if !isText || !isImage || !strings.HasSuffix(label.Text, space+" "+time) {
+			t.Fatalf("frame %d is not a label and its image: %v", i+1, reply.Content[1+2*i])
+		}
+		if _, hasJPEG := frame["jpeg"]; hasJPEG || frame["space"] != space || frame["time"] != time || frame["source_time"] != time {
+			t.Fatalf("unexpected frame metadata: %v", frame)
+		}
+		image, err := jpeg.Decode(bytes.NewReader(picture.Data))
+		if err != nil {
+			t.Fatalf("review frame JPEG decode: %v", err)
+		}
+		if bounds := image.Bounds(); frame["width"] != float64(bounds.Dx()) || frame["height"] != float64(bounds.Dy()) {
+			t.Fatalf("frame metadata and image dimensions disagree: %v %v", frame, bounds)
+		}
+	}
+}

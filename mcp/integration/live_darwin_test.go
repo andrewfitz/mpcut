@@ -191,6 +191,23 @@ func TestLiveBundle(t *testing.T) {
 	checkReviewFrame(t, rawCall(t, "review_editor_frame_read", object{"project_handle": a["project_handle"], "space": "sequence", "time": frameTime}),
 		object{"space": "sequence", "time": frameTime, "source_time": frameTime})
 	t.Log("verified indexed review-frame time and decoded JPEG over MCP")
+	clip := a["clips"].([]any)[0].(object)
+	checkReviewBatch(t, rawCall(t, "review_editor_frame_read", object{"project_handle": a["project_handle"], "space": "source",
+		"source_id": clip["source_id"], "times": []string{"0", frameTime}, "max_edge": 160}), "source", []string{"0", frameTime})
+	checkReviewBatch(t, rawCall(t, "review_editor_frame_read", object{"project_handle": a["project_handle"], "space": "source",
+		"file": clip["file"], "times": []string{frameTime}}), "source", []string{frameTime})
+	// The fixture is 160 by 90, so half of its width at its own pixels is 80 wide.
+	zoomed := call("review_editor_frame_read", object{"project_handle": a["project_handle"], "space": "sequence", "time": frameTime,
+		"region": object{"x": 0.5, "y": 0, "width": 0.5, "height": 1}}, "")
+	if zoomed["width"] != float64(80) || zoomed["height"] != float64(90) || zoomed["native_width"] != float64(160) || zoomed["region"] == nil {
+		t.Fatalf("a region should return that part of the frame and the frame's own size: %v", zoomed)
+	}
+	call("review_editor_frame_read", object{"project_handle": a["project_handle"], "space": "sequence", "time": "3600"}, "invalid_target")
+	call("review_editor_frame_read", object{"project_handle": a["project_handle"], "space": "source", "time": "0"}, "invalid_arguments")
+	if _, listed := a["available_operations"]; listed || a["unavailable_operations"] == nil {
+		t.Fatalf("state should report only the blocked operations: %v", a)
+	}
+	t.Log("verified source-clock frame batches and the blocked-operation list over MCP")
 	b := open(pathB)
 	if a["project_handle"] == b["project_handle"] {
 		t.Fatal("two documents resolved to the same project")

@@ -98,26 +98,40 @@ package final class ParticipantOutputPicture {
     }
 
     package func jpeg(at time: RationalTime, preset: JPEGPreset) throws -> (data: Data, width: Int, height: Int) {
-        let size = preset == .review ? CGSize(width: 640, height: 640) : session.extent.size
-        let picture = try scaledPicture(at: time, size: size)
+        let size = preset == .review
+            ? CGSize(width: JPEGReviewSize.maxEdge, height: JPEGReviewSize.maxEdge) : session.extent.size
+        let picture = try scaledPicture(at: time, size: size, region: preset == .review ? JPEGReviewSize.region : nil)
         let quality = CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String)
-        guard let data = ParticipantCompositor.context.jpegRepresentation(
-            of: picture, colorSpace: ParticipantCompositor.colorSpace, options: [quality: preset == .review ? 0.62 : 0.95]
-        ) else { throw JPEGRenderer.failure }
+        func make(_ level: Double) -> Data? {
+            ParticipantCompositor.context.jpegRepresentation(of: picture, colorSpace: ParticipantCompositor.colorSpace,
+                                                             options: [quality: level])
+        }
+        let data = try preset == .review ? JPEGReviewSize.encode(make) : make(0.95) ?? { throw JPEGRenderer.failure }()
         return (data, Int(picture.extent.width), Int(picture.extent.height))
     }
 
-    private func scaledPicture(at time: RationalTime, size: CGSize, exact: Bool = false) throws -> CIImage {
+    /// The rendered program's full size, before a review scales or crops it.
+    package var nativeSize: CGSize { session.extent.size }
+
+    /// `region` is the part to keep, in fractions of the picture measured from its top left.
+    private func scaledPicture(at time: RationalTime, size: CGSize, exact: Bool = false, region: CGRect? = nil) throws -> CIImage {
         let instant = try session.sampleTime(at: time, exact: exact)
         let picture = try session.picture(at: instant)
         try session.verifySources(at: instant)
-        let scale = min(1, size.width / session.extent.width, size.height / session.extent.height)
+        let full = session.extent
+        // Core Image measures up from the bottom edge.
+        let crop = region.map {
+            CGRect(x: full.minX + $0.minX * full.width, y: full.minY + (1 - $0.maxY) * full.height,
+                   width: $0.width * full.width, height: $0.height * full.height)
+        } ?? CGRect(origin: .zero, size: full.size)
+        let scale = min(1, size.width / crop.width, size.height / crop.height)
         guard scale.isFinite, scale > 0 else { throw JPEGRenderer.failure }
-        let width = max(1, (session.extent.width * scale).rounded())
-        let height = max(1, (session.extent.height * scale).rounded())
+        let width = max(1, (crop.width * scale).rounded())
+        let height = max(1, (crop.height * scale).rounded())
         let extent = CGRect(x: 0, y: 0, width: width, height: height)
-        return picture.transformed(by: .init(scaleX: width / session.extent.width, y: height / session.extent.height),
-                                   highQualityDownsample: true).cropped(to: extent)
+        let fitted = CGAffineTransform(translationX: -crop.minX, y: -crop.minY)
+            .concatenating(.init(scaleX: width / crop.width, y: height / crop.height))
+        return picture.transformed(by: fitted, highQualityDownsample: true).cropped(to: extent)
     }
 }
 

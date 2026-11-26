@@ -196,7 +196,7 @@ func checkTranscriptEditParity(t *testing.T, ctx context.Context, contents, dir 
 	}
 	newLocation := call("transcript_editor_occurrences_locate", object{"project_handle": live, "word_id": "s0-w0", "space": "source"}, "")
 	shifted := newLocation["items"].([]any)
-	if len(shifted) != 1 || !reflect.DeepEqual(shifted[0].(object)["range"], object{"from": "1/2", "to": "3/4"}) {
+	if len(shifted) != 1 || shifted[0].(object)["from"] != "1/2" || shifted[0].(object)["to"] != "3/4" {
 		t.Fatalf("rebind did not shift the word by exactly 1/4 second: %v", newLocation)
 	}
 	staleApply := stamp("stale-apply-transcript-parity")
@@ -215,7 +215,7 @@ func checkTranscriptEditParity(t *testing.T, ctx context.Context, contents, dir 
 		t.Helper()
 		page := call("transcript_editor_occurrences_locate", object{"project_handle": live, "word_id": "s0-w0", "space": "source"}, "")
 		rows := page["items"].([]any)
-		if len(rows) != 1 || rows[0].(object)["text"] != want || rows[0].(object)["range"] == nil {
+		if len(rows) != 1 || rows[0].(object)["text"] != want || rows[0].(object)["from"] == nil {
 			t.Fatalf("expected transcript text %q, got %v", want, page)
 		}
 	}

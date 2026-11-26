@@ -36,6 +36,9 @@ package struct ProjectOutputJPEG {
 
     package func verifySources() throws { try picture.verifySources() }
 
+    /// The rendered program's full size, before a review scales or crops it.
+    package var nativeSize: CGSize { picture.nativeSize }
+
     private struct Manifest: Encodable {
         let schemaVersion = 2
         let selection = "program"

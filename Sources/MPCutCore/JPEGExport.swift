@@ -8,6 +8,48 @@ import Metal
 public enum JPEGPreset: String, CaseIterable, Sendable, Encodable { case review, full }
 public enum JPEGSample: String, CaseIterable, Sendable, Encodable { case first, midpoint }
 
+/// The longest edge of a review-preset picture. Files and the CLI always use the default. A live
+/// review request can bind another value around its own render, which reads it on the calling thread.
+package enum JPEGReviewSize {
+    package static let defaultEdge = 640
+    package static let edges = 160...1920
+    @TaskLocal package static var maxEdge = defaultEdge
+    /// The part of the picture to return, in fractions of its width and height measured from the top left.
+    /// A crop keeps the picture's own pixels up to `maxEdge`, so small detail in a large picture stays legible.
+    @TaskLocal package static var region: CGRect?
+    static let byteLimit = 1_048_576
+    static let tooLarge = "The review JPEG exceeds 1 MiB."
+
+    /// The decoder may hand back a smaller picture. With a crop it must keep enough pixels for the cropped part.
+    static var decodeEdge: Int32 {
+        guard let region else { return Int32(maxEdge) }
+        return Int32(min(16_384, (Double(maxEdge) / Double(max(region.width, region.height))).rounded(.up)))
+    }
+
+    /// The crop within a picture occupying `extent`, whose y axis points up when `flipped`,
+    /// and the pixel size that fits the crop's long edge without enlarging it.
+    static func fit(_ extent: CGRect, flipped: Bool) -> (crop: CGRect, width: CGFloat, height: CGFloat) {
+        let part = region ?? CGRect(x: 0, y: 0, width: 1, height: 1)
+        let top = flipped ? 1 - part.maxY : part.minY
+        let crop = CGRect(x: extent.minX + part.minX * extent.width, y: extent.minY + top * extent.height,
+                          width: part.width * extent.width, height: part.height * extent.height)
+        let scale = min(1, CGFloat(maxEdge) / max(crop.width, crop.height))
+        return (crop, max(1, (crop.width * scale).rounded()), max(1, (crop.height * scale).rounded()))
+    }
+
+    /// Encodes at the review quality, then lower, until the picture fits the inline limit.
+    static func encode(_ make: (Double) throws -> Data?) throws -> Data {
+        var smallest: Data?
+        for quality in [0.62, 0.45, 0.3] {
+            guard let data = try make(quality) else { break }
+            smallest = data
+            if data.count <= byteLimit { break }
+        }
+        guard let smallest else { throw JPEGRenderer.failure }
+        return smallest
+    }
+}
+
 /// The file format of an exported frame. JPEG is the 8-bit sRGB review rendition. PNG and TIFF are
 /// lossless: they keep the decoder's R′G′B′ values unchanged, with 16 bits per channel when the source
 /// has more than 8, and embed the profile that describes them (the source's gamut and transfer,
@@ -774,7 +816,7 @@ final class JPEGRenderer {
                  clampsLikePreview: Bool = false) throws -> CIImage {
         var buffer: CVPixelBuffer?
         var error = [CChar](repeating: 0, count: 256)
-        guard mp_jpeg_frame(reader, pts, seekDTS, preset == .review ? 640 : 0, &buffer, &error, error.count) >= 0,
+        guard mp_jpeg_frame(reader, pts, seekDTS, preset == .review ? JPEGReviewSize.decodeEdge : 0, &buffer, &error, error.count) >= 0,
               let buffer else {
             try control.check()
             throw CutError(code: "frame_export_failed", message: "Could not decode source picture at PTS \(pts): " + String(cString: error))
@@ -793,13 +835,14 @@ final class JPEGRenderer {
         image = image.transformed(by: natural.concatenating(displayTransform))
         let extent = image.extent
         guard extent.width.isFinite, extent.height.isFinite, extent.width >= 0.5, extent.height >= 0.5 else { throw Self.failure }
-        let scale = preset == .review ? min(1, 640 / max(extent.width, extent.height)) : 1
-        let width = max(1, (extent.width * scale).rounded()), height = max(1, (extent.height * scale).rounded())
+        // Core Image measures up from the bottom edge.
+        let (crop, width, height) = preset == .review ? JPEGReviewSize.fit(extent, flipped: true)
+            : (extent, max(1, extent.width.rounded()), max(1, extent.height.rounded()))
         // JPEG encodes each dimension in 16 bits.
         guard width <= 65535, height <= 65535 else { throw Self.failure }
         let rect = CGRect(x: 0, y: 0, width: width, height: height)
-        let transform = CGAffineTransform(translationX: -extent.minX, y: -extent.minY)
-            .concatenating(CGAffineTransform(scaleX: width / extent.width, y: height / extent.height))
+        let transform = CGAffineTransform(translationX: -crop.minX, y: -crop.minY)
+            .concatenating(CGAffineTransform(scaleX: width / crop.width, y: height / crop.height))
         return image.transformed(by: transform, highQualityDownsample: true).cropped(to: rect)
     }
 
@@ -817,9 +860,11 @@ final class JPEGRenderer {
 
     func encode(_ image: CIImage, preset: JPEGPreset) throws -> Data {
         let quality = CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String)
-        guard let data = Self.context.jpegRepresentation(of: image, colorSpace: Self.colorSpace,
-                                                   options: [quality: preset == .review ? 0.62 : 0.95]) else { throw Self.failure }
-        return data
+        func make(_ level: Double) -> Data? {
+            Self.context.jpegRepresentation(of: image, colorSpace: Self.colorSpace, options: [quality: level])
+        }
+        guard preset == .review else { return try make(0.95) ?? { throw Self.failure }() }
+        return try JPEGReviewSize.encode(make)
     }
 }
 
@@ -838,7 +883,7 @@ extension JPEGRenderer {
     func sourcePicture(at pts: Int64, seekDTS: Int64, preset: JPEGPreset) throws -> (image: CIImage, profile: CGColorSpace) {
         var buffer: CVPixelBuffer?
         var error = [CChar](repeating: 0, count: 256)
-        guard mp_jpeg_frame(reader, pts, seekDTS, preset == .review ? 640 : 0, &buffer, &error, error.count) >= 0,
+        guard mp_jpeg_frame(reader, pts, seekDTS, preset == .review ? Int32(JPEGReviewSize.maxEdge) : 0, &buffer, &error, error.count) >= 0,
               let buffer else {
             try control.check()
             throw CutError(code: "frame_export_failed", message: "Could not decode source picture at PTS \(pts): " + String(cString: error))
@@ -864,7 +909,7 @@ extension JPEGRenderer {
         if !placement.isIdentity { image = image.transformed(by: placement) }
         let extent = image.extent
         guard extent.width.isFinite, extent.height.isFinite, extent.width >= 0.5, extent.height >= 0.5 else { throw Self.failure }
-        let scale = preset == .review ? min(1, 640 / max(extent.width, extent.height)) : 1
+        let scale = preset == .review ? min(1, CGFloat(JPEGReviewSize.maxEdge) / max(extent.width, extent.height)) : 1
         let width = max(1, (extent.width * scale).rounded()), height = max(1, (extent.height * scale).rounded())
         guard width <= 65535, height <= 65535 else { throw Self.failure }
         let rect = CGRect(x: 0, y: 0, width: width, height: height)
@@ -1009,8 +1054,8 @@ extension JPEGExport {
                                 control: control,
                                 fileName: fileName, progress: { _, _ in }) { data, name in
             // The review size limit belongs to the JPEG that tools return inline.
-            guard format != .jpeg || preset != .review || data.count <= 1_048_576 else {
-                throw CutError(code: "image_too_large", message: "The review JPEG exceeds 1 MiB.")
+            guard format != .jpeg || preset != .review || data.count <= JPEGReviewSize.byteLimit else {
+                throw CutError(code: "image_too_large", message: JPEGReviewSize.tooLarge)
             }
             try write(data, name)
         }

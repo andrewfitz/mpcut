@@ -50,6 +50,218 @@ final class MCPReviewFrameTests: XCTestCase {
         }
     }
 
+    func testSourceClockReadsRemovedMaterialInBatchesAtARequestedSize() async throws {
+        let preferences = EditorPreferences()
+        preferences.useAnalysisSidecars = false
+        let registry = ProjectSessions(preferences: preferences)
+        let session = ProjectSession(id: UUID(), preferences: preferences)
+        defer { session.end() }
+        let fixture = try XCTUnwrap(Bundle.module.url(forResource: "Scene-Cadence-Change", withExtension: "mov", subdirectory: "Fixtures"))
+        let editor = session.editor
+        func settle() async throws {
+            let deadline = ContinuousClock.now.advanced(by: .seconds(15))
+            while editor.isBusy {
+                guard ContinuousClock.now < deadline else { throw CancellationError() }
+                try await Task.sleep(for: .milliseconds(25))
+            }
+        }
+        editor.importFiles([fixture])
+        try await settle()
+        let (sourceID, media) = try editor.mcpReplacementSource(try XCTUnwrap(editor.mcpClipIDs.first))
+        let frames = media.frames.map(\.time)
+        let cut = frames[frames.count / 2]
+        func read(_ arguments: [String: Any]) async throws -> [String: Any] {
+            try await registry.mcpReviewFrame(arguments: arguments, session: session, checkAccess: {})
+        }
+        func code(_ arguments: [String: Any]) async -> String? {
+            do { _ = try await read(arguments) } catch let error as MCPCommandError { return error.code } catch {}
+            return nil
+        }
+
+        // Remove the opening half. Its pictures keep their source times and lose their sequence times.
+        _ = try await editor.mcpCommand(tool: "sequence_range_edit",
+                                        arguments: ["action": "delete_range", "from": "0", "to": cut.description], validateCommit: {})
+        try await settle()
+        XCTAssertEqual(editor.sequenceClips.first?.from, cut)
+        let kept = try await read(["space": "sequence", "time": "0"])
+        XCTAssertEqual(kept["source_time"] as? String, cut.description)
+        let beyond = try editor.mcpDuration.adding(cut)
+        do {
+            _ = try await read(["space": "sequence", "time": beyond.description])
+            XCTFail("A time past the sequence has no picture.")
+        } catch let error as MCPCommandError {
+            XCTAssertEqual(error.code, "invalid_target")
+            XCTAssertTrue(error.message.contains("space \"source\""), error.message)
+        }
+
+        let removed = try await read(["space": "source", "time": "0", "source_id": sourceID.uuidString])
+        XCTAssertEqual(removed["space"] as? String, "source")
+        XCTAssertEqual(removed["view"] as? String, "source")
+        XCTAssertEqual(removed["source_time"] as? String, "0")
+        XCTAssertEqual(removed["source_id"] as? String, sourceID.uuidString)
+        XCTAssertEqual(removed["file"] as? String, media.url.path)
+        XCTAssertEqual(removed["width"] as? Int, 640)
+        XCTAssertNotEqual(removed["jpeg"] as? String, kept["jpeg"] as? String)
+
+        // Several times by file in one reply, at a smaller size.
+        let times = [frames[0], frames[1], cut].map(\.description)
+        let batch = try await read(["space": "source", "times": times, "file": fixture.path, "max_edge": 320])
+        XCTAssertEqual(batch["view"] as? String, "source")
+        XCTAssertNil(batch["jpeg"])
+        let rows = try XCTUnwrap(batch["frames"] as? [[String: Any]])
+        XCTAssertEqual(rows.map { $0["source_time"] as? String }, times)
+        for row in rows {
+            XCTAssertEqual(row["width"] as? Int, 320)
+            XCTAssertEqual(row["height"] as? Int, 180)
+            let bytes = try XCTUnwrap(Data(base64Encoded: try XCTUnwrap(row["jpeg"] as? String)))
+            let image = try XCTUnwrap(CGImageSourceCreateWithData(bytes as CFData, nil).flatMap { CGImageSourceCreateImageAtIndex($0, 0, nil) })
+            XCTAssertEqual(image.width, 320)
+        }
+        // A region keeps the picture's own pixels: a quarter of this 640 by 360 frame is 320 by 180.
+        func quarter(y: Double, edge: Int? = nil) async throws -> [String: Any] {
+            var arguments: [String: Any] = ["space": "source", "time": "0", "file": fixture.path,
+                                            "region": ["x": 0.5, "y": y, "width": 0.5, "height": 0.5]]
+            arguments["max_edge"] = edge
+            return try await read(arguments)
+        }
+        let lowerRight = try await quarter(y: 0.5), upperRight = try await quarter(y: 0)
+        for crop in [lowerRight, upperRight] {
+            XCTAssertEqual(crop["width"] as? Int, 320)
+            XCTAssertEqual(crop["height"] as? Int, 180)
+            XCTAssertEqual(crop["native_width"] as? Int, 640)
+            XCTAssertEqual(crop["native_height"] as? Int, 360)
+            XCTAssertEqual((crop["region"] as? [String: Double])?["width"], 0.5)
+        }
+        // The fixture's brown block sits mostly below the middle of the right half.
+        XCTAssertGreaterThan(try meanRed(lowerRight), try meanRed(upperRight) + 10)
+        let smallCrop = try await quarter(y: 0.5, edge: 160)
+        XCTAssertEqual(smallCrop["width"] as? Int, 160)
+        // A reduced whole frame says how large the picture really is. A full-size one has nothing to add.
+        XCTAssertEqual(rows[0]["native_width"] as? Int, 640)
+        XCTAssertNil(removed["native_width"])
+        XCTAssertNil(removed["region"])
+
+        // The requested size ends with its request.
+        let after = try await read(["space": "sequence", "time": "0"])
+        XCTAssertEqual(after["width"] as? Int, 640)
+        let one = try await read(["space": "sequence", "times": ["0"]])
+        XCTAssertEqual((one["frames"] as? [[String: Any]])?.count, 1)
+
+        // With every clip removed, the recording is still found in the retained history.
+        _ = try await editor.mcpCommand(tool: "sequence_range_edit",
+                                        arguments: ["action": "delete_range", "from": "0", "to": editor.mcpDuration.description],
+                                        validateCommit: {})
+        try await settle()
+        XCTAssertTrue(editor.mcpClipIDs.isEmpty)
+        let retained = try await read(["space": "source", "time": cut.description, "file": fixture.path])
+        XCTAssertEqual(retained["source_time"] as? String, cut.description)
+        XCTAssertEqual(retained["source_id"] as? String, sourceID.uuidString)
+
+        let invalid: [[String: Any]] = [
+            ["space": "source", "time": "0"],
+            ["space": "sequence", "time": "0", "source_id": sourceID.uuidString],
+            ["space": "source", "time": "0", "file": fixture.path, "view": "output"],
+            ["space": "sequence", "time": "0", "times": ["0"]],
+            ["space": "sequence", "times": Array(repeating: "0", count: 13)],
+            ["space": "sequence", "time": "0", "max_edge": 4000],
+            ["space": "sequence", "time": "0", "region": ["x": 0.5, "y": 0, "width": 0.75, "height": 1]],
+            ["space": "sequence", "time": "0", "region": ["x": 0, "y": 0, "width": 0, "height": 1]],
+        ]
+        for arguments in invalid {
+            let rejected = await code(arguments)
+            XCTAssertEqual(rejected, "invalid_arguments", "\(arguments)")
+        }
+        let unknown = await code(["space": "source", "time": "0", "file": "/tmp/not-in-this-project.mov"])
+        XCTAssertEqual(unknown, "invalid_target")
+        let past = await code(["space": "source", "time": "3600", "file": fixture.path])
+        XCTAssertEqual(past, "invalid_target")
+    }
+
+    /// The rendered program and a still picture have their own scaling code. Each crops from the top left.
+    func testRegionAndBatchesOnTheRenderedProgramAndOnAStill() async throws {
+        let preferences = EditorPreferences()
+        preferences.useAnalysisSidecars = false
+        let registry = ProjectSessions(preferences: preferences)
+        let fixture = try XCTUnwrap(Bundle.module.url(forResource: "Scene-Cadence-Change", withExtension: "mov", subdirectory: "Fixtures"))
+        func region(y: Double, height: Double = 0.5) -> [String: Double] { ["x": 0.5, "y": y, "width": 0.5, "height": height] }
+
+        let program = ProjectSession(id: UUID(), preferences: preferences)
+        defer { program.end() }
+        program.isMulticam = true
+        let media = try CutEngine(useSidecar: false).inspectMulticamSource(fixture)
+        program.multicam.confirmSetup(drafts: [.init(source: .init(id: "wide", file: fixture.path), media: media)],
+                                      opening: "wide", audio: .none)
+        XCTAssertTrue(program.multicam.edit("Set Output Canvas") {
+            $0.participants.tileOutput = .init(canvas: .init(width: 640, height: 360), audio: .init(mode: .silence))
+        })
+        func output(_ arguments: [String: Any]) async throws -> [String: Any] {
+            try await registry.mcpReviewFrame(arguments: arguments.merging(["space": "assembly"]) { old, _ in old },
+                                              session: program, checkAccess: {})
+        }
+        let lower = try await output(["time": "0", "region": region(y: 0.5)])
+        let upper = try await output(["time": "0", "region": region(y: 0)])
+        for crop in [lower, upper] {
+            XCTAssertEqual(crop["view"] as? String, "output")
+            XCTAssertEqual(crop["width"] as? Int, 320)
+            XCTAssertEqual(crop["height"] as? Int, 180)
+            XCTAssertEqual(crop["native_width"] as? Int, 640)
+        }
+        // The fixture's brown block sits mostly below the middle of the right half.
+        XCTAssertGreaterThan(try meanRed(lower), try meanRed(upper) + 10)
+        let second = try XCTUnwrap(media.frames.dropFirst().first?.time)
+        let batch = try await output(["times": ["0", second.description], "max_edge": 320])
+        let frames = try XCTUnwrap(batch["frames"] as? [[String: Any]])
+        XCTAssertEqual(frames.map { $0["time"] as? String }, ["0", second.description])
+        XCTAssertEqual(frames.map { $0["width"] as? Int }, [320, 320])
+        XCTAssertEqual(frames.map { $0["native_width"] as? Int }, [640, 640])
+        XCTAssertNotNil(frames[1]["frame_time"])
+
+        // A still that is red above its middle and blue below it.
+        let session = ProjectSession(id: UUID(), preferences: preferences)
+        defer { session.end() }
+        session.editor.importFiles([fixture])
+        let deadline = ContinuousClock.now.advanced(by: .seconds(15))
+        while session.editor.isBusy {
+            guard ContinuousClock.now < deadline else { throw CancellationError() }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        let (plain, directory) = try makeArtwork()
+        let context = try XCTUnwrap(CGContext(data: nil, width: 64, height: 36, bitsPerComponent: 8, bytesPerRow: 0,
+                                              space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                              bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
+        context.setFillColor(red: 0, green: 0, blue: 1, alpha: 1)
+        context.fill(CGRect(x: 0, y: 0, width: 64, height: 18))
+        context.setFillColor(red: 1, green: 0, blue: 0, alpha: 1)
+        context.fill(CGRect(x: 0, y: 18, width: 64, height: 18))
+        let splitURL = directory.appendingPathComponent("split.png")
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(splitURL as CFURL, "public.png" as CFString, 1, nil))
+        CGImageDestinationAddImage(destination, try XCTUnwrap(context.makeImage()), nil)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+        let asset = StillAsset(id: "split", file: splitURL.path, displayName: "Split", fingerprint: try StillImage.fingerprint(splitURL))
+        let title = StillInsert(id: "title", assetID: asset.id, duration: .init(numerator: 1), cadence: .init(numerator: 1, denominator: 30))
+        let clips = session.editor.sequenceClips.map(StillSequenceItem.source)
+        try session.editor.applyStillProject(.stillSequence(StillSequenceProject(items: [.still(title)] + clips, stillAssets: [asset, plain])),
+                                             action: "Add title")
+        func still(_ arguments: [String: Any]) async throws -> [String: Any] {
+            try await registry.mcpReviewFrame(arguments: arguments.merging(["space": "sequence", "time": "1/2"]) { old, _ in old },
+                                              session: session, checkAccess: {})
+        }
+        let whole = try await still([:])
+        XCTAssertEqual(whole["placement"] as? String, "title")
+        let width = try XCTUnwrap(whole["width"] as? Int), height = try XCTUnwrap(whole["height"] as? Int)
+        let top = try await still(["region": ["x": 0, "y": 0, "width": 1, "height": 0.5]])
+        let bottom = try await still(["region": ["x": 0, "y": 0.5, "width": 1, "height": 0.5]])
+        for crop in [top, bottom] {
+            XCTAssertEqual(crop["width"] as? Int, width)
+            XCTAssertEqual(crop["height"] as? Int, height / 2)
+            XCTAssertEqual(crop["native_height"] as? Int, height)
+        }
+        XCTAssertGreaterThan(try meanRed(top), try meanRed(bottom) + 100)
+        let smaller = try await still(["max_edge": 160])
+        XCTAssertEqual(smaller["width"] as? Int, 160)
+        XCTAssertEqual(smaller["native_width"] as? Int, width)
+    }
+
     func testRepeatedMulticamAssemblyMapsToGroupAndCamera() async throws {
         let preferences = EditorPreferences()
         preferences.useAnalysisSidecars = false
@@ -311,6 +523,17 @@ final class MCPReviewFrameTests: XCTestCase {
                                                             session: session, checkAccess: {})
         XCTAssertEqual(secondPhoto["placement"] as? String, "photo")
         XCTAssertEqual(secondPhoto["group_time"] as? String, range.from.description)
+    }
+
+    private func meanRed(_ row: [String: Any]) throws -> Double {
+        let bytes = try XCTUnwrap(Data(base64Encoded: try XCTUnwrap(row["jpeg"] as? String)))
+        let image = try XCTUnwrap(CGImageSourceCreateWithData(bytes as CFData, nil).flatMap { CGImageSourceCreateImageAtIndex($0, 0, nil) })
+        var pixels = [UInt8](repeating: 0, count: image.width * image.height * 4)
+        let context = try XCTUnwrap(CGContext(data: &pixels, width: image.width, height: image.height, bitsPerComponent: 8,
+                                              bytesPerRow: image.width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        return stride(from: 0, to: pixels.count, by: 4).reduce(0.0) { $0 + Double(pixels[$1]) } / Double(image.width * image.height)
     }
 
     private func makeArtwork() throws -> (StillAsset, URL) {

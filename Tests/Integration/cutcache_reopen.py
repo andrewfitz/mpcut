@@ -146,7 +146,7 @@ def run(products, folder):
         try:
             def located():
                 return word_in(live.call("transcript_editor_occurrences_locate", project_handle=handle,
-                                         space="source", word_id="w1"))
+                                         space="source", word_id="w1", verbose=True))
 
             def threshold():
                 return live.call("analysis_editor_state_read", project_handle=handle).get("manual_threshold_db")

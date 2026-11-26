@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
-	"slices"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -186,8 +185,8 @@ func checkStillAuthoring(t *testing.T, toolCaller func(*testing.T) func(string, 
 			}
 			snapshot := state()
 			for _, tool := range []any{"still_editor_placements_list", "still_editor_placement_insert", "still_editor_placement_update", "still_editor_placement_remove", "still_editor_asset_relink", "timeline_clips_space"} {
-				if !slices.Contains(snapshot["available_operations"].([]any), tool) {
-					t.Fatalf("available operations are missing %s: %v", tool, snapshot["available_operations"])
+				if reason, blocked := snapshot["unavailable_operations"].(map[string]any)[tool.(string)]; blocked {
+					t.Fatalf("%s is unavailable: %v", tool, reason)
 				}
 			}
 			spacingArgs := object{"project_handle": project, "expected_revision": snapshot["revision"], "operation_id": opID("space"), "duration": "1001/15000"}
@@ -464,7 +463,8 @@ func checkClipSpacing(t *testing.T, call func(string, object, string) object, di
 	var current object
 	eventually(t, "indexed source spacing project", func() bool {
 		current = call("project_editor_state_read", object{"project_handle": project}, "")
-		return slices.Contains(current["available_operations"].([]any), "timeline_clips_space")
+		_, blocked := current["unavailable_operations"].(map[string]any)["timeline_clips_space"]
+		return !blocked
 	})
 	spacingArgs := object{"project_handle": project, "expected_revision": current["revision"],
 		"operation_id": "source-spacing-edit", "source_timing": true, "background": "#123456"}
@@ -576,7 +576,8 @@ func checkClearVariableRateSpacing(t *testing.T, call func(string, object, strin
 	var current object
 	eventually(t, "indexed variable rate spacing project", func() bool {
 		current = call("project_editor_state_read", object{"project_handle": project}, "")
-		return slices.Contains(current["available_operations"].([]any), "timeline_clips_space")
+		_, blocked := current["unavailable_operations"].(map[string]any)["timeline_clips_space"]
+		return !blocked
 	})
 	call("timeline_clips_space", object{"project_handle": project, "expected_revision": current["revision"],
 		"operation_id": "vfr-spacing-missing-cadence", "duration": "1/10"}, "invalid_arguments")

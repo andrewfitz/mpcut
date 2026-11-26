@@ -59,7 +59,12 @@ package struct StillReviewFrame: Sendable {
 
     package func image(maximumDimension: Int?, cancelled: @escaping () -> Bool) throws -> CGImage {
         try validateAsset(cancelled: cancelled)
-        let scale = maximumDimension.map { min(1, Double($0) / Double(max(width, height))) } ?? 1
+        // A review can ask for part of the picture. Render enough of the whole for that part to fill the limit.
+        let region = maximumDimension == nil ? nil : JPEGReviewSize.region
+        let part = region ?? CGRect(x: 0, y: 0, width: 1, height: 1)
+        let scale = maximumDimension.map {
+            min(1, Double($0) / max(Double(width) * part.width, Double(height) * part.height))
+        } ?? 1
         let renderWidth = max(1, Int((Double(width) * scale).rounded()))
         let renderHeight = max(1, Int((Double(height) * scale).rounded()))
         let image = try StillImage.render(url, canvas: StillImageCanvas(width: renderWidth, height: renderHeight, displayAspect: displayAspect),
@@ -67,26 +72,37 @@ package struct StillReviewFrame: Sendable {
                                           cancelled: cancelled).sdrImage()
         try checkCancellation(cancelled)
         try validateIdentity()
-        return image
+        guard region != nil else { return image }
+        // A bitmap measures down from its top edge, as the region does.
+        let crop = CGRect(x: (part.minX * Double(image.width)).rounded(), y: (part.minY * Double(image.height)).rounded(),
+                          width: max(1, (part.width * Double(image.width)).rounded()),
+                          height: max(1, (part.height * Double(image.height)).rounded()))
+        guard let cropped = image.cropping(to: crop) else {
+            throw CutError(code: "frame_export_failed", message: "Could not crop the still review picture.")
+        }
+        return cropped
     }
 
     package func jpeg(preset: JPEGPreset, cancelled: @escaping () -> Bool) throws -> (data: Data, width: Int, height: Int) {
-        let image = try image(maximumDimension: preset == .review ? 640 : nil, cancelled: cancelled)
-        let data = NSMutableData()
-        guard let destination = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil) else {
-            throw CutError(code: "frame_export_failed", message: "Could not create a JPEG encoder.")
+        let image = try image(maximumDimension: preset == .review ? JPEGReviewSize.maxEdge : nil, cancelled: cancelled)
+        func make(_ quality: Double) throws -> Data? {
+            let data = NSMutableData()
+            guard let destination = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil) else {
+                throw CutError(code: "frame_export_failed", message: "Could not create a JPEG encoder.")
+            }
+            CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
+            guard CGImageDestinationFinalize(destination) else {
+                throw CutError(code: "frame_export_failed", message: "Could not encode the still review JPEG.")
+            }
+            return data as Data
         }
-        let properties = [kCGImageDestinationLossyCompressionQuality: preset == .review ? 0.62 : 0.95] as CFDictionary
-        CGImageDestinationAddImage(destination, image, properties)
-        guard CGImageDestinationFinalize(destination) else {
-            throw CutError(code: "frame_export_failed", message: "Could not encode the still review JPEG.")
-        }
+        let data = try preset == .review ? JPEGReviewSize.encode(make) : make(0.95) ?? Data()
         try checkCancellation(cancelled)
-        guard preset != .review || data.length <= 1_048_576 else {
-            throw CutError(code: "image_too_large", message: "The review JPEG exceeds 1 MiB.")
+        guard preset != .review || data.count <= JPEGReviewSize.byteLimit else {
+            throw CutError(code: "image_too_large", message: JPEGReviewSize.tooLarge)
         }
         try validateIdentity()
-        return (data as Data, image.width, image.height)
+        return (data, image.width, image.height)
     }
 
     /// The review picture in the requested file format. PNG and TIFF hold the 16-bit sRGB rendition
@@ -94,7 +110,7 @@ package struct StillReviewFrame: Sendable {
     package func encoded(preset: JPEGPreset, format: FrameImageFormat,
                          cancelled: @escaping () -> Bool) throws -> (data: Data, width: Int, height: Int) {
         guard format != .jpeg else { return try jpeg(preset: preset, cancelled: cancelled) }
-        let image = try image(maximumDimension: preset == .review ? 640 : nil, cancelled: cancelled)
+        let image = try image(maximumDimension: preset == .review ? JPEGReviewSize.maxEdge : nil, cancelled: cancelled)
         let data = try format.encode(image)
         try checkCancellation(cancelled)
         try validateIdentity()

@@ -477,3 +477,54 @@ func TestCatalogPreservesSignedTimestampBounds(t *testing.T) {
 		}
 	}
 }
+
+func TestToolSelection(t *testing.T) {
+	chosen, rest, err := parseSelection([]string{"--toolsets", "sequence, review", "--live-only"})
+	if err != nil || len(rest) != 0 || !chosen.liveOnly || !slices.Equal(chosen.groups, []string{"sequence", "review"}) {
+		t.Fatalf("unexpected selection %+v %v %v", chosen, rest, err)
+	}
+	if _, rest, err := parseSelection([]string{"--files-only", "--toolsets", "transcript"}); err != nil || !slices.Equal(rest, []string{"--files-only"}) {
+		t.Fatalf("files-only should remain for the mode switch: %v %v", rest, err)
+	}
+	for _, invalid := range [][]string{{"--toolsets", ","}, {"--live-only", "--files-only"}} {
+		if _, _, err := parseSelection(invalid); err == nil {
+			t.Errorf("accepted %v", invalid)
+		}
+	}
+	for _, tc := range []struct {
+		name, group string
+		filesOnly   bool
+		want        bool
+	}{
+		{"sequence_range_edit", "sequence", false, true},
+		{"project_windows_list", "projects", false, true},
+		{"project_windows_list", "projects", true, false},
+		{"tiles_editor_scan", "tiles", false, false},
+		{"file_job_status_read", "file", false, false},
+		{"review_file_frame_read", "review", false, false},
+	} {
+		if got := chosen.includes(tc.name, tc.group, tc.filesOnly); got != tc.want {
+			t.Errorf("%s in %s: included %v, want %v", tc.name, tc.group, got, tc.want)
+		}
+	}
+	files := toolSelection{groups: []string{"transcript"}}
+	if !files.includes("file_job_status_read", "file", true) || !files.includes("transcript_file_words_read", "transcript", true) ||
+		files.includes("media_file_inspect", "file", true) {
+		t.Error("a files-only selection should keep its group and the job receipts")
+	}
+	if all := (toolSelection{}); !all.includes("tiles_editor_scan", "tiles", false) {
+		t.Error("no selection should advertise the whole catalog")
+	}
+
+	previous := selection
+	t.Cleanup(func() { selection = previous })
+	selection = toolSelection{groups: []string{"no-such-group"}}
+	if _, err := configuredServer("mpcut-mcp", "", false); err == nil || !strings.Contains(err.Error(), "unknown tool group") ||
+		!strings.Contains(err.Error(), "timeline_review") {
+		t.Fatalf("an unknown group should name the valid ones: %v", err)
+	}
+	selection = toolSelection{groups: []string{"sequence", "review"}, liveOnly: true}
+	if _, err := configuredServer("mpcut-mcp", "", false); err != nil {
+		t.Fatal(err)
+	}
+}

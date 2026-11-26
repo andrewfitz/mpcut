@@ -132,6 +132,109 @@ private func transcriptMCPObject<T: Encodable>(_ value: T) throws -> [String: An
     return result
 }
 
+/// Transcript reads answer in compact rows unless the request sets `verbose`. A full word record is about
+/// 2 KB of binding, lane and evidence fields. A compact row keeps what reading and selecting need.
+enum TranscriptMCPCompact {
+    /// Keys a compact word keeps as they are.
+    private static let kept = ["id", "word_id", "text", "speaker_id", "speaker_name", "attachment_id", "source_id", "file"]
+    /// The transcript and recording repeat on every row. A value shared by a whole page is reported once.
+    private static let shared = ["attachment_id", "file", "source_id"]
+
+    private static func isWord(_ value: [String: Any]) -> Bool {
+        value["word_id"] is String && value["range"] is [String: Any] && value["timeline_revision"] != nil
+    }
+
+    private static func isMatch(_ value: [String: Any]) -> Bool {
+        guard let words = value["words"] as? [[String: Any]], let first = words.first else { return false }
+        return isWord(first) && value["before"] is [Any] && value["after"] is [Any]
+    }
+
+    static func word(_ full: [String: Any]) -> [String: Any] {
+        var row = full.filter { kept.contains($0.key) }
+        let range = full["range"] as? [String: Any]
+        row["from"] = range?["from"]
+        row["to"] = range?["to"]
+        // Report a flag only where it departs from an ordinary recognized word.
+        if let original = full["original_text"] as? String, original != full["text"] as? String { row["original_text"] = original }
+        if full["precision"] as? String == "cue" { row["precision"] = "cue" }
+        if full["audibility"] as? String == "inferred" { row["audibility"] = "inferred" }
+        for flag in ["partial", "approximate", "stale_matches"] where full[flag] as? Bool == true { row[flag] = true }
+        return row
+    }
+
+    private static func text(_ words: [[String: Any]]) -> String {
+        words.compactMap { $0["text"] as? String }.joined(separator: " ")
+    }
+
+    /// One row for a run of words, with the four identifiers a selection takes.
+    private static func span(_ words: [[String: Any]]) -> [String: Any] {
+        guard let first = words.first, let last = words.last else { return [:] }
+        var row: [String: Any] = ["text": text(words), "words": words.count]
+        for key in ["speaker_id", "speaker_name", "attachment_id", "source_id", "file"] { row[key] = first[key] }
+        row["from"] = (first["range"] as? [String: Any])?["from"]
+        row["to"] = (last["range"] as? [String: Any])?["to"]
+        row["first_word_id"] = first["word_id"]
+        row["first_occurrence_id"] = first["id"]
+        row["last_word_id"] = last["word_id"]
+        row["last_occurrence_id"] = last["id"]
+        return row
+    }
+
+    /// Compacts every word record in a result, and each phrase match or take to one row with its context as text.
+    static func compact(_ value: Any) -> Any {
+        if let list = value as? [Any] { return list.map(compact) }
+        guard var object = value as? [String: Any] else { return value }
+        if isWord(object) { return word(object) }
+        if isMatch(object), let words = object["words"] as? [[String: Any]] {
+            let before = object["before"] as? [[String: Any]] ?? [], after = object["after"] as? [[String: Any]] ?? []
+            for key in ["words", "before", "after"] { object[key] = nil }
+            var row = object.mapValues(compact)
+            row.merge(span(words)) { _, new in new }
+            if !before.isEmpty { row["before"] = text(before) }
+            if !after.isEmpty { row["after"] = text(after) }
+            return row
+        }
+        return object.mapValues(compact)
+    }
+
+    /// Groups a page of words into dialogue lines: one row per utterance of one speaker in one clip.
+    static func lines(_ words: [[String: Any]]) -> [[String: Any]] {
+        func seconds(_ word: [String: Any], _ edge: String) -> Double? {
+            ((word["range"] as? [String: Any])?[edge] as? String).flatMap { try? RationalTime(parsing: $0).seconds }
+        }
+        func key(_ word: [String: Any]) -> [String?] {
+            ["attachment_id", "speaker_id", "utterance_id", "clip_id", "source_id", "file"].map { word[$0] as? String }
+                + [(word["assembly_index"] as? Int).map(String.init)]
+        }
+        var rows: [[String: Any]] = [], run: [[String: Any]] = []
+        for word in words {
+            if let last = run.last {
+                let pause = (seconds(word, "from") ?? 0) - (seconds(last, "to") ?? 0)
+                if key(last) != key(word) || pause > 2 || run.count >= 80 {
+                    rows.append(span(run))
+                    run = []
+                }
+            }
+            run.append(word)
+        }
+        if !run.isEmpty { rows.append(span(run)) }
+        return rows
+    }
+
+    /// Moves a recording identity that every row repeats to one top-level `shared` object.
+    static func hoist(_ page: inout [String: Any]) {
+        guard let rows = page["items"] as? [[String: Any]], rows.count > 1 else { return }
+        var common: [String: Any] = [:]
+        for key in shared {
+            guard let value = rows[0][key] as? String, rows.allSatisfy({ $0[key] as? String == value }) else { continue }
+            common[key] = value
+        }
+        guard !common.isEmpty else { return }
+        page["shared"] = common
+        page["items"] = rows.map { row in row.filter { common[$0.key] == nil } }
+    }
+}
+
 private func prepareTranscriptMCP<Value: Sendable>(_ work: @escaping @Sendable () throws -> Value) async throws -> Value {
     let task = Task.detached(priority: .userInitiated) {
         try Task.checkCancellation()
@@ -546,14 +649,17 @@ extension ProjectSessions {
         let cache = controller.mcpProjectIndexCache
         let index = try await prepareTranscriptMCP { cache.index(for: indexes, space: space) }
         let page: [String: Any]
+        var projected = false
         switch a.action {
         case "read":
             if let id = a.fields["occurrence_id"] as? String {
                 page = try a.page(index.occurrence(id: id, filter: a.filter).map { [$0] } ?? [])
             } else {
+                // Project before measuring, so a compact page holds as many words as were asked for.
                 page = try a.boundedPage { limit in
-                    try transcriptMCPObject(index.read(filter: a.filter, offset: a.offset, limit: limit))
+                    try Self.transcriptRows(transcriptMCPObject(index.read(filter: a.filter, offset: a.offset, limit: limit)), arguments: a)
                 }
+                projected = true
             }
         case "search":
             guard a.fields["occurrence_id"] == nil else {
@@ -561,8 +667,9 @@ extension ProjectSessions {
             }
             let query = try a.string("query")
             page = try a.boundedPage { limit in
-                try transcriptMCPObject(index.search(query, filter: a.filter, offset: a.offset, limit: limit))
+                try Self.transcriptRows(transcriptMCPObject(index.search(query, filter: a.filter, offset: a.offset, limit: limit)), arguments: a)
             }
+            projected = true
         case "locate":
             if let id = a.fields["occurrence_id"] as? String {
                 let occurrence = index.occurrence(id: id, filter: a.filter)
@@ -592,7 +699,8 @@ extension ProjectSessions {
             }
             try validateRead()
             try controller.seek(occurrence, space: a.space, attachmentID: attachment?.id)
-            result["occurrence"] = try transcriptMCPJSON(occurrence)
+            let located = try transcriptMCPJSON(occurrence)
+            result["occurrence"] = a.fields["verbose"] as? Bool == true ? located : TranscriptMCPCompact.compact(located)
             return result
         case "compare", "align-script", "script-candidates", "script-qualifiers", "suggest":
             page = try await mcpTranscriptEditorial(a, index: index)
@@ -600,8 +708,26 @@ extension ProjectSessions {
             throw MCPCommandError("invalid_arguments", "Unknown transcript read action.")
         }
         try validateRead()
-        result.merge(page, uniquingKeysWith: { old, _ in old })
+        result.merge(projected ? page : try Self.transcriptRows(page, arguments: a), uniquingKeysWith: { old, _ in old })
         return result
+    }
+
+    /// Full word records on request; otherwise compact rows, or dialogue lines for a page of words.
+    private static func transcriptRows(_ page: [String: Any], arguments a: MCPTranscriptArguments) throws -> [String: Any] {
+        let verbose = a.fields["verbose"] as? Bool ?? false, lines = a.fields["lines"] as? Bool ?? false
+        guard !lines || (a.action == "read" && !verbose) else {
+            throw MCPCommandError("invalid_arguments", "lines groups a compact words read. Omit verbose, and use it with transcript_editor_words_read.")
+        }
+        guard !verbose else { return page }
+        var compact = page
+        if lines, let words = page["items"] as? [[String: Any]] {
+            compact["items"] = TranscriptMCPCompact.lines(words)
+            compact["words"] = words.count
+        } else {
+            compact = TranscriptMCPCompact.compact(page) as? [String: Any] ?? page
+        }
+        TranscriptMCPCompact.hoist(&compact)
+        return compact
     }
 
     private func mcpTranscriptEditorial(_ a: MCPTranscriptArguments, index: TranscriptProjectIndex) async throws -> [String: Any] {

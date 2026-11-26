@@ -73,7 +73,7 @@ def run(products, folder):
         assert str(draft) in [item["draft_path"] for item in drafts], drafts
         handle = live.call("project_draft_recover", draft_path=str(draft), operation_id=operation())["project_handle"]
         assert_word(live.call("transcript_editor_occurrences_locate", project_handle=handle,
-                              space="source", word_id=word["i"]))
+                              space="source", word_id=word["i"], verbose=True))
         mutate(live, handle, "silence_editor_threshold_set", silence_threshold_db=-37.5)
         assert current_threshold(live, handle) == -37.5
         autosaved = json.loads(draft.read_bytes())
@@ -97,7 +97,7 @@ def run(products, folder):
         mutate(live, handle, "history_redo")
         assert current_threshold(live, handle) == -37.5
         assert_word(live.call("transcript_editor_occurrences_locate", project_handle=handle,
-                              space="source", word_id=word["i"]))
+                              space="source", word_id=word["i"], verbose=True))
         mutate(live, handle, "project_save")
         assert saved.stat().st_size > minimum
         print(f"Reopened and saved {saved.stat().st_size:,} bytes, including restored history", flush=True)

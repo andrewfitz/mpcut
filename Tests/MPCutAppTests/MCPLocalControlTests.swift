@@ -77,6 +77,18 @@ final class MCPLocalControlTests: XCTestCase {
         XCTAssertThrowsError(try schemas.validate(tool: "review_editor_frame_read", arguments: ["project_handle": "a", "space": "sequence"]))
         XCTAssertThrowsError(try schemas.validate(tool: "review_editor_frame_read", arguments: ["project_handle": "a", "time": "0"]))
         XCTAssertNoThrow(try schemas.validate(tool: "review_editor_frame_read", arguments: ["project_handle": "a", "space": "sequence", "time": "0"]))
+        let frame: [String: Any] = ["project_handle": "a"]
+        for accepted: [String: Any] in [["space": "sequence", "times": ["0", "1"]], ["space": "source", "time": "19:01", "source_id": "s"],
+                                        ["space": "source", "times": ["0"], "file": "/m.mov", "max_edge": 1280], ["max_edge": 160],
+                                        ["region": ["x": 0.5, "y": 0, "width": 0.5, "height": 1]]] {
+            XCTAssertNoThrow(try schemas.validate(tool: "review_editor_frame_read", arguments: frame.merging(accepted) { _, new in new }), "\(accepted)")
+        }
+        for rejected: [String: Any] in [["times": ["0"]], ["space": "sequence", "time": "0", "times": ["0"]], ["space": "sequence", "times": [String]()],
+                                        ["space": "sequence", "time": "0", "source_id": "s"], ["space": "group", "time": "0", "file": "/m.mov"],
+                                        ["file": "/m.mov"], ["max_edge": 100], ["max_edge": 4000],
+                                        ["region": ["x": 0.5, "y": 0, "width": 0.5]], ["region": ["x": 2, "y": 0, "width": 0.5, "height": 1]]] {
+            XCTAssertThrowsError(try schemas.validate(tool: "review_editor_frame_read", arguments: frame.merging(rejected) { _, new in new }), "\(rejected)")
+        }
         let output: [String: Any] = ["project_handle": "a", "expected_revision": 0, "operation_id": "frame-export", "output": "/tmp/review"]
         XCTAssertThrowsError(try schemas.validate(tool: "review_editor_frames_export",
                                                    arguments: output.merging(["selection": "times"]) { _, new in new }))
