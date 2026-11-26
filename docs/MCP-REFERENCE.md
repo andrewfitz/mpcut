@@ -9943,7 +9943,7 @@ Returns the native history action, whether the edit changed the timeline and the
 
 ### `transcript_editor_edit_plan`
 
-Review a transcript edit and retain its exact boundaries for apply or queue. A top-level attachment_id or result_id scopes its selections. To plan across attachments, address each selection by attachment or occurrence IDs.
+Review a transcript edit and retain its exact boundaries for apply or queue. A top-level attachment_id or result_id scopes its selections. To plan across attachments, address each selection by attachment or occurrence IDs. Affected speech is compact unless verbose is set.
 
 Returns the plan ID, resolved boundaries, selections, durations, affected speech and any tier assessment.
 
@@ -9955,6 +9955,7 @@ Returns the plan ID, resolved boundaries, selections, durations, affected speech
 | `result_id` | required | string, minimum length `1`, maximum length `64` | Result identity returned by the attachment or prior transcript page. |
 | `operation_id` | required | string, minimum length `1`, maximum length `128` | Replay key. Reuse it only with identical arguments. |
 | `edit` | required | object |  |
+| `verbose` | optional | boolean | Return full affected speech word records instead of compact rows. |
 | `edit.action` | required | `split` / `trim_start` / `trim_end` / `delete` / `tighten` / `assemble` / `insert` / `replace` / `switch_angle` / `queue` |  |
 | `edit.selections` | required | array of object, minimum items `1`, maximum items `64` |  |
 | `edit.selections[].first_word_id` | required | string, minimum length `1`, maximum length `512` |  |

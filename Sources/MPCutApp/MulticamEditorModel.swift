@@ -2219,6 +2219,9 @@ final class MulticamEditorModel: ObservableObject {
         let result: RationalTime?
         if time == original {
             result = original
+        } else if analysis.snapTarget == .playhead {
+            let playhead = currentGroupTime()
+            result = range.contains(playhead) ? playhead : nil
         } else if analysis.snapTarget == .keyframes {
             result = nearestAssemblyCopyEdge(target, edge: edge, range: range, project: project,
                                              angle: assemblyItems[index].angleOverride)

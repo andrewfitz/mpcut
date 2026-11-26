@@ -560,6 +560,7 @@ private final class TranscriptFlowLine: NSView, NSViewToolTipOwner {
     @objc private func markOutAtSentence() { if let word = contextOccurrence { owner?.contextMarkOut?(word) } }
     private var contextOccurrence: TranscriptOccurrence? {
         guard let contextWord, let layoutResult else { return nil }
+        guard layoutResult.source.words.indices.contains(contextWord) else { return nil }
         return layoutResult.source.words[contextWord]
     }
     @objc private func inspectWord() {

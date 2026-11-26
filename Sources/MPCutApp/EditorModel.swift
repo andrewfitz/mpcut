@@ -3043,7 +3043,7 @@ final class EditorModel: ObservableObject {
         case .off: candidates = media.hasVideo ? segment.source.frames :
             [media.audioEditBoundary(near: target)]
         case .playhead:
-            guard let boundary = try? RationalTime(parsing: target.description) else { return }
+            guard let boundary = timelineRationalTime(target) else { return }
             candidates = [boundary]
         case .keyframes: candidates = copyBoundaries(for: segment.source)?.splitPoints ?? []
         case .scenes, .silence:
@@ -3156,7 +3156,7 @@ final class EditorModel: ObservableObject {
     private func playheadBoundary(in segment: EditorSegment, offset: RationalTime, edge: TimelineEdge) -> RationalTime? {
         let position = playhead - offset.seconds
         guard position >= 0, position <= segment.duration.seconds else { return nil }
-        guard let elapsed = try? RationalTime(parsing: position.description),
+        guard let elapsed = timelineRationalTime(position),
               let local = try? segment.start.adding(elapsed) else { return nil }
         switch edge {
         case .start where local <= segment.start: return nil

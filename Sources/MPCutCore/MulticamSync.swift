@@ -278,10 +278,16 @@ public enum MulticamSync {
                     if measuredEnds { drift = change }
                 }
             }
+            let alreadyAligned: Bool
+            if let match = matches.first {
+                alreadyAligned = match.offset == currentOffset
+            } else {
+                alreadyAligned = metadataOffset == currentOffset
+            }
             return Suggestion(sourceID: source.id, currentOffset: currentOffset, stamp: targetStamp,
                               metadataOffset: metadataOffset, metadataIssue: stampIssue, audioStream: targetStream,
                               waveformOffset: matches.first?.offset, waveformIssue: waveIssue, matches: matches, drift: drift,
-                              alreadyAligned: metadataOffset == currentOffset || matches.first?.offset == currentOffset)
+                              alreadyAligned: alreadyAligned)
         }
         try checkCancellation()
         return Report(referenceSourceID: reference.id, referenceStamp: referenceStamp,

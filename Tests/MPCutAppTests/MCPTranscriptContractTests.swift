@@ -155,6 +155,16 @@ final class MCPTranscriptContractTests: XCTestCase {
                                                    arguments: ["project_handle": "test", "occurrence_id": "occurrence"]))
     }
 
+    func testSelectionMarkAcceptsSentenceExpansion() throws {
+        let schemas = try MCPSchemas.loaded.get()
+        let selection: [String: Any] = ["first_word_id": "word-0", "space": "current_cut"]
+        XCTAssertNoThrow(try schemas.validate(tool: "transcript_editor_selection_mark", arguments: [
+            "project_handle": "test", "expected_revision": 1, "expected_transcript_revision": 1,
+            "result_id": String(repeating: "a", count: 64), "operation_id": "mark-sentence",
+            "selection": selection, "expansion": "sentence"
+        ]))
+    }
+
     func testLaneReadoutPreservesSpeakerFieldsAndAddsMetadata() throws {
         let speaker = TranscriptSpeaker(id: "guest", name: "Guest")
         let first = TranscriptLaneMetadata(id: "boom", order: 0, label: "Boom", colorSlot: 2)

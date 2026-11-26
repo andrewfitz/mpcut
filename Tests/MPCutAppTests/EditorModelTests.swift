@@ -882,6 +882,22 @@ final class EditorModelTests: XCTestCase {
     }
 
     @MainActor
+    func testPlayheadSnapTrimsToTheVisiblePlayhead() async throws {
+        let file = try XCTUnwrap(Bundle.module.url(forResource: "SmartTrim-GOP", withExtension: "mp4",
+                                                   subdirectory: "Fixtures"))
+        let model = EditorModel()
+        defer { model.endSession() }
+        model.importFiles([file])
+        try await waitForEdit(model)
+        let id = try XCTUnwrap(model.selectedID)
+        model.seek(0.6)
+        model.snapTarget = .playhead
+        XCTAssertEqual(try XCTUnwrap(model.trim(id, edge: .start, sourceTime: 0.2, commit: false)), 0.6, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(model.trim(id, edge: .start, sourceTime: 0.2, commit: true)), 0.6, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(model.timelineClips.first?.sourceStart), 0.6, accuracy: 1e-9)
+    }
+
+    @MainActor
     func testVariableFrameRateUsesPresentationBoundariesForBothHandlesAndMarks() async throws {
         let source = try XCTUnwrap(Bundle.module.url(forResource: "VFR-PTS", withExtension: "mp4",
                                                      subdirectory: "Fixtures"))

@@ -108,7 +108,7 @@ struct SnapTargetPicker: View {
     var body: some View {
         Picker("Snap to", selection: $selection) {
             ForEach(TimelineSnapTarget.allCases, id: \.self) { target in
-                if !audioOnly || target == .off || target == .silence { Text(target.label).tag(target) }
+                if !audioOnly || target == .off || target == .playhead || target == .silence { Text(target.label).tag(target) }
             }
         }
         .help("Choose edit snapping targets")
@@ -124,7 +124,7 @@ struct SnapTargetMenu: View {
         Menu {
             Picker("Snap to", selection: $selection) {
                 ForEach(TimelineSnapTarget.allCases, id: \.self) { target in
-                    if !audioOnly || target == .off || target == .silence { Text(target.label).tag(target) }
+                    if !audioOnly || target == .off || target == .playhead || target == .silence { Text(target.label).tag(target) }
                 }
             }
             .pickerStyle(.inline)

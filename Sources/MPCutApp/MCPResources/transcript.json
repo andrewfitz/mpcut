@@ -4698,7 +4698,7 @@
   },
   {
     "name": "transcript_editor_edit_plan",
-    "description": "Review a transcript edit and retain its exact boundaries for apply or queue. A top-level attachment_id or result_id scopes its selections. To plan across attachments, address each selection by attachment or occurrence IDs.",
+    "description": "Review a transcript edit and retain its exact boundaries for apply or queue. A top-level attachment_id or result_id scopes its selections. To plan across attachments, address each selection by attachment or occurrence IDs. Affected speech is compact unless verbose is set.",
     "annotations": {
       "readOnlyHint": false,
       "openWorldHint": false
@@ -5078,6 +5078,10 @@
           "minLength": 1,
           "maxLength": 512,
           "description": "Attachment from transcript_editor_attachments_list. Required when several transcripts are attached, unless each selection carries attachment_id or an occurrence ID."
+        },
+        "verbose": {
+          "type": "boolean",
+          "description": "Return full affected speech word records instead of compact rows."
         }
       },
       "required": [
