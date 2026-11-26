@@ -158,6 +158,7 @@ python3 Tests/Integration/audit3_damage.py dist/MPCut.app/Contents/Helpers/mpcut
 python3 Tests/Integration/csv_edits.py dist/MPCut.app/Contents/Helpers/mpcut
 python3 Tests/Integration/list_file_audit.py dist/MPCut.app/Contents/Helpers/mpcut
 python3 Tests/Integration/project_convert.py dist/MPCut.app/Contents/Helpers/mpcut
+python3 Tests/Integration/project_merge.py dist/MPCut.app/Contents/Helpers/mpcut
 python3 Tests/Integration/mixed_timeline.py dist/MPCut.app/Contents/Helpers/mpcut
 python3 Tests/Integration/resolve_export.py --cli dist/MPCut.app/Contents/Helpers/mpcut
 python3 Tests/Integration/resolve_native.py --cli dist/MPCut.app/Contents/Helpers/mpcut

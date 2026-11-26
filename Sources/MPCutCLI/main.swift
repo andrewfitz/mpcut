@@ -2495,7 +2495,9 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
         let mergedLines = output.fileHandleForReading.readDataToEndOfFile()
         merge.waitUntilExit()
         try interruption.beginResponse(checkCancellation: false)
-        guard merge.terminationReason == .exit, (0...127).contains(merge.terminationStatus) else {
+        // A conflict always prints the marked text. A status with no text is Git not running at all, which env reports as 126 or 127.
+        guard merge.terminationReason == .exit, (0...127).contains(merge.terminationStatus),
+              merge.terminationStatus == 0 || !mergedLines.isEmpty else {
             throw CLIError("merge_failed", "git merge-file could not merge \(ours).")
         }
         let merged = try sides.restoringAssets(in: mergedLines)
@@ -3125,6 +3127,9 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
 private func exitStatus(_ code: String, operation: Bool) -> Int32 {
     if code == "cancelled" { return 130 }
     if ["invalid_time", "invalid_arguments", "empty_edit"].contains(code) { return 2 }
+    // Git reads a merge driver's status: 1 to 128 is a conflict left in OURS to resolve, and above 128 is a merge that failed.
+    if ["merge_conflict", "merge_invalid"].contains(code) { return 1 }
+    if code == "merge_failed" { return 255 }
     return operation ? 1 : 2
 }
 
