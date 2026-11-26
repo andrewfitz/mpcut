@@ -66,8 +66,8 @@ public final class ResolveExport {
         if !committed, let audioDirectory { try? FileManager.default.removeItem(at: audioDirectory) }
     }
 
-    public static func validateTimelineHandoff(_ project: CutProject) throws {
-        _ = try ProjectConverter.prepareForInterchange(project, for: "DaVinci Resolve timeline handoff", allowLoss: false)
+    public static func validateTimelineHandoff(_ project: CutProject, allowLoss: Bool = false) throws {
+        _ = try ProjectConverter.prepareForInterchange(project, for: "DaVinci Resolve timeline handoff", allowLoss: allowLoss)
     }
 
     /// Each `write` returns what the timeline could not keep exactly, such as a cut rounded to the frame grid.
@@ -75,15 +75,17 @@ public final class ResolveExport {
     public static func write(_ project: CutProject, relativeTo location: URL, to output: URL,
                              useSidecar: Bool = true, matching imported: [MediaInfo] = [],
                              matchingMulticam indexed: [String: MediaInfo] = [:],
+                             allowLoss: Bool = false,
                              auxiliaryOutput: ((URL) -> Void)? = nil,
                              cancelled: (@Sendable () -> Bool)? = nil) throws -> [String] {
         try ProjectConverter.checkCancellation(cancelled ?? { false })
         switch project {
         case .multicam(let group):
             return try write(group, relativeTo: location, to: output, useSidecar: useSidecar, matching: indexed,
+                             allowLoss: allowLoss,
                              auxiliaryOutput: auxiliaryOutput, cancelled: cancelled)
         case .sequence, .stillSequence:
-            try validateTimelineHandoff(project)
+            try validateTimelineHandoff(project, allowLoss: allowLoss)
             let clips = project.sequenceClips ?? []
             let sequence = CutProject.sequence(clips)
             try InterchangeMediaPreflight.require(clips.map(\.file), relativeTo: location)
@@ -93,18 +95,21 @@ public final class ResolveExport {
             let note = "The Resolve timeline links each playable source with its replacement audio. It omits MPCut’s original "
                 + "recording references, replacement track names and preview-track choices."
             return try (replaced ? [note] : []) + write(sequence.requests(relativeTo: location), to: output, useSidecar: useSidecar,
-                                                        matching: imported, auxiliaryOutput: auxiliaryOutput, cancelled: cancelled)
+                                                        matching: imported, allowLoss: allowLoss,
+                                                        auxiliaryOutput: auxiliaryOutput, cancelled: cancelled)
         }
     }
 
     @discardableResult
     public static func write(_ project: MulticamProject, relativeTo location: URL, to output: URL,
                              useSidecar: Bool = true, matching imported: [String: MediaInfo] = [:],
+                             allowLoss: Bool = false,
                              auxiliaryOutput: ((URL) -> Void)? = nil,
                              cancelled: (@Sendable () -> Bool)? = nil) throws -> [String] {
         try ProjectConverter.checkCancellation(cancelled ?? { false })
-        try validateTimelineHandoff(.multicam(project))
+        try validateTimelineHandoff(.multicam(project), allowLoss: allowLoss)
         let writer = try ResolveExport(output, useSidecar: useSidecar, cancelled: cancelled)
+        writer.allowLoss = allowLoss
         try InterchangeMediaPreflight.require(project.sources.map(\.file), relativeTo: location)
         try writer.multicam(project, location: location, imported: imported)
         if let audio = writer.audioDirectory { auxiliaryOutput?(audio) }
@@ -113,10 +118,12 @@ public final class ResolveExport {
 
     @discardableResult
     public static func write(_ clips: [ClipRequest], to output: URL, useSidecar: Bool = true, matching imported: [MediaInfo] = [],
+                             allowLoss: Bool = false,
                              auxiliaryOutput: ((URL) -> Void)? = nil,
                              cancelled: (@Sendable () -> Bool)? = nil) throws -> [String] {
         try ProjectConverter.checkCancellation(cancelled ?? { false })
         let writer = try ResolveExport(output, useSidecar: useSidecar, cancelled: cancelled)
+        writer.allowLoss = allowLoss
         try InterchangeMediaPreflight.require(clips.map(\.file))
         let dependencies = Set(clips.map { $0.file.standardizedFileURL })
         try writer.remember(imported.filter { dependencies.contains($0.url.standardizedFileURL) })

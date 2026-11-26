@@ -488,7 +488,7 @@ final class MCPFileJobTests: XCTestCase {
         XCTAssertEqual(capabilities["standalone_fixed_grid"], true)
         XCTAssertEqual(capabilities["auto_backend"], true)
         XCTAssertEqual(capabilities["cpu_only_backend"], true)
-        XCTAssertEqual(capabilities["tile_trail"], ParticipantAnalysis.isAvailable)
+        XCTAssertEqual(capabilities["participant_analysis"], ParticipantAnalysis.isAvailable)
         XCTAssertEqual(capabilities["auto_feed_layout"], ParticipantAnalysis.supportsFeedLayouts)
         XCTAssertEqual(capabilities["gallery_grid"], ParticipantAnalysis.supportsGalleryHint)
         XCTAssertEqual(capabilities["adaptive_sampling"], ParticipantAnalysis.supportsAdaptiveSampling)

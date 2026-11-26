@@ -290,7 +290,7 @@
         },
         "value": {
           "type": "string",
-          "description": "Snap target off, keyframes, scenes, or silence, or a copy container extension supported by this sequence. Snap to is a shared setting: with Settings → Automation → Let agents change settings off, snap is refused with settings_write_disabled."
+          "description": "Snap target off, playhead, keyframes, scenes, or silence, or a copy container extension supported by this sequence. Snap to is a shared setting: with Settings → Automation → Let agents change settings off, snap is refused with settings_write_disabled."
         },
         "slot": {
           "type": "integer",
@@ -580,7 +580,7 @@
         },
         "value": {
           "type": "string",
-          "description": "Snap target off, keyframes, scenes, or silence, or a copy container extension supported by this sequence. Snap to is a shared setting: with Settings → Automation → Let agents change settings off, snap is refused with settings_write_disabled."
+          "description": "Snap target off, playhead, keyframes, scenes, or silence, or a copy container extension supported by this sequence. Snap to is a shared setting: with Settings → Automation → Let agents change settings off, snap is refused with settings_write_disabled."
         }
       },
       "required": [

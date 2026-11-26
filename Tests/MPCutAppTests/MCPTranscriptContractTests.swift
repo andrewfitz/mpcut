@@ -87,6 +87,13 @@ final class MCPTranscriptContractTests: XCTestCase {
         XCTAssertEqual(lines[1]["first_occurrence_id"] as? String, full[80]["id"] as? String)
         XCTAssertEqual(lines[1]["last_occurrence_id"] as? String, full[99]["id"] as? String)
         XCTAssertEqual((lines[1]["text"] as? String)?.split(separator: " ").count, 20)
+        let spaced: [[String: Any]] = [
+            ["text": "  hello  ", "range": ["from": "0", "to": "1"],
+             "speaker_id": "speaker", "attachment_id": "word"],
+            ["text": "\tworld\n", "range": ["from": "1", "to": "2"],
+             "speaker_id": "speaker", "attachment_id": "word"]
+        ]
+        XCTAssertEqual(TranscriptRows.lines(spaced).first?["text"] as? String, "hello world")
         XCTAssertEqual(lines[0]["attachment_id"] as? String, "word")
         XCTAssertLessThan(try size(lines) * 30, try size(full))
         // A page reports its one transcript once, and a line never joins two transcripts.

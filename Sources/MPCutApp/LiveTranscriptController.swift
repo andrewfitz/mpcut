@@ -286,8 +286,11 @@ final class LiveTranscriptController: ObservableObject {
     }
 
     @discardableResult
-    func mark(_ selection: TranscriptWordSelection, attachmentID: String? = nil) throws -> TranscriptResolvedSelection {
-        let result = try select(selection, attachmentID: attachmentID)
+    func mark(_ selection: TranscriptWordSelection, attachmentID: String? = nil,
+              expansion: TranscriptSelectionExpansion? = nil) throws -> TranscriptResolvedSelection {
+        let owner = try selection.attachmentOwner(in: state.attachments.map(\.id)) ?? attachmentID
+        let result = try TranscriptEditPlanner.select(selection, expansion: expansion,
+                                                       in: index(attachmentID: owner, clocks: [selection.space]))
         if session.isMulticam {
             guard !session.multicam.isBusy else { throw busyEditor() }
             switch result.space {

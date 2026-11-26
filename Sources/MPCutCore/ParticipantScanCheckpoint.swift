@@ -241,7 +241,7 @@ final class ParticipantScanChunks {
     }
 
     private static var invalid: CutError {
-        CutError(code: "participant_result_invalid", message: "TileTrail returned an invalid result chunk.")
+        CutError(code: "participant_result_invalid", message: "Participant analysis returned an invalid result chunk.")
     }
 }
 #endif

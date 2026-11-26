@@ -31,7 +31,10 @@ package enum TranscriptRows {
     }
 
     private static func text(_ words: [[String: Any]]) -> String {
-        words.compactMap { $0["text"] as? String }.joined(separator: " ")
+        words.compactMap { $0["text"] as? String }
+            .joined(separator: " ")
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
     }
 
     /// One row for a run of words, with the four identifiers a selection takes.

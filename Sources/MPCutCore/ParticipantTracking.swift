@@ -541,7 +541,7 @@ public struct ParticipantSourceTime: Codable, Equatable, Sendable {
             // their timestamps already relative to the recording origin.
             let timestamp = try RawTimestamp(from: decoder)
             guard timestamp.timeBase.numerator > 0 else {
-                throw CutError(code: "participant_result_invalid", message: "TileTrail returned an invalid time base.")
+                throw CutError(code: "participant_result_invalid", message: "Participant analysis returned an invalid time base.")
             }
             wrappedValue = try RationalTime(numerator: timestamp.pts).multiplied(by: timestamp.timeBase)
                 .subtracting(origin ?? .zero)

@@ -601,7 +601,7 @@ final class MulticamAnalysisStore: ObservableObject {
         switch target {
         case .scenes: automaticSceneScans.removeAll()
         case .silence: automaticPauseScans.removeAll()
-        case .off, .keyframes: break
+        case .off, .playhead, .keyframes: break
         }
     }
 
@@ -1022,7 +1022,7 @@ final class MulticamAnalysisStore: ObservableObject {
         switch target {
         case .off: return activeSilenceTracks.subtracting(visibleOnlyWaveforms).map(Job.waveform)
         case .silence: return scannedSilenceTracks.map(Job.silence)
-        case .scenes, .keyframes: return []
+        case .playhead, .scenes, .keyframes: return []
         }
     }
 
@@ -1218,6 +1218,7 @@ extension MulticamAnalysisStore {
         case .off: return []
         case .silence: return routedSilenceMarkers
         case .scenes: return mergedSceneTimes(routedSceneMarkers, routedTileSceneMarkers)
+        case .playhead: return []
         case .keyframes: return routedKeyframeMarkers
         }
     }

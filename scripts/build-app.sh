@@ -40,16 +40,18 @@ if [[ -n "$output_dir" && -d "$output_dir" ]]; then
     done
 fi
 
-if [[ -n "${MPCUT_TILETRAIL_PREFIX:-}" ]]; then
-    MPCUT_TILETRAIL_PREFIX=$(cd "$MPCUT_TILETRAIL_PREFIX" && pwd)
-    export MPCUT_TILETRAIL_PREFIX
-    for file in include/tiletrail.h lib/libtiletrail.a LICENSE; do
-        if [[ ! -f "$MPCUT_TILETRAIL_PREFIX/$file" ]]; then
-            echo "TileTrail artifact is missing $file." >&2
-            exit 1
-        fi
-    done
+if [[ -z "${MPCUT_TILETRAIL_PREFIX:-}" ]]; then
+    echo "MPCUT_TILETRAIL_PREFIX is required to build MPCut." >&2
+    exit 1
 fi
+MPCUT_TILETRAIL_PREFIX=$(cd "$MPCUT_TILETRAIL_PREFIX" && pwd)
+export MPCUT_TILETRAIL_PREFIX
+for file in include/tiletrail.h lib/libtiletrail.a LICENSE; do
+    if [[ ! -f "$MPCUT_TILETRAIL_PREFIX/$file" ]]; then
+        echo "The participant-analysis artifact is missing $file." >&2
+        exit 1
+    fi
+done
 
 "$root/scripts/build-ffmpeg.sh"
 ffmpeg="$root/.build/mpcut-ffmpeg"
@@ -85,9 +87,7 @@ fi
 install -m 755 "$ffmpeg/install/bin/ffmpeg" "$contents/Helpers/ffmpeg"
 install -m 644 "$root/packaging/Info.plist" "$contents/Info.plist"
 install -m 644 "$root/packaging/Credits.html" "$contents/Resources/Credits.html"
-if [[ -n "${MPCUT_TILETRAIL_PREFIX:-}" ]]; then
-    install -m 644 "$MPCUT_TILETRAIL_PREFIX/LICENSE" "$contents/Resources/TileTrail-LICENSE.txt"
-fi
+install -m 644 "$MPCUT_TILETRAIL_PREFIX/LICENSE" "$contents/Resources/TileTrail-LICENSE.txt"
 (cd "$root/packaging/premiere" && /usr/bin/zip -q -X "$contents/Resources/MPCut Premiere.ccx" manifest.json index.html index.js)
 manual="$contents/Resources/Documentation"
 mkdir -p "$manual/packaging"

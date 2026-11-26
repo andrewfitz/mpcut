@@ -2952,6 +2952,8 @@ final class EditorModel: ObservableObject {
         let boundary: RationalTime?
         switch effectiveSnapTarget {
         case .off: return time
+        case .playhead:
+            return time
         case .keyframes:
             if time == offset.seconds { return time }
             boundary = nearest(in: clip.source.keyframes, to: local, after: clip.start,
@@ -3040,6 +3042,9 @@ final class EditorModel: ObservableObject {
         switch targetMode {
         case .off: candidates = media.hasVideo ? segment.source.frames :
             [media.audioEditBoundary(near: target)]
+        case .playhead:
+            guard let boundary = try? RationalTime(parsing: target.description) else { return }
+            candidates = [boundary]
         case .keyframes: candidates = copyBoundaries(for: segment.source)?.splitPoints ?? []
         case .scenes, .silence:
             guard let boundary = analysisBoundary(in: segment, to: target, after: segment.start, before: segment.end) else {
@@ -3142,6 +3147,21 @@ final class EditorModel: ObservableObject {
             }
         } else {
             finish(perform(CutEngine()))
+        }
+    }
+
+    /// Resolves the sequence playhead to the active clip's source clock. A playhead
+    /// snap only applies while the playhead is inside the occurrence and on the
+    /// requested side of its existing boundary.
+    private func playheadBoundary(in segment: EditorSegment, offset: RationalTime, edge: TimelineEdge) -> RationalTime? {
+        let position = playhead - offset.seconds
+        guard position >= 0, position <= segment.duration.seconds else { return nil }
+        guard let elapsed = try? RationalTime(parsing: position.description),
+              let local = try? segment.start.adding(elapsed) else { return nil }
+        switch edge {
+        case .start where local <= segment.start: return nil
+        case .end where local >= segment.end: return nil
+        default: return local
         }
     }
 
@@ -3299,6 +3319,11 @@ final class EditorModel: ObservableObject {
                 if commit { cancelTrim(); showAnalysisBoundaryError(segment, title: "Can’t Trim Clip") }
                 return nil
             }
+        } else if snap == .playhead {
+            guard let playheadBoundary = playheadBoundary(in: segment, offset: offset, edge: edge) else {
+                return nil
+            }
+            cut = playheadBoundary
         } else {
             guard let frame = editBoundary(in: segment.source, to: sourceTime, after: minimum, before: maximum) else {
                 return nil
@@ -5118,6 +5143,7 @@ final class EditorModel: ObservableObject {
             if edge == .end ? pointerLower : pointerUpper { return target }
             switch effectiveSnapTarget {
             case .off: return target
+            case .playhead: return target
             case .scenes, .silence:
                 if let cut = analysisBoundary(in: segment, to: target.seconds, after: segment.start, before: segment.end) {
                     return cut
@@ -6095,6 +6121,8 @@ final class EditorModel: ObservableObject {
         let boundary: RationalTime
         switch (pointer ?? usesPointerPosition) ? .off : effectiveSnapTarget {
         case .off:
+            boundary = editBoundary(in: segment.source, to: target) ?? segment.start
+        case .playhead:
             boundary = editBoundary(in: segment.source, to: target) ?? segment.start
         case .keyframes:
             let keys = segment.source.keyframes
@@ -8112,7 +8140,7 @@ extension EditorModel {
                         let target = time.seconds
                         let snapped: RationalTime?
                         switch self.effectiveSnapTarget {
-                        case .off: snapped = self.editBoundary(in: clip.source, to: target)
+                        case .off, .playhead: snapped = self.editBoundary(in: clip.source, to: target)
                         case .keyframes: snapped = self.nearest(in: clip.source.keyframes, to: target)
                         case .scenes, .silence: snapped = self.analysisBoundary(in: clip, to: target)
                         }

@@ -4672,6 +4672,17 @@
           "minLength": 1,
           "maxLength": 512,
           "description": "Attachment from transcript_editor_attachments_list. Required when several transcripts are attached, unless each selection carries attachment_id or an occurrence ID."
+        },
+        "expansion": {
+          "type": "string",
+          "enum": [
+            "earlier",
+            "later",
+            "sentence",
+            "speaker_turn",
+            "preceding_question"
+          ],
+          "description": "Expand the selection before setting native timeline marks."
         }
       },
       "required": [

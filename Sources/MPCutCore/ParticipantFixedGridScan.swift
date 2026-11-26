@@ -7,7 +7,7 @@ extension ParticipantAnalysis {
         if cancelled() { throw CancellationError() }
         guard options.backend != .gpuRequired else {
             throw CutError(code: "participant_gpu_unavailable",
-                           message: "GPU-required grid analysis needs a TileTrail build with native feed layouts.")
+                           message: "GPU-required grid analysis needs native feed-layout support.")
         }
         let file = AnalysisSidecar.canonicalSource(url)
         let identity = try SourceIdentity(file)

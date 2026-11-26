@@ -3987,7 +3987,7 @@ Additional schema rules
               "camera_multiview",
               "even_grid"
             ],
-            "description": "Find Tiles layout for a recording with no saved layout. A build without TileTrail uses even_grid. Factory video_call."
+            "description": "Find Tiles layout for a recording with no saved layout. A build without automatic layout detection uses even_grid. Factory video_call."
           }
         }
       }

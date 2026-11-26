@@ -141,6 +141,15 @@ extension ProjectSession {
             && editor.canInsertStill && !editor.mcpHasActiveTrim && !hasLifecycleModal
     }
 
+    /// Validate the picture path before committing a still edit. Still generation
+    /// checks the actual helper, source identities and picture clock, so an edit
+    /// cannot create a project that only fails when it is exported later.
+    func mcpPreflightStillExport(_ candidate: CutProject) throws {
+        guard candidate.mcpHasStills else { return }
+        _ = try StillExportPlanner().resolve(candidate, relativeTo: mcpStillLocation,
+                                             tracks: .video, offerAlternatives: false)
+    }
+
     func mcpCommitStill(_ candidate: CutProject, action: String) throws {
         guard mcpCanEditStills || (mcpCanStartStillTimeline && candidate.stillFormat != nil) else {
             throw MCPCommandError("editor_busy", "An editable picture timeline is required.")
@@ -371,6 +380,7 @@ extension ProjectSessions {
         try checkAccess()
         guard session.mcpRevision == revision else { throw MCPCommandError("stale_revision", "The project changed during the still edit.") }
         if candidate != project {
+            try session.mcpPreflightStillExport(candidate)
             if let soundtrackMedia { session.editor.cacheStillSoundtrackMedia(soundtrackMedia) }
             try session.mcpCommitStill(candidate, action: action)
         }

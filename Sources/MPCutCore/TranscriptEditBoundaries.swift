@@ -257,7 +257,7 @@ final class TranscriptBoundaryResolver {
                          policy: TranscriptEditRequest.BoundaryPolicy, nudge: Int = 0) throws -> RationalTime {
         let time = nudge == 0 ? requested : try nudging(requested, by: nudge, in: media)
         guard time >= bounds.from, time <= bounds.to else {
-            throw transcriptEditError("The selected boundary lies outside its recording or occurrence.")
+            throw transcriptEditError("The boundary at \(time.description) lies outside the valid range \(bounds.from.description)–\(bounds.to.description).")
         }
         func nearby(_ points: [RationalTime]) -> [RationalTime] {
             let position = points.lowerBound { $0 >= time }

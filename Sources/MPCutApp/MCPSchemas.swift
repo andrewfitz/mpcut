@@ -103,8 +103,18 @@ struct MCPSchemas {
             throw reject("Expected one of " + choices.map { String(describing: $0) }.joined(separator: ", ") + ".")
         }
         if let variants = schema["oneOf"] as? [Object] {
-            let matches = variants.compactMap { try? check(value, schema: $0, tool: tool, path: path, wireIntegers: wireIntegers) }
-            guard matches.count == 1 else { throw reject("The value must match one supported variant.") }
+            var matches: [Any] = []
+            var failures: [String] = []
+            for variant in variants {
+                do { matches.append(try check(value, schema: variant, tool: tool, path: path, wireIntegers: wireIntegers)) }
+                catch { failures.append(error.localizedDescription) }
+            }
+            guard matches.count == 1 else {
+                if matches.isEmpty, !failures.isEmpty {
+                    throw reject("No supported variant matched. " + failures.joined(separator: " "))
+                }
+                throw reject("The value matches multiple supported variants.")
+            }
             value = matches[0]
         }
         for constraint in schema["allOf"] as? [Object] ?? [] {

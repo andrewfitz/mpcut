@@ -5,21 +5,22 @@ import PackageDescription
 // The bundle script supplies the pinned FFmpeg headers and libraries directly.
 let bundledFFmpeg = ProcessInfo.processInfo.environment["MPCUT_BUNDLED_FFMPEG"] == "1"
 
-// The independently released TileTrail C ABI is optional for normal builds.
-let tileTrailPrefix = ProcessInfo.processInfo.environment["MPCUT_TILETRAIL_PREFIX"].flatMap {
-    $0.isEmpty ? nil : URL(fileURLWithPath: $0).standardizedFileURL
-}
-let tileTrailArchive = tileTrailPrefix?.appendingPathComponent("lib/libtiletrail.a").path
+// The independently released TileTrail C ABI is required by MPCutCore.
+let tileTrailPrefix: URL = {
+    guard let raw = ProcessInfo.processInfo.environment["MPCUT_TILETRAIL_PREFIX"], !raw.isEmpty else {
+        fatalError("MPCUT_TILETRAIL_PREFIX is required to build MPCutCore.")
+    }
+    return URL(fileURLWithPath: raw).standardizedFileURL
+}()
+let tileTrailArchive = tileTrailPrefix.appendingPathComponent("lib/libtiletrail.a").path
 // The explicit Clang module scanner also loads CTileTrail when compiling
 // Swift targets that import MPCutCore.
-let tileTrailSwiftSettings: [SwiftSetting] = tileTrailPrefix.map {
-    [.unsafeFlags(["-Xcc", "-I" + $0.appendingPathComponent("include").path])]
-} ?? []
-if let prefix = tileTrailPrefix, let archive = tileTrailArchive {
-    precondition(FileManager.default.fileExists(atPath: prefix.appendingPathComponent("include/tiletrail.h").path)
-        && FileManager.default.fileExists(atPath: archive),
-        "MPCUT_TILETRAIL_PREFIX must contain include/tiletrail.h and lib/libtiletrail.a.")
-}
+let tileTrailSwiftSettings: [SwiftSetting] = [
+    .unsafeFlags(["-Xcc", "-I" + tileTrailPrefix.appendingPathComponent("include").path])
+]
+precondition(FileManager.default.fileExists(atPath: tileTrailPrefix.appendingPathComponent("include/tiletrail.h").path)
+    && FileManager.default.fileExists(atPath: tileTrailArchive),
+    "MPCUT_TILETRAIL_PREFIX must contain include/tiletrail.h and lib/libtiletrail.a.")
 
 let package = Package(
     name: "MPCut",
@@ -28,7 +29,7 @@ let package = Package(
         .executable(name: "MPCutDesktop", targets: ["MPCutApp"]),
         .executable(name: "mpcut", targets: ["MPCutCLI"])
     ],
-    targets: (tileTrailPrefix == nil ? [] : [.systemLibrary(name: "CTileTrail")]) + [
+    targets: [.systemLibrary(name: "CTileTrail")] + [
         .systemLibrary(
             name: "CFFmpeg",
             pkgConfig: bundledFFmpeg ? nil : "libavformat",
@@ -52,14 +53,14 @@ let package = Package(
         ),
         .target(
             name: "MPCutCore",
-            dependencies: ["PacketWriter", "MediaProbe"] + (tileTrailPrefix == nil ? [] : ["CTileTrail"]),
+            dependencies: ["PacketWriter", "MediaProbe", "CTileTrail"],
             resources: [.copy("Gap.png")],
             swiftSettings: tileTrailSwiftSettings,
-            linkerSettings: tileTrailArchive.map {
-                [.unsafeFlags([$0]), .linkedFramework("Metal"), .linkedFramework("QuartzCore"),
-                 .linkedFramework("Foundation"), .linkedFramework("CoreFoundation"),
-                 .linkedFramework("CoreGraphics"), .linkedLibrary("objc"), .linkedLibrary("iconv")]
-            } ?? []
+            linkerSettings: [
+                .unsafeFlags([tileTrailArchive]), .linkedFramework("Metal"), .linkedFramework("QuartzCore"),
+                .linkedFramework("Foundation"), .linkedFramework("CoreFoundation"),
+                .linkedFramework("CoreGraphics"), .linkedLibrary("objc"), .linkedLibrary("iconv")
+            ]
         ),
         .executableTarget(name: "MPCutCLI", dependencies: ["MPCutCore"], swiftSettings: tileTrailSwiftSettings),
         .executableTarget(name: "MPCutApp", dependencies: ["MPCutCore", "FFPreview"],

@@ -128,7 +128,7 @@ struct ParticipantInspector: View {
         _scanColumns = State(initialValue: String(defaults.columns))
         _scanRows = State(initialValue: String(defaults.rows))
         _scanDetail = State(initialValue: defaults.detail)
-        // The layout starts on one the picker offers: a build without TileTrail has only the even grid.
+        // The layout starts on one the picker offers: a build without the required layout detectors has only the even grid.
         _scanLayout = State(initialValue: Self.startingScanLayout(defaults.layout))
     }
 

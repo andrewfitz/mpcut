@@ -167,10 +167,10 @@ public enum ParticipantAnalysis {
         guard isAvailable else { throw unavailable }
         switch options.feedLayout {
         case .gallery where !supportsGalleryHint:
-            throw CutError(code: "participant_gallery_hint_unavailable", message: "Gallery hints require a newer TileTrail build.")
+            throw CutError(code: "participant_gallery_hint_unavailable", message: "Gallery layout hints require a newer participant-analysis capability.")
         case .automatic where !supportsFeedLayouts:
             throw CutError(code: "participant_feed_layout_unavailable",
-                           message: "Scanning generic feeds requires a TileTrail build with feed layouts.")
+                           message: "Scanning generic feeds requires automatic layout detection support.")
         default: break
         }
         let file = url.standardizedFileURL
@@ -376,7 +376,7 @@ public enum ParticipantAnalysis {
 
     private static var unavailable: CutError {
         CutError(code: "participant_analysis_unavailable",
-                 message: "Participant analysis requires an MPCut build linked against the TileTrail C ABI v1 artifact.")
+                 message: "Participant analysis is unavailable in this build.")
     }
 }
 
@@ -430,7 +430,7 @@ private final class TileTrailOutput {
     var contents: Data {
         get throws {
             guard let data = buffer.data, let count = Int(exactly: buffer.len) else {
-                throw CutError(code: "participant_result_invalid", message: "TileTrail returned an invalid result.")
+                throw CutError(code: "participant_result_invalid", message: "Participant analysis returned an invalid result.")
             }
             return Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: data), count: count,
                         deallocator: .custom { [self] _, _ in withExtendedLifetime(self) {} })
@@ -441,14 +441,14 @@ private final class TileTrailOutput {
 private extension tiletrail_timestamp_t {
     init(_ time: RationalTime) throws {
         guard let denominator = UInt32(exactly: time.denominator) else {
-            throw CutError(code: "participant_clock_unsupported", message: "TileTrail cannot represent this source clock.")
+            throw CutError(code: "participant_clock_unsupported", message: "Participant analysis cannot represent this source clock.")
         }
         self.init(pts: time.numerator, numerator: 1, denominator: denominator)
     }
 
     func localTime(origin: RationalTime) throws -> RationalTime {
         guard numerator > 0, denominator > 0 else {
-            throw CutError(code: "participant_result_invalid", message: "TileTrail returned an invalid resume clock.")
+            throw CutError(code: "participant_result_invalid", message: "Participant analysis returned an invalid resume clock.")
         }
         return try RationalTime(numerator: pts)
             .multiplied(by: RationalTime(numerator: Int64(numerator), denominator: Int64(denominator)))
@@ -544,7 +544,7 @@ private final class TileTrailScan {
         }
         try checkTileTrail(status, &error)
         guard let result else {
-            throw CutError(code: "participant_analysis_failed", message: "TileTrail did not return an analyzer.")
+            throw CutError(code: "participant_analysis_failed", message: "Participant analysis did not return an analyzer.")
         }
         handle = result
     }
@@ -724,7 +724,7 @@ private final class TileTrailScan {
         tiletrail_analyzer_free(handle)
         handle = nil
         guard analysis.schemaVersion == 1, analysis.start == .zero, analysis.end == analyzedEnd else {
-            throw CutError(code: "participant_result_invalid", message: "TileTrail returned an unexpected result clock or schema version.")
+            throw CutError(code: "participant_result_invalid", message: "Participant analysis returned an unexpected result clock or schema version.")
         }
         if analyzedEnd < source.duration {
             analysis.end = source.duration

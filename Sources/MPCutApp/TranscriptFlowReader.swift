@@ -186,6 +186,10 @@ struct TranscriptFlowReader: NSViewRepresentable {
     let selection: TranscriptFlowSelection?
     let scroll: TranscriptFlowScroll?
     let choose: (TranscriptOccurrence, Bool, Bool) -> Void
+    let contextSentence: (TranscriptOccurrence) -> Void
+    let contextSplit: (TranscriptOccurrence) -> Void
+    let contextMarkIn: (TranscriptOccurrence) -> Void
+    let contextMarkOut: (TranscriptOccurrence) -> Void
     let inspect: () -> Void
     let describe: (TranscriptOccurrence) -> String
     var textSize = TranscriptFlowLayout.factoryTextSize
@@ -203,6 +207,10 @@ struct TranscriptFlowReader: NSViewRepresentable {
 
     func updateNSView(_ view: TranscriptFlowScrollView, context: Context) {
         view.choose = choose
+        view.contextSentence = contextSentence
+        view.contextSplit = contextSplit
+        view.contextMarkIn = contextMarkIn
+        view.contextMarkOut = contextMarkOut
         view.inspect = inspect
         view.describe = describe
         view.update(source: source, active: active, selection: selection, scroll: scroll, textSize: textSize)
@@ -228,6 +236,10 @@ final class TranscriptFlowScrollView: NSScrollView, NSTableViewDataSource, NSTab
     private var appliedRequest: UUID?
     weak var viewport: TranscriptFlowViewport?
     var choose: ((TranscriptOccurrence, Bool, Bool) -> Void)?
+    var contextSentence: ((TranscriptOccurrence) -> Void)?
+    var contextSplit: ((TranscriptOccurrence) -> Void)?
+    var contextMarkIn: ((TranscriptOccurrence) -> Void)?
+    var contextMarkOut: ((TranscriptOccurrence) -> Void)?
     var inspect: (() -> Void)?
     var describe: ((TranscriptOccurrence) -> String)?
     private static let inset: CGFloat = 12
@@ -530,6 +542,10 @@ private final class TranscriptFlowLine: NSView, NSViewToolTipOwner {
         contextWord = i
         let menu = NSMenu()
         for (title, action) in [("Seek to Word", #selector(seek)), ("Extend Selection to Word", #selector(extendSelection)),
+                                ("Select Sentence", #selector(selectSentence)),
+                                ("Split at Sentence…", #selector(splitAtSentence)),
+                                ("Mark In at Sentence Start", #selector(markInAtSentence)),
+                                ("Mark Out at Sentence End", #selector(markOutAtSentence)),
                                 ("Inspect Word Evidence", #selector(inspectWord))] {
             menu.addItem(withTitle: title, action: action, keyEquivalent: "").target = self
         }
@@ -538,6 +554,14 @@ private final class TranscriptFlowLine: NSView, NSViewToolTipOwner {
 
     @objc private func seek() { if let contextWord { owner?.pick(contextWord, extending: false, seek: true) } }
     @objc private func extendSelection() { if let contextWord { owner?.pick(contextWord, extending: true, seek: true) } }
+    @objc private func selectSentence() { if let word = contextOccurrence { owner?.contextSentence?(word) } }
+    @objc private func splitAtSentence() { if let word = contextOccurrence { owner?.contextSplit?(word) } }
+    @objc private func markInAtSentence() { if let word = contextOccurrence { owner?.contextMarkIn?(word) } }
+    @objc private func markOutAtSentence() { if let word = contextOccurrence { owner?.contextMarkOut?(word) } }
+    private var contextOccurrence: TranscriptOccurrence? {
+        guard let contextWord, let layoutResult else { return nil }
+        return layoutResult.source.words[contextWord]
+    }
     @objc private func inspectWord() {
         if let contextWord { owner?.pick(contextWord, extending: false, seek: false); owner?.inspect?() }
     }

@@ -15,7 +15,7 @@ struct TilesScanDefaults: Equatable {
         self.rows = rows
         self.detail = detail
         let grid = ParticipantFeedLayout.fixed(columns: UInt32(max(1, columns)), rows: UInt32(max(1, rows)))
-        // A build without TileTrail has neither meeting layout, so it starts on the even grid.
+        // A build without the required layout detectors has neither meeting layout, so it starts on the even grid.
         switch layout {
         case .videoCall: self.layout = isAvailable ? .meeting : grid
         case .cameraMultiview: self.layout = supportsFeedLayouts ? .automatic : isAvailable ? .meeting : grid

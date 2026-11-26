@@ -241,7 +241,7 @@ extension ProjectSessions {
         if tool == "multicam_setup_read" {
             let rows = model.setup.map { draft -> [String: Any] in
                 ["id": draft.id, "path": draft.source.file, "video": draft.media.hasVideo,
-                 "name": draft.source.name as Any? ?? NSNull(), "streams": draft.media.audio.map { $0.stream.index }]
+                 "name": draft.source.displayName, "streams": draft.media.audio.map { $0.stream.index }]
             }
             return ["sources": rows, "adding": model.project != nil,
                     "opening": model.pendingSetupProject?.referenceAngle as Any? ?? NSNull(),
@@ -254,6 +254,7 @@ extension ProjectSessions {
               session.window?.attachedSheet == nil || session.window?.attachedSheet === model.setupWindow else {
             throw lifecycleBusy()
         }
+        let previousHandle = session.mcpHandle
         switch tool {
         case "multicam_setup_dismiss": model.dismissSetup()
         case "multicam_setup_confirm":
@@ -310,7 +311,13 @@ extension ProjectSessions {
             guard model.setup.isEmpty else { throw MCPFailure("setup_failed", model.notice?.message ?? "The editor declined setup.") }
         default: throw lifecycleInvalid("Choose confirm or dismiss.")
         }
-        return lifecycleState(session)
+        var state = lifecycleState(session)
+        if tool == "multicam_setup_confirm" {
+            state["previous_project_handle"] = previousHandle
+            state["new_project_handle"] = session.mcpHandle
+            state["handle_changed"] = previousHandle != session.mcpHandle
+        }
+        return state
     }
 }
 
@@ -524,7 +531,7 @@ extension EditorPreferences {
             guard let s = value as? String, let v = ExportMode(rawValue: s) else { throw lifecycleInvalid("Choose copy, smart, or encode.") }
             defaultExportMode = v
         case .timelineSnapTarget:
-            guard let s = value as? String, let v = TimelineSnapTarget(rawValue: s) else { throw lifecycleInvalid("Choose off, keyframes, scenes, or silence.") }
+            guard let s = value as? String, let v = TimelineSnapTarget(rawValue: s) else { throw lifecycleInvalid("Choose off, playhead, keyframes, scenes, or silence.") }
             snapTarget = v
         case .exportJpegDefaultPreset:
             guard let s = value as? String, let v = JPEGPreset(rawValue: s) else { throw lifecycleInvalid("Choose review or full.") }

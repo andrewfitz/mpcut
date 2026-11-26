@@ -843,6 +843,7 @@ extension ProjectSessions {
                     let warnings = try ResolveExport.write(snapshot, relativeTo: location, to: output,
                                                            useSidecar: AnalysisSidecar.readsEnabled,
                                                            matching: ordinary, matchingMulticam: indexed,
+                                                           allowLoss: allowLoss,
                                                            auxiliaryOutput: progress.published, cancelled: outputCancelled)
                     progress.published(output)
                     if open { try ResolveExport.openInResolve(output, cancelled: outputCancelled) }
@@ -914,6 +915,9 @@ extension ProjectSessions {
         }
         configured.organization = .init(subfolder: args["subfolder"] as? String ?? "", baseName: args["base_name"] as? String ?? "")
         let options = configured
+        // Reject invalid queue destinations before creating the asynchronous job.
+        // Callers receive the validation error synchronously and no job is persisted.
+        try options.organization.validateSubfolder(in: output, protectedMedia: protected)
         let audioAction: ReencodeAudio? = args["audio"] == nil ? nil : options.audio
         let audioOutput = try outputEnum(args, "audio_output", multi
             ? encoding.audioOutput(container: container, tracks: options.tracks, audio: audioAction) : MulticamAudioOutput.separateTracks)
@@ -933,7 +937,6 @@ extension ProjectSessions {
             var multicamPlans: [[String: Any]] = []
             var picturePlans: [[String: Any]] = []
             do {
-                try options.organization.validateSubfolder(in: output, protectedMedia: protected)
                 if multi {
                     let engine = MulticamEngine(cancelled: outputCancelled)
                     let batch = try MulticamBulkExport(ranges: groups, directory: output, container: container,

@@ -137,6 +137,12 @@ private extension ProjectSession {
         }
         response["revision"] = mcpRevision
         response["project_handle"] = mcpHandle
+        if response["changed"] == nil {
+            response["changed"] = result.update.map { $0 != project } ?? false
+        }
+        if response["operation_count"] == nil {
+            response["operation_count"] = (response["changed"] as? Bool) == true ? 1 : 0
+        }
         return response
     }
 }
@@ -323,6 +329,13 @@ private enum MCPTilesWork {
 
     static func scan(_ input: Input, project: CutProject, document: URL, progress: MCPLiveOutputProgress,
                      useSidecar: Bool) throws -> Result {
+        let requestedFeedLayout = try input.optional("feed_layout", as: String.self)
+        let requestedGallery = try input.optional("gallery_grid", as: String.self)
+        let requestsAutomaticLayout = requestedGallery != nil || requestedFeedLayout == nil || requestedFeedLayout == "auto"
+        if requestsAutomaticLayout && !ParticipantAnalysis.isAvailable {
+            throw CutError(code: "participant_analysis_unavailable",
+                           message: "Participant analysis is unavailable in this build.")
+        }
         let id = try sourceID(input, project: project, scanned: false)
         let source = try CheckedSource(sourceURL(id, project: project, document: document))
         let previous = project.participants.pendingReviews.first { $0.sourceID == id }

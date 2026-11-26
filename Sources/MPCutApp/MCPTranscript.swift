@@ -814,10 +814,12 @@ extension ProjectSessions {
             let target = try controller.attachment(id: selectionOwner ?? attachment?.id)
             result["result_id"] = target.resultID
             try checkAccess()
+            let expansion: TranscriptSelectionExpansion? = try a.fields["expansion"] == nil
+                ? nil : a.decode("expansion")
             let resolved = try a.action == "mark"
-                ? controller.mark(selection, attachmentID: target.id)
+                ? controller.mark(selection, attachmentID: target.id, expansion: expansion)
                 : controller.select(selection, attachmentID: target.id,
-                                        expansion: a.fields["expansion"] == nil ? nil : a.decode("expansion"))
+                                        expansion: expansion)
             result["selection"] = try transcriptMCPJSON(resolved)
         case "plan":
             let edit: TranscriptEditRequest = try a.decode("edit")
@@ -840,13 +842,15 @@ extension ProjectSessions {
             guard controller.timelineRevision == timelineRevision, controller.state.revision == transcriptRevision else {
                 throw MCPCommandError("stale_transcript_plan", "The project or transcript changed while preparing the edit. Review it again.")
             }
+            let verbose = a.fields["verbose"] as? Bool == true
+            let affectedSpeechJSON = try transcriptMCPJSON(Array(plan.affectedSpeech.prefix(32)))
             let details: [String: Any] = [
                 "action": plan.action.rawValue,
                 "history_action": plan.historyAction,
                 "attachment_results": plan.attachmentResults,
                 "boundaries": try transcriptMCPJSON(plan.boundaries),
                 "selections": try transcriptMCPJSON(plan.selections),
-                "affected_speech": try transcriptMCPJSON(Array(plan.affectedSpeech.prefix(32))),
+                "affected_speech": verbose ? affectedSpeechJSON : TranscriptRows.compact(affectedSpeechJSON),
                 "affected_speech_count": plan.affectedSpeech.count,
                 "unavailable_evidence_attachment_ids": plan.unavailableEvidenceAttachmentIDs,
                 "affected_occurrences": plan.affectedOccurrences,

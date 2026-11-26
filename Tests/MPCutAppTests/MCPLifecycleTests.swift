@@ -126,9 +126,13 @@ final class MCPLifecycleTests: XCTestCase {
                                                    session: session, checkAccess: {})
         let rows = try XCTUnwrap(setup?["sources"] as? [[String: Any]])
         let angle = try XCTUnwrap(rows.first?["id"] as? String)
-        _ = try await sessions.mcpLifecycle(tool: "multicam_setup_confirm",
+        XCTAssertEqual(rows.first?["name"] as? String, media.lastPathComponent)
+        let confirmed = try await sessions.mcpLifecycle(tool: "multicam_setup_confirm",
             arguments: ["opening": angle, "audio": ["mode": "none"], "names": [angle: "Wide"]],
             session: session, checkAccess: {})
+        XCTAssertEqual(confirmed?["previous_project_handle"] as? String, handle)
+        XCTAssertEqual(confirmed?["new_project_handle"] as? String, confirmed?["project_handle"] as? String)
+        XCTAssertEqual(confirmed?["handle_changed"] as? Bool, true)
         XCTAssertEqual(session.multicam.project?.angles.first?.name, "Wide")
         XCTAssertEqual(session.multicam.project?.audio, MulticamAudioPolicy.none)
         XCTAssertTrue(session.multicam.setup.isEmpty)

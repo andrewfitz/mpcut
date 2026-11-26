@@ -88,11 +88,12 @@ enum TimelineEdge {
 }
 
 enum TimelineSnapTarget: String, CaseIterable {
-    case off, keyframes, scenes, silence
+    case off, playhead, keyframes, scenes, silence
 
     var label: String {
         switch self {
         case .off: "Off"
+        case .playhead: "Playhead"
         case .keyframes: "Keyframes"
         case .scenes: "Scenes"
         case .silence: "Silence"
@@ -1283,7 +1284,8 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
                 let edge = trimPosition.edge == .start ? position.keptStart : position.keptEnd
                 drawTimelinePlayhead(x: stripX(at: edge), top: 16, bottom: tileLaneBottom + 2, color: .controlAccentColor)
                 drawTrimTime(trimPosition.time, edgeX: stripX(at: edge))
-            } else if !(enclosingScrollView is TimelineScrollView) {
+            }
+            if !(enclosingScrollView is TimelineScrollView) {
                 drawTimelinePlayhead(x: x(at: timeline.playhead), top: 16, bottom: tileLaneBottom + 2, color: .systemRed)
             }
         }

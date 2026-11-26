@@ -618,7 +618,10 @@ struct TranscriptPane: View {
                                      choose: { word, extending, seek in
                     dialogueFocused = true
                     choose(word, extending: extending, seek: seek)
-                }, inspect: showEvidence, describe: wordDescription, textSize: readerTextSize)
+                }, contextSentence: selectSentence, contextSplit: splitSentence,
+                contextMarkIn: { markTimelineBoundary(at: $0, isIn: true) },
+                contextMarkOut: { markTimelineBoundary(at: $0, isIn: false) },
+                inspect: showEvidence, describe: wordDescription, textSize: readerTextSize)
                 .frame(width: geometry.size.width, height: geometry.size.height)
                 .focused($dialogueFocused)
             }
@@ -1068,6 +1071,47 @@ struct TranscriptPane: View {
                 }
             }
         }
+    }
+
+    private func selectSentence(_ word: TranscriptOccurrence) {
+        guard readerReady, let index,
+              let endpoints = TranscriptSelectionExpansion.sentence.endpoints(from: word, to: word,
+                                                                                in: index, space: space) else { return }
+        selectionStart = endpoints.first
+        selectionEnd = endpoints.last
+        if let position = readerPosition(endpoints.first) { scrollRequest = .init(word: position) }
+        dialogueFocused = true
+    }
+
+    private func splitSentence(_ word: TranscriptOccurrence) {
+        selectSentence(word)
+        Task { @MainActor in showEdit(.split) }
+    }
+
+    private func markTimelineBoundary(at word: TranscriptOccurrence, isIn: Bool) {
+        guard readerReady, let index else { return }
+        selectSentence(word)
+        let pair = TranscriptSelectionExpansion.sentence.endpoints(from: word, to: word, in: index, space: space)
+        let endpoint = isIn ? pair?.first.range.from : pair?.last.range.to
+        guard let endpoint else { return }
+        if isMulticam {
+            guard space == .currentCut, multicam.assemblyPreview else {
+                status = "Timeline marks from the transcript require Current Cut assembly view."
+                return
+            }
+            multicam.seekAssembly(at: endpoint, scrubbing: false)
+            if isIn { multicam.markIn = multicam.markAnalysisTime() }
+            else { multicam.markOut = multicam.markAnalysisTime() }
+        } else {
+            guard space == .currentCut else {
+                status = "Timeline marks from the transcript require Current Cut view."
+                return
+            }
+            editor.seek(endpoint.seconds)
+            if isIn { editor.setIn() } else { editor.setOut() }
+        }
+        status = isIn ? "Marked In at (timelineTime(endpoint.seconds, milliseconds: true))." :
+            "Marked Out at (timelineTime(endpoint.seconds, milliseconds: true))."
     }
 
     private func followMulticam(_ output: RationalTime, scrolling: Bool = true) {

@@ -151,7 +151,7 @@ The checkout’s packaged app is `dist/MPCut.app`. To check it before installati
 
 Use `./scripts/build-app.sh /Applications` to install the source build there for the CLI examples above.
 
-A standalone MPCut build can work with fixed grids and hand-drawn tiles. For automatic meeting and multiview detection, build TileTrail for Apple Silicon macOS and set `MPCUT_TILETRAIL_PREFIX` to the directory containing its matching `include/tiletrail.h` and `lib/libtiletrail.a` when running `swift build`, `swift build --build-tests`, or `scripts/build-app.sh`. Use a current build of TileTrail for gallery hints and incremental scan checkpoints. Adaptive scans skip unchanged stretches with a TileTrail build that supports coarse pushes. The app and CLI link the analyzer statically. Run the resulting macOS test host through Backstage as described in AGENTS.md. [Tiles editing guide](docs/PARTICIPANTS.md)
+MPCut requires its participant-analysis dependency for every supported build. Set `MPCUT_TILETRAIL_PREFIX` to the directory containing the matching `include/tiletrail.h` and `lib/libtiletrail.a` when running `swift build`, `swift build --build-tests`, or `scripts/build-app.sh`. MPCut exposes participant analysis, layout detection and adaptive scanning through its normal app, CLI and MCP interfaces. Run the resulting macOS test host through Backstage as described in AGENTS.md. [Tiles editing guide](docs/PARTICIPANTS.md)
 
 For development, install Homebrew FFmpeg and pkg-config. Build the tests with `swift build --build-tests`, then launch their XCTest hosts on Backstage as described in AGENTS.md. The integration suites also use Python 3 and the FFmpeg CLI tools. [Test commands and qualification limits](AUDIT.md#reproduce-the-release-checks)
 

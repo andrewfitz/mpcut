@@ -43,7 +43,7 @@ Global `mpcut help --json` includes command references and export option lists. 
 | `project_schema_versions` | Saved-project versions this build reads and writes. The current build supports only schema 9. |
 | `detector_capabilities` | Availability flags for this build and host. |
 
-`detector_capabilities` reports `tile_trail` for meeting detection, `auto_feed_layout` for automatic generic feed detection, `gallery_grid` for meeting gallery hints, and `adaptive_sampling` for TileTrail's adaptive scanning. `standalone_fixed_grid` covers explicit grids without TileTrail. `auto_backend` and `cpu_only_backend` include that fallback. `gpu_required_backend` reports whether TileTrail can initialize its GPU backend on this host. A standalone fixed grid accepts only `auto` and `cpu-only`.
+`detector_capabilities` reports `participant_analysis` for participant analysis, `auto_feed_layout` for automatic generic feed detection, `gallery_grid` for meeting gallery hints, and `adaptive_sampling` for adaptive scanning. `standalone_fixed_grid` covers explicit grids. `auto_backend` and `cpu_only_backend` include that fallback. `gpu_required_backend` reports whether the GPU analysis backend can initialize on this host. A standalone fixed grid accepts only `auto` and `cpu-only`.
 
 From a source checkout with a built app, keep the first three frames of the included 29.97 fps ProRes clip. The temporary directory gives the media and export fresh paths on each run.
 
@@ -323,7 +323,7 @@ When a multicam boundary fails, read `error.multicam` and `error.nearest`. If `m
 
 ## Edit camera feeds and recorded calls
 
-Run `mpcut help tiles` to find commands for scanning a recording, correcting assignments and delivering synchronized movies. Automatic scanning requires a TileTrail-enabled build. Inspection and delivery can start from accepted tiles in a saved project.
+Run `mpcut help tiles` to find commands for scanning a recording, correcting assignments and delivering synchronized movies. Automatic scanning requires participant analysis. Inspection and delivery can start from accepted tiles in a saved project.
 
 ```sh
 mpcut tiles scan gallery.mov --output gallery-scan.json --progress stderr --json
@@ -340,7 +340,7 @@ Feed decisions about one tile share a `group_id` and report their `group_count`,
 
 `--at`, and the bounds of a tile correction, refer to the recording's source clock. Use `--source-id ID` when a project contains several tile recordings. Edits to a saved project require `--out-project FILE` or `--in-place`.
 
-When the linked TileTrail supports incremental checkpoints, a tile-only scan with `--output` can resume from its most recent committed checkpoint. Rerun with the same input, options and output path. An interrupted scan keeps its checkpoint next to the requested output. A scan that finds incomplete coverage saves its report, including the affected intervals. Legacy resume files and scans that include scenes use decoded replay to reconstruct the tracker.
+When the analysis backend supports incremental checkpoints, a tile-only scan with `--output` can resume from its most recent committed checkpoint. Rerun with the same input, options and output path. An interrupted scan keeps its checkpoint next to the requested output. A scan that finds incomplete coverage saves its report, including the affected intervals. Legacy resume files and scans that include scenes use decoded replay to reconstruct the tracker.
 
 To deliver every eligible feed from a source, use the one-shot command. To deliver a subset, make a plan with a `--feed-id` for each selected feed, then render that plan.
 

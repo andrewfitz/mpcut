@@ -32,6 +32,8 @@ public enum MulticamSync {
         public let waveformIssue: String?
         public let matches: [Match]
         public let drift: RationalTime?
+        /// True when the available metadata or waveform proposal already matches the source offset.
+        public let alreadyAligned: Bool
     }
 
     public struct Report: Encodable, Sendable {
@@ -179,7 +181,8 @@ public enum MulticamSync {
                 try checkCancellation()
                 return Suggestion(sourceID: source.id, currentOffset: source.offset, stamp: nil,
                                   metadataOffset: nil, metadataIssue: error.localizedDescription,
-                                  audioStream: nil, waveformOffset: nil, waveformIssue: nil, matches: [], drift: nil)
+                                  audioStream: nil, waveformOffset: nil, waveformIssue: nil, matches: [], drift: nil,
+                                  alreadyAligned: false)
             }
             let targetStream = audioStream(source, media: media, explicit: replacement?.stream)
             if replacement != nil, targetStream == nil {
@@ -277,7 +280,8 @@ public enum MulticamSync {
             }
             return Suggestion(sourceID: source.id, currentOffset: currentOffset, stamp: targetStamp,
                               metadataOffset: metadataOffset, metadataIssue: stampIssue, audioStream: targetStream,
-                              waveformOffset: matches.first?.offset, waveformIssue: waveIssue, matches: matches, drift: drift)
+                              waveformOffset: matches.first?.offset, waveformIssue: waveIssue, matches: matches, drift: drift,
+                              alreadyAligned: metadataOffset == currentOffset || matches.first?.offset == currentOffset)
         }
         try checkCancellation()
         return Report(referenceSourceID: reference.id, referenceStamp: referenceStamp,

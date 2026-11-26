@@ -4,7 +4,7 @@ import MPCutCore
 
 struct CLIVersion: Encodable {
     struct DetectorCapabilities: Encodable {
-        let tileTrail = ParticipantAnalysis.isAvailable
+        let participantAnalysis = ParticipantAnalysis.isAvailable
         let standaloneFixedGrid = true
         let autoFeedLayout = ParticipantAnalysis.supportsFeedLayouts
         let galleryGrid = ParticipantAnalysis.supportsGalleryHint
